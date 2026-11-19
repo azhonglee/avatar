@@ -1,0 +1,26 @@
+{
+  "name": "personal-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "飞书个人 superagent：后台静默整理知识库、识别与追踪任务、提醒，并通过 ACP 调度多个 harness",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "bin": {
+    "pa": "bin/pa"
+  },
+  "scripts": {
+    "typecheck": "tsc",
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test test/*.test.ts"
+  },
+  "dependencies": {
+    "croner": "^9.1.0",
+    "yaml": "^2.8.1",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "typescript": "^5.9.3"
+  }
+}

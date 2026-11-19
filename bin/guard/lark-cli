@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# personal-agent 的 lark-cli 守卫：agent 进程的 PATH 里它排在真正的 lark-cli 前面。
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)"
+exec node --experimental-strip-types --disable-warning=ExperimentalWarning "$ROOT/src/guard-cli.ts" "$@"
