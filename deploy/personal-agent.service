@@ -1,0 +1,20 @@
+# systemd 用户服务。安装：
+#   mkdir -p ~/.config/systemd/user && cp deploy/personal-agent.service ~/.config/systemd/user/
+#   修改下面的 WorkingDirectory / ExecStart 路径后：
+#   systemctl --user daemon-reload && systemctl --user enable --now personal-agent
+#   loginctl enable-linger $USER     # 退出登录后继续运行
+#   journalctl --user -u personal-agent -f
+[Unit]
+Description=personal-agent (Feishu superagent)
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/personal-agent
+ExecStart=%h/personal-agent/bin/pa run
+Restart=always
+RestartSec=10
+# 让 lark-cli / acpx / 各 harness 的命令行在 PATH 里（按你的安装位置调整）
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

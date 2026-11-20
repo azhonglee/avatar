@@ -1,0 +1,72 @@
+# personal-agent 配置。复制为 config.yaml 后按需修改（config.yaml 不进 git）。
+
+owner:
+  open_id: ""              # 留空：pa init 时从 lark-cli auth status 自动获取
+  timezone: Asia/Shanghai
+
+data_dir: ~/.personal-agent  # 本地状态（SQLite）、运行日志、worktree
+
+# 飞书网页域名，用于拼文档/妙记链接；企业租户填 https://<租户>.feishu.cn
+lark_web: https://feishu.cn
+
+# ── harness：都通过 acpx（ACP）调用；agent 是 acpx 内置名或 ~/.acpx/config.json 里自定义的名字 ──
+harnesses:
+  claude:
+    agent: claude            # Claude Code（经 claude-agent-acp 适配器）
+  codex:
+    agent: codex
+  gemini:
+    agent: gemini
+  dsh:
+    agent: deepseek-harness  # DeepSeek Harness（需安装 dsh 并配置好 provider）
+  # Doubao 有两种常见接入方式，按你实际使用的选一种：
+  # 1) TRAE CLI：
+  # doubao:
+  #   agent: trae
+  # 2) 用 Claude Code 指向方舟（Ark）的 Anthropic 兼容端点，密钥用 ${环境变量} 引用，不要写进本文件：
+  # doubao:
+  #   agent: claude
+  #   model: <方舟上的模型名>
+  #   env:
+  #     ANTHROPIC_BASE_URL: <方舟的 Anthropic 兼容地址>
+  #     ANTHROPIC_AUTH_TOKEN: ${ARK_API_KEY}
+
+roles:
+  brain: claude      # 分诊、私聊对话、知识库整理
+  reviewer: codex    # 派单结果的交叉审查；留空则不审查
+
+dispatch:
+  default_harness: claude   # 任务标题没写 [harness] 前缀时用谁
+  max_parallel: 2
+  timeout_sec: 3600
+  fix_rounds: 1             # 审查不通过时返工几轮
+  repos:                    # 任务描述里写 “repo: 别名” 即在该仓库的独立 worktree 里执行
+    # web: ~/code/web
+
+capture:
+  min_confidence: 0.6        # ≥ 该值进“待确认”
+  auto_inbox_confidence: 0.9 # ≥ 该值直接进 Inbox
+  lookback_hours: 24         # 第一次运行回看多久的消息
+
+schedules:                   # cron 表达式，按 owner.timezone
+  capture: "*/15 * * * *"
+  dispatch: "*/5 * * * *"
+  brief_morning: "30 8 * * 1-5"
+  brief_evening: "30 18 * * 1-5"
+
+events:                      # 需在飞书开发者后台「事件与回调 → 长连接」里开启对应事件并发布版本
+  bot_messages: true         # im.message.receive_v1：你私聊机器人发指令
+  task_updates: true         # task.task.update_user_access_v2：任务变更后尽快扫描派单列
+  doc_comments: true         # drive.notice.comment_add_v1：文档评论 @我 → 识别任务
+  minutes: true              # minutes.minute.generated_v1：妙记生成 → 识别待办 + 写会议纪要
+
+kb:
+  space_name: 个人知识库
+  nodes: ["00 Inbox", "会议纪要", "项目", "主题", "变更日志"]
+  minutes_notes: true
+
+jobs:                        # 定时 agent 作业：brain 带受限的 lark-cli 执行一段提示词
+  kb-weekly:
+    cron: "0 17 * * 5"
+    prompt: prompts/kb-weekly.md
+    notify: true
