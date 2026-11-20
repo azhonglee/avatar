@@ -49,10 +49,11 @@ export class Store {
     return r.changes > 0;
   }
 
-  addSignal(s: { id: string; source: string; text: string; link: string }): void {
-    this.db
+  addSignal(s: { id: string; source: string; text: string; link: string }): boolean {
+    const r = this.db
       .prepare("INSERT OR IGNORE INTO signals (id, source, at, text, link) VALUES (?, ?, ?, ?, ?)")
       .run(s.id, s.source, Date.now(), s.text, s.link);
+    return r.changes > 0;
   }
 
   setVerdict(id: string, verdict: string, taskGuid = ""): void {

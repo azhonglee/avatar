@@ -99,8 +99,10 @@ if (key.startsWith("event consume")) {
       ok({ node: { node_token: `nd_${flag("--title")}`, title: flag("--title") } });
     case "im +messages-search": {
       if (argv.includes("--is-at-me"))
-        ok({ messages: [{ message_id: "om_1", chat_id: "oc_g1", chat_type: "group", chat_name: "预算群", sender: { id: "ou_alice", name: "Alice" }, content: "@主人 周五前帮忙评审一下 Q4 预算方案", create_time: "2026-11-19 10:00" }] });
+        ok({ has_more: false, page_token: "", messages: [{ message_id: "om_1", chat_id: "oc_g1", chat_type: "group", chat_name: "预算群", sender: { id: "ou_alice", name: "Alice" }, content: "@主人 周五前帮忙评审一下 Q4 预算方案", create_time: "2026-11-19 10:00" }] });
       ok({
+        has_more: false,
+        page_token: "",
         messages: [
           { message_id: "om_2", chat_id: "oc_p1", chat_type: "p2p", sender: { id: "ou_bob", name: "Bob" }, content: "收到，谢谢", create_time: "2026-11-19 10:05" },
           { message_id: "om_3", chat_id: "oc_p1", chat_type: "p2p", sender: { id: "ou_owner", name: "主人" }, content: "我自己发的", create_time: "2026-11-19 10:06" },

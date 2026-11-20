@@ -2,8 +2,14 @@ import type { Board } from "../board.ts";
 import type { Config } from "../config.ts";
 import type { Lark } from "../lark.ts";
 import type { Store } from "../store.ts";
-import { errMsg, findItems, isoWithOffset, log, truncate } from "../util.ts";
+import { errMsg, isoWithOffset, log, truncate } from "../util.ts";
 import { triage, type Signal } from "./triage.ts";
+
+type SearchMessage = Record<string, unknown> & { message_id: string };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 /**
  * 任务识别：把各处信号（@我 的消息、私聊、文档评论 @我、妙记待办）收进本地队列，
@@ -34,33 +40,61 @@ export class Capture {
     return chatId ? `https://${this.cfg.applink_host}/client/chat/open?openChatId=${chatId}` : "";
   }
 
+  /** 单页调用让我们能检查每个续页游标，不受 CLI --page-all 的页数上限影响。 */
+  private async searchMessages(args: string[]): Promise<SearchMessage[]> {
+    const messages: SearchMessage[] = [];
+    const tokens = new Set<string>();
+    let token: string | undefined;
+    do {
+      const data = await this.lark.run(token ? [...args, "--page-token", token] : args, { as: "user" });
+      if (!isRecord(data)) throw new Error("消息搜索返回格式无效");
+      if ("message_ids" in data) throw new Error("消息搜索仅返回 ID，消息详情获取失败");
+      if (!Array.isArray(data.messages) || typeof data.has_more !== "boolean") {
+        throw new Error("消息搜索缺少消息列表或分页状态");
+      }
+      for (const message of data.messages) {
+        if (!isRecord(message) || typeof message.message_id !== "string" || !message.message_id.trim()) {
+          throw new Error("消息搜索返回了无效的消息");
+        }
+        messages.push({ ...message, message_id: message.message_id });
+      }
+      if (!data.has_more) break;
+      if (typeof data.page_token !== "string" || !data.page_token.trim() || tokens.has(data.page_token)) {
+        throw new Error("消息搜索返回了缺失或重复的分页游标");
+      }
+      token = data.page_token;
+      tokens.add(token);
+    } while (true);
+    return messages;
+  }
+
   /** 增量拉取 @我 的消息和别人发给我的私聊（这两类机器人收不到事件，只能以本人身份拉）。 */
   async pollMessages(): Promise<number> {
     const end = new Date();
     const cursor = this.store.get("capture.cursor");
     const start = cursor ? new Date(cursor) : new Date(end.getTime() - this.cfg.capture.lookback_hours * 3_600_000);
     const range = ["--start", isoWithOffset(start), "--end", isoWithOffset(end)];
-    const common = ["im", "+messages-search", "--query", "", "--no-reactions", "--page-all", "--page-size", "50", ...range];
+    const common = ["im", "+messages-search", "--query", "", "--no-reactions", "--page-size", "50", ...range];
     const batches = await Promise.all([
-      this.lark.run([...common, "--is-at-me"], { as: "user" }),
-      this.lark.run([...common, "--chat-type", "p2p", "--exclude-sender-type", "bot"], { as: "user" }),
+      this.searchMessages([...common, "--is-at-me"]),
+      this.searchMessages([...common, "--chat-type", "p2p", "--exclude-sender-type", "bot"]),
     ]);
     let added = 0;
-    for (const m of batches.flatMap((b) => findItems(b, "message_id"))) {
+    for (const m of batches.flat()) {
       const sender = (m.sender ?? {}) as Record<string, unknown>;
       const senderId = String(sender.id ?? sender.open_id ?? "");
       if (m.deleted || senderId === this.cfg.owner.open_id) continue;
       const id = `msg:${m.message_id}`;
-      if (!this.store.markSeen(id, "signal")) continue;
       const chat = String(m.chat_name ?? (m.chat_type === "p2p" ? "私聊" : "群聊"));
-      this.store.addSignal({
+      const inserted = this.store.addSignal({
         id,
         source: m.chat_type === "p2p" ? "私聊" : "群聊@我",
         text: `[${chat}] ${sender.name ?? senderId}（${m.create_time ?? ""}）：${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`,
         link: this.chatLink(String(m.chat_id ?? "")),
       });
-      added++;
+      if (inserted) added++;
     }
+    // signals.id 去重；中途退出时可以重拉，已入库信号不会重插。
     this.store.set("capture.cursor", end.toISOString());
     return added;
   }
