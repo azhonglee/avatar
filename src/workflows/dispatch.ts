@@ -1,193 +1,497 @@
 import fs from "node:fs";
 import path from "node:path";
+import { z } from "zod";
 import type { Board, BoardTask } from "../board.ts";
-import type { Config } from "../config.ts";
+import { repoSpec, type Config } from "../config.ts";
+import { comment, move } from "../effects.ts";
+import { checkpoint, type Ctx, type Handler } from "../engine.ts";
 import { loadPrompt, runHarness } from "../harness.ts";
+import type { Effect, Ledger, WorkItem } from "../ledger.ts";
 import type { Store } from "../store.ts";
-import { errMsg, expandHome, log, render, runProcess, truncate } from "../util.ts";
+import { log, render, runProcess, truncate } from "../util.ts";
 
 const COMMENT_MAX = 2800;
 
+// ───────────────────────── 纯函数：解析与决策（单元测试覆盖） ─────────────────────────
+
 /** 从任务标题前缀 `[codex]` 或描述里的 `harness: codex` 行解析执行者。 */
-export function parseHarness(t: BoardTask, known: string[]): string | undefined {
+export function parseHarness(t: Pick<BoardTask, "summary" | "description">, known: string[]): string | undefined {
   const m = t.summary.match(/^\s*\[([\w-]+)\]/) ?? t.description.match(/^\s*harness\s*[:：]\s*([\w-]+)\s*$/im);
   return m && known.includes(m[1]) ? m[1] : undefined;
 }
 
 /** 描述里的 `repo: 别名或路径` 行。 */
-export function parseRepo(t: BoardTask): string | undefined {
+export function parseRepo(t: Pick<BoardTask, "description">): string | undefined {
   return t.description.match(/^\s*repo\s*[:：]\s*(\S+)\s*$/im)?.[1];
 }
 
-/** 交叉审查必须换一个 harness：执行者正好是 reviewer 时改由 brain 审；都相同则不审。 */
+/** 交叉审查必须换一个 harness：执行者正好是 reviewer 时改由 brain 审；都相同则没有审查者。 */
 export function pickReviewer(roles: { brain: string; reviewer: string }, worker: string): string {
   if (!roles.reviewer) return "";
   if (roles.reviewer !== worker) return roles.reviewer;
   return roles.brain !== worker ? roles.brain : "";
 }
 
-export function parseVerdict(review: string): "approve" | "changes" {
-  return /VERDICT\s*[:：]\s*APPROVE/i.test(review) ? "approve" : "changes";
-}
+const Review = z.object({
+  verdict: z.preprocess((v) => (typeof v === "string" ? v.trim().toLowerCase() : v), z.enum(["approve", "changes"])),
+  summary: z.string().default(""),
+  issues: z
+    .array(
+      z.object({
+        severity: z.string().default(""),
+        location: z.string().default(""),
+        problem: z.string().default(""),
+        suggestion: z.string().default(""),
+      }),
+    )
+    .default([]),
+});
+export type Review = z.infer<typeof Review>;
 
 /**
- * 派单：看板“派给Agent”列里的任务 → 按标题前缀选 harness → 在独立 worktree/工作目录执行 →
- * （可选）另一个 harness 交叉审查并返工一轮 → 结果写成任务评论 → 移到“待验收”。
- * worker 不拿飞书权限，飞书只由守护进程写。
+ * 解析审查结论。优先取回复里最后一个合法的 JSON 对象（prompts/review.md 要求的格式）；
+ * 兼容旧格式时只认最后一个非空行的 `VERDICT: APPROVE|CHANGES`——正文里提到这个字样不算数。
+ * 解析不出来返回 undefined：这是审查器故障，不是打回。
+ */
+export function parseReview(text: string): Review | undefined {
+  const candidates = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)].map((m) => m[1]).reverse();
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  if (first >= 0 && last > first) candidates.push(text.slice(first, last + 1));
+  for (const c of candidates) {
+    try {
+      const r = Review.safeParse(JSON.parse(c));
+      if (r.success) return r.data;
+    } catch {
+      // 不是 JSON，继续试下一个
+    }
+  }
+  const lastLine = text.trim().split("\n").map((s) => s.trim()).filter(Boolean).at(-1) ?? "";
+  const m = lastLine.match(/^VERDICT\s*[:：]\s*(APPROVE|CHANGES)$/i);
+  return m ? { verdict: m[1].toLowerCase() as Review["verdict"], summary: text.trim(), issues: [] } : undefined;
+}
+
+export interface CheckResult {
+  kind: "command" | "review";
+  name: string;
+  status: "pass" | "fail" | "error";
+  detail: string;
+}
+
+export type Next = "accept" | "rework" | "needs_human" | "unverified";
+export type Reason = "passed" | "checks_failed" | "rejected" | "verifier_error" | "unverified";
+
+/**
+ * 验收关卡：本轮校验结果 → 下一步。
+ *   校验器故障        → 需人工介入（故障 ≠ 打回，不消耗返工轮次）
+ *   有校验不通过      → 还有返工轮次就返工，否则需人工介入
+ *   没有任何校验      → 按 on_unverified 策略：需人工介入，或标为“未验证”进待验收
+ *   全部通过          → 通过
+ */
+export function decideRound(
+  round: number,
+  maxRounds: number,
+  checks: CheckResult[],
+  onUnverified: "needs_human" | "review",
+): { next: Next; reason: Reason } {
+  if (checks.some((c) => c.status === "error")) return { next: "needs_human", reason: "verifier_error" };
+  if (checks.some((c) => c.status === "fail"))
+    return round < maxRounds ? { next: "rework", reason: "checks_failed" } : { next: "needs_human", reason: "rejected" };
+  if (!checks.length) return onUnverified === "review" ? { next: "unverified", reason: "unverified" } : { next: "needs_human", reason: "unverified" };
+  return { next: "accept", reason: "passed" };
+}
+
+const REASON_TEXT: Record<string, string> = {
+  passed: "校验全部通过",
+  rejected: "返工轮次用完，校验仍未通过",
+  verifier_error: "校验器故障（审查超时 / 无输出 / 结论无法解析，或校验命令无法运行），无法判断是否达标",
+  unverified: "没有配置任何校验（无 reviewer、无 verify 命令），结果未经验证",
+  errored: "执行反复失败",
+  cancelled: "卡片被移出派单列，已取消",
+};
+
+/**
+ * 对账计划：比较看板（派给Agent / Agent进行中 两列里的卡片）和账本，得出要新建和要取消的派单。
+ * 看板上的操作是用户意图：拖进“派给Agent”= 派单；把进行中的卡片拖走或完成 = 取消。
+ */
+export function planReconcile(input: {
+  cards: { guid: string; section: "dispatch" | "running" }[];
+  /** 每个任务最新的一项派单工作 */
+  latest: Map<string, { id: string; terminal: boolean; pendingEffects: number }>;
+}): { enqueue: string[]; cancel: string[] } {
+  const visible = new Set(input.cards.map((c) => c.guid));
+  const enqueue = input.cards
+    .filter((c) => c.section === "dispatch")
+    .map((c) => c.guid)
+    .filter((g) => {
+      const w = input.latest.get(g);
+      // 上一项派单已终结且它的飞书写入都已落地：卡片又被拖回派单列 = 再派一次
+      return !w || (w.terminal && w.pendingEffects === 0);
+    });
+  const cancel = [...input.latest.entries()].filter(([g, w]) => !w.terminal && !visible.has(g)).map(([, w]) => w.id);
+  return { enqueue: [...new Set(enqueue)], cancel };
+}
+
+// ───────────────────────── 状态机 ─────────────────────────
+
+export interface DispatchPayload {
+  guid: string;
+  summary: string;
+  description: string;
+  harness: string;
+  reviewer: string;
+  verify: string;
+  cwd: string;
+  branch: string;
+  base: string;
+  round: number;
+  maxRounds: number;
+  /** 每轮开始时的 git 提交：崩溃后重跑这一轮前先回到这里，保证起点确定 */
+  checkpoints: Record<string, string>;
+  report: string;
+  feedback: string;
+  history: { round: number; checks: CheckResult[] }[];
+}
+
+type Item = WorkItem<DispatchPayload>;
+
+/**
+ * 派单：queued → executing(第 n 轮) → verifying(第 n 轮) → [executing(n+1) | 终态]
+ * 终态：accepted（通过）/ unverified（未验证）/ needs_human（需人工介入）/ errored（执行出错）/ cancelled（已取消）
+ *
+ * 每一步结束都用 ledger.transition 持久化（连同要写到飞书的评论/移动）；崩溃后从当前状态继续。
+ * worker 不拿飞书权限，飞书只经由 outbox 写。
  */
 export class Dispatcher {
   cfg: Config;
+  ledger: Ledger;
   store: Store;
   board: Board;
-  private active = new Set<Promise<void>>();
-  private scanning = false;
 
-  constructor(cfg: Config, store: Store, board: Board) {
+  constructor(cfg: Config, ledger: Ledger, store: Store, board: Board) {
     this.cfg = cfg;
+    this.ledger = ledger;
     this.store = store;
     this.board = board;
   }
 
-  async scan(): Promise<number> {
-    if (this.scanning) return 0;
-    this.scanning = true;
-    let started = 0;
-    try {
-      const tasks = await this.board.listSection("dispatch");
-      for (const t of tasks) {
-        if (this.store.runningCount() >= this.cfg.dispatch.max_parallel) break;
-        if (this.store.isRunning(t.guid)) continue;
-        const p = this.execute(t).catch((e) => log("error", "派单执行异常", { task: t.guid, err: errMsg(e) }));
-        this.active.add(p);
-        p.finally(() => this.active.delete(p));
-        started++;
-      }
-    } finally {
-      this.scanning = false;
+  /** 看板 → 账本 对账：新建派单、取消被拖走的派单。返回新建数量。 */
+  async reconcile(): Promise<{ enqueued: number; cancelled: number }> {
+    const [queued, running] = await Promise.all([this.board.listSection("dispatch"), this.board.listSection("running")]);
+    const cards = [
+      ...queued.map((t) => ({ guid: t.guid, section: "dispatch" as const, task: t })),
+      ...running.map((t) => ({ guid: t.guid, section: "running" as const, task: t })),
+    ];
+    const latest = new Map<string, { id: string; terminal: boolean; pendingEffects: number }>();
+    for (const g of new Set([...cards.map((c) => c.guid), ...this.ledger.active("dispatch").map((w) => w.ref)])) {
+      const w = this.ledger.latest("dispatch", g);
+      if (w) latest.set(g, { id: w.id, terminal: w.terminal, pendingEffects: this.ledger.pendingEffects(w.id) });
     }
-    return started;
-  }
-
-  /** 等所有进行中的派单结束（命令行单次运行时用）。 */
-  async drain(): Promise<void> {
-    while (this.active.size) await Promise.all([...this.active]);
-  }
-
-  async execute(brief: BoardTask): Promise<void> {
-    const short = brief.guid.slice(0, 8);
-    const logDir = path.join(this.cfg.dataDir, "runs", short);
-    fs.mkdirSync(logDir, { recursive: true });
-    // 第一个 await 之前同步占位，scan 的并发上限和防重复领取才可靠
-    const runId = this.store.startRun({ task_guid: brief.guid, harness: "", role: "worker", cwd: "", log: logDir });
-    let t = brief;
-    let harness = "";
-    try {
-      t = { ...brief, ...(await this.board.getTask(brief.guid)) };
-      harness = parseHarness(t, Object.keys(this.cfg.harnesses)) ?? (this.cfg.dispatch.default_harness || this.cfg.roles.brain);
-      await this.board.move(t.guid, "running");
-      const ws = await this.prepareWorkspace(t);
-      this.store.updateRun(runId, harness, ws.cwd);
-      await this.board.comment(t.guid, `🤖 ${harness} 开始执行\n工作目录：${ws.cwd}${ws.branch ? `\n分支：${ws.branch}` : ""}`);
-
-      const reviewer = pickReviewer(this.cfg.roles, harness);
-      let feedback = "";
-      let report = "";
-      let reviewNote = "";
-      const rounds = 1 + (reviewer ? this.cfg.dispatch.fix_rounds : 0);
-      for (let round = 1; round <= rounds; round++) {
-        const r = await runHarness(this.cfg, {
-          harness,
-          prompt: render(loadPrompt("worker.md"), {
-            summary: t.summary.replace(/^\s*\[[\w-]+\]\s*/, ""),
-            description: t.description,
-            cwd: ws.cwd,
-            feedback: feedback || "（无）",
-          }),
-          cwd: ws.cwd,
-          tools: "write",
-          lark: "none",
-          timeoutSec: this.cfg.dispatch.timeout_sec,
-          logFile: path.join(logDir, `worker-${round}.log`),
-        });
-        report = r.text || "（无输出）";
-        if (!r.ok) throw new Error(`${harness} 执行失败（exit ${r.exitCode}${r.timedOut ? "，超时" : ""}）：${truncate(report, 800)}`);
-        if (!reviewer) break;
-
-        const diff = ws.base ? await gitDiff(ws.cwd, ws.base) : "";
-        const rv = await runHarness(this.cfg, {
-          harness: reviewer,
-          prompt: render(loadPrompt("review.md"), {
-            summary: t.summary,
-            description: t.description,
-            report: truncate(report, 8000),
-            diff: diff ? truncate(diff, 30000) : "（非代码任务，无 diff）",
-          }),
-          cwd: ws.cwd,
-          tools: "read",
-          lark: "none",
-          timeoutSec: 1200,
-          logFile: path.join(logDir, `review-${round}.log`),
-        });
-        const verdict = rv.text ? parseVerdict(rv.text) : "changes";
-        reviewNote = `🔍 ${reviewer} 审查（第 ${round} 轮）：${verdict === "approve" ? "通过" : "需修改"}\n${truncate(rv.text, 1500)}`;
-        await this.board.comment(t.guid, truncate(reviewNote, COMMENT_MAX));
-        if (verdict === "approve") break;
-        feedback = rv.text;
+    const plan = planReconcile({ cards, latest });
+    let enqueued = 0;
+    for (const guid of plan.enqueue) {
+      const t = cards.find((c) => c.guid === guid)!.task;
+      // 唯一索引保证同一卡片至多一项未终结派单：并发对账时后到的插入被忽略
+      const added = this.ledger.enqueue({
+        id: `dispatch:${guid}:${Date.now()}`,
+        kind: "dispatch",
+        ref: guid,
+        state: "queued",
+        payload: { guid, summary: t.summary, description: t.description },
+      });
+      if (added) {
+        enqueued++;
+        log("info", "新派单入队", { task: t.summary });
       }
+    }
+    for (const id of plan.cancel) {
+      this.ledger.requestCancel(id);
+      log("info", "卡片已离开派单列，请求取消", { work: id });
+    }
+    return { enqueued, cancelled: plan.cancel.length };
+  }
 
-      const stat = ws.base ? await gitDiffStat(ws.cwd, ws.base) : "";
-      const final = [`✅ ${harness} 完成`, truncate(report, 2000), stat ? `\n变更：\n${stat}` : "", ws.branch ? `分支：${ws.branch}（worktree：${ws.cwd}）` : ""]
-        .filter(Boolean)
-        .join("\n");
-      await this.board.comment(t.guid, truncate(final, COMMENT_MAX));
-      await this.board.move(t.guid, "review");
-      this.store.endRun(runId, "ok", truncate(report, 500));
-      log("info", "派单完成", { task: t.summary, harness });
+  handler(): Handler<DispatchPayload> {
+    return {
+      kind: "dispatch",
+      concurrency: this.cfg.dispatch.max_parallel,
+      maxAttempts: this.cfg.dispatch.max_attempts,
+      run: (item, ctx) => this.advance(item, ctx),
+      onExhausted: (item, err) => {
+        const p = item.payload;
+        const effects: Effect[] = [];
+        if (p.guid) {
+          effects.push(
+            comment(p.guid, truncate(`❌ 执行失败（${stateText(item.state)}阶段已达尝试上限 ${this.cfg.dispatch.max_attempts} 次，含进程中断）：${err}\n日志：${this.logDir(p.guid)}`, COMMENT_MAX)),
+            move(p.guid, "attention"),
+          );
+        }
+        return { patch: { state: "errored", outcome: "errored", reason: "errored" }, effects };
+      },
+    };
+  }
+
+  private logDir(guid: string): string {
+    return path.join(this.cfg.dataDir, "runs", guid.slice(0, 8));
+  }
+
+  async advance(start: Item, ctx: Ctx): Promise<void> {
+    let it = start;
+    for (;;) {
+      if (this.ledger.isCancelled(it.id)) {
+        this.finish(it, "cancelled", "cancelled", [comment(it.payload.guid, `⏹️ ${REASON_TEXT.cancelled}。已有改动保留在工作目录${it.payload.cwd ? `：${it.payload.cwd}` : ""}。`)]);
+        return;
+      }
+      checkpoint(ctx);
+      if (it.state === "queued") it = await this.prepare(it);
+      else if (it.state === "executing") it = await this.execute(it, ctx);
+      else if (it.state === "verifying") it = await this.verify(it, ctx);
+      else return;
+      if (it.terminal) return;
+    }
+  }
+
+  private finish(it: Item, state: string, reason: string, effects: Effect[], payload?: DispatchPayload): void {
+    this.ledger.transition(it, { state, terminal: true, outcome: state, reason, payload }, effects);
+    log(state === "accepted" ? "info" : "warn", "派单结束", { task: it.payload.summary, state, reason });
+  }
+
+  /** queued：读取最新的卡片内容，选执行者/审查者，准备工作目录。 */
+  private async prepare(it: Item): Promise<Item> {
+    const t = { ...it.payload, ...(await this.board.getTask(it.payload.guid)) };
+    const harness = parseHarness(t, Object.keys(this.cfg.harnesses)) ?? (this.cfg.dispatch.default_harness || this.cfg.roles.brain);
+    const reviewer = pickReviewer(this.cfg.roles, harness);
+    const ws = await this.prepareWorkspace(t);
+    fs.mkdirSync(this.logDir(t.guid), { recursive: true });
+    const payload: DispatchPayload = {
+      guid: t.guid,
+      summary: t.summary,
+      description: t.description,
+      harness,
+      reviewer,
+      verify: ws.verify,
+      cwd: ws.cwd,
+      branch: ws.branch,
+      base: ws.base,
+      round: 1,
+      maxRounds: 1 + this.cfg.dispatch.fix_rounds,
+      checkpoints: {},
+      report: "",
+      feedback: "",
+      history: [],
+    };
+    const checks = [reviewer && `${reviewer} 审查`, ws.verify && `命令 \`${ws.verify}\``].filter(Boolean).join(" + ") || "无（结果将标为未验证）";
+    return this.ledger.transition(it, { state: "executing", payload }, [
+      move(t.guid, "running"),
+      comment(t.guid, `🤖 ${harness} 开始执行\n工作目录：${ws.cwd}${ws.branch ? `\n分支：${ws.branch}` : ""}\n验收：${checks}`),
+    ]);
+  }
+
+  /** executing：在本轮检查点上运行 worker；成功则提交本轮改动，进入 verifying。 */
+  private async execute(it: Item, ctx: Ctx): Promise<Item> {
+    let p = it.payload;
+    const round = String(p.round);
+    if (p.base) {
+      const cp = p.checkpoints[round];
+      if (cp) {
+        // 重入（崩溃 / 失败重试）：丢弃上次没跑完的半成品，回到本轮起点
+        await git(p.cwd, ["reset", "--hard", cp]);
+        await git(p.cwd, ["clean", "-fd"]);
+        log("info", "回到本轮检查点后重跑", { task: p.summary, round: p.round, checkpoint: cp.slice(0, 8) });
+      } else {
+        await autoCommit(p.cwd, `pa: 第 ${round} 轮开始前的快照`);
+        p = { ...p, checkpoints: { ...p.checkpoints, [round]: (await git(p.cwd, ["rev-parse", "HEAD"])).trim() } };
+        it = this.ledger.transition(it, { payload: p }); // 先落检查点，再动手
+      }
+    }
+    const logFile = path.join(this.logDir(p.guid), `worker-${round}-${ctx.attempt}.log`);
+    const step = this.ledger.startStep({ work_id: it.id, name: `worker#${round}`, harness: p.harness, log: logFile });
+    const r = await runHarness(this.cfg, {
+      harness: p.harness,
+      prompt: render(loadPrompt("worker.md"), {
+        summary: p.summary.replace(/^\s*\[[\w-]+\]\s*/, ""),
+        description: p.description,
+        cwd: p.cwd,
+        feedback: p.feedback || "（无）",
+      }),
+      cwd: p.cwd,
+      tools: "write",
+      lark: "none",
+      timeoutSec: this.cfg.dispatch.timeout_sec,
+      logFile,
+      signal: ctx.signal,
+      onSpawn: (pid) => this.ledger.setStepPid(step, pid),
+    });
+    const report = r.text || "（无输出）";
+    if (!r.ok) {
+      this.ledger.endStep(step, "failed", r.aborted ? "中止" : truncate(report, 500));
+      checkpoint(ctx);
+      throw new Error(`${p.harness} 执行失败（exit ${r.exitCode}${r.timedOut ? "，超时" : ""}）：${truncate(report, 800)}`);
+    }
+    if (p.base) await autoCommit(p.cwd, `pa: 第 ${round} 轮（${p.harness}）`);
+    this.ledger.endStep(step, "ok", truncate(report, 500));
+    return this.ledger.transition(it, { state: "verifying", payload: { ...p, report } });
+  }
+
+  /** verifying：确定性校验 → LLM 审查 → 验收关卡决定下一步。 */
+  private async verify(it: Item, ctx: Ctx): Promise<Item> {
+    const p = it.payload;
+    const checks: CheckResult[] = [];
+    if (p.verify) checks.push(await this.runVerifyCommand(it, ctx));
+    // 确定性校验没过就不必再花钱审查，直接返工
+    if (p.reviewer && !checks.some((c) => c.status === "fail")) checks.push(await this.runReview(it, ctx));
+    checkpoint(ctx);
+
+    const d = decideRound(p.round, p.maxRounds, checks, this.cfg.acceptance.on_unverified);
+    const history = [...p.history, { round: p.round, checks }];
+    const notes = checks.map((c) => truncate(`${c.kind === "review" ? "🔍" : "🧪"} ${c.name}（第 ${p.round} 轮）：${statusText(c.status)}\n${c.detail}`, COMMENT_MAX));
+    const effects: Effect[] = notes.map((n) => comment(p.guid, n));
+
+    if (d.next === "rework") {
+      const feedback = checks.filter((c) => c.status === "fail").map((c) => `### ${c.name}\n${c.detail}`).join("\n\n");
+      return this.ledger.transition(it, { state: "executing", payload: { ...p, history, round: p.round + 1, feedback } }, effects);
+    }
+    const stat = p.base ? await gitDiffStat(p.cwd, p.base) : "";
+    const tail = [truncate(p.report, 1800), stat ? `\n变更：\n${stat}` : "", p.branch ? `分支：${p.branch}（worktree：${p.cwd}）` : ""].filter(Boolean).join("\n");
+    const final = { ...p, history };
+    if (d.next === "accept") {
+      this.finish(it, "accepted", d.reason, [...effects, comment(p.guid, truncate(`✅ ${p.harness} 完成，已通过验收\n${tail}`, COMMENT_MAX)), move(p.guid, "review")], final);
+    } else if (d.next === "unverified") {
+      this.finish(it, "unverified", d.reason, [...effects, comment(p.guid, truncate(`⚪ ${p.harness} 完成，但${REASON_TEXT.unverified}\n${tail}`, COMMENT_MAX)), move(p.guid, "review")], final);
+    } else {
+      const effectsHuman = [
+        ...effects,
+        comment(p.guid, truncate(`⚠️ 需要你介入：${REASON_TEXT[d.reason]}\n\n执行者报告：\n${tail}`, COMMENT_MAX)),
+        move(p.guid, "attention"),
+      ];
+      this.finish(it, "needs_human", d.reason, effectsHuman, final);
+    }
+    return this.ledger.get<DispatchPayload>(it.id)!;
+  }
+
+  private async runVerifyCommand(it: Item, ctx: Ctx): Promise<CheckResult> {
+    const p = it.payload;
+    const name = `校验命令 \`${p.verify}\``;
+    const logFile = path.join(this.logDir(p.guid), `verify-${p.round}-${ctx.attempt}.log`);
+    const step = this.ledger.startStep({ work_id: it.id, name: `verify#${p.round}`, log: logFile });
+    try {
+      const r = await runProcess("bash", ["-lc", p.verify], {
+        cwd: p.cwd,
+        timeoutMs: this.cfg.acceptance.verify_timeout_sec * 1000,
+        group: true,
+        signal: ctx.signal,
+        onSpawn: (pid) => this.ledger.setStepPid(step, pid),
+      });
+      const out = `${r.stdout}\n${r.stderr}`.trim();
+      fs.writeFileSync(logFile, `# exit=${r.code} timedOut=${r.timedOut}\n${out}`);
+      checkpoint(ctx);
+      const ok = r.code === 0 && !r.timedOut;
+      this.ledger.endStep(step, ok ? "ok" : "failed", `exit ${r.code}`);
+      const detail = ok ? "通过" : `${r.timedOut ? "超时" : `退出码 ${r.code}`}，输出末尾：\n${out.slice(-1500)}`;
+      return { kind: "command", name, status: ok ? "pass" : "fail", detail };
     } catch (e) {
-      const msg = errMsg(e);
-      this.store.endRun(runId, "failed", msg);
-      log("error", "派单失败", { task: t.summary, harness, err: msg });
-      await this.board.comment(t.guid, truncate(`❌ 执行失败：${msg}\n日志：${logDir}`, COMMENT_MAX)).catch(() => undefined);
-      await this.board.move(t.guid, "review").catch(() => undefined);
+      this.ledger.endStep(step, "failed", String(e));
+      checkpoint(ctx);
+      return { kind: "command", name, status: "error", detail: `无法运行：${String(e)}` };
     }
   }
 
-  /** 指定了仓库就在该仓库的独立 git worktree 里干活；否则给一个独立的空工作目录。 */
-  async prepareWorkspace(t: BoardTask): Promise<{ cwd: string; branch: string; base: string }> {
+  /** LLM 交叉审查；审查器故障会重试，仍失败返回 error（不是 fail）。 */
+  private async runReview(it: Item, ctx: Ctx): Promise<CheckResult> {
+    const p = it.payload;
+    const name = `${p.reviewer} 审查`;
+    const diff = p.base ? await gitDiff(p.cwd, p.base) : "";
+    let lastErr = "";
+    for (let i = 0; i <= this.cfg.acceptance.review_retries; i++) {
+      checkpoint(ctx);
+      const logFile = path.join(this.logDir(p.guid), `review-${p.round}-${ctx.attempt}-${i + 1}.log`);
+      const step = this.ledger.startStep({ work_id: it.id, name: `review#${p.round}`, harness: p.reviewer, log: logFile });
+      const rv = await runHarness(this.cfg, {
+        harness: p.reviewer,
+        prompt: render(loadPrompt("review.md"), {
+          summary: p.summary,
+          description: p.description,
+          report: truncate(p.report, 8000),
+          diff: diff ? truncate(diff, 30000) : "（非代码任务，无 diff）",
+        }),
+        cwd: p.cwd,
+        tools: "read",
+        lark: "none",
+        timeoutSec: this.cfg.acceptance.review_timeout_sec,
+        logFile,
+        signal: ctx.signal,
+        onSpawn: (pid) => this.ledger.setStepPid(step, pid),
+      });
+      checkpoint(ctx);
+      const parsed = rv.text ? parseReview(rv.text) : undefined;
+      if (parsed) {
+        this.ledger.endStep(step, "ok", parsed.verdict);
+        return { kind: "review", name, status: parsed.verdict === "approve" ? "pass" : "fail", detail: formatReview(parsed) };
+      }
+      lastErr = rv.text ? `结论无法解析：${truncate(rv.text, 300)}` : `无输出（exit ${rv.exitCode}${rv.timedOut ? "，超时" : ""}）`;
+      this.ledger.endStep(step, "failed", lastErr);
+      log("warn", "审查器故障", { task: p.summary, try: i + 1, err: lastErr });
+    }
+    return { kind: "review", name, status: "error", detail: lastErr };
+  }
+
+  /** 指定了仓库就在该仓库的独立 git worktree 里干活；否则给一个独立的空工作目录。可重复调用。 */
+  async prepareWorkspace(t: BoardTask): Promise<{ cwd: string; branch: string; base: string; verify: string }> {
     const repoRef = parseRepo(t);
     const short = t.guid.slice(0, 8);
     if (!repoRef) {
       const cwd = path.join(this.cfg.dataDir, "workspace", short);
       fs.mkdirSync(cwd, { recursive: true });
-      return { cwd, branch: "", base: "" };
+      return { cwd, branch: "", base: "", verify: "" };
     }
-    const repo = path.resolve(expandHome(this.cfg.dispatch.repos[repoRef] ?? repoRef));
+    const spec = repoSpec(this.cfg, repoRef);
     const cwd = path.join(this.cfg.dataDir, "worktrees", short);
     const branch = `pa/${short}`;
     const baseKey = `worktree.${t.guid}.base`;
     if (!fs.existsSync(cwd)) {
-      const head = await git(repo, ["rev-parse", "HEAD"]);
-      const hasBranch = (await runProcess("git", ["-C", repo, "rev-parse", "--verify", "--quiet", branch])).code === 0;
-      await git(repo, hasBranch ? ["worktree", "add", cwd, branch] : ["worktree", "add", "-b", branch, cwd]);
-      this.store.set(baseKey, head.trim());
+      const head = await git(spec.path, ["rev-parse", "HEAD"]);
+      const hasBranch = (await runProcess("git", ["-C", spec.path, "rev-parse", "--verify", "--quiet", branch])).code === 0;
+      await git(spec.path, hasBranch ? ["worktree", "add", cwd, branch] : ["worktree", "add", "-b", branch, cwd]);
+      if (!this.store.get(baseKey)) this.store.set(baseKey, head.trim());
     }
-    return { cwd, branch, base: this.store.get(baseKey) ?? "" };
+    const base = this.store.get(baseKey) ?? "";
+    return { cwd, branch, base, verify: spec.verify ?? "" };
   }
 }
 
+function stateText(s: string): string {
+  return { queued: "准备", executing: "执行", verifying: "验收" }[s] ?? s;
+}
+
+function statusText(s: CheckResult["status"]): string {
+  return s === "pass" ? "通过" : s === "fail" ? "需修改" : "故障";
+}
+
+export function formatReview(r: Review): string {
+  const issues = r.issues.map((i, n) => `${n + 1}. [${i.severity || "-"}] ${i.location ? `${i.location}：` : ""}${i.problem}${i.suggestion ? `（建议：${i.suggestion}）` : ""}`);
+  return [r.summary, ...issues].filter(Boolean).join("\n") || (r.verdict === "approve" ? "没有发现问题" : "需修改");
+}
+
+const GIT_ID = ["-c", "user.name=personal-agent", "-c", "user.email=personal-agent@localhost"];
+
 async function git(cwd: string, args: string[]): Promise<string> {
-  const r = await runProcess("git", ["-C", cwd, ...args]);
+  const r = await runProcess("git", ["-C", cwd, ...GIT_ID, ...args]);
   if (r.code !== 0) throw new Error(`git ${args.join(" ")} 失败：${r.stderr.trim()}`);
   return r.stdout;
 }
 
-/** 相对创建 worktree 时的基线（含未提交和新文件）。 */
+/** 有改动就提交（含新文件）；没有改动什么都不做。 */
+async function autoCommit(cwd: string, message: string): Promise<void> {
+  await git(cwd, ["add", "-A"]);
+  const dirty = (await runProcess("git", ["-C", cwd, "diff", "--cached", "--quiet"])).code !== 0;
+  if (dirty) await git(cwd, ["commit", "-q", "--no-verify", "-m", message]);
+}
+
+/** 相对创建 worktree 时的基线（每轮结束都已自动提交，所以比较到 HEAD 即可）。 */
 async function gitDiff(cwd: string, base: string): Promise<string> {
-  await runProcess("git", ["-C", cwd, "add", "-A", "--intent-to-add"]);
-  return (await runProcess("git", ["-C", cwd, "diff", base])).stdout;
+  return (await runProcess("git", ["-C", cwd, "diff", base, "HEAD"])).stdout;
 }
 
 async function gitDiffStat(cwd: string, base: string): Promise<string> {
-  await runProcess("git", ["-C", cwd, "add", "-A", "--intent-to-add"]);
-  return (await runProcess("git", ["-C", cwd, "diff", "--stat", base])).stdout.trim();
+  return (await runProcess("git", ["-C", cwd, "diff", "--stat", base, "HEAD"])).stdout.trim();
 }

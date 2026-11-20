@@ -23,7 +23,18 @@
 
 ## 输出
 
-用中文列出问题（按严重程度排序，每条给出位置和修改建议）；没有问题就说明。
-最后一行必须是以下两者之一：
-VERDICT: APPROVE
-VERDICT: CHANGES
+只输出一个 JSON 对象（可以放在 ```json 代码块里），不要输出其他内容：
+
+```json
+{
+  "verdict": "approve 或 changes",
+  "summary": "一两句话的总体结论（中文）",
+  "issues": [
+    { "severity": "high|medium|low", "location": "文件:行 或 模块", "problem": "问题", "suggestion": "修改建议" }
+  ]
+}
+```
+
+- 只要存在任何 high 或 medium 问题、或任务要求没有完成，`verdict` 必须是 `changes`。
+- 没有问题时 `issues` 为空数组，`verdict` 为 `approve`。
+- issues 按严重程度排序。你的结论会决定这项工作是否交付，所以不要放过真实问题，也不要为了凑数挑刺。

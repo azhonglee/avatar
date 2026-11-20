@@ -2,6 +2,7 @@ import type { Board, BoardTask } from "../board.ts";
 import { toBoardTask } from "../board.ts";
 import type { Config } from "../config.ts";
 import type { Lark } from "../lark.ts";
+import type { Ledger } from "../ledger.ts";
 import type { Store } from "../store.ts";
 import { findItems } from "../util.ts";
 
@@ -13,6 +14,7 @@ export async function buildBrief(
   cfg: Config,
   lark: Lark,
   store: Store,
+  ledger: Ledger,
   board: Board,
   mode: "morning" | "evening",
 ): Promise<string> {
@@ -29,8 +31,13 @@ export async function buildBrief(
   const tomorrow = mine.filter((t) => t.dueMs !== null && t.dueMs > dayEnd && t.dueMs <= dayEnd + 86_400_000);
   const pending = await board.listSection("pending");
   const review = await board.listSection("review");
+  const attention = await board.listSection("attention");
   const since = now - 86_400_000;
-  const runs = store.runsSince(since).filter((r) => r.role === "worker");
+  // 派单统计按验收结果（outcome）算，而不是按执行者退出码
+  const dispatches = ledger.recent(["dispatch"], since);
+  const count = (s: string) => dispatches.filter((w) => w.state === s).length;
+  const inFlight = dispatches.filter((w) => !w.terminal).length;
+  const failures = ledger.failuresSince(since);
   const sig = store.countSignalsSince(since);
 
   const fmt = (t: BoardTask) => `- ${t.url ? `[${t.summary}](${t.url})` : t.summary}${t.dueMs ? `（${fmtTime(t.dueMs, tz)}）` : ""}`;
@@ -42,10 +49,13 @@ export async function buildBrief(
     ...section("📌 今天截止", today),
     ...(mode === "evening" ? section("⏭️ 明天截止", tomorrow) : []),
     ...section("❓ 待你确认（agent 识别出的候选任务，拖到 Inbox 即确认）", pending),
+    ...section("🚨 需要你介入（审查未通过 / 未能验证 / 执行出错）", attention),
     ...section("🧪 待你验收（agent 已完成）", review),
-    `**🤖 过去 24 小时**：识别信号 ${sig.total} 条，建任务 ${sig.tasks ?? 0} 个；派单 ${runs.length} 次（成功 ${runs.filter((r) => r.status === "ok").length}，失败 ${runs.filter((r) => r.status === "failed").length}，进行中 ${runs.filter((r) => r.status === "running").length}）`,
+    `**🤖 过去 24 小时**：识别信号 ${sig.total} 条，建任务 ${sig.tasks ?? 0} 个；派单 ${dispatches.length} 个（通过验收 ${count("accepted")}，未验证 ${count("unverified")}，需介入 ${count("needs_human")}，出错 ${count("errored")}，取消 ${count("cancelled")}，进行中 ${inFlight}）`,
   ];
   if (lines.length === 2) lines.splice(1, 0, "今天没有逾期或到期的任务 🎉");
+  const broken = (failures.event ?? 0) + (failures.effect ?? 0);
+  if (broken) lines.push(`⚠️ 有 ${failures.event ?? 0} 个事件处理、${failures.effect ?? 0} 次飞书写入在多次重试后仍失败，详见 \`pa status\`。`);
   return lines.join("\n");
 }
 

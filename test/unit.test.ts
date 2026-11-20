@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { decide } from "../src/guard.ts";
 import { endOfLocalDay } from "../src/workflows/brief.ts";
-import { parseHarness, parseRepo, parseVerdict, pickReviewer } from "../src/workflows/dispatch.ts";
+import { parseHarness, parseRepo, parseReview, decideRound, planReconcile, type CheckResult, pickReviewer } from "../src/workflows/dispatch.ts";
 import { parseVerdicts } from "../src/workflows/triage.ts";
 import { deepFind, findItems, isoWithOffset, render } from "../src/util.ts";
 
@@ -55,9 +55,6 @@ test("派单：解析 harness、仓库和审查结论", () => {
   assert.equal(parseHarness(t("[unknown] 修 bug"), known), undefined);
   assert.equal(parseRepo(t("x", "背景\nrepo: web\n")), "web");
   assert.equal(parseRepo(t("x", "没有仓库")), undefined);
-  assert.equal(parseVerdict("很好\nVERDICT: APPROVE"), "approve");
-  assert.equal(parseVerdict("有问题\nVERDICT: CHANGES"), "changes");
-  assert.equal(parseVerdict("忘了写结论"), "changes");
   assert.equal(pickReviewer({ brain: "claude", reviewer: "codex" }, "claude"), "codex");
   assert.equal(pickReviewer({ brain: "claude", reviewer: "codex" }, "codex"), "claude");
   assert.equal(pickReviewer({ brain: "codex", reviewer: "codex" }, "codex"), "");
@@ -72,4 +69,53 @@ test("工具函数", () => {
   // 2026-11-19 10:00 北京时间 → 当天 23:59:59.999 北京时间
   const ms = Date.parse("2026-11-19T10:00:00+08:00");
   assert.equal(endOfLocalDay(ms, "Asia/Shanghai"), Date.parse("2026-11-19T23:59:59.999+08:00"));
+});
+
+test("审查结论：结构化 JSON 优先，兼容格式只认最后一行，解析不了是故障而不是打回", () => {
+  const json = parseReview('看完了。\n```json\n{"verdict":"Changes","summary":"有 bug","issues":[{"severity":"high","location":"a.ts:3","problem":"空指针"}]}\n```');
+  assert.equal(json?.verdict, "changes");
+  assert.equal(json?.issues[0].location, "a.ts:3");
+  assert.equal(parseReview('{"verdict":"approve","summary":"ok"}')?.verdict, "approve");
+  // 多个 JSON 块：以最后一个为准
+  assert.equal(parseReview('```json\n{"verdict":"approve"}\n```\n更正：\n```json\n{"verdict":"changes"}\n```')?.verdict, "changes");
+  assert.equal(parseReview("很好\nVERDICT: APPROVE")?.verdict, "approve");
+  assert.equal(parseReview("有问题\nVERDICT: CHANGES")?.verdict, "changes");
+  // 正文里提到 APPROVE 字样，但最后一行是 CHANGES：不能误判为通过
+  assert.equal(parseReview("如果修好了我会给 VERDICT: APPROVE\n但现在：\nVERDICT: CHANGES")?.verdict, "changes");
+  assert.equal(parseReview("如果修好了我会给 VERDICT: APPROVE，现在还不行"), undefined);
+  assert.equal(parseReview("忘了写结论"), undefined);
+  assert.equal(parseReview('{"verdict":"maybe"}'), undefined);
+});
+
+test("验收关卡：故障≠打回，返工耗尽进人工，无校验按策略", () => {
+  const c = (status: CheckResult["status"]): CheckResult => ({ kind: "review", name: "r", status, detail: "" });
+  assert.deepEqual(decideRound(1, 2, [c("pass")], "needs_human"), { next: "accept", reason: "passed" });
+  assert.deepEqual(decideRound(1, 2, [c("fail")], "needs_human"), { next: "rework", reason: "checks_failed" });
+  assert.deepEqual(decideRound(2, 2, [c("fail")], "needs_human"), { next: "needs_human", reason: "rejected" });
+  assert.deepEqual(decideRound(1, 2, [c("error")], "needs_human"), { next: "needs_human", reason: "verifier_error" });
+  assert.deepEqual(decideRound(1, 2, [c("pass"), c("error")], "needs_human"), { next: "needs_human", reason: "verifier_error" });
+  assert.deepEqual(decideRound(1, 1, [], "needs_human"), { next: "needs_human", reason: "unverified" });
+  assert.deepEqual(decideRound(1, 1, [], "review"), { next: "unverified", reason: "unverified" });
+});
+
+test("对账计划：派单列的新卡片入队，进行中的卡片被拖走则取消，飞书没跟上时不误判", () => {
+  const latest = new Map([
+    ["running_ok", { id: "w1", terminal: false, pendingEffects: 0 }],
+    ["moved_away", { id: "w2", terminal: false, pendingEffects: 0 }],
+    ["redo", { id: "w3", terminal: true, pendingEffects: 0 }],
+    ["finishing", { id: "w4", terminal: true, pendingEffects: 2 }],
+    ["queued_not_moved_yet", { id: "w5", terminal: false, pendingEffects: 1 }],
+  ]);
+  const plan = planReconcile({
+    cards: [
+      { guid: "new", section: "dispatch" },
+      { guid: "running_ok", section: "running" },
+      { guid: "redo", section: "dispatch" },
+      { guid: "finishing", section: "dispatch" },
+      { guid: "queued_not_moved_yet", section: "dispatch" },
+    ],
+    latest,
+  });
+  assert.deepEqual(plan.enqueue.sort(), ["new", "redo"]);
+  assert.deepEqual(plan.cancel, ["w2"]);
 });

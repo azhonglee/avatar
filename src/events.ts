@@ -1,32 +1,35 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
 import readline from "node:readline";
 import type { Config } from "./config.ts";
 import type { Identity } from "./lark.ts";
-import type { Store } from "./store.ts";
 import { errMsg, log } from "./util.ts";
 
 export interface Subscription {
   key: string;
   as: Identity;
-  handler: (ev: Record<string, unknown>) => Promise<void>;
 }
+
+/** 收到一个事件：调用方把它写进 inbox（同步、落库即返回），处理交给引擎。 */
+export type OnEvent = (key: string, eventId: string, ev: Record<string, unknown>) => void;
 
 /**
  * 守护 `lark-cli event consume` 子进程：每个 EventKey 一个进程（官方要求），
- * 读 NDJSON、按 event_id 去重、退出后指数退避重启。
+ * 读 NDJSON 交给 onEvent（写 inbox，按 event_id 去重），退出后指数退避重启。
+ * 这里不做任何业务处理：事件只是“该看一眼”的提示，可靠性由 inbox + 引擎重试 + 定时对账保证。
  *
  * 注意：unbounded 的 consume 读到 stdin EOF 就会退出，所以这里一直持有 stdin 管道不关闭；
  * 停止时关闭 stdin 让它优雅退出（不要 kill -9，妙记/会议类事件会残留服务端订阅）。
  */
 export class EventSupervisor {
   cfg: Config;
-  store: Store;
+  onEvent: OnEvent;
   private procs = new Map<string, ChildProcessWithoutNullStreams>();
   private stopping = false;
 
-  constructor(cfg: Config, store: Store) {
+  constructor(cfg: Config, onEvent: OnEvent) {
     this.cfg = cfg;
-    this.store = store;
+    this.onEvent = onEvent;
   }
 
   start(subs: Subscription[]): void {
@@ -58,9 +61,13 @@ export class EventSupervisor {
         return;
       }
       const header = ev.header as Record<string, unknown> | undefined;
-      const id = String(ev.event_id ?? header?.event_id ?? "");
-      if (id && !this.store.markSeen(`event:${id}`, sub.key)) return;
-      sub.handler(ev).catch((e) => log("error", "事件处理失败", { key: sub.key, err: errMsg(e) }));
+      // 没有 event_id 的事件用内容哈希去重
+      const id = String(ev.event_id ?? header?.event_id ?? "") || createHash("sha256").update(line).digest("hex").slice(0, 32);
+      try {
+        this.onEvent(sub.key, id, ev);
+      } catch (e) {
+        log("error", "事件写入 inbox 失败", { key: sub.key, err: errMsg(e) });
+      }
     });
 
     child.on("error", (e) => log("error", "事件进程启动失败", { key: sub.key, err: errMsg(e) }));

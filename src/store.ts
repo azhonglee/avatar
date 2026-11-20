@@ -1,20 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 
-export interface Run {
-  id: number;
-  task_guid: string;
-  harness: string;
-  role: string;
-  status: "running" | "ok" | "failed";
-  started: number;
-  ended: number | null;
-  cwd: string;
-  summary: string;
-  log: string;
-}
-
-/** 本地状态只放“飞书里不该放”的东西：游标、去重、运行记录、分诊审计。业务状态都在飞书。 */
+/**
+ * 本地状态：kv（游标、看板/知识库 ID、幂等操作结果）与信号队列（分诊审计）。
+ * 工作的进度与副作用在账本里（ledger.ts，和本类共用同一个 SQLite 文件）。
+ */
 export class Store {
   db: DatabaseSync;
 
@@ -22,11 +12,13 @@ export class Store {
     this.db = new DatabaseSync(path.join(dataDir, "state.db"));
     this.db.exec(`
       PRAGMA journal_mode = WAL;
+      PRAGMA busy_timeout = 10000;
       CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS seen (id TEXT PRIMARY KEY, kind TEXT NOT NULL, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS signals (
         id TEXT PRIMARY KEY, source TEXT NOT NULL, at INTEGER NOT NULL, text TEXT NOT NULL,
         link TEXT NOT NULL, verdict TEXT NOT NULL DEFAULT '', task_guid TEXT NOT NULL DEFAULT '');
+      -- runs 是旧版的运行记录，已由 ledger 的 work/steps 取代，保留表以兼容旧数据
       CREATE TABLE IF NOT EXISTS runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT, task_guid TEXT NOT NULL, harness TEXT NOT NULL,
         role TEXT NOT NULL, status TEXT NOT NULL, started INTEGER NOT NULL, ended INTEGER,
@@ -43,10 +35,27 @@ export class Store {
     this.db.prepare("INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(k, v);
   }
 
-  /** 首次见到返回 true 并记下；重复返回 false。用于事件和信号去重。 */
+  /** 旧版去重表的写入（只保留给兼容测试；新代码用 ledger.enqueue / addSignal 的主键去重）。 */
   markSeen(id: string, kind: string): boolean {
     const r = this.db.prepare("INSERT OR IGNORE INTO seen (id, kind, at) VALUES (?, ?, ?)").run(id, kind, Date.now());
     return r.changes > 0;
+  }
+
+  hasSignal(id: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM signals WHERE id = ?").get(id);
+  }
+
+  /**
+   * 幂等的外部创建操作：同一 key 只创建一次，结果（如任务 guid）记在 kv。
+   * 创建成功与记录结果之间崩溃仍可能重复——外部接口没有幂等参数时这是能做到的最小窗口。
+   */
+  async once(key: string, create: () => Promise<string>): Promise<string> {
+    const k = `op.${key}`;
+    const done = this.get(k);
+    if (done) return done;
+    const v = await create();
+    this.set(k, v);
+    return v;
   }
 
   addSignal(s: { id: string; source: string; text: string; link: string }): boolean {
@@ -68,41 +77,6 @@ export class Store {
     return this.db
       .prepare("SELECT COUNT(*) AS total, SUM(task_guid != '') AS tasks FROM signals WHERE at >= ?")
       .get(ms) as never;
-  }
-
-  startRun(r: { task_guid: string; harness: string; role: string; cwd: string; log: string }): number {
-    const res = this.db
-      .prepare("INSERT INTO runs (task_guid, harness, role, status, started, cwd, log) VALUES (?, ?, ?, 'running', ?, ?, ?)")
-      .run(r.task_guid, r.harness, r.role, Date.now(), r.cwd, r.log);
-    return Number(res.lastInsertRowid);
-  }
-
-  updateRun(id: number, harness: string, cwd: string): void {
-    this.db.prepare("UPDATE runs SET harness = ?, cwd = ? WHERE id = ?").run(harness, cwd, id);
-  }
-
-  endRun(id: number, status: "ok" | "failed", summary: string): void {
-    this.db.prepare("UPDATE runs SET status = ?, ended = ?, summary = ? WHERE id = ?").run(status, Date.now(), summary, id);
-  }
-
-  isRunning(taskGuid: string): boolean {
-    return !!this.db.prepare("SELECT 1 FROM runs WHERE task_guid = ? AND status = 'running'").get(taskGuid);
-  }
-
-  runningCount(): number {
-    return (this.db.prepare("SELECT COUNT(*) AS n FROM runs WHERE status = 'running' AND role = 'worker'").get() as { n: number }).n;
-  }
-
-  runsSince(ms: number): Run[] {
-    return this.db.prepare("SELECT * FROM runs WHERE started >= ? ORDER BY started").all(ms) as unknown as Run[];
-  }
-
-  /** 进程重启后，上次没跑完的 run 不会再有结果，标记失败。 */
-  failStaleRuns(): number {
-    return Number(
-      this.db.prepare("UPDATE runs SET status = 'failed', ended = ?, summary = '进程重启，运行中断' WHERE status = 'running'").run(Date.now())
-        .changes,
-    );
   }
 
   prune(days = 30): void {
