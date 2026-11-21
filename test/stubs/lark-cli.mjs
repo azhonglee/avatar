@@ -75,6 +75,13 @@ if (key.startsWith("event consume")) {
   const params = flag("--params") ? JSON.parse(flag("--params")) : {};
   const data = flag("--data") ? JSON.parse(flag("--data")) : {};
 
+  // 故障注入：state.failOnce[命令] = 次数，前 N 次调用失败
+  if (state.failOnce?.[key] > 0) {
+    state.failOnce[key]--;
+    save();
+    fail(`注入的临时故障：${key}`);
+  }
+
   switch (key) {
     case "auth status":
       ok({ identity: "user", user: { open_id: "ou_owner", name: "主人" } });
@@ -132,6 +139,11 @@ if (key.startsWith("event consume")) {
       if (!t) fail("no such task");
       t.comments.push(flag("--content"));
       ok({ comment: { id: nextId("c") } });
+    }
+    case "task comments list": {
+      const t = state.tasks[params.resource_id];
+      if (!t) fail("no such task");
+      ok({ items: [...t.comments].reverse().map((content, i) => ({ id: `c_${i}`, content })), has_more: false });
     }
     case "task +get-my-tasks":
       ok({

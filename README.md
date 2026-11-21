@@ -2,7 +2,7 @@
 
 飞书个人 superagent：在远程开发机上静默运行，识别和追踪任务、整理知识库、早晚提醒，并通过 [acpx](https://github.com/openclaw/acpx)（ACP）把工作派给 Claude Code / Codex / Gemini / DeepSeek Harness / Doubao 等不同 harness，执行后由另一个 harness 交叉审查。
 
-完整方案见 [docs/方案.md](docs/方案.md)。
+完整方案见 [docs/方案.md](docs/方案.md)，可靠性设计（账本、对账、验收关卡）见 [docs/可靠性设计.md](docs/可靠性设计.md)。
 
 ## 快速开始
 
@@ -34,13 +34,15 @@ bin/pa run                             # 前台试跑；常驻见 deploy/
 | 你做什么 | 发生什么 |
 |---|---|
 | 什么都不做 | 每 15 分钟识别 @我/私聊/评论/妙记里的任务 → 看板“待确认”；工作日 8:30、18:30 私信概览；周五整理知识库 |
-| 把卡片拖进“派给Agent” | 5 分钟内被领取。标题前缀 `[codex]` 选执行者，描述写 `repo: 别名` 在独立 worktree 执行；完成后另一个 harness 审查，结果写评论，移到“待验收” |
+| 把卡片拖进“派给Agent” | 5 分钟内被领取。标题前缀 `[codex]` 选执行者，描述写 `repo: 别名` 在独立 worktree 执行；完成后跑校验命令（可选）并由另一个 harness 审查。**通过验收**才移到“待验收”；审查未通过、无法验证或执行出错移到“需人工介入”。每一步写在卡片评论里 |
+| 把进行中的卡片拖走 / 标记完成 | 取消这次派单，改动保留在 worktree |
+| 进程崩溃或重启 | 没做完的派单、事件、飞书写入从断点继续；派单回到本轮检查点重跑 |
 | 私聊机器人 | `/brief` `/capture` `/dispatch` `/status` `/do [harness] 描述`；其他文字交给 superagent 处理 |
 
 ## 命令
 
 ```
-pa doctor | init | run | brief [morning|evening] [--print] | capture | dispatch
+pa doctor | init | run | brief [morning|evening] [--print] | capture | dispatch | status
 pa job <名称> | ask <文字> | publish-doc <file.md> [--title] [--parent 节点名]
 pa guard-check <none|readonly|agent> -- <lark-cli 参数…>
 ```
@@ -50,24 +52,34 @@ pa guard-check <none|readonly|agent> -- <lark-cli 参数…>
 ```
 src/
   cli.ts            命令入口
-  app.ts            组装组件、初始化、常驻进程（事件 + 定时）
+  app.ts            组装组件、初始化、常驻进程（事件 → inbox，定时 → 对账/入队，引擎执行）
+  ledger.ts         账本：work（event/effect/dispatch/job）+ steps，租约、fencing、幂等入队
+  engine.ts         工作引擎：领取、心跳续约、退避重试、耗尽落终态、取消与优雅退出
+  effects.ts        outbox 发布器：评论 / 移卡片 / 私信，幂等投递
   config.ts         配置加载与校验（config.example.yaml）
   lark.ts           lark-cli 封装（身份、JSON 信封、错误、私信主人）
   guard.ts          agent 调 lark-cli 的放行策略；guard-cli.ts 是 bin/guard/lark-cli 的实现
   harness.ts        通过 acpx 调用任一 harness（权限、超时、守卫环境、日志）
-  events.ts         lark-cli event consume 子进程守护（去重、退避重启、优雅退出）
+  events.ts         lark-cli event consume 子进程守护（事件写入 inbox、退避重启、优雅退出）
   board.ts          看板（任务清单/分组）与知识库（空间/节点/文档）
-  store.ts          SQLite：游标、去重、信号审计、运行记录
+  store.ts          SQLite：kv（游标、ID、幂等操作结果）、信号队列
   workflows/
     triage.ts       分诊（无工具，只输出 JSON）
     capture.ts      任务识别：消息/评论/妙记 → 信号 → 分诊 → 建任务
-    dispatch.ts     派单：worktree → 执行 → 交叉审查 → 返工 → 评论 → 待验收
+    dispatch.ts     派单状态机：对账 → worktree → 检查点 → 执行 → 校验/审查 → 验收关卡
     brief.ts        早晚报（不调模型）
-    agent.ts        superagent 作业与私聊指令
+    agent.ts        superagent 作业（至多一次）与私聊指令
 prompts/            各角色提示词（可直接改）
 deploy/             systemd 单元 / 无 systemd 时的守护脚本
 test/               单元测试 + 基于有状态桩（test/stubs）的端到端测试
 ```
+
+## 可靠性
+
+- **能重启就能续跑**：所有工作（派单、事件、作业、对飞书的写操作）都记在本地账本里，用租约表示归属。进程崩溃后，工作会被接管并从最后的检查点继续，不需要手动处理。
+- **事件不会丢**：飞书事件先落库再处理，处理失败会退避重试；重试耗尽会私信告诉你。看板靠定时对账兜底，不依赖事件。
+- **完成 = 达标**：派单是否进“待验收”由验收关卡决定。没配置 reviewer 或 verify 时默认进“需人工介入”，可以用 `acceptance.on_unverified` 调整。
+- `pa status` 查看最近的工作，以及重试中或失败的事件和飞书写入。详见 [docs/可靠性设计.md](docs/可靠性设计.md)。
 
 ## 安全边界
 
@@ -79,7 +91,7 @@ test/               单元测试 + 基于有状态桩（test/stubs）的端到�
 ## 开发
 
 ```bash
-npm test          # 单元测试 + 端到端测试（桩程序，不访问飞书和模型）
+npm test          # 单元 / 账本引擎 / 端到端测试（桩程序，不访问飞书和模型；含 kill -9 崩溃恢复、故障注入）
 npm run typecheck
 ```
 

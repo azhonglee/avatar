@@ -73,11 +73,23 @@ export class Board {
 
   /** 列出某一列里未完成的任务（拖动卡片不产生事件，所以靠定时拉取）。 */
   async listSection(key: SectionKey): Promise<BoardTask[]> {
-    const data = await this.lark.run(
-      ["task", "sections", "tasks", "--params", JSON.stringify({ section_guid: this.section(key), completed: false, page_size: 50 })],
-      { as: "user" },
-    );
-    return findItems(data, "guid").map(toBoardTask);
+    // 必须翻完所有页：对账依据“卡片不在列里”来判断取消，漏一页就会误取消
+    const out: BoardTask[] = [];
+    const seen = new Set<string>();
+    let token: string | undefined;
+    do {
+      const params: Record<string, unknown> = { section_guid: this.section(key), completed: false, page_size: 50 };
+      if (token) params.page_token = token;
+      const data = await this.lark.run(["task", "sections", "tasks", "--params", JSON.stringify(params)], { as: "user" });
+      out.push(...findItems(data, "guid").map(toBoardTask));
+      const more = deepFind(data, "has_more") === true;
+      const next = deepFind(data, "page_token");
+      if (!more) break;
+      if (typeof next !== "string" || !next || seen.has(next)) throw new Error(`列出看板分组 ${key} 时分页游标缺失或重复`);
+      seen.add(next);
+      token = next;
+    } while (true);
+    return out;
   }
 
   async getTask(guid: string): Promise<BoardTask> {
@@ -86,15 +98,27 @@ export class Board {
     return toBoardTask(t as Record<string, unknown>);
   }
 
-  async createTask(t: { summary: string; description: string; due?: string; section: SectionKey }): Promise<string> {
-    const args = ["task", "+create", "--summary", t.summary, "--description", t.description, "--tasklist-id", this.tasklistGuid];
-    if (t.due) args.push("--due", t.due);
-    if (this.cfg.owner.open_id) args.push("--assignee", this.cfg.owner.open_id);
-    const created = await this.lark.run(args, { as: "user" });
-    const guid = String(deepFind(created, "guid") ?? "");
-    if (!guid) throw new Error(`创建任务失败：${JSON.stringify(created)}`);
+  /**
+   * 建任务并放进某一列。给了 opKey 时幂等：同一 opKey 只建一次（建好后“移到列”失败重试，不会再建一张）。
+   */
+  async createTask(t: { summary: string; description: string; due?: string; section: SectionKey; opKey?: string }): Promise<string> {
+    const create = async () => {
+      const args = ["task", "+create", "--summary", t.summary, "--description", t.description, "--tasklist-id", this.tasklistGuid];
+      if (t.due) args.push("--due", t.due);
+      if (this.cfg.owner.open_id) args.push("--assignee", this.cfg.owner.open_id);
+      const created = await this.lark.run(args, { as: "user" });
+      const guid = String(deepFind(created, "guid") ?? "");
+      if (!guid) throw new Error(`创建任务失败：${JSON.stringify(created)}`);
+      return guid;
+    };
+    const guid = t.opKey ? await this.store.once(`task.create.${t.opKey}`, create) : await create();
     await this.move(guid, t.section);
     return guid;
+  }
+
+  /** 所有分组都已初始化（升级后新增分组时为 false，需要再跑一次 init）。 */
+  isInitialized(): boolean {
+    return !!this.store.get("board.tasklist") && Object.keys(this.cfg.board.sections).every((k) => this.store.get(`board.section.${k}`));
   }
 
   /** 把任务移到看板的某一列。 */
@@ -103,6 +127,20 @@ export class Board {
       ["task", "+tasklist-task-add", "--tasklist-id", this.tasklistGuid, "--section-guid", this.section(key), "--task-id", guid],
       { as: "user" },
     );
+  }
+
+  /** 任务下是否已有内容相同的评论（重试投递评论前去重用；查询失败返回 false，退化为至少一次）。 */
+  async hasComment(guid: string, content: string): Promise<boolean> {
+    try {
+      const data = await this.lark.run(
+        ["task", "comments", "list", "--params", JSON.stringify({ resource_type: "task", resource_id: guid, page_size: 100, direction: "desc" })],
+        { as: "user" },
+      );
+      return findItems(data, "content").some((c) => String(c.content).trim() === content.trim());
+    } catch (e) {
+      log("warn", "查询任务评论失败，按未发送处理", { guid, err: String(e) });
+      return false;
+    }
   }
 
   async comment(guid: string, content: string): Promise<void> {

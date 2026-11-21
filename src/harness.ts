@@ -19,6 +19,10 @@ export interface HarnessRun {
   lark: Profile;
   timeoutSec: number;
   logFile: string;
+  /** 中止（取消 / 优雅退出）：结束整个 harness 进程组 */
+  signal?: AbortSignal;
+  /** harness 进程组启动后回调 pgid，调用方持久化它，崩溃恢复时据此清理遗留进程 */
+  onSpawn?: (pgid: number) => void;
 }
 
 export interface HarnessResult {
@@ -26,6 +30,7 @@ export interface HarnessResult {
   exitCode: number;
   text: string;
   timedOut: boolean;
+  aborted: boolean;
 }
 
 /** 通过 acpx（ACP）以无头方式调用任一 harness 跑一次性任务，返回最终回复文本。 */
@@ -62,13 +67,16 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
     input: run.prompt,
     // acpx 自己有 --timeout；这里多留 2 分钟兜底，防止进程卡死
     timeoutMs: (run.timeoutSec + 120) * 1000,
+    group: true,
+    signal: run.signal,
+    onSpawn: run.onSpawn,
   });
   fs.writeFileSync(
     run.logFile,
     [
       `# ${started} harness=${run.harness} tools=${run.tools} lark=${run.lark} cwd=${run.cwd}`,
       `# acpx ${args.join(" ")}`,
-      `# exit=${r.code} timedOut=${r.timedOut}`,
+      `# exit=${r.code} timedOut=${r.timedOut} aborted=${!!run.signal?.aborted}`,
       "## prompt",
       run.prompt,
       "## stdout",
@@ -77,7 +85,8 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       r.stderr,
     ].join("\n"),
   );
-  return { ok: r.code === 0 && !r.timedOut, exitCode: r.code, text: r.stdout.trim(), timedOut: r.timedOut };
+  const aborted = !!run.signal?.aborted;
+  return { ok: r.code === 0 && !r.timedOut && !aborted, exitCode: r.code, text: r.stdout.trim(), timedOut: r.timedOut, aborted };
 }
 
 /** 守卫需要真实 lark-cli 的绝对路径，否则会递归调用自己。 */
