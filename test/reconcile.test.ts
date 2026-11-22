@@ -137,7 +137,7 @@ test("对账：上一次派单已终结、列表里又看到卡片在「派给Ag
   assert.equal(ledger.active("dispatch").length, 1);
 });
 
-test("locateTask：按真实接口结构解析完成状态与所在分组，结构不明时抛错（由对账留到下次）", async (t) => {
+function realBoard(t: TestContext) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-locate-"));
   const file = path.join(dir, "config.yaml");
   fs.writeFileSync(file, JSON.stringify({ data_dir: dir, harnesses: { stub: { agent: "stub" } }, roles: { brain: "stub" } }));
@@ -153,6 +153,11 @@ test("locateTask：按真实接口结构解析完成状态与所在分组，结�
   const reply = (task: unknown) => {
     lark.run = async () => ({ task });
   };
+  return { cfg, store, lark, board, reply };
+}
+
+test("locateTask：按真实接口结构解析完成状态与所在分组，结构不明时抛错（由对账留到下次）", async (t) => {
+  const { board, reply } = realBoard(t);
   reply({ guid: "g", completed_at: "0", tasklists: [{ tasklist_guid: "tl_board", section_guid: "sec_running" }] });
   assert.deepEqual(await board.locateTask("g"), { completed: false, sectionGuid: "sec_running" });
   reply({ guid: "g", completed_at: "1732000000000", tasklists: [] });
@@ -165,4 +170,42 @@ test("locateTask：按真实接口结构解析完成状态与所在分组，结�
   await assert.rejects(board.locateTask("g"), /分组未知/);
   reply({ guid: "other" });
   await assert.rejects(board.locateTask("g"), /结构无法识别/);
+});
+
+test("locateTask：completed_at 只认已核实的两种形式（\"0\" 与毫秒时间戳字符串），其他一律查不清", async (t) => {
+  const { board, reply } = realBoard(t);
+  const inList = [{ tasklist_guid: "tl_board", section_guid: "sec_running" }];
+  reply({ guid: "g", completed_at: "1732000000000", tasklists: inList });
+  assert.equal((await board.locateTask("g")).completed, true);
+  reply({ guid: "g", completed_at: "0", tasklists: inList });
+  assert.equal((await board.locateTask("g")).completed, false);
+  // 非空、非 "0" 但不是毫秒时间戳的值：以前会被判为已完成，现在是查不清
+  for (const v of ["null", "abc", "", " ", "123", "1732000000", "01732000000000", "-1732000000000", "1732000000000.5", null, undefined, 1732000000000, 0, true]) {
+    reply({ guid: "g", completed_at: v, tasklists: inList });
+    await assert.rejects(board.locateTask("g"), /完成状态无法识别/, `completed_at=${JSON.stringify(v)}`);
+  }
+  // status 不是已核实的来源：completed_at 说未完成就是未完成
+  reply({ guid: "g", completed_at: "0", status: "done", tasklists: inList });
+  assert.equal((await board.locateTask("g")).completed, false);
+});
+
+test("对账：completed_at 无法识别时不取消，留到下次对账", async (t) => {
+  const { board, lark, cfg, store } = realBoard(t);
+  store.set("board.section.dispatch", "sec_dispatch");
+  store.set("board.section.running", "sec_running");
+  let completedAt: unknown = "null";
+  lark.run = async (args) => {
+    if (args[1] === "sections") return { items: [], has_more: false }; // 两列都没读到
+    return { task: { guid: GUID, completed_at: completedAt, tasklists: [] } };
+  };
+  const ledger = new Ledger(store.db);
+  const dispatcher = new Dispatcher(cfg, ledger, store, board);
+  const id = `dispatch:${GUID}:1`;
+  ledger.enqueue({ id, kind: "dispatch", ref: GUID, state: "executing", payload: { guid: GUID } });
+  let r = await dispatcher.reconcile();
+  assert.equal(ledger.isCancelled(id), false, "\"null\" 不能被当作已完成");
+  assert.equal(r.deferred, 1);
+  completedAt = "1732000000000";
+  r = await dispatcher.reconcile();
+  assert.equal(ledger.isCancelled(id), true, "查清是已完成后才取消");
 });
