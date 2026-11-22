@@ -189,6 +189,42 @@ test("崩溃恢复：执行中 kill -9 常驻进程，再次运行时结束遗�
   );
 });
 
+test("取消：执行中把卡片拖回 Inbox，对账按 ID 核实后取消，结束正在跑的 harness", async () => {
+  const hangFile = path.join(tmp, "hang-cancel");
+  fs.writeFileSync(hangFile, "armed");
+  addCard("task_cancel_1", "[codex] 取消测试", "repo: demo");
+  const env2 = { ...env, STUB_HANG_FILE: hangFile };
+  const daemon = spawn(path.join(ROOT, "bin", "pa"), ["run"], { env: env2, cwd: tmp, stdio: ["ignore", "pipe", "pipe"] });
+  let output = "";
+  daemon.stdout.on("data", (d) => (output += d));
+  daemon.stderr.on("data", (d) => (output += d));
+  const started = () => fs.readFileSync(hangFile, "utf8") !== "armed" && state().tasks.task_cancel_1.comments.some((c: string) => c.includes("开始执行"));
+  for (let i = 0; i < 600 && !started(); i++) await sleep(100);
+  assert.ok(started(), `worker 没有启动。输出：\n${output}`);
+  const hungPid = Number(fs.readFileSync(hangFile, "utf8"));
+
+  // 用户把正在跑的卡片拖回 Inbox；任意一次对账（这里用命令行）发现它不在两列，按 ID 核实后请求取消
+  const s = state();
+  s.tasks.task_cancel_1.section = "sec_Inbox";
+  fs.writeFileSync(env.STUB_STATE, JSON.stringify(s));
+  pa("dispatch");
+
+  const cancelled = () => state().tasks.task_cancel_1.comments.some((c: string) => c.includes("已取消"));
+  for (let i = 0; i < 200 && !(cancelled() && !alive(hungPid)); i++) await sleep(100);
+  const code = await new Promise((resolve) => {
+    daemon.on("close", resolve);
+    daemon.kill("SIGTERM");
+  });
+  assert.ok(cancelled(), `没有收尾为已取消。输出：\n${output}`);
+  assert.ok(!alive(hungPid), "正在跑的 harness 已被结束");
+  assert.equal(state().tasks.task_cancel_1.section, "sec_Inbox", "取消不移动卡片：位置由用户决定");
+  assert.equal(code, 0, output);
+  const d = db();
+  const w = d.prepare("SELECT state FROM work WHERE kind = 'dispatch' AND ref = 'task_cancel_1'").get() as { state: string };
+  d.close();
+  assert.equal(w.state, "cancelled");
+});
+
 test("brief：汇总逾期、待确认、待验收并私信主人", () => {
   const text = pa("brief", "--print");
   assert.match(text, /已逾期（1）/);

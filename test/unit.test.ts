@@ -98,7 +98,7 @@ test("验收关卡：故障≠打回，返工耗尽进人工，无校验按策�
   assert.deepEqual(decideRound(1, 1, [], "review"), { next: "unverified", reason: "unverified" });
 });
 
-test("对账计划：派单列的新卡片入队，进行中的卡片被拖走则取消，飞书没跟上时不误判", () => {
+test("对账计划：新卡片入队；再派与取消只给出候选，飞书没跟上时不误判", () => {
   const latest = new Map([
     ["running_ok", { id: "w1", terminal: false, pendingEffects: 0 }],
     ["moved_away", { id: "w2", terminal: false, pendingEffects: 0 }],
@@ -116,6 +116,7 @@ test("对账计划：派单列的新卡片入队，进行中的卡片被拖走�
     ],
     latest,
   });
-  assert.deepEqual(plan.enqueue.sort(), ["new", "redo"]);
-  assert.deepEqual(plan.cancel, ["w2"]);
+  assert.deepEqual(plan.enqueue, ["new"], "从没派过的新卡片直接入队");
+  assert.deepEqual(plan.redo, ["redo"], "再派要先按 ID 核实");
+  assert.deepEqual(plan.suspects, ["w2"], "两列都没看到只是候选，要按 ID 核实才取消");
 });

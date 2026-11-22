@@ -132,7 +132,16 @@ if (key.startsWith("event consume")) {
     case "task tasks get": {
       const t = state.tasks[params.task_guid];
       if (!t) fail("no such task");
-      ok({ task: { guid: t.guid, summary: t.summary, description: t.description } });
+      // 与真实接口一致：completed_at 为 "0" 表示未完成，tasklists 给出所在清单与分组
+      ok({
+        task: {
+          guid: t.guid,
+          summary: t.summary,
+          description: t.description,
+          completed_at: t.completed ? String(Date.now()) : "0",
+          tasklists: t.section ? [{ tasklist_guid: "tl_board", section_guid: t.section }] : [],
+        },
+      });
     }
     case "task +comment": {
       const t = state.tasks[flag("--task-id")];

@@ -8,7 +8,7 @@ import { checkpoint, type Ctx, type Handler } from "../engine.ts";
 import { loadPrompt, runHarness } from "../harness.ts";
 import type { Effect, Ledger, WorkItem } from "../ledger.ts";
 import type { Store } from "../store.ts";
-import { log, render, runProcess, truncate } from "../util.ts";
+import { errMsg, log, render, runProcess, truncate } from "../util.ts";
 
 const COMMENT_MAX = 2800;
 
@@ -111,25 +111,35 @@ const REASON_TEXT: Record<string, string> = {
 };
 
 /**
- * 对账计划：比较看板（派给Agent / Agent进行中 两列里的卡片）和账本，得出要新建和要取消的派单。
+ * 对账计划：比较看板（派给Agent / Agent进行中 两列里的卡片）和账本。
  * 看板上的操作是用户意图：拖进“派给Agent”= 派单；把进行中的卡片拖走或完成 = 取消。
+ *
+ * 两次列表读取不是同一个快照（Avatar 自己移列时，可能先读到移动前的“进行中”、再读到移动后的“派给Agent”），
+ * 所以这里只给出“候选”，凡是会产生不可逆后果的判断都要按任务 ID 核实（见 Dispatcher.reconcile）：
+ *   enqueue  —— 从没派过的新卡片：直接入队（读漏了只是晚一轮，不会出错）
+ *   redo     —— 上一次派单已终结、卡片又出现在派单列：核实确实在“派给Agent”才再派
+ *   suspects —— 未终结的派单，两列都没看到：核实确实已完成 / 离开两列才取消
  */
 export function planReconcile(input: {
   cards: { guid: string; section: "dispatch" | "running" }[];
   /** 每个任务最新的一项派单工作 */
   latest: Map<string, { id: string; terminal: boolean; pendingEffects: number }>;
-}): { enqueue: string[]; cancel: string[] } {
+}): { enqueue: string[]; redo: string[]; suspects: string[] } {
   const visible = new Set(input.cards.map((c) => c.guid));
-  const enqueue = input.cards
-    .filter((c) => c.section === "dispatch")
-    .map((c) => c.guid)
-    .filter((g) => {
-      const w = input.latest.get(g);
-      // 上一项派单已终结且它的飞书写入都已落地：卡片又被拖回派单列 = 再派一次
-      return !w || (w.terminal && w.pendingEffects === 0);
-    });
-  const cancel = [...input.latest.entries()].filter(([g, w]) => !w.terminal && !visible.has(g)).map(([, w]) => w.id);
-  return { enqueue: [...new Set(enqueue)], cancel };
+  const queued = [...new Set(input.cards.filter((c) => c.section === "dispatch").map((c) => c.guid))];
+  const enqueue = queued.filter((g) => !input.latest.has(g));
+  // 上一项派单的飞书写入还没落地时，看板还没跟上，不算“又拖回来了”
+  const redo = queued.filter((g) => {
+    const w = input.latest.get(g);
+    return !!w && w.terminal && w.pendingEffects === 0;
+  });
+  const suspects = [...input.latest.entries()].filter(([g, w]) => !w.terminal && !visible.has(g)).map(([, w]) => w.id);
+  return { enqueue, redo, suspects };
+}
+
+/** 按 ID 核实后：卡片是否确实离开了派单两列（已完成、不在本看板、或在其他列）。 */
+export function hasLeft(loc: { completed: boolean; sectionGuid: string | null }, activeSections: string[]): boolean {
+  return loc.completed || loc.sectionGuid === null || !activeSections.includes(loc.sectionGuid);
 }
 
 // ───────────────────────── 状态机 ─────────────────────────
@@ -175,8 +185,11 @@ export class Dispatcher {
     this.board = board;
   }
 
-  /** 看板 → 账本 对账：新建派单、取消被拖走的派单。返回新建数量。 */
-  async reconcile(): Promise<{ enqueued: number; cancelled: number }> {
+  /**
+   * 看板 → 账本 对账：新建派单、取消被拖走的派单。
+   * 列表读取只用来发现候选；取消和再派这类不可逆的决定都先按任务 ID 核实，查不清就留到下次对账。
+   */
+  async reconcile(): Promise<{ enqueued: number; cancelled: number; deferred: number }> {
     const [queued, running] = await Promise.all([this.board.listSection("dispatch"), this.board.listSection("running")]);
     const cards = [
       ...queued.map((t) => ({ guid: t.guid, section: "dispatch" as const, task: t })),
@@ -188,27 +201,60 @@ export class Dispatcher {
       if (w) latest.set(g, { id: w.id, terminal: w.terminal, pendingEffects: this.ledger.pendingEffects(w.id) });
     }
     const plan = planReconcile({ cards, latest });
+    const activeSections = [this.board.section("dispatch"), this.board.section("running")];
     let enqueued = 0;
-    for (const guid of plan.enqueue) {
-      const t = cards.find((c) => c.guid === guid)!.task;
-      // 唯一索引保证同一卡片至多一项未终结派单：并发对账时后到的插入被忽略
-      const added = this.ledger.enqueue({
-        id: `dispatch:${guid}:${Date.now()}`,
-        kind: "dispatch",
-        ref: guid,
-        state: "queued",
-        payload: { guid, summary: t.summary, description: t.description },
-      });
-      if (added) {
-        enqueued++;
-        log("info", "新派单入队", { task: t.summary });
+    let cancelled = 0;
+    let deferred = 0;
+    /** 按 ID 核实；查不清返回 undefined（留到下次对账） */
+    const locate = async (guid: string) => {
+      try {
+        return await this.board.locateTask(guid);
+      } catch (e) {
+        deferred++;
+        log("warn", "无法按任务 ID 核实卡片位置，留到下次对账", { task: guid, err: errMsg(e) });
+        return undefined;
       }
+    };
+
+    for (const guid of plan.redo) {
+      const loc = await locate(guid);
+      if (!loc) continue;
+      if (hasLeft(loc, activeSections) || loc.sectionGuid !== this.board.section("dispatch")) {
+        log("info", "列表里的卡片已不在“派给Agent”（读取到的是旧快照），不再派", { task: guid });
+        continue;
+      }
+      if (this.enqueue(cards.find((c) => c.guid === guid)!.task)) enqueued++;
     }
-    for (const id of plan.cancel) {
+    for (const guid of plan.enqueue) {
+      if (this.enqueue(cards.find((c) => c.guid === guid)!.task)) enqueued++;
+    }
+    for (const id of plan.suspects) {
+      const w = this.ledger.get(id);
+      if (!w || w.terminal) continue;
+      const loc = await locate(w.ref);
+      if (!loc) continue;
+      if (!hasLeft(loc, activeSections)) {
+        log("info", "两列读取都没看到卡片，但按 ID 核实仍在派单列（读取不一致），不取消", { work: id });
+        continue;
+      }
       this.ledger.requestCancel(id);
-      log("info", "卡片已离开派单列，请求取消", { work: id });
+      cancelled++;
+      log("info", "卡片已离开派单列，请求取消", { work: id, completed: loc.completed, section: loc.sectionGuid });
     }
-    return { enqueued, cancelled: plan.cancel.length };
+    return { enqueued, cancelled, deferred };
+  }
+
+  /** 唯一索引保证同一卡片至多一项未终结派单：并发对账时后到的插入被忽略。返回是否新入队。 */
+  private enqueue(t: BoardTask): boolean {
+    const added = this.ledger.enqueue({
+      id: `dispatch:${t.guid}:${Date.now()}`,
+      kind: "dispatch",
+      ref: t.guid,
+      state: "queued",
+      payload: { guid: t.guid, summary: t.summary, description: t.description },
+    });
+    if (added) log("info", "新派单入队", { task: t.summary });
+    return added;
   }
 
   handler(): Handler<DispatchPayload> {
