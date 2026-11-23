@@ -116,6 +116,13 @@ test("集成：设置脱敏读取、热加载预算并保留 YAML 注释、拒�
   assert.equal(app.cfg.budget.daily_usd, 0.05, "内存配置已热更新");
   assert.match(fs.readFileSync(app.cfg.file, "utf8"), /# 保留注释测试/);
 
+  // 删除映射中的最后一个键（前端 diffPatch 发送 null）：YAML 仍可正常校验，且键确实被删除
+  const del = (await (
+    await api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ budget: { pricing: { codex: null } } }) })
+  ).json()) as SettingsUpdateResult;
+  assert.equal(del.ok, true, JSON.stringify(del.errors));
+  assert.deepEqual(app.cfg.budget.pricing, {});
+
   const bad = await api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ data_dir: "/tmp/evil" }) });
   assert.equal(bad.status, 400);
 });

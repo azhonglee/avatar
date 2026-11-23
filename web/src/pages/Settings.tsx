@@ -30,6 +30,28 @@ export function setIn(o: Obj, path: string, value: unknown): Obj {
 }
 
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v ?? {}));
+const isPlainObj = (v: unknown): v is Obj => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/**
+ * 计算两份配置段的增量补丁，与后端 SettingsService 的补丁语义对齐：
+ * 未变化的键省略，被删除的键写 null（如删除仓库别名 / 交付平台 / 可选字段）。
+ */
+export function diffPatch(before: unknown, after: unknown): unknown {
+  if (JSON.stringify(before) === JSON.stringify(after)) return undefined;
+  if (isPlainObj(before) && isPlainObj(after)) {
+    const out: Obj = {};
+    for (const k of new Set([...Object.keys(before), ...Object.keys(after)])) {
+      if (!(k in after)) out[k] = null;
+      else if (!(k in before)) out[k] = after[k];
+      else {
+        const d = diffPatch(before[k], after[k]);
+        if (d !== undefined) out[k] = d;
+      }
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
+  return after === undefined ? null : after;
+}
 
 interface FormApi {
   draft: Obj;
@@ -417,7 +439,11 @@ export function SettingsForm({ view, onSaved }: { view: SettingsView; onSaved: (
     if (!dirty.length || localErr.length) return;
     setSaving(true);
     try {
-      const patch = Object.fromEntries(dirty.map((k) => [k, draft[k]]));
+      const patch: Obj = {};
+      for (const k of dirty) {
+        const d = diffPatch(view.config[k], draft[k]);
+        if (d !== undefined) patch[k] = d;
+      }
       const r = await request<SettingsUpdateResult>("/api/settings", { method: "PUT", body: patch, accept: [400] });
       if (r?.ok) {
         setErrors([]);
@@ -492,7 +518,14 @@ export function SettingsForm({ view, onSaved }: { view: SettingsView; onSaved: (
       </p>
 
       <div className="settings" key={version}>
-        <Section id="harness" title="执行者" keys={["roles", "dispatch"]} hot={hot} dirty={isDirty("roles")} desc="执行者（harness）在配置文件中定义；这里选择各角色用哪个。">
+        <Section
+          id="harness"
+          title="执行者"
+          keys={["roles", "dispatch"]}
+          hot={hot}
+          dirty={isDirty("roles") || getIn(draft, "dispatch.default_harness") !== getIn(view.config, "dispatch.default_harness")}
+          desc="执行者（harness）在配置文件中定义；这里选择各角色用哪个。"
+        >
           {harnesses.length ? (
             <div className="table-wrap">
               <table className="table table-compact">

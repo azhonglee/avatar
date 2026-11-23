@@ -86,10 +86,10 @@ describe("SettingsPage", () => {
     await user.click(saveBtn);
 
     await waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(2));
-    // Verify only the dirty section was sent in PUT body
+    // Verify only the changed leaf was sent in PUT body
     const putInit = fetchSpy.mock.calls[1][1] as RequestInit;
     expect(putInit.method).toBe("PUT");
-    expect(JSON.parse(String(putInit.body))).toEqual({ budget: { daily_usd: -5, per_task_usd: 2, pricing: {} } });
+    expect(JSON.parse(String(putInit.body))).toEqual({ budget: { daily_usd: -5 } });
 
     // Top banner + field-level inline error both show the message
     const alerts = await screen.findAllByRole("alert");
@@ -125,5 +125,32 @@ describe("SettingsPage", () => {
 
     const banners = await screen.findAllByRole("status");
     expect(banners.some((b) => b.textContent?.includes("需要重启常驻进程"))).toBe(true);
+  });
+
+  it("sends null in patch when deleting a configured provider so YAML removes the key", async () => {
+    const user = userEvent.setup();
+    const view = makeSettingsView();
+    view.config.delivery = {
+      default_provider: "",
+      discard_retention_days: 7,
+      providers: {
+        gh: { type: "github", token_env: "GITHUB_TOKEN", remote: "origin" },
+      },
+    };
+    const okRes: SettingsUpdateResult = { ok: true, errors: [], restart_required: false };
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify(view), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(okRes), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(makeSettingsView()), { status: 200 }));
+
+    renderSettings();
+    const delBtn = await screen.findByRole("button", { name: "删除代码平台 gh" });
+    await user.click(delBtn);
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(3));
+    const putInit = fetchSpy.mock.calls[1][1] as RequestInit;
+    expect(JSON.parse(String(putInit.body))).toEqual({ delivery: { providers: { gh: null } } });
   });
 });
