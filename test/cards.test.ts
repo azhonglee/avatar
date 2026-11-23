@@ -423,8 +423,16 @@ test("onAction：命令失败 → 私信原因（failure 类型）且卡片底�
   // 重复投递不重复私信
   await app.ext.cards!.onAction(ev({ event_id: "c1", action_value: JSON.stringify({ cmd: "candidate.reject", args: { signal_id: "sig:c" }, card: "candidate:sig:c" }) }), ctxStub);
   assert.equal(app.ledger.list({ kinds: ["effect"], ref: "card:action-errors", limit: 10 }).length, fx.length);
-  await app.ext.cards!.onAction(ev({ event_id: "c2", action_value: JSON.stringify({ cmd: "delivery.create_pr", args: { id: "nope" } }) }), ctxStub);
-  assert.ok(app.ledger.list<Effect>({ kinds: ["effect"], ref: "card:action-errors", limit: 10 }).some((f) => f.payload.op === "notify" && /未知的命令/.test(f.payload.args.markdown)));
+  // 命令未注册（对应模块未启用）同样私信提示
+  const defs = (app.commands as unknown as { defs: Map<string, unknown> }).defs;
+  const saved = defs.get("delivery.create_pr");
+  defs.delete("delivery.create_pr");
+  try {
+    await app.ext.cards!.onAction(ev({ event_id: "c2", action_value: JSON.stringify({ cmd: "delivery.create_pr", args: { id: "nope" } }) }), ctxStub);
+    assert.ok(app.ledger.list<Effect>({ kinds: ["effect"], ref: "card:action-errors", limit: 10 }).some((f) => f.payload.op === "notify" && /未知的命令/.test(f.payload.args.markdown)));
+  } finally {
+    if (saved) defs.set("delivery.create_pr", saved);
+  }
 });
 
 /** 放一项派单到账本里（不经飞书）。 */
@@ -577,7 +585,7 @@ test("端到端：一次派单只有一张卡片，随状态原地更新；卡�
   assert.equal(done.length, 1);
   assert.ok((done[0].patches as number) >= 3, `原地更新了 ${done[0].patches} 次`);
   assert.match(text(done[0].card), /已通过验收/);
-  assert.deepEqual(cmds(done[0].card), ["dispatch.retry"], "交付命令未注册时不显示");
+  assert.deepEqual(cmds(done[0].card), ["delivery.merge_local", "dispatch.retry", "delivery.discard"], "未配置 PR 平台时不显示创建 PR，显示本地合并/重试/放弃");
 
   // 点卡片上的“重试”
   const retry = callbackValue(buttonFor(done[0].card, "dispatch.retry"))!;

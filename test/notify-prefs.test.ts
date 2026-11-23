@@ -94,7 +94,7 @@ test("门控：按类型关闭、失败总是发送、未标注类型的私信�
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pa-notify-"));
 let app: App;
-const stubState = () => JSON.parse(fs.readFileSync(path.join(tmp, "stub-state.json"), "utf8")) as { messages: { markdown: string }[] };
+const stubState = () => JSON.parse(fs.readFileSync(path.join(tmp, "stub-state.json"), "utf8")) as { messages: { markdown?: string; card?: unknown }[] };
 
 before(() => {
   process.env.STUB_STATE = path.join(tmp, "stub-state.json");
@@ -135,7 +135,7 @@ test("集成：免打扰期间的私信延后（不计重试次数），结束�
     assert.equal(app.ledger.effectsOf("p4")[0].state, "done");
     assert.equal(app.ledger.effectsOf("p5")[0].terminal, false);
     assert.equal(app.ledger.effectsOf("p5")[0].next_at, end);
-    const texts = () => stubState().messages.map((m) => m.markdown);
+    const texts = () => stubState().messages.map((m) => m.markdown ?? JSON.stringify(m.card ?? ""));
 
     const [deferred] = app.ledger.effectsOf("p1");
     assert.equal(deferred.terminal, false);

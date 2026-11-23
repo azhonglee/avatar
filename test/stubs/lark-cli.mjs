@@ -12,7 +12,9 @@ if (lockPath && !(argv[0] === "event" && argv[1] === "consume")) {
     try {
       fs.closeSync(fs.openSync(lockPath, "wx"));
       break;
-    } catch {
+    } catch (e) {
+      // 目录不存在等非冲突错误直接抛出，避免测试目录已清理时死循环
+      if (e && e.code !== "EEXIST") throw e;
       if (Date.now() > deadline) fs.rmSync(lockPath, { force: true });
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
     }

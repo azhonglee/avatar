@@ -54,6 +54,8 @@ export function createApp(cfg: Config) {
   capture.onCandidate = (e) => bus.emit("candidate.created", e);
   const commands = new Commands(ledger, bus);
   commands.kick = () => engine.kick();
+  // 账本每次变更（含 transition/enqueue 附带的 outbox 副作用）都立刻唤醒引擎，不必等下一个 tick_ms
+  bus.on("work.changed", () => engine.kick());
   const ext: Extensions = {};
   const effectHooks: EffectHooks = {};
   const app = { cfg, store, ledger, lark, board, kb, capture, dispatcher, engine, bot, hooks, bus, commands, ext, effectHooks };
