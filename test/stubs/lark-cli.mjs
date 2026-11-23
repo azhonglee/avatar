@@ -162,8 +162,31 @@ if (key.startsWith("event consume")) {
         ],
       });
     case "im +messages-send":
+      // 交互卡片：记下解析后的卡片 JSON；同一幂等键只发一次（与真实接口一致）
+      if (flag("--msg-type") === "interactive") {
+        const idem = flag("--idempotency-key");
+        const dup = idem && state.messages.find((m) => m.msg_type === "interactive" && m.idem === idem);
+        if (dup) ok({ message_id: dup.message_id });
+        const content = flag("--content") === "-" ? stdin : flag("--content");
+        let parsed;
+        try {
+          parsed = JSON.parse(content);
+        } catch {
+          fail("卡片内容不是合法 JSON");
+        }
+        const message_id = nextId("om_card");
+        state.messages.push({ to: flag("--user-id"), as: flag("--as"), msg_type: "interactive", card: parsed, message_id, idem, patches: 0 });
+        ok({ message_id });
+      }
       state.messages.push({ to: flag("--user-id"), as: flag("--as"), markdown: stdin || flag("--markdown") || flag("--text") });
       ok({ message_id: nextId("om") });
+    case "im messages patch": {
+      const m = state.messages.find((x) => x.msg_type === "interactive" && x.message_id === params.message_id);
+      if (!m) fail(`没有这条卡片消息：${params.message_id}`);
+      m.card = JSON.parse(data.content);
+      m.patches++;
+      ok({});
+    }
     case "drive +batch-query-comments":
       ok({ items: [{ comment_id: flag("--comment-ids"), reply_list: { replies: [{ content: "@主人 这里请补充一下数据来源" }] } }] });
     case "minutes +detail":
