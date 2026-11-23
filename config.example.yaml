@@ -33,15 +33,22 @@ harnesses:
 
 roles:
   brain: claude      # 分诊、私聊对话、知识库整理
-  reviewer: codex    # 派单结果的交叉审查；留空则不审查
+  reviewer: codex    # 派单结果的交叉审查；留空则不审查（此时结果按 acceptance.on_unverified 处理）
 
 dispatch:
   default_harness: claude   # 任务标题没写 [harness] 前缀时用谁
   max_parallel: 2
   timeout_sec: 3600
-  fix_rounds: 1             # 审查不通过时返工几轮
+  fix_rounds: 1             # 校验不通过时返工几轮
+  max_attempts: 2           # 同一阶段最多尝试几次（含进程崩溃中断），超过后进“需人工介入”
   repos:                    # 任务描述里写 “repo: 别名” 即在该仓库的独立 worktree 里执行
     # web: ~/code/web
+    # api: { path: ~/code/api, verify: "npm test" }   # verify：确定性校验命令，失败即打回返工
+
+# 验收关卡：派单“完成”由它定义，而不是由执行者的退出码定义
+acceptance:
+  on_unverified: needs_human  # 没有任何校验（无 reviewer、无 verify）时：needs_human 进“需人工介入”；review 标为未验证进“待验收”
+  review_retries: 1           # reviewer 故障（超时/无输出/结论无法解析）重试次数；仍失败进“需人工介入”，不算打回
 
 capture:
   min_confidence: 0.6        # ≥ 该值进“待确认”

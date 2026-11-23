@@ -73,11 +73,23 @@ export class Board {
 
   /** 列出某一列里未完成的任务（拖动卡片不产生事件，所以靠定时拉取）。 */
   async listSection(key: SectionKey): Promise<BoardTask[]> {
-    const data = await this.lark.run(
-      ["task", "sections", "tasks", "--params", JSON.stringify({ section_guid: this.section(key), completed: false, page_size: 50 })],
-      { as: "user" },
-    );
-    return findItems(data, "guid").map(toBoardTask);
+    // 必须翻完所有页：对账依据“卡片不在列里”来判断取消，漏一页就会误取消
+    const out: BoardTask[] = [];
+    const seen = new Set<string>();
+    let token: string | undefined;
+    do {
+      const params: Record<string, unknown> = { section_guid: this.section(key), completed: false, page_size: 50 };
+      if (token) params.page_token = token;
+      const data = await this.lark.run(["task", "sections", "tasks", "--params", JSON.stringify(params)], { as: "user" });
+      out.push(...findItems(data, "guid").map(toBoardTask));
+      const more = deepFind(data, "has_more") === true;
+      const next = deepFind(data, "page_token");
+      if (!more) break;
+      if (typeof next !== "string" || !next || seen.has(next)) throw new Error(`列出看板分组 ${key} 时分页游标缺失或重复`);
+      seen.add(next);
+      token = next;
+    } while (true);
+    return out;
   }
 
   async getTask(guid: string): Promise<BoardTask> {
@@ -86,15 +98,48 @@ export class Board {
     return toBoardTask(t as Record<string, unknown>);
   }
 
-  async createTask(t: { summary: string; description: string; due?: string; section: SectionKey }): Promise<string> {
-    const args = ["task", "+create", "--summary", t.summary, "--description", t.description, "--tasklist-id", this.tasklistGuid];
-    if (t.due) args.push("--due", t.due);
-    if (this.cfg.owner.open_id) args.push("--assignee", this.cfg.owner.open_id);
-    const created = await this.lark.run(args, { as: "user" });
-    const guid = String(deepFind(created, "guid") ?? "");
-    if (!guid) throw new Error(`创建任务失败：${JSON.stringify(created)}`);
+  /**
+   * 建任务并放进某一列。给了 opKey 时幂等：同一 opKey 只建一次（建好后“移到列”失败重试，不会再建一张）。
+   */
+  /**
+   * 按任务 ID 查卡片此刻的真实状态：是否已完成、在本看板的哪一列（sectionGuid 为 null = 已不在本看板）。
+   * 对账用它核实“列表里没看到”是不是真的离开了——两次列表读取不是同一个快照，不能直接下结论。
+   * 查不清（接口失败、结构或完成状态无法识别、缺少分组信息）就抛错，由调用方留到下次对账。
+   */
+  async locateTask(guid: string): Promise<{ completed: boolean; sectionGuid: string | null }> {
+    const data = await this.lark.run(["task", "tasks", "get", "--params", JSON.stringify({ task_guid: guid })], { as: "user" });
+    const t = (deepFind(data, "task") ?? data) as Record<string, unknown> | undefined;
+    if (!t || typeof t !== "object" || String(t.guid ?? "") !== guid) {
+      throw new Error(`任务详情结构无法识别：${JSON.stringify(data).slice(0, 200)}`);
+    }
+    const completed = parseCompletedAt(t.completed_at);
+    if (completed === undefined) throw new Error(`任务完成状态无法识别：completed_at=${JSON.stringify(t.completed_at)}`);
+    if (completed) return { completed: true, sectionGuid: null };
+    if (!Array.isArray(t.tasklists)) throw new Error("任务详情缺少 tasklists，无法确认所在分组");
+    const mine = (t.tasklists as Record<string, unknown>[]).find((l) => l?.tasklist_guid === this.tasklistGuid);
+    if (!mine) return { completed: false, sectionGuid: null };
+    if (typeof mine.section_guid !== "string" || !mine.section_guid) throw new Error("任务在本看板中的分组未知");
+    return { completed: false, sectionGuid: mine.section_guid };
+  }
+
+  async createTask(t: { summary: string; description: string; due?: string; section: SectionKey; opKey?: string }): Promise<string> {
+    const create = async () => {
+      const args = ["task", "+create", "--summary", t.summary, "--description", t.description, "--tasklist-id", this.tasklistGuid];
+      if (t.due) args.push("--due", t.due);
+      if (this.cfg.owner.open_id) args.push("--assignee", this.cfg.owner.open_id);
+      const created = await this.lark.run(args, { as: "user" });
+      const guid = String(deepFind(created, "guid") ?? "");
+      if (!guid) throw new Error(`创建任务失败：${JSON.stringify(created)}`);
+      return guid;
+    };
+    const guid = t.opKey ? await this.store.once(`task.create.${t.opKey}`, create) : await create();
     await this.move(guid, t.section);
     return guid;
+  }
+
+  /** 所有分组都已初始化（升级后新增分组时为 false，需要再跑一次 init）。 */
+  isInitialized(): boolean {
+    return !!this.store.get("board.tasklist") && Object.keys(this.cfg.board.sections).every((k) => this.store.get(`board.section.${k}`));
   }
 
   /** 把任务移到看板的某一列。 */
@@ -105,9 +150,34 @@ export class Board {
     );
   }
 
+  /** 任务下是否已有内容相同的评论（重试投递评论前去重用；查询失败返回 false，退化为至少一次）。 */
+  async hasComment(guid: string, content: string): Promise<boolean> {
+    try {
+      const data = await this.lark.run(
+        ["task", "comments", "list", "--params", JSON.stringify({ resource_type: "task", resource_id: guid, page_size: 100, direction: "desc" })],
+        { as: "user" },
+      );
+      return findItems(data, "content").some((c) => String(c.content).trim() === content.trim());
+    } catch (e) {
+      log("warn", "查询任务评论失败，按未发送处理", { guid, err: String(e) });
+      return false;
+    }
+  }
+
   async comment(guid: string, content: string): Promise<void> {
     await this.lark.run(["task", "+comment", "--task-id", guid, "--content", content], { as: "user" });
   }
+}
+
+/**
+ * 任务详情的 completed_at：只认真实接口上核实过的两种形式——未完成为字符串 "0"，已完成为 13 位毫秒时间戳字符串。
+ * 其他任何值（"null"、空串、秒级时间戳、数字类型……）都返回 undefined，即“查不清”：
+ * 对账据此取消正在执行的派单，判断错了不可逆，宁可留到下次。
+ */
+export function parseCompletedAt(v: unknown): boolean | undefined {
+  if (v === "0") return false;
+  if (typeof v === "string" && /^[1-9]\d{12}$/.test(v)) return true;
+  return undefined;
 }
 
 export function toBoardTask(t: Record<string, unknown>): BoardTask {

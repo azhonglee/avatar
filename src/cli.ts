@@ -1,11 +1,11 @@
 import fs from "node:fs";
 import { parseArgs } from "node:util";
-import { createApp, initApp, runConfiguredJob, runDaemon, sendBrief } from "./app.ts";
+import { createApp, initApp, runConfiguredJob, runDaemon, runDispatchOnce, sendBrief } from "./app.ts";
 import { loadConfig } from "./config.ts";
 import { decide, type Profile } from "./guard.ts";
 import { resolveBin } from "./harness.ts";
 import { errMsg, runProcess } from "./util.ts";
-import { runAgentJob } from "./workflows/agent.ts";
+import { runAgentJob, statusText } from "./workflows/agent.ts";
 import { buildBrief } from "./workflows/brief.ts";
 
 const USAGE = `用法：pa <命令>
@@ -15,7 +15,8 @@ const USAGE = `用法：pa <命令>
   run                         常驻运行（事件长连接 + 定时任务）
   brief [morning|evening]     生成概览并私信给你（--print 只打印不发送）
   capture                     立即识别一轮任务
-  dispatch                    立即处理“派给Agent”列，并等待完成
+  dispatch                    立即对账“派给Agent”列并执行派单（含崩溃后未完成的），等待完成
+  status                      最近 24 小时的派单、作业，以及重试中/失败的事件和飞书写入
   job <名称>                  立即执行 config.yaml 里定义的 agent 作业
   ask <文字>                  让 superagent 处理一句话并打印回复
   publish-doc <file.md>       把 Markdown 发布为飞书文档（--title 标题，--parent 知识库节点名，缺省放“我的文档库”）
@@ -47,21 +48,30 @@ async function main(): Promise<void> {
     case "brief": {
       const { values, positionals } = parseArgs({ args: rest, options: { print: { type: "boolean" } }, allowPositionals: true });
       const mode = positionals[0] === "evening" ? "evening" : "morning";
-      if (values.print) console.log(await buildBrief(cfg, app.lark, app.store, app.board, mode));
-      else await sendBrief(app, mode);
+      if (values.print) console.log(await buildBrief(cfg, app.lark, app.store, app.ledger, app.board, mode));
+      else {
+        await sendBrief(app, mode);
+        await app.engine.drain(["effect"]);
+      }
       return;
     }
     case "capture":
       return void console.log(await app.capture.run());
-    case "dispatch":
-      console.log(`领取 ${await app.dispatcher.scan()} 个任务，执行中…`);
-      await app.dispatcher.drain();
-      return void console.log("完成");
+    case "dispatch": {
+      const r = await runDispatchOnce(app);
+      console.log(`新派单 ${r.enqueued} 个`);
+      for (const w of r.items) if (w) console.log(`- ${w.state}${w.terminal ? "" : "（未完成，常驻进程会继续）"} ${String(w.payload.summary ?? w.ref)}`);
+      const pending = app.ledger.active("effect").length;
+      if (pending) console.log(`⚠️ 还有 ${pending} 条飞书写入待重试，常驻进程会继续投递`);
+      return;
+    }
+    case "status":
+      return void console.log(statusText(app.ledger));
     case "job":
       if (!rest[0]) throw new Error("用法：pa job <名称>");
       return void console.log(await runConfiguredJob(app, rest[0]));
     case "ask": {
-      const r = await runAgentJob(cfg, app.store, { name: "ask", task: rest.join(" ") });
+      const r = await runAgentJob(cfg, app.store, app.ledger, { name: "ask", task: rest.join(" ") });
       return void console.log(r.text);
     }
     case "publish-doc": {
@@ -114,6 +124,11 @@ async function doctor(app: ReturnType<typeof createApp>): Promise<void> {
     console.log(`ℹ️  harness ${name} → ${h.agent ? `acpx ${h.agent}` : `acpx --agent '${h.agentCommand}'`}${h.model ? ` (model ${h.model})` : ""}`);
   }
   console.log(`ℹ️  角色：brain=${cfg.roles.brain} reviewer=${cfg.roles.reviewer || "无"} 默认执行者=${cfg.dispatch.default_harness || cfg.roles.brain}`);
+  const verified = Object.entries(cfg.dispatch.repos).filter(([, v]) => typeof v !== "string" && v.verify).map(([k]) => k);
+  console.log(`ℹ️  验收：无校验时 → ${cfg.acceptance.on_unverified === "needs_human" ? "需人工介入" : "标为未验证进待验收"}；带 verify 命令的仓库：${verified.join(", ") || "无"}`);
+  if (!cfg.roles.reviewer && !verified.length && cfg.acceptance.on_unverified === "needs_human")
+    console.log("⚠️  没有配置 reviewer 也没有 verify 命令：所有派单结果都会进“需人工介入”");
+  if (store.get("board.tasklist") && !app.board.isInitialized()) console.log("⚠️  看板有新增分组尚未创建，请再运行一次 pa init");
   console.log(`ℹ️  数据目录：${cfg.dataDir}`);
 }
 

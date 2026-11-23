@@ -45,6 +45,8 @@ const Schema = z.object({
           dispatch: z.string().default("派给Agent"),
           running: z.string().default("Agent进行中"),
           review: z.string().default("待验收"),
+          /** 审查未通过 / 无法验证 / 执行出错：需要你介入 */
+          attention: z.string().default("需人工介入"),
           waiting: z.string().default("等待他人"),
         })
         .prefault({}),
@@ -71,8 +73,36 @@ const Schema = z.object({
       max_parallel: z.number().int().min(1).default(2),
       timeout_sec: z.number().int().min(60).default(3600),
       fix_rounds: z.number().int().min(0).default(1),
-      /** 仓库别名 → 本地路径；任务描述里写 `repo: 别名` 即在该仓库的 git worktree 中执行 */
-      repos: z.record(z.string(), z.string()).default({}),
+      /** 同一阶段最多尝试几次（含进程崩溃中断）；超过后落到“需人工介入” */
+      max_attempts: z.number().int().min(1).default(2),
+      /**
+       * 仓库别名 → 本地路径，或 { path, verify }；任务描述里写 `repo: 别名` 即在该仓库的 git worktree 中执行。
+       * verify 是确定性校验命令（如 npm test），在 worktree 里运行，失败即打回返工。
+       */
+      repos: z.record(z.string(), z.union([z.string(), z.object({ path: z.string(), verify: z.string().optional() })])).default({}),
+    })
+    .prefault({}),
+  /** 验收关卡：派单“完成”由它定义，而不是由执行者退出码定义 */
+  acceptance: z
+    .object({
+      /** 没有任何校验（无 reviewer、无 verify 命令）时：needs_human 进“需人工介入”；review 标为未验证后进“待验收” */
+      on_unverified: z.enum(["needs_human", "review"]).default("needs_human"),
+      /** reviewer 故障（超时、无输出、结论无法解析）时重试几次；仍失败则需人工介入，不算打回 */
+      review_retries: z.number().int().min(0).default(1),
+      review_timeout_sec: z.number().int().min(60).default(1200),
+      verify_timeout_sec: z.number().int().min(10).default(1800),
+    })
+    .prefault({}),
+  /** 工作引擎（一般不用改） */
+  engine: z
+    .object({
+      lease_sec: z.number().min(1).default(60),
+      tick_ms: z.number().int().min(50).default(5000),
+      retry_base_ms: z.number().int().min(10).default(5000),
+      retry_max_ms: z.number().int().min(10).default(600_000),
+      /** 事件处理、飞书写入各自最多尝试几次 */
+      event_attempts: z.number().int().min(1).default(6),
+      effect_attempts: z.number().int().min(1).default(10),
     })
     .prefault({}),
   capture: z
@@ -117,6 +147,14 @@ const Schema = z.object({
 });
 
 export type Config = z.infer<typeof Schema> & { dataDir: string; file: string };
+
+/** 解析 `repo:` 引用：配置里的别名（字符串或 {path, verify}），否则当作路径。 */
+export function repoSpec(cfg: Config, ref: string): { path: string; verify?: string } {
+  const v = cfg.dispatch.repos[ref];
+  if (v === undefined) return { path: path.resolve(expandHome(ref)) };
+  if (typeof v === "string") return { path: path.resolve(expandHome(v)) };
+  return { path: path.resolve(expandHome(v.path)), verify: v.verify };
+}
 
 export function loadConfig(file = process.env.PA_CONFIG ?? path.join(ROOT, "config.yaml")): Config {
   if (!fs.existsSync(file)) {

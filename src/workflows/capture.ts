@@ -99,37 +99,38 @@ export class Capture {
     return added;
   }
 
-  /** 文档评论 @我（drive.notice.comment_add_v1，事件只带 ID，正文要再查一次）。 */
-  async onComment(ev: Record<string, unknown>): Promise<void> {
-    if (!ev.is_mentioned || ev.from_open_id === this.cfg.owner.open_id) return;
+  /**
+   * 文档评论 @我（drive.notice.comment_add_v1，事件只带 ID，正文要再查一次）。
+   * 幂等：只在信号成功入库后才算处理过；拉正文失败会抛错，由 inbox 重试。返回是否新增了信号。
+   */
+  async onComment(ev: Record<string, unknown>): Promise<boolean> {
+    if (!ev.is_mentioned || ev.from_open_id === this.cfg.owner.open_id) return false;
     const id = `comment:${ev.comment_id}:${ev.reply_id ?? ""}`;
-    if (!this.store.markSeen(id, "signal")) return;
+    if (this.store.hasSignal(id)) return false;
     const data = await this.lark.run(
       ["drive", "+batch-query-comments", "--token", String(ev.file_token), "--type", String(ev.file_type), "--comment-ids", String(ev.comment_id)],
       { as: "user" },
     );
-    this.store.addSignal({
+    return this.store.addSignal({
       id,
       source: "文档评论@我",
       text: `文档 ${ev.file_type}/${ev.file_token} 的评论：${truncate(JSON.stringify(data), 3000)}`,
       link: `${this.cfg.lark_web}/${ev.file_type}/${ev.file_token}`,
     });
-    await this.process();
   }
 
-  /** 妙记生成（minutes.minute.generated_v1）：拉取纪要和待办，交给分诊。 */
-  async onMinutes(ev: Record<string, unknown>): Promise<void> {
+  /** 妙记生成（minutes.minute.generated_v1）：拉取纪要和待办，入库等待分诊。幂等，失败抛错由 inbox 重试。 */
+  async onMinutes(ev: Record<string, unknown>): Promise<boolean> {
     const token = String(ev.minute_token ?? "");
     const id = `minutes:${token}`;
-    if (!token || !this.store.markSeen(id, "signal")) return;
+    if (!token || this.store.hasSignal(id)) return false;
     const data = await this.lark.run(["minutes", "+detail", "--minute-tokens", token, "--summary", "--todo"], { as: "user" });
-    this.store.addSignal({
+    return this.store.addSignal({
       id,
       source: "会议妙记",
       text: `会议「${ev.title ?? ""}」的纪要与待办：${truncate(JSON.stringify(data), 6000)}`,
       link: `${this.cfg.lark_web}/minutes/${token}`,
     });
-    await this.process();
   }
 
   /** 一轮完整的识别：拉消息 + 分诊所有待处理信号。 */
@@ -180,7 +181,8 @@ export class Capture {
           `[pa:signal=${s.id}]`,
         ].join("\n");
         try {
-          const guid = await this.board.createTask({ summary: v.summary, description, due: v.due ?? undefined, section });
+          // 以信号 id 为幂等键：建好后“移到列/记结论”失败重试，不会再建一张
+          const guid = await this.board.createTask({ summary: v.summary, description, due: v.due ?? undefined, section, opKey: `signal:${s.id}` });
           this.store.setVerdict(s.id, `task(${v.confidence})`, guid);
           existing.push(v.summary);
           created++;

@@ -75,6 +75,13 @@ if (key.startsWith("event consume")) {
   const params = flag("--params") ? JSON.parse(flag("--params")) : {};
   const data = flag("--data") ? JSON.parse(flag("--data")) : {};
 
+  // 故障注入：state.failOnce[命令] = 次数，前 N 次调用失败
+  if (state.failOnce?.[key] > 0) {
+    state.failOnce[key]--;
+    save();
+    fail(`注入的临时故障：${key}`);
+  }
+
   switch (key) {
     case "auth status":
       ok({ identity: "user", user: { open_id: "ou_owner", name: "主人" } });
@@ -125,13 +132,27 @@ if (key.startsWith("event consume")) {
     case "task tasks get": {
       const t = state.tasks[params.task_guid];
       if (!t) fail("no such task");
-      ok({ task: { guid: t.guid, summary: t.summary, description: t.description } });
+      // 与真实接口一致：completed_at 为 "0" 表示未完成，tasklists 给出所在清单与分组
+      ok({
+        task: {
+          guid: t.guid,
+          summary: t.summary,
+          description: t.description,
+          completed_at: t.completed ? String(Date.now()) : "0",
+          tasklists: t.section ? [{ tasklist_guid: "tl_board", section_guid: t.section }] : [],
+        },
+      });
     }
     case "task +comment": {
       const t = state.tasks[flag("--task-id")];
       if (!t) fail("no such task");
       t.comments.push(flag("--content"));
       ok({ comment: { id: nextId("c") } });
+    }
+    case "task comments list": {
+      const t = state.tasks[params.resource_id];
+      if (!t) fail("no such task");
+      ok({ items: [...t.comments].reverse().map((content, i) => ({ id: `c_${i}`, content })), has_more: false });
     }
     case "task +get-my-tasks":
       ok({

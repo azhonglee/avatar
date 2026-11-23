@@ -25,15 +25,27 @@ if (prompt.includes("<signal id=")) {
     return { signal_id: id, is_task: isTask, summary: isTask ? `处理：${text.slice(-12)}` : "", due: null, confidence: isTask ? 0.8 : 0.1, reason: "stub" };
   });
   process.stdout.write("好的，结果如下：\n```json\n" + JSON.stringify(out) + "\n```\n");
-} else if (prompt.includes("VERDICT: APPROVE")) {
-  process.stdout.write("改动符合要求，没有发现问题。\nVERDICT: APPROVE\n");
+} else if (prompt.includes("你是代码与交付审查者")) {
+  // 审查：标题含“总是打回”的一律要求修改；含“审查乱码”的输出无法解析的内容（模拟审查器故障）
+  if (prompt.includes("审查乱码")) process.stdout.write("嗯……我看了一下。\n");
+  else if (prompt.includes("总是打回"))
+    process.stdout.write('```json\n{"verdict":"changes","summary":"还不够好","issues":[{"severity":"high","location":"hello.txt","problem":"内容不对","suggestion":"重写"}]}\n```\n');
+  else process.stdout.write('改动符合要求，没有发现问题。\n```json\n{"verdict":"approve","summary":"改动符合要求","issues":[]}\n```\n');
 } else if (prompt.includes("你是一名执行者")) {
+  // 崩溃测试：STUB_HANG_FILE 内容为 armed 时，先留下一个未提交的半成品，再记下自己的 pid 并卡住
+  const hang = process.env.STUB_HANG_FILE;
+  if (hang && fs.existsSync(hang) && fs.readFileSync(hang, "utf8") === "armed") {
+    fs.writeFileSync(path.join(cwd, "partial.txt"), "half done\n");
+    fs.writeFileSync(hang, String(process.pid));
+    setInterval(() => undefined, 1 << 30);
+  } else {
   fs.writeFileSync(path.join(cwd, "hello.txt"), "hello from " + agent + "\n");
   if (fs.existsSync(path.join(cwd, ".git"))) {
     execFileSync("git", ["-C", cwd, "add", "-A"]);
-    execFileSync("git", ["-C", cwd, "-c", "user.name=stub", "-c", "user.email=stub@x", "commit", "-qm", "add hello"]);
+    execFileSync("git", ["-C", cwd, "-c", "user.name=stub", "-c", "user.email=stub@x", "commit", "-q", "--allow-empty", "-m", "add hello"]);
   }
   process.stdout.write(`已完成：新增 hello.txt（${agent}）\n`);
+  }
 } else {
   // agent 作业：通过 PATH 上的守卫调用 lark-cli，一次越权、一次正常读取
   const bad = spawnSync("lark-cli", ["im", "+messages-send", "--as", "bot", "--user-id", "ou_someone_else", "--text", "hi"], { encoding: "utf8" });
