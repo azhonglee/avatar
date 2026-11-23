@@ -32,9 +32,14 @@ export function taskUrl(app: App, guid: string): string {
   return guid ? `https://${app.cfg.applink_host}/client/todo/detail?guid=${encodeURIComponent(guid)}` : "";
 }
 
-/** 派单的交付状态：由 ref = 派单 id 的最新一项 delivery 工作推导。 */
+/**
+ * 派单的交付状态：由 ref = 派单 id 的最新一项 delivery 工作推导。
+ * action = "cleanup" 是放弃后的延迟清理，属于放弃的附属动作，不改变状态（保留期内外都是 discarded）。
+ */
 export function deliveryOf(app: App, dispatchId: string): { status: DeliveryStatus; url: string } {
-  const d = app.ledger.latest<{ action?: string; url?: string }>("delivery", dispatchId);
+  const d = app.ledger
+    .list<{ action?: string; url?: string }>({ kinds: ["delivery"], ref: dispatchId, limit: 50 })
+    .find((x) => x.payload.action !== "cleanup");
   if (!d) return { status: "none", url: "" };
   if (!d.terminal) return { status: "pending", url: "" };
   if (d.state !== "done") return { status: "failed", url: "" };

@@ -29,7 +29,12 @@ const Schema = z.object({
     .prefault({}),
   data_dir: z.string().default("~/.personal-agent"),
   bins: z
-    .object({ lark: z.string().default("lark-cli"), acpx: z.string().default("acpx") })
+    .object({
+      lark: z.string().default("lark-cli"),
+      acpx: z.string().default("acpx"),
+      /** 交付到公司 Codebase 时用的 bytedcli */
+      bytedcli: z.string().default("bytedcli"),
+    })
     .prefault({}),
   applink_host: z.string().default("applink.feishu.cn"),
   /** 飞书网页域名，用于拼文档/妙记链接；企业租户一般是 https://<租户>.feishu.cn */

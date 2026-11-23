@@ -1,4 +1,5 @@
 import type { App } from "./app.ts";
+import { registerDelivery } from "./delivery/index.ts";
 
 /**
  * 可选模块注册表。每个模块提供 register(app)：注册命令、填充 app.ext、订阅 app.bus、设置钩子。
@@ -6,4 +7,5 @@ import type { App } from "./app.ts";
  */
 export function registerModules(app: App): void {
   void app;
+  registerDelivery(app);
 }
