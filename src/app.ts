@@ -8,7 +8,7 @@ import type { EffectHooks } from "./effects.ts";
 import type { Extensions } from "./ext.ts";
 import { registerModules } from "./modules.ts";
 import type { Config } from "./config.ts";
-import { effectHandler, notify } from "./effects.ts";
+import { card, effectHandler, notify } from "./effects.ts";
 import { Engine, type Handler } from "./engine.ts";
 import { EventSupervisor, type Subscription } from "./events.ts";
 import { loadPrompt } from "./harness.ts";
@@ -131,10 +131,13 @@ export async function initApp(app: App): Promise<void> {
   await app.kb.init();
 }
 
-/** 生成概览并经 outbox 私信（同一天同一种只发一次）。 */
+/** 生成概览并经 outbox 私信（同一天同一种只发一次）。启用卡片时以卡片发送。 */
 export async function sendBrief(app: App, mode: "morning" | "evening"): Promise<void> {
   const text = await buildBrief(app.cfg, app.lark, app.store, app.ledger, app.board, mode);
-  app.ledger.emit("brief", [notify(text)], `brief-${mode}-${new Date().toISOString().slice(0, 10)}`);
+  const date = new Date().toISOString().slice(0, 10);
+  const c = app.cfg.cards.enabled ? app.ext.cards?.brief?.(mode, text) : undefined;
+  if (c) app.ledger.emit(`card:brief:${date}-${mode}`, [card(`brief:${date}-${mode}`, c, "brief")], `brief-${mode}-${date}`);
+  else app.ledger.emit("brief", [notify(text)], `brief-${mode}-${date}`);
 }
 
 /** 立即执行一个配置的作业并等待结果（命令行用）。 */

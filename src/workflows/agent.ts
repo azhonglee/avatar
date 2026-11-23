@@ -111,7 +111,7 @@ const HELP = [
   "- `/brief` 立即生成概览",
   "- `/capture` 立即识别一轮任务",
   "- `/dispatch` 立即扫描“派给Agent”列",
-  "- `/do [harness] 任务描述` 新建派单任务，例如 `/do [codex] 修复登录页报错 repo: web`",
+  "- `/do [harness] 任务描述` 新建派单任务，例如 `/do [codex] 修复登录页报错 repo: web`；只发 `/do` 会弹出派单表单（需启用卡片）",
   "- `/status` 最近 24 小时的运行情况",
   "- 其他任何文字：交给 superagent 处理（可查询/整理你的任务和知识库）",
 ].join("\n");
@@ -130,6 +130,8 @@ export class BotHandler {
   capture: Capture;
   dispatcher: Dispatcher;
   kick: () => void;
+  /** /do 不带参数时发派单表单卡片（由卡片模块设置）；返回 false 表示没有发 */
+  doForm?: (messageId: string) => boolean;
 
   constructor(
     cfg: Config,
@@ -188,7 +190,11 @@ export class BotHandler {
         return `本轮新派单 ${r.enqueued} 个${r.cancelled ? `，取消 ${r.cancelled} 个` : ""}。进度会写在卡片评论里。`;
       }
       case "/do": {
-        if (!arg) return "用法：/do [harness] 任务描述（可在描述中写 repo: 别名）";
+        if (!arg) {
+          // 启用卡片时弹出派单表单，不用记格式
+          if (this.doForm?.(ctx.messageId)) return "📝 已发送派单表单，填好后点「派单」即可。";
+          return "用法：/do [harness] 任务描述（可在描述中写 repo: 别名）";
+        }
         const repo = arg.match(/\brepo\s*[:：]\s*(\S+)/)?.[1];
         const summary = arg.replace(/\brepo\s*[:：]\s*\S+/, "").trim();
         const guid = await this.board.createTask({

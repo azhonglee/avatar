@@ -32,5 +32,7 @@ export interface Extensions {
   cards?: {
     /** 处理 card.action.trigger 事件（经 inbox 投递，可重试；需幂等） */
     onAction(ev: Record<string, unknown>, ctx: Ctx): Promise<void>;
+    /** 把晨报 / 晚报的 Markdown 渲染成卡片 JSON（schema 2.0）；未提供时按私信发送 */
+    brief?(mode: "morning" | "evening", text: string): Record<string, unknown>;
   };
 }
