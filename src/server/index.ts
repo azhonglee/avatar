@@ -1,0 +1,326 @@
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import fs from "node:fs";
+import http from "node:http";
+import path from "node:path";
+import type { App } from "../app.ts";
+import type { ApiError, ServerEvent } from "../api/types.ts";
+import * as Q from "../api/queries.ts";
+import { CommandError } from "../commands.ts";
+import { ROOT } from "../config.ts";
+import { errMsg, log } from "../util.ts";
+
+/**
+ * 本机控制台服务：REST API + SSE + 静态页面。
+ *
+ * 安全：
+ *   - 只监听 cfg.server.host（默认 127.0.0.1），经 SSH / VS Code 端口转发访问
+ *   - 令牌鉴权：令牌存在 kv（server.token），`pa console` 打印一次性登录链接；
+ *     /login?token= 校验后写入 HttpOnly + SameSite=Strict 的 Cookie。也接受 Authorization: Bearer
+ *   - 写请求要求 JSON 且同源（Origin 与 Host 一致），防 CSRF
+ */
+
+const COOKIE = "pa_session";
+const MAX_BODY = 1024 * 1024;
+const WEB_DIST = path.join(ROOT, "web", "dist");
+
+export function serverToken(app: App, rotate = false): string {
+  let t = app.store.get("server.token");
+  if (!t || rotate) {
+    t = randomBytes(24).toString("base64url");
+    app.store.set("server.token", t);
+  }
+  return t;
+}
+
+class HttpError extends Error {
+  status: number;
+  code: ApiError["error"]["code"];
+  constructor(status: number, code: ApiError["error"]["code"], message: string) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+const STATUS: Record<ApiError["error"]["code"], number> = {
+  unauthorized: 401,
+  not_found: 404,
+  invalid: 400,
+  conflict: 409,
+  forbidden: 403,
+  unavailable: 503,
+  internal: 500,
+};
+
+function safeEqual(a: string, b: string): boolean {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual(x, y);
+}
+
+function cookies(req: http.IncomingMessage): Record<string, string> {
+  return Object.fromEntries(
+    (req.headers.cookie ?? "")
+      .split(";")
+      .map((c) => c.trim().split("="))
+      .filter((kv) => kv.length === 2)
+      .map(([k, v]) => [k, decodeURIComponent(v)]),
+  );
+}
+
+const SECURITY_HEADERS = {
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+  "X-Frame-Options": "DENY",
+  "Content-Security-Policy": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+};
+
+function send(res: http.ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+  const data = JSON.stringify(body);
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", ...SECURITY_HEADERS, ...headers });
+  res.end(data);
+}
+
+async function readJson(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+  const ct = req.headers["content-type"] ?? "";
+  if (!ct.startsWith("application/json")) throw new HttpError(415, "invalid", "请求体必须是 JSON");
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const c of req) {
+    size += (c as Buffer).length;
+    if (size > MAX_BODY) throw new HttpError(413, "invalid", "请求体过大");
+    chunks.push(c as Buffer);
+  }
+  if (!chunks.length) return {};
+  try {
+    const v = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    if (typeof v !== "object" || v === null || Array.isArray(v)) throw new Error();
+    return v as Record<string, unknown>;
+  } catch {
+    throw new HttpError(400, "invalid", "请求体不是合法的 JSON 对象");
+  }
+}
+
+const MIME: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
+  ".json": "application/json",
+  ".woff2": "font/woff2",
+  ".map": "application/json",
+};
+
+const NOT_BUILT = `<!doctype html><meta charset="utf-8"><title>Avatar 控制台</title>
+<body style="font-family:system-ui;padding:40px;color:#333"><h2>控制台页面尚未构建</h2>
+<p>在项目目录运行 <code>npm run build:web</code> 后刷新本页。API 已可用：<code>/api/meta</code>。</p></body>`;
+
+function serveStatic(req: http.IncomingMessage, res: http.ServerResponse, pathname: string): void {
+  const index = path.join(WEB_DIST, "index.html");
+  if (!fs.existsSync(index)) {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", ...SECURITY_HEADERS });
+    res.end(NOT_BUILT);
+    return;
+  }
+  const rel = decodeURIComponent(pathname).replace(/^\/+/, "");
+  const file = path.resolve(WEB_DIST, rel);
+  const inside = file.startsWith(WEB_DIST + path.sep);
+  const target = inside && rel && fs.existsSync(file) && fs.statSync(file).isFile() ? file : index; // SPA 回退
+  const ext = path.extname(target);
+  const immutable = target !== index && rel.startsWith("assets/");
+  res.writeHead(200, {
+    "Content-Type": MIME[ext] ?? "application/octet-stream",
+    "Cache-Control": immutable ? "public, max-age=31536000, immutable" : "no-cache",
+    ...SECURITY_HEADERS,
+  });
+  if (req.method === "HEAD") return void res.end();
+  fs.createReadStream(target).pipe(res);
+}
+
+export interface ConsoleServer {
+  url: string;
+  close(): Promise<void>;
+}
+
+export async function startServer(app: App, o: { version: string; port?: number; host?: string }): Promise<ConsoleServer> {
+  const token = serverToken(app);
+  const host = o.host ?? app.cfg.server.host;
+  const clients = new Set<http.ServerResponse>();
+
+  const broadcast = (e: ServerEvent) => {
+    const line = `data: ${JSON.stringify(e)}\n\n`;
+    for (const c of clients) c.write(line);
+  };
+  let lastBus = 0;
+  const offs = [
+    app.bus.on("work.changed", (e) => {
+      lastBus = Date.now();
+      broadcast({ type: "work", ...e });
+    }),
+    app.bus.on("candidate.created", (e) => {
+      lastBus = Date.now();
+      broadcast({ type: "candidate", signal_id: e.signalId });
+    }),
+    app.bus.on("command.executed", (e) => broadcast({ type: "command", name: e.name, ok: e.ok, target: e.target })),
+  ];
+  // 跨进程变化（命令行、另一个进程）：轮询账本的最后更新时间
+  let lastMax = 0;
+  const poll = setInterval(() => {
+    if (!clients.size) return;
+    const m = (app.ledger.db.prepare("SELECT COALESCE(MAX(updated), 0) AS m FROM work").get() as { m: number }).m;
+    if (lastMax && m > lastMax && Date.now() - lastBus > 2000) broadcast({ type: "refresh" });
+    lastMax = m;
+  }, 2000);
+  const ping = setInterval(() => broadcast({ type: "ping", at: Date.now() }), 15_000);
+
+  const authed = (req: http.IncomingMessage): boolean => {
+    const bearer = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const c = cookies(req)[COOKIE];
+    return (!!bearer && safeEqual(bearer, token)) || (!!c && safeEqual(c, token));
+  };
+
+  const sameOrigin = (req: http.IncomingMessage): boolean => {
+    const origin = req.headers.origin;
+    if (!origin) return true; // 非浏览器客户端（curl 等）没有 Origin，靠令牌
+    try {
+      return new URL(origin).host === req.headers.host;
+    } catch {
+      return false;
+    }
+  };
+
+  const route = async (req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<void> => {
+    const { pathname } = url;
+    const m = req.method ?? "GET";
+
+    if (pathname === "/login" && m === "GET") {
+      const t = url.searchParams.get("token") ?? "";
+      if (!safeEqual(t, token)) {
+        res.writeHead(401, { "Content-Type": "text/html; charset=utf-8", ...SECURITY_HEADERS });
+        return void res.end("<meta charset=utf-8><p>登录链接无效或已过期。请在开发机上运行 <code>pa console</code> 获取新链接。</p>");
+      }
+      res.writeHead(302, {
+        "Set-Cookie": `${COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${30 * 86400}`,
+        Location: "/",
+        ...SECURITY_HEADERS,
+      });
+      return void res.end();
+    }
+    if (pathname === "/logout" && m === "POST") {
+      return send(res, 200, { ok: true }, { "Set-Cookie": `${COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0` });
+    }
+    if (pathname === "/api/health/live") return send(res, 200, { ok: true });
+
+    if (!pathname.startsWith("/api/")) return serveStatic(req, res, pathname);
+    if (!authed(req)) throw new HttpError(401, "unauthorized", "未登录：请在开发机上运行 pa console 获取登录链接");
+    if (m !== "GET" && m !== "HEAD" && !sameOrigin(req)) throw new HttpError(403, "forbidden", "跨站请求被拒绝");
+
+    const seg = pathname.slice(5).split("/").map(decodeURIComponent); // 去掉 /api/
+    const need = <T>(v: T | undefined, what: string): T => {
+      if (v === undefined) throw new HttpError(404, "not_found", `${what}不存在`);
+      return v;
+    };
+    const ext = <K extends keyof App["ext"]>(k: K): NonNullable<App["ext"][K]> => {
+      const v = app.ext[k];
+      if (!v) throw new HttpError(501, "unavailable", "该功能未启用");
+      return v as NonNullable<App["ext"][K]>;
+    };
+
+    if (m === "GET") {
+      switch (seg[0]) {
+        case "meta":
+          return send(res, 200, Q.meta(app, o.version));
+        case "overview":
+          return send(res, 200, Q.overview(app));
+        case "dispatches":
+          if (!seg[1])
+            return send(
+              res,
+              200,
+              Q.listDispatches(app, {
+                filter: (url.searchParams.get("filter") as Q.DispatchFilter) ?? "all",
+                q: url.searchParams.get("q") ?? undefined,
+                limit: Number(url.searchParams.get("limit") ?? 200),
+              }),
+            );
+          if (seg[2] === "diff") return send(res, 200, need(await Q.dispatchDiff(app, seg[1]), "派单"));
+          return send(res, 200, need(await Q.dispatchDetail(app, seg[1]), "派单"));
+        case "steps":
+          if (seg[2] === "log") return send(res, 200, need(Q.stepLog(app, Number(seg[1]), Number(url.searchParams.get("offset") ?? 0)), "步骤"));
+          break;
+        case "candidates":
+          return send(
+            res,
+            200,
+            ext("candidates").list({
+              days: Number(url.searchParams.get("days") ?? 14),
+              feedback: (url.searchParams.get("feedback") as "" | "confirmed" | "rejected" | "all") ?? "all",
+            }),
+          );
+        case "jobs":
+          return send(res, 200, Q.jobs(app));
+        case "health":
+          return send(res, 200, Q.health(app));
+        case "usage":
+          return send(res, 200, ext("usage").summary(Number(url.searchParams.get("days") ?? 14)));
+        case "settings":
+          return send(res, 200, ext("settings").get());
+        case "doctor":
+          return send(res, 200, await ext("doctor").run());
+        case "audit":
+          return send(res, 200, Q.auditViews(app, url.searchParams.get("target") ?? undefined, Number(url.searchParams.get("limit") ?? 100)));
+        case "commands":
+          return send(res, 200, app.commands.names());
+        case "events": {
+          res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-store", Connection: "keep-alive", ...SECURITY_HEADERS });
+          res.write(`data: ${JSON.stringify({ type: "ping", at: Date.now() } satisfies ServerEvent)}\n\n`);
+          clients.add(res);
+          req.on("close", () => clients.delete(res));
+          return;
+        }
+      }
+    }
+    if (m === "POST" && seg[0] === "commands" && seg[1]) {
+      const body = await readJson(req);
+      return send(res, 200, await app.commands.exec(seg[1], body.args ?? {}, { source: "web", actor: "owner" }));
+    }
+    if (m === "PUT" && seg[0] === "settings") {
+      const body = await readJson(req);
+      const r = await ext("settings").put(body);
+      return send(res, r.ok ? 200 : 400, r);
+    }
+    throw new HttpError(404, "not_found", `没有这个接口：${m} ${pathname}`);
+  };
+
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    route(req, res, url).catch((e) => {
+      if (res.headersSent) return void res.end();
+      if (e instanceof HttpError) return send(res, e.status, { error: { code: e.code, message: e.message } } satisfies ApiError);
+      if (e instanceof CommandError) return send(res, STATUS[e.code], { error: { code: e.code, message: e.message } } satisfies ApiError);
+      log("error", "控制台请求失败", { path: url.pathname, err: errMsg(e) });
+      send(res, 500, { error: { code: "internal", message: errMsg(e) } } satisfies ApiError);
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(o.port ?? app.cfg.server.port, host, () => resolve());
+  });
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : app.cfg.server.port;
+  const url = `http://${host === "0.0.0.0" ? "127.0.0.1" : host}:${port}`;
+  log("info", "控制台已启动", { url });
+  return {
+    url,
+    close: async () => {
+      clearInterval(poll);
+      clearInterval(ping);
+      offs.forEach((f) => f());
+      for (const c of clients) c.end();
+      clients.clear();
+      await new Promise<void>((r) => server.close(() => r()));
+    },
+  };
+}

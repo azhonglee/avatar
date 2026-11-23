@@ -53,6 +53,7 @@ export async function runAgentJob(
       logFile,
       signal: job.signal,
       onSpawn: (pid) => ledger.setStepPid(step, pid),
+      stepId: step,
     });
     const text = r.text || `（无输出，exit ${r.exitCode}）`;
     ledger.endStep(step, r.ok ? "ok" : "failed", truncate(text, 500));

@@ -1,5 +1,12 @@
+import fs from "node:fs";
 import { Cron } from "croner";
 import { Board, KnowledgeBase } from "./board.ts";
+import { Bus } from "./bus.ts";
+import { Commands } from "./commands.ts";
+import { registerCoreCommands } from "./core-commands.ts";
+import type { EffectHooks } from "./effects.ts";
+import type { Extensions } from "./ext.ts";
+import { registerModules } from "./modules.ts";
 import type { Config } from "./config.ts";
 import { effectHandler, notify } from "./effects.ts";
 import { Engine, type Handler } from "./engine.ts";
@@ -7,12 +14,15 @@ import { EventSupervisor, type Subscription } from "./events.ts";
 import { loadPrompt } from "./harness.ts";
 import { Lark } from "./lark.ts";
 import { Ledger, type WorkItem } from "./ledger.ts";
+import { startServer, type ConsoleServer } from "./server/index.ts";
 import { Store } from "./store.ts";
 import { deepFind, errMsg, log, render, truncate } from "./util.ts";
 import { BotHandler, enqueueJob, jobHandler, type JobPayload } from "./workflows/agent.ts";
 import { buildBrief } from "./workflows/brief.ts";
 import { Capture } from "./workflows/capture.ts";
 import { Dispatcher, type DispatchPayload } from "./workflows/dispatch.ts";
+
+export const VERSION = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version as string;
 
 /**
  * 组装所有组件。命令行单次命令和常驻进程共用。
@@ -24,7 +34,9 @@ import { Dispatcher, type DispatchPayload } from "./workflows/dispatch.ts";
 export function createApp(cfg: Config) {
   const store = new Store(cfg.dataDir);
   cfg.owner.open_id ||= store.get("owner.open_id") ?? "";
+  const bus = new Bus();
   const ledger = new Ledger(store.db);
+  ledger.bus = bus;
   const lark = new Lark(cfg);
   const board = new Board(cfg, lark, store);
   const kb = new KnowledgeBase(cfg, lark, store);
@@ -39,11 +51,18 @@ export function createApp(cfg: Config) {
   });
   const bot = new BotHandler(cfg, lark, store, ledger, board, capture, dispatcher, () => engine.kick());
   const hooks = { onTaskUpdate: () => undefined as void, onSignals: () => undefined as void };
-  const app = { cfg, store, ledger, lark, board, kb, capture, dispatcher, engine, bot, hooks };
-  engine.register(effectHandler(cfg, ledger, board, lark));
+  capture.onCandidate = (e) => bus.emit("candidate.created", e);
+  const commands = new Commands(ledger, bus);
+  commands.kick = () => engine.kick();
+  const ext: Extensions = {};
+  const effectHooks: EffectHooks = {};
+  const app = { cfg, store, ledger, lark, board, kb, capture, dispatcher, engine, bot, hooks, bus, commands, ext, effectHooks };
+  engine.register(effectHandler(cfg, ledger, board, lark, store, effectHooks));
   engine.register(dispatcher.handler());
   engine.register(jobHandler(cfg, store, ledger));
   engine.register(eventHandler(app));
+  registerCoreCommands(commands, { cfg, ledger, board, dispatcher });
+  registerModules(app);
   return app;
 }
 export type App = ReturnType<typeof createApp>;
@@ -52,7 +71,7 @@ export type App = ReturnType<typeof createApp>;
  * inbox 处理器：飞书事件落库后由这里处理。每个分支都是幂等的，失败抛错即可，引擎会退避重试；
  * 重试耗尽私信告诉你。这里只做“把输入变成账本里的工作”，耗时的事交给对应的工作类型。
  */
-function eventHandler(app: Pick<App, "cfg" | "ledger" | "capture" | "bot" | "engine" | "hooks">): Handler<Record<string, unknown>> {
+function eventHandler(app: Pick<App, "cfg" | "ledger" | "capture" | "bot" | "engine" | "hooks" | "ext">): Handler<Record<string, unknown>> {
   const { cfg, ledger, capture, bot, engine, hooks } = app;
   return {
     kind: "event",
@@ -81,6 +100,10 @@ function eventHandler(app: Pick<App, "cfg" | "ledger" | "capture" | "bot" | "eng
           }
           break;
         }
+        case "card.action.trigger":
+          if (app.ext.cards) await app.ext.cards.onAction(ev, ctx);
+          else log("warn", "收到卡片操作，但卡片模块未启用", {});
+          break;
         default:
           log("warn", "未知事件类型，忽略", { key: item.ref });
       }
@@ -176,6 +199,7 @@ export async function runDaemon(app: App): Promise<void> {
   if (cfg.events.task_updates) subs.push({ key: "task.task.update_user_access_v2", as: "user" });
   if (cfg.events.doc_comments) subs.push({ key: "drive.notice.comment_add_v1", as: "user" });
   if (cfg.events.minutes) subs.push({ key: "minutes.minute.generated_v1", as: "user" });
+  if (cfg.events.card_actions && app.ext.cards) subs.push({ key: "card.action.trigger", as: "bot" });
   const events = new EventSupervisor(cfg, (key, id, ev) => {
     if (ledger.enqueue({ id: `event:${key}:${id}`, kind: "event", ref: key, payload: ev })) engine.kick();
   });
@@ -204,6 +228,18 @@ export async function runDaemon(app: App): Promise<void> {
         }),
     ),
   ];
+  // 心跳：控制台据此判断常驻进程是否在线
+  const beat = () => store.set("daemon.heartbeat", `${ledger.owner}|${Date.now()}`);
+  beat();
+  const heartbeat = setInterval(beat, 15_000);
+  let server: ConsoleServer | undefined;
+  if (cfg.server.enabled) {
+    try {
+      server = await startServer(app, { version: VERSION });
+    } catch (e) {
+      log("error", "控制台启动失败（常驻进程继续运行）", { err: errMsg(e) });
+    }
+  }
   reconcileSoon(); // 启动时先对一次账：停机期间拖进派单列的卡片、被拖走的卡片
   log("info", "personal-agent 已启动", { owner: ledger.owner, events: subs.map((s) => s.key), jobs: Object.keys(cfg.jobs) });
 
@@ -213,6 +249,8 @@ export async function runDaemon(app: App): Promise<void> {
       crons.forEach((c) => c.stop());
       reconcileSoon.cancel();
       triageSoon.cancel();
+      clearInterval(heartbeat);
+      await server?.close();
       await events.stop();
       await engine.stop(); // 中止进行中的 harness；租约释放，下次启动从检查点继续
       resolve();

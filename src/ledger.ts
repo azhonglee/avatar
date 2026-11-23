@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import type { DatabaseSync } from "node:sqlite";
+import type { Bus } from "./bus.ts";
 import { isAlive } from "./util.ts";
 
 /**
@@ -17,7 +18,7 @@ import { isAlive } from "./util.ts";
  * （fencing），失去租约的旧执行者无法覆盖新执行者的进度。
  */
 
-export type WorkKind = "event" | "effect" | "dispatch" | "job";
+export type WorkKind = "event" | "effect" | "dispatch" | "job" | "delivery";
 
 export interface WorkItem<P = Record<string, unknown>> {
   seq: number;
@@ -44,7 +45,16 @@ export interface WorkItem<P = Record<string, unknown>> {
 export type Effect =
   | { op: "task.move"; args: { guid: string; section: string } }
   | { op: "task.comment"; args: { guid: string; content: string } }
-  | { op: "notify"; args: { markdown: string } };
+  | { op: "task.complete"; args: { guid: string } }
+  | { op: "notify"; args: { markdown: string; kind?: NotifyKind } }
+  /**
+   * 飞书交互卡片：同一个 key 只有一张卡片——第一次发送，之后原地更新（messages patch）。
+   * card 是完整的卡片 JSON（schema 2.0）。
+   */
+  | { op: "card.upsert"; args: { key: string; card: Record<string, unknown>; kind?: NotifyKind } };
+
+/** 通知类型，对应 config.notify.types，用于免打扰与开关 */
+export type NotifyKind = "candidate" | "progress" | "result" | "failure" | "brief";
 
 export interface Patch<P> {
   state?: string;
@@ -58,6 +68,10 @@ export interface Patch<P> {
 
 export interface Step {
   id: number;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd: number;
+  duration_ms: number;
   work_id: string;
   name: string;
   harness: string;
@@ -102,9 +116,23 @@ export function isDeadOwner(owner: string, self: string): boolean {
   return !isAlive(pid);
 }
 
+export interface AuditEntry {
+  id: number;
+  at: number;
+  source: string;
+  actor: string;
+  command: string;
+  target: string;
+  args: string;
+  ok: number;
+  message: string;
+}
+
 export class Ledger {
   db: DatabaseSync;
   owner: string;
+  /** 可选：进程内事件总线，状态变化时发出 work.changed（刷新控制台、更新卡片） */
+  bus?: Bus;
   constructor(db: DatabaseSync, owner = makeOwnerId()) {
     this.db = db;
     this.owner = owner;
@@ -144,7 +172,34 @@ export class Ledger {
         started INTEGER NOT NULL,
         ended INTEGER);
       CREATE INDEX IF NOT EXISTS steps_work ON steps (work_id);
+      CREATE TABLE IF NOT EXISTS audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        actor TEXT NOT NULL DEFAULT '',
+        command TEXT NOT NULL,
+        target TEXT NOT NULL DEFAULT '',
+        args TEXT NOT NULL DEFAULT '{}',
+        ok INTEGER NOT NULL,
+        message TEXT NOT NULL DEFAULT '');
     `);
+    // 迁移：用量列（旧库没有）
+    for (const [col, def] of [
+      ["tokens_in", "INTEGER NOT NULL DEFAULT 0"],
+      ["tokens_out", "INTEGER NOT NULL DEFAULT 0"],
+      ["cost_usd", "REAL NOT NULL DEFAULT 0"],
+      ["duration_ms", "INTEGER NOT NULL DEFAULT 0"],
+    ] as const) {
+      const cols = db.prepare("PRAGMA table_info(steps)").all() as { name: string }[];
+      if (!cols.some((c) => c.name === col)) db.exec(`ALTER TABLE steps ADD COLUMN ${col} ${def}`);
+    }
+  }
+
+  /** 通知总线（在事务提交之后调用）。 */
+  private changed(id: string): void {
+    if (!this.bus) return;
+    const w = this.get(id);
+    if (w) this.bus.emit("work.changed", { id: w.id, kind: w.kind, ref: w.ref, state: w.state, terminal: w.terminal });
   }
 
   tx<T>(fn: () => T): T {
@@ -160,14 +215,20 @@ export class Ledger {
   }
 
   /** 幂等入队：同一 id 只会插入一次（事件去重、作业按时间槽去重都靠它）。返回是否新插入。 */
-  enqueue(w: { id: string; kind: WorkKind; ref?: string; state?: string; payload?: unknown; next_at?: number }): boolean {
+  enqueue(w: { id: string; kind: WorkKind; ref?: string; state?: string; payload?: unknown; next_at?: number }, effects: Effect[] = []): boolean {
     const now = Date.now();
-    const r = this.db
-      .prepare(
-        "INSERT OR IGNORE INTO work (id, kind, ref, state, payload, next_at, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      )
-      .run(w.id, w.kind, w.ref ?? "", w.state ?? "pending", JSON.stringify(w.payload ?? {}), w.next_at ?? 0, now, now);
-    return r.changes > 0;
+    const added = this.tx(() => {
+      const r = this.db
+        .prepare(
+          "INSERT OR IGNORE INTO work (id, kind, ref, state, payload, next_at, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(w.id, w.kind, w.ref ?? "", w.state ?? "pending", JSON.stringify(w.payload ?? {}), w.next_at ?? 0, now, now);
+      // 副作用只在真正入队时一起提交（与入队原子）
+      if (r.changes > 0) this.insertEffects(w.id, effects, now);
+      return r.changes > 0;
+    });
+    if (added && w.kind !== "effect") this.changed(w.id);
+    return added;
   }
 
   get<P = Record<string, unknown>>(id: string): WorkItem<P> | undefined {
@@ -219,7 +280,7 @@ export class Ledger {
    * 进入新状态时 attempts 重置为 1（当前这次就是新状态的第 1 次尝试）；进入终态时同时释放租约。
    */
   transition<P>(item: WorkItem<P>, patch: Patch<P>, effects: Effect[] = []): WorkItem<P> {
-    return this.tx(() => {
+    const w = this.tx(() => {
       const cur = this.db.prepare("SELECT * FROM work WHERE id = ?").get(item.id) as Row | undefined;
       if (!cur || cur.lease_owner !== this.owner || Number(cur.terminal)) throw new LeaseLost(item.id);
       const now = Date.now();
@@ -247,6 +308,8 @@ export class Ledger {
       this.insertEffects(item.id, effects, now);
       return toItem<P>(this.db.prepare("SELECT * FROM work WHERE id = ?").get(item.id) as Row);
     });
+    if (w.kind !== "effect") this.changed(w.id);
+    return w;
   }
 
   /** 不伴随状态迁移的副作用（例如晨报私信），同样落库后由发布器投递。key 用于去重。 */
@@ -271,8 +334,72 @@ export class Ledger {
   }
 
   /** 请求取消（用户把卡片拖走等）。执行者在步骤边界或心跳时看到后自行收尾。 */
-  requestCancel(id: string): void {
-    this.db.prepare("UPDATE work SET cancel = 1, next_at = 0, updated = ? WHERE id = ? AND terminal = 0").run(Date.now(), id);
+  requestCancel(id: string): boolean {
+    const n = this.db.prepare("UPDATE work SET cancel = 1, next_at = 0, updated = ? WHERE id = ? AND terminal = 0").run(Date.now(), id).changes;
+    if (n) this.changed(id);
+    return n > 0;
+  }
+
+  /**
+   * 重新激活一项失败落定的工作（event / effect / job 的 dead / errored）：回到 pending，清零尝试次数，立即可领取。
+   * 只允许没有被他人持有的终态工作。返回是否成功。
+   */
+  revive(id: string): boolean {
+    const n = this.db
+      .prepare(
+        `UPDATE work SET terminal = 0, state = 'pending', outcome = '', reason = '', attempts = 0, next_at = 0, error = '',
+           lease_owner = '', lease_until = 0, cancel = 0, updated = ? WHERE id = ? AND terminal = 1 AND state IN ('dead', 'errored')`,
+      )
+      .run(Date.now(), id).changes;
+    if (n) this.changed(id);
+    return n > 0;
+  }
+
+  /** 确认知晓一项失败（不再在健康页 / 晨报里提示）。 */
+  acknowledge(id: string): boolean {
+    const n = this.db
+      .prepare("UPDATE work SET outcome = 'acknowledged', updated = ? WHERE id = ? AND terminal = 1 AND state IN ('dead', 'errored')")
+      .run(Date.now(), id).changes;
+    if (n) this.changed(id);
+    return n > 0;
+  }
+
+  /** 列出工作（控制台用）。 */
+  list<P = Record<string, unknown>>(f: { kinds: WorkKind[]; states?: string[]; ref?: string; limit?: number; before?: number }): WorkItem<P>[] {
+    const where = [`kind IN (${f.kinds.map(() => "?").join(",")})`];
+    const args: (string | number)[] = [...f.kinds];
+    if (f.states?.length) {
+      where.push(`state IN (${f.states.map(() => "?").join(",")})`);
+      args.push(...f.states);
+    }
+    if (f.ref) {
+      where.push("ref = ?");
+      args.push(f.ref);
+    }
+    if (f.before) {
+      where.push("seq < ?");
+      args.push(f.before);
+    }
+    const q = `SELECT * FROM work WHERE ${where.join(" AND ")} ORDER BY seq DESC LIMIT ?`;
+    return (this.db.prepare(q).all(...args, f.limit ?? 100) as Row[]).map((r) => toItem<P>(r));
+  }
+
+  /** 某项工作产生的副作用（含已投递的），按顺序。 */
+  effectsOf(parent: string): WorkItem<Effect>[] {
+    return (this.db.prepare("SELECT * FROM work WHERE kind = 'effect' AND ref = ? ORDER BY seq").all(parent) as Row[]).map((r) => toItem<Effect>(r));
+  }
+
+  // ── 审计：所有命令（控制台、卡片、私聊、CLI）都记一条 ──
+
+  audit(e: { source: string; actor: string; command: string; target: string; args: unknown; ok: boolean; message: string }): void {
+    this.db
+      .prepare("INSERT INTO audit (at, source, actor, command, target, args, ok, message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(Date.now(), e.source, e.actor, e.command, e.target, JSON.stringify(e.args ?? {}), e.ok ? 1 : 0, e.message);
+  }
+
+  auditLog(limit = 100, target?: string): AuditEntry[] {
+    if (target) return this.db.prepare("SELECT * FROM audit WHERE target = ? ORDER BY id DESC LIMIT ?").all(target, limit) as unknown as AuditEntry[];
+    return this.db.prepare("SELECT * FROM audit ORDER BY id DESC LIMIT ?").all(limit) as unknown as AuditEntry[];
   }
 
   isCancelled(id: string): boolean {
@@ -327,7 +454,34 @@ export class Ledger {
   }
 
   endStep(id: number, status: "ok" | "failed", summary: string): void {
-    this.db.prepare("UPDATE steps SET status = ?, summary = ?, ended = ? WHERE id = ? AND status = 'running'").run(status, summary, Date.now(), id);
+    this.db
+      .prepare("UPDATE steps SET status = ?, summary = ?, ended = ?, duration_ms = ? - started WHERE id = ? AND status = 'running'")
+      .run(status, summary, Date.now(), Date.now(), id);
+  }
+
+  /** 记录一步的用量（token 与费用；拿不到时保持 0）。 */
+  setStepUsage(id: number, u: { tokens_in?: number; tokens_out?: number; cost_usd?: number }): void {
+    this.db
+      .prepare("UPDATE steps SET tokens_in = ?, tokens_out = ?, cost_usd = ? WHERE id = ?")
+      .run(u.tokens_in ?? 0, u.tokens_out ?? 0, u.cost_usd ?? 0, id);
+  }
+
+  step(id: number): Step | undefined {
+    return this.db.prepare("SELECT * FROM steps WHERE id = ?").get(id) as unknown as Step | undefined;
+  }
+
+  /** 一项工作（含同一张卡片的所有派单）累计花费。 */
+  costOf(workIds: string[]): number {
+    if (!workIds.length) return 0;
+    const r = this.db
+      .prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS c FROM steps WHERE work_id IN (${workIds.map(() => "?").join(",")})`)
+      .get(...workIds) as { c: number };
+    return r.c;
+  }
+
+  /** 时间段内的总花费。 */
+  costSince(since: number): number {
+    return (this.db.prepare("SELECT COALESCE(SUM(cost_usd), 0) AS c FROM steps WHERE started >= ?").get(since) as { c: number }).c;
   }
 
   /** 接管一项工作时，把前任遗留的 running 步骤标为中断并返回（调用方据此清理遗留进程组）。 */

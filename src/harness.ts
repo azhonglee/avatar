@@ -23,6 +23,18 @@ export interface HarnessRun {
   signal?: AbortSignal;
   /** harness 进程组启动后回调 pgid，调用方持久化它，崩溃恢复时据此清理遗留进程 */
   onSpawn?: (pgid: number) => void;
+  /** 对应的步骤 id（用量记录用） */
+  stepId?: number;
+}
+
+/**
+ * 用量记录器：每次 harness 结束后调用（由用量模块设置），从输出里解析 token 数并写入步骤。
+ * 解析失败不影响主流程。
+ */
+export type UsageRecorder = (run: HarnessRun, out: { stdout: string; stderr: string; code: number }) => void;
+let usageRecorder: UsageRecorder | undefined;
+export function setUsageRecorder(fn: UsageRecorder | undefined): void {
+  usageRecorder = fn;
 }
 
 export interface HarnessResult {
@@ -85,6 +97,11 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       r.stderr,
     ].join("\n"),
   );
+  try {
+    usageRecorder?.(run, { stdout: r.stdout, stderr: r.stderr, code: r.code });
+  } catch {
+    // 用量解析失败不影响主流程
+  }
   const aborted = !!run.signal?.aborted;
   return { ok: r.code === 0 && !r.timedOut && !aborted, exitCode: r.code, text: r.stdout.trim(), timedOut: r.timedOut, aborted };
 }

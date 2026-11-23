@@ -3,6 +3,7 @@ import { parseArgs } from "node:util";
 import { createApp, initApp, runConfiguredJob, runDaemon, runDispatchOnce, sendBrief } from "./app.ts";
 import { loadConfig } from "./config.ts";
 import { decide, type Profile } from "./guard.ts";
+import { serverToken } from "./server/index.ts";
 import { resolveBin } from "./harness.ts";
 import { errMsg, runProcess } from "./util.ts";
 import { runAgentJob, statusText } from "./workflows/agent.ts";
@@ -17,6 +18,8 @@ const USAGE = `用法：pa <命令>
   capture                     立即识别一轮任务
   dispatch                    立即对账“派给Agent”列并执行派单（含崩溃后未完成的），等待完成
   status                      最近 24 小时的派单、作业，以及重试中/失败的事件和飞书写入
+  console [--rotate]          打印控制台登录链接（--rotate 作废旧链接）；常驻进程运行时可用
+  command <名称> [JSON 参数]   执行一条命令（与控制台/卡片按钮相同），如 pa command dispatch.cancel '{"id":"…"}'
   job <名称>                  立即执行 config.yaml 里定义的 agent 作业
   ask <文字>                  让 superagent 处理一句话并打印回复
   publish-doc <file.md>       把 Markdown 发布为飞书文档（--title 标题，--parent 知识库节点名，缺省放“我的文档库”）
@@ -67,6 +70,22 @@ async function main(): Promise<void> {
     }
     case "status":
       return void console.log(statusText(app.ledger));
+    case "console": {
+      const token = serverToken(app, rest.includes("--rotate"));
+      const base = `http://${cfg.server.host === "0.0.0.0" ? "127.0.0.1" : cfg.server.host}:${cfg.server.port}`;
+      console.log(`控制台登录链接（在本机浏览器打开；远程开发机请先转发端口 ${cfg.server.port}）：\n${base}/login?token=${token}`);
+      console.log(`\n端口转发示例：ssh -L ${cfg.server.port}:127.0.0.1:${cfg.server.port} <开发机>   （VS Code Remote 会自动转发）`);
+      if (!cfg.server.enabled) console.log("⚠️  config.yaml 里 server.enabled 为 false，常驻进程不会启动控制台");
+      return;
+    }
+    case "command": {
+      const [name, json] = rest;
+      if (!name) return void console.log(`可用命令：\n${app.commands.names().map((n) => `  ${n}`).join("\n")}`);
+      const r = await app.commands.exec(name, json ? JSON.parse(json) : {}, { source: "cli", actor: "owner" });
+      console.log(`${r.ok ? "✅" : "❌"} ${r.message}${r.target ? `（${r.target}）` : ""}${r.url ? `\n${r.url}` : ""}`);
+      await app.engine.drain(["effect"]);
+      return;
+    }
     case "job":
       if (!rest[0]) throw new Error("用法：pa job <名称>");
       return void console.log(await runConfiguredJob(app, rest[0]));

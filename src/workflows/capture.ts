@@ -21,6 +21,8 @@ export class Capture {
   store: Store;
   board: Board;
   private chain: Promise<unknown> = Promise.resolve();
+  /** 建出候选任务后调用（卡片模块据此发“候选任务”卡片） */
+  onCandidate?: (e: { signalId: string; taskGuid: string; summary: string; section: string }) => void;
 
   constructor(cfg: Config, lark: Lark, store: Store, board: Board) {
     this.cfg = cfg;
@@ -184,6 +186,7 @@ export class Capture {
           // 以信号 id 为幂等键：建好后“移到列/记结论”失败重试，不会再建一张
           const guid = await this.board.createTask({ summary: v.summary, description, due: v.due ?? undefined, section, opKey: `signal:${s.id}` });
           this.store.setVerdict(s.id, `task(${v.confidence})`, guid);
+          this.onCandidate?.({ signalId: s.id, taskGuid: guid, summary: v.summary, section });
           existing.push(v.summary);
           created++;
           log("info", "识别到任务", { summary: v.summary, section, confidence: v.confidence });

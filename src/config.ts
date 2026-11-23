@@ -79,7 +79,22 @@ const Schema = z.object({
        * 仓库别名 → 本地路径，或 { path, verify }；任务描述里写 `repo: 别名` 即在该仓库的 git worktree 中执行。
        * verify 是确定性校验命令（如 npm test），在 worktree 里运行，失败即打回返工。
        */
-      repos: z.record(z.string(), z.union([z.string(), z.object({ path: z.string(), verify: z.string().optional() })])).default({}),
+      repos: z
+        .record(
+          z.string(),
+          z.union([
+            z.string(),
+            z.object({
+              path: z.string(),
+              verify: z.string().optional(),
+              /** 交付：用 delivery.providers 里的哪个平台创建 PR/MR（缺省用 delivery.default_provider） */
+              provider: z.string().optional(),
+              /** 交付：PR/MR 的目标分支（缺省用仓库当前默认分支） */
+              target_branch: z.string().optional(),
+            }),
+          ]),
+        )
+        .default({}),
     })
     .prefault({}),
   /** 验收关卡：派单“完成”由它定义，而不是由执行者退出码定义 */
@@ -91,6 +106,65 @@ const Schema = z.object({
       review_retries: z.number().int().min(0).default(1),
       review_timeout_sec: z.number().int().min(60).default(1200),
       verify_timeout_sec: z.number().int().min(10).default(1800),
+    })
+    .prefault({}),
+  /** 本机 Web 控制台与 API（只监听本机，经 SSH / VS Code 端口转发访问，令牌鉴权） */
+  server: z
+    .object({
+      enabled: z.boolean().default(true),
+      host: z.string().default("127.0.0.1"),
+      /** 0 表示随机端口（测试用） */
+      port: z.number().int().min(0).max(65535).default(7878),
+    })
+    .prefault({}),
+  /** 飞书交互卡片（候选任务、派单进度、验收结果、失败告警、早晚报） */
+  cards: z.object({ enabled: z.boolean().default(true) }).prefault({}),
+  /** 交付：把派单结果变成 PR/MR、合并到本地分支或放弃 */
+  delivery: z
+    .object({
+      default_provider: z.string().default(""),
+      providers: z
+        .record(
+          z.string(),
+          z.object({
+            type: z.enum(["github", "gitlab", "codebase"]),
+            /** GitLab/自建实例的地址，如 https://gitlab.example.com；GitHub 缺省 https://api.github.com */
+            base_url: z.string().optional(),
+            /** 存放访问令牌的环境变量名（codebase 走 bytedcli 登录态，不需要） */
+            token_env: z.string().optional(),
+            /** 推送用的 git remote 名 */
+            remote: z.string().default("origin"),
+          }),
+        )
+        .default({}),
+      /** 放弃后保留 worktree 与分支的天数，期间可以恢复 */
+      discard_retention_days: z.number().int().min(0).default(7),
+    })
+    .prefault({}),
+  /** 用量与预算：0 表示不限制 */
+  budget: z
+    .object({
+      daily_usd: z.number().min(0).default(0),
+      per_task_usd: z.number().min(0).default(0),
+      /** 每百万 token 单价（美元），按 harness 名；没配的只记耗时不计费 */
+      pricing: z.record(z.string(), z.object({ input: z.number().min(0), output: z.number().min(0) })).default({}),
+    })
+    .prefault({}),
+  /** 通知偏好 */
+  notify: z
+    .object({
+      /** 免打扰时段（按 owner.timezone，如 "22:00"–"08:00"）；期间的非紧急私信延后到结束时发送 */
+      quiet_start: z.string().default(""),
+      quiet_end: z.string().default(""),
+      types: z
+        .object({
+          candidate: z.boolean().default(true),
+          progress: z.boolean().default(true),
+          result: z.boolean().default(true),
+          failure: z.boolean().default(true),
+          brief: z.boolean().default(true),
+        })
+        .prefault({}),
     })
     .prefault({}),
   /** 工作引擎（一般不用改） */
@@ -130,6 +204,8 @@ const Schema = z.object({
       task_updates: z.boolean().default(true),
       doc_comments: z.boolean().default(true),
       minutes: z.boolean().default(true),
+      /** card.action.trigger：飞书卡片上的按钮 / 表单 */
+      card_actions: z.boolean().default(true),
     })
     .prefault({}),
   /** 定时的 agent 作业：用 brain（或指定 harness）带受限的 lark-cli 执行一段提示词 */
@@ -149,12 +225,22 @@ const Schema = z.object({
 export type Config = z.infer<typeof Schema> & { dataDir: string; file: string };
 
 /** 解析 `repo:` 引用：配置里的别名（字符串或 {path, verify}），否则当作路径。 */
-export function repoSpec(cfg: Config, ref: string): { path: string; verify?: string } {
+export interface RepoSpec {
+  path: string;
+  verify?: string;
+  provider?: string;
+  target_branch?: string;
+}
+
+export function repoSpec(cfg: Config, ref: string): RepoSpec {
   const v = cfg.dispatch.repos[ref];
   if (v === undefined) return { path: path.resolve(expandHome(ref)) };
   if (typeof v === "string") return { path: path.resolve(expandHome(v)) };
-  return { path: path.resolve(expandHome(v.path)), verify: v.verify };
+  return { path: path.resolve(expandHome(v.path)), verify: v.verify, provider: v.provider, target_branch: v.target_branch };
 }
+
+/** 配置的 zod schema（设置服务用它校验写入）。 */
+export const ConfigSchema = Schema;
 
 export function loadConfig(file = process.env.PA_CONFIG ?? path.join(ROOT, "config.yaml")): Config {
   if (!fs.existsSync(file)) {
