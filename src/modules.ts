@@ -1,6 +1,8 @@
 import type { App } from "./app.ts";
+import { registerCandidates } from "./candidates.ts";
 import { registerDelivery } from "./delivery/index.ts";
 import { registerPlatform } from "./platform.ts";
+import { registerUsage } from "./usage.ts";
 
 /**
  * 可选模块注册表。每个模块提供 register(app)：注册命令、填充 app.ext、订阅 app.bus、设置钩子。
@@ -9,4 +11,6 @@ import { registerPlatform } from "./platform.ts";
 export function registerModules(app: App): void {
   registerDelivery(app);
   registerPlatform(app);
+  registerUsage(app);
+  registerCandidates(app);
 }

@@ -170,6 +170,19 @@ if (key.startsWith("event consume")) {
       ok({ minutes: [{ title: "周会", summary: "讨论了上线计划", todos: [{ content: "主人：整理上线清单", owner: "主人" }] }] });
     case "docs +create":
       ok({ document: { document_id: "doc_1", url: "https://feishu.cn/docx/doc_1" } });
+    case "task +update": {
+      const t = state.tasks[flag("--task-id")];
+      if (!t) fail("no such task");
+      if (flag("--description") !== undefined) t.description = flag("--description");
+      if (flag("--summary") !== undefined) t.summary = flag("--summary");
+      ok({ task: { guid: t.guid } });
+    }
+    case "task +complete": {
+      const t = state.tasks[flag("--task-id")];
+      if (!t) fail("no such task");
+      t.completed = true;
+      ok({ task: { guid: t.guid } });
+    }
     default:
       fail(`stub 不支持：${key}`);
   }
