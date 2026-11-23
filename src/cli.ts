@@ -4,8 +4,8 @@ import { createApp, initApp, runConfiguredJob, runDaemon, runDispatchOnce, sendB
 import { loadConfig } from "./config.ts";
 import { decide, type Profile } from "./guard.ts";
 import { serverToken } from "./server/index.ts";
-import { resolveBin } from "./harness.ts";
-import { errMsg, runProcess } from "./util.ts";
+import { formatReport, runDoctor } from "./doctor.ts";
+import { errMsg } from "./util.ts";
 import { runAgentJob, statusText } from "./workflows/agent.ts";
 import { buildBrief } from "./workflows/brief.ts";
 
@@ -117,38 +117,9 @@ async function main(): Promise<void> {
 }
 
 async function doctor(app: ReturnType<typeof createApp>): Promise<void> {
-  const { cfg, store } = app;
-  const line = (ok: boolean, msg: string) => console.log(`${ok ? "✅" : "❌"} ${msg}`);
-  const [major, minor] = process.versions.node.split(".").map(Number);
-  line(major > 22 || (major === 22 && minor >= 13), `Node ${process.versions.node}（需要 ≥ 22.13）`);
-  for (const [name, bin] of [["lark-cli", cfg.bins.lark], ["acpx", cfg.bins.acpx]] as const) {
-    try {
-      const p = resolveBin(bin);
-      const v = await runProcess(p, ["--version"], { timeoutMs: 15_000 });
-      line(v.code === 0, `${name}: ${p} ${v.stdout.trim()}`);
-    } catch (e) {
-      line(false, `${name}: ${errMsg(e)}`);
-    }
-  }
-  try {
-    const s = await app.lark.run(["auth", "status", "--json"]);
-    line(true, `lark-cli 已登录：${JSON.stringify(s).slice(0, 200)}`);
-  } catch (e) {
-    line(false, `lark-cli 未就绪：${errMsg(e)}（运行 lark-cli config init --new 和 lark-cli auth login --recommend）`);
-  }
-  line(!!cfg.owner.open_id, `主人 open_id：${cfg.owner.open_id || "未知（运行 pa init）"}`);
-  line(!!store.get("board.tasklist"), `看板清单：${store.get("board.tasklist") ?? "未初始化（运行 pa init）"}`);
-  line(!!store.get("kb.space"), `知识空间：${store.get("kb.space") ?? "未初始化（运行 pa init）"}`);
-  for (const [name, h] of Object.entries(cfg.harnesses)) {
-    console.log(`ℹ️  harness ${name} → ${h.agent ? `acpx ${h.agent}` : `acpx --agent '${h.agentCommand}'`}${h.model ? ` (model ${h.model})` : ""}`);
-  }
-  console.log(`ℹ️  角色：brain=${cfg.roles.brain} reviewer=${cfg.roles.reviewer || "无"} 默认执行者=${cfg.dispatch.default_harness || cfg.roles.brain}`);
-  const verified = Object.entries(cfg.dispatch.repos).filter(([, v]) => typeof v !== "string" && v.verify).map(([k]) => k);
-  console.log(`ℹ️  验收：无校验时 → ${cfg.acceptance.on_unverified === "needs_human" ? "需人工介入" : "标为未验证进待验收"}；带 verify 命令的仓库：${verified.join(", ") || "无"}`);
-  if (!cfg.roles.reviewer && !verified.length && cfg.acceptance.on_unverified === "needs_human")
-    console.log("⚠️  没有配置 reviewer 也没有 verify 命令：所有派单结果都会进“需人工介入”");
-  if (store.get("board.tasklist") && !app.board.isInitialized()) console.log("⚠️  看板有新增分组尚未创建，请再运行一次 pa init");
-  console.log(`ℹ️  数据目录：${cfg.dataDir}`);
+  const report = await runDoctor(app);
+  console.log(formatReport(report));
+  if (!report.ready) process.exitCode = 1;
 }
 
 main().catch((e) => {
