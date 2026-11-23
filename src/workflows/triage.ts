@@ -30,6 +30,22 @@ export function parseVerdicts(text: string): Verdict[] {
 }
 
 /**
+ * 历史判断校准：返回主人对过往候选任务的反馈（确认 / 驳回）样例文本，填进 prompts/triage.md 的 {{examples}}。
+ * 由候选任务模块设置；没有设置或出错时显示“（暂无）”，分诊照常进行。
+ */
+let examplesProvider: (() => string) | undefined;
+export function setTriageExamples(fn: (() => string) | undefined): void {
+  examplesProvider = fn;
+}
+function triageExamples(): string {
+  try {
+    return examplesProvider?.() || "（暂无）";
+  } catch {
+    return "（暂无）";
+  }
+}
+
+/**
  * 分诊：判断每条信号是不是“需要我做的事”。
  * 这一步只要文本输出——不给任何工具、不给飞书权限，信号内容再怎么注入也做不了事。
  */
@@ -43,6 +59,7 @@ export async function triage(cfg: Config, signals: Signal[], existingSummaries: 
     timezone: cfg.owner.timezone,
     owner: cfg.owner.open_id,
     existing: existingSummaries.map((s) => `- ${s}`).join("\n") || "（无）",
+    examples: triageExamples(),
     signals: body,
   });
   const r = await runHarness(cfg, {

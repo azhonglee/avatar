@@ -168,6 +168,13 @@ test("SSE：账本变化实时推送", async () => {
 });
 
 test("未启用的模块：接口返回 501，而不是报错", async () => {
-  const r = await api("/api/usage");
-  assert.equal(r.status, 501);
+  // 模块是否注册取决于 src/modules.ts；这里临时摘掉一个，验证未启用时的行为
+  const saved = app.ext.usage;
+  delete app.ext.usage;
+  try {
+    const r = await api("/api/usage");
+    assert.equal(r.status, 501);
+  } finally {
+    app.ext.usage = saved;
+  }
 });

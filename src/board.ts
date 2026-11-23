@@ -167,6 +167,11 @@ export class Board {
   async comment(guid: string, content: string): Promise<void> {
     await this.lark.run(["task", "+comment", "--task-id", guid, "--content", content], { as: "user" });
   }
+
+  /** 改写任务描述（整段替换）。 */
+  async updateDescription(guid: string, description: string): Promise<void> {
+    await this.lark.run(["task", "+update", "--task-id", guid, "--description", description], { as: "user" });
+  }
 }
 
 /**
