@@ -91,6 +91,8 @@ test("未初始化：看板失败、仓库问题、令牌与环境变量提醒�
   assert.match(ev.fix, /im\.message\.receive_v1/);
   assert.equal(byId(r, "daemon").status, "warn");
   assert.match(byId(r, "acceptance").detail, /codex/);
+  assert.match(byId(r, "server").detail, /0\.0\.0\.0:7878/);
+  assert.match(byId(r, "server").detail, /http:\/\//);
   // 每项都有中文标题；失败项都有修复指引
   for (const c of r.checks) {
     assert.ok(c.title);

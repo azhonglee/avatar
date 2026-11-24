@@ -3,6 +3,7 @@
  * 不访问飞书：只用到账本，lark-cli 指向测试桩。
  */
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { createApp, type App } from "../src/app.ts";
 import type { CommandResult, DispatchDetail, DispatchSummary, Meta, Overview } from "../src/api/types.ts";
 import { loadConfig } from "../src/config.ts";
-import { serverToken, startServer, type ConsoleServer } from "../src/server/index.ts";
+import { consoleBaseUrl, detectLanIp, isLoopbackHost, isWildcardHost, serverToken, startServer, type ConsoleServer } from "../src/server/index.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pa-server-"));
@@ -177,4 +178,76 @@ test("未启用的模块：接口返回 501，而不是报错", async () => {
   } finally {
     app.ext.usage = saved;
   }
+});
+
+test("局域网地址解析：优先物理网卡私网 IPv4，避开 docker/网桥/link-local，无可用网卡回退 127.0.0.1", () => {
+  const nic = (address: string, extra: Partial<os.NetworkInterfaceInfo> = {}): os.NetworkInterfaceInfo =>
+    ({ address, netmask: "255.255.255.0", family: "IPv4", mac: "00:00:00:00:00:00", internal: false, cidr: `${address}/24`, ...extra }) as os.NetworkInterfaceInfo;
+
+  assert.equal(
+    detectLanIp({
+      lo: [nic("127.0.0.1", { internal: true })],
+      docker0: [nic("172.17.0.1")],
+      "br-1234": [nic("172.18.0.1")],
+      utun0: [nic("100.64.0.2")],
+      eth0: [nic("169.254.1.9"), nic("2605:340::1", { family: "IPv6" }), nic("10.251.232.51")],
+    }),
+    "10.251.232.51",
+  );
+  assert.equal(detectLanIp({ lo: [nic("127.0.0.1", { internal: true })], docker0: [nic("172.17.0.1")] }), "172.17.0.1");
+  assert.equal(detectLanIp({ lo: [nic("127.0.0.1", { internal: true })], eth0: [nic("169.254.1.9"), nic("::1", { family: "IPv6" })] }), undefined);
+
+  const fakeIfaces = { eth0: [nic("10.251.232.51")] };
+  assert.equal(consoleBaseUrl("0.0.0.0", 7878, fakeIfaces), "http://10.251.232.51:7878");
+  assert.equal(consoleBaseUrl("::", 7878, fakeIfaces), "http://10.251.232.51:7878");
+  assert.equal(consoleBaseUrl("", 7878, fakeIfaces), "http://10.251.232.51:7878");
+  assert.equal(consoleBaseUrl("0.0.0.0", 7878, {}), "http://127.0.0.1:7878");
+  assert.equal(consoleBaseUrl("127.0.0.1", 7878, fakeIfaces), "http://127.0.0.1:7878");
+  assert.equal(consoleBaseUrl("192.168.1.20", 7878, fakeIfaces), "http://192.168.1.20:7878");
+  assert.equal(consoleBaseUrl("::1", 7878, fakeIfaces), "http://[::1]:7878");
+  assert.equal(isWildcardHost("0.0.0.0"), true);
+  assert.equal(isWildcardHost("[::]"), true);
+  assert.equal(isLoopbackHost("127.0.0.1"), true);
+  assert.equal(isLoopbackHost("[::1]"), true);
+  assert.equal(isLoopbackHost("10.251.232.51"), false);
+});
+
+test("默认监听 0.0.0.0 返回局域网地址；显式 127.0.0.1 返回回环地址；pa console 输出匹配", async () => {
+  const expectedDefaultHost = detectLanIp() ?? "127.0.0.1";
+  assert.equal(new URL(srv.url).hostname, expectedDefaultHost);
+
+  const localSrv = await startServer(app, { version: "test", host: "127.0.0.1", port: 0 });
+  try {
+    assert.equal(new URL(localSrv.url).hostname, "127.0.0.1");
+  } finally {
+    await localSrv.close();
+  }
+
+  const outDefault = execFileSync(path.join(ROOT, "bin", "pa"), ["console"], {
+    env: { ...process.env, PA_CONFIG: path.join(tmp, "config.yaml") },
+    encoding: "utf8",
+  });
+  assert.ok(outDefault.includes(`http://${expectedDefaultHost}:7878/login?token=`), outDefault);
+  if (expectedDefaultHost !== "127.0.0.1") {
+    assert.ok(!outDefault.includes("127.0.0.1:7878"), outDefault);
+  }
+
+  const loopCfg = path.join(tmp, "config-loopback.yaml");
+  fs.writeFileSync(
+    loopCfg,
+    JSON.stringify({
+      data_dir: path.join(tmp, "data"),
+      bins: { lark: path.join(ROOT, "test/stubs/lark-cli"), acpx: path.join(ROOT, "test/stubs/acpx") },
+      harnesses: { claude: { agent: "claude" } },
+      roles: { brain: "claude" },
+      owner: { open_id: "ou_owner" },
+      server: { host: "127.0.0.1", port: 7878 },
+    }),
+  );
+  const outLoop = execFileSync(path.join(ROOT, "bin", "pa"), ["console"], {
+    env: { ...process.env, PA_CONFIG: loopCfg },
+    encoding: "utf8",
+  });
+  assert.ok(outLoop.includes("http://127.0.0.1:7878/login?token="), outLoop);
+  assert.match(outLoop, /ssh -L 7878:127\.0\.0\.1:7878/);
 });

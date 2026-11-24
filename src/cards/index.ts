@@ -5,6 +5,7 @@ import type { BusEvents } from "../bus.ts";
 import { availableActions } from "../core-commands.ts";
 import { card as cardEffect, notify } from "../effects.ts";
 import type { Effect, NotifyKind, WorkItem } from "../ledger.ts";
+import { consoleBaseUrl } from "../server/index.ts";
 import { errMsg, log, truncate } from "../util.ts";
 import type { DispatchPayload } from "../workflows/dispatch.ts";
 import { parseAction } from "./actions.ts";
@@ -127,7 +128,7 @@ export class CardService {
     const { cfg } = this.app;
     return {
       harnesses: Object.keys(cfg.harnesses),
-      consoleBase: cfg.server.enabled ? `http://127.0.0.1:${cfg.server.port}` : "",
+      consoleBase: cfg.server.enabled ? consoleBaseUrl(cfg.server.host, cfg.server.port) : "",
       timezone: cfg.owner.timezone,
       notice,
     };

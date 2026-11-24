@@ -55,10 +55,10 @@ acceptance:
   on_unverified: needs_human  # 没有任何校验（无 reviewer、无 verify）时：needs_human 进“需人工介入”；review 标为未验证进“待验收”
   review_retries: 1           # reviewer 故障（超时/无输出/结论无法解析）重试次数；仍失败进“需人工介入”，不算打回
 
-# 本机 Web 控制台与 API（只监听本机端口，远程开发机通过 SSH / VS Code 端口转发访问，令牌鉴权）
+# Web 控制台与 API（默认监听 0.0.0.0，同局域网可直接访问，令牌鉴权；仅限本机可改为 127.0.0.1）
 server:
   enabled: true
-  host: 127.0.0.1
+  host: 0.0.0.0
   port: 7878
 
 # 飞书交互卡片（需 lark-cli ≥ 1.0.100 并在开发者后台开启 card.action.trigger 回调）

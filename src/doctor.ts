@@ -6,6 +6,7 @@ import type { App } from "./app.ts";
 import type { DoctorCheck, DoctorReport } from "./api/types.ts";
 import { repoSpec } from "./config.ts";
 import { resolveBin } from "./harness.ts";
+import { consoleBaseUrl, isLoopbackHost } from "./server/index.ts";
 import { validateConfig } from "./settings.ts";
 import { deepFind, errMsg, runProcess, truncate } from "./util.ts";
 
@@ -306,11 +307,11 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
   add("server", "Web 控制台", async () => {
     const s = cfg.server;
     if (!s.enabled) return skip("server.enabled 为 false：常驻进程不会启动控制台", `把 ${code("server.enabled")} 改为 true 后重启常驻进程`);
-    const loopback = ["127.0.0.1", "localhost", "::1"].includes(s.host);
-    const detail = `监听 ${s.host}:${s.port}`;
-    if (!loopback)
-      return warn(`${detail}：不是本机回环地址，同网段的机器也能访问（仍需令牌）`, `建议把 ${code("server.host")} 改回 ${code("127.0.0.1")}，经 SSH 端口转发访问`);
-    return ok(detail, `运行 ${code("bin/pa console")} 获取登录链接；远程开发机先转发端口：${code(`ssh -L ${s.port}:127.0.0.1:${s.port} <开发机>`)}`);
+    const url = consoleBaseUrl(s.host, s.port);
+    if (isLoopbackHost(s.host)) {
+      return ok(`监听 ${s.host}:${s.port}（仅本机）`, `运行 ${code("bin/pa console")} 获取登录链接；远程开发机先转发端口：${code(`ssh -L ${s.port}:127.0.0.1:${s.port} <开发机>`)}`);
+    }
+    return ok(`监听 ${s.host}:${s.port}（访问地址 ${url}，令牌鉴权）`, `运行 ${code("bin/pa console")} 获取登录链接；如需仅限本机访问，可把 ${code("server.host")} 设为 ${code("127.0.0.1")}`);
   });
 
   add("events", "飞书事件订阅", async () => {

@@ -12,7 +12,7 @@ export function NeedLogin({ onRetry }: { onRetry: () => void }) {
             在开发机终端运行 <code>pa console</code>
           </li>
           <li>
-            打开它打印的登录链接（形如 <code>http://127.0.0.1:7878/login?token=…</code>）。通过 SSH / VS Code 端口转发访问时，把主机和端口换成转发后的地址
+            打开它打印的登录链接（形如 <code>http://&lt;局域网IP&gt;:7878/login?token=…</code>）。若配置为仅监听本机，通过 SSH / VS Code 端口转发访问时把主机和端口换成转发后的地址
           </li>
           <li>登录状态会保存在这个浏览器里 30 天</li>
         </ol>

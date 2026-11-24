@@ -22,7 +22,7 @@ export interface ActionValue {
 
 export interface RenderCtx {
   harnesses: string[];
-  /** 控制台地址（如 http://127.0.0.1:7878），没启用控制台时为空 */
+  /** 控制台地址（如 http://<局域网IP>:7878），没启用控制台时为空 */
   consoleBase: string;
   timezone: string;
   /** 刚执行的操作结果，显示在卡片底部 */

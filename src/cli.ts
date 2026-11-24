@@ -3,7 +3,7 @@ import { parseArgs } from "node:util";
 import { createApp, initApp, runConfiguredJob, runDaemon, runDispatchOnce, sendBrief } from "./app.ts";
 import { loadConfig } from "./config.ts";
 import { decide, type Profile } from "./guard.ts";
-import { serverToken } from "./server/index.ts";
+import { consoleBaseUrl, isLoopbackHost, resolveConsoleHost, serverToken } from "./server/index.ts";
 import { formatReport, runDoctor } from "./doctor.ts";
 import { errMsg } from "./util.ts";
 import { runAgentJob, statusText } from "./workflows/agent.ts";
@@ -72,9 +72,16 @@ async function main(): Promise<void> {
       return void console.log(statusText(app.ledger));
     case "console": {
       const token = serverToken(app, rest.includes("--rotate"));
-      const base = `http://${cfg.server.host === "0.0.0.0" ? "127.0.0.1" : cfg.server.host}:${cfg.server.port}`;
-      console.log(`控制台登录链接（在本机浏览器打开；远程开发机请先转发端口 ${cfg.server.port}）：\n${base}/login?token=${token}`);
-      console.log(`\n端口转发示例：ssh -L ${cfg.server.port}:127.0.0.1:${cfg.server.port} <开发机>   （VS Code Remote 会自动转发）`);
+      const displayHost = resolveConsoleHost(cfg.server.host);
+      const base = consoleBaseUrl(displayHost, cfg.server.port);
+      if (isLoopbackHost(cfg.server.host)) {
+        console.log(`控制台登录链接（仅本机监听；远程开发机请先转发端口 ${cfg.server.port}）：\n${base}/login?token=${token}`);
+        console.log(`\n端口转发示例：ssh -L ${cfg.server.port}:127.0.0.1:${cfg.server.port} <开发机>   （VS Code Remote 会自动转发）`);
+      } else if (isLoopbackHost(displayHost)) {
+        console.log(`控制台登录链接（未检测到局域网 IP，已回退到本机地址）：\n${base}/login?token=${token}`);
+      } else {
+        console.log(`控制台登录链接（同局域网浏览器可直接打开）：\n${base}/login?token=${token}`);
+      }
       if (!cfg.server.enabled) console.log("⚠️  config.yaml 里 server.enabled 为 false，常驻进程不会启动控制台");
       return;
     }

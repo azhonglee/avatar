@@ -113,11 +113,11 @@ const Schema = z.object({
       verify_timeout_sec: z.number().int().min(10).default(1800),
     })
     .prefault({}),
-  /** 本机 Web 控制台与 API（只监听本机，经 SSH / VS Code 端口转发访问，令牌鉴权） */
+  /** Web 控制台与 API（默认监听 0.0.0.0，同局域网可直接访问，令牌鉴权；仅限本机可改为 127.0.0.1） */
   server: z
     .object({
       enabled: z.boolean().default(true),
-      host: z.string().default("127.0.0.1"),
+      host: z.string().default("0.0.0.0"),
       /** 0 表示随机端口（测试用） */
       port: z.number().int().min(0).max(65535).default(7878),
     })

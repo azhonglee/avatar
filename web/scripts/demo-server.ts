@@ -4,6 +4,7 @@
  *
  * 用法：
  *   PORT=7878 npm run demo:web
+ *   HOST=127.0.0.1 PORT=7878 npm run demo:web   # 如需仅监听本机回环
  */
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -470,8 +471,9 @@ fs.writeFileSync(
 const app = createApp(loadConfig(configFile));
 seedAll(app, demoRepo, baseSha);
 
+const host = process.env.HOST ?? app.cfg.server.host;
 const port = Number(process.env.PORT ?? 7878);
-const srv = await startServer(app, { version: `${VERSION}-demo`, port });
+const srv = await startServer(app, { version: `${VERSION}-demo`, host, port });
 const token = serverToken(app);
 
 console.log(`Avatar demo server listening on ${srv.url}`);

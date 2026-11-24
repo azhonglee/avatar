@@ -1,6 +1,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import type { App } from "../app.ts";
 import type { ApiError, ServerEvent } from "../api/types.ts";
@@ -10,14 +11,77 @@ import { ROOT } from "../config.ts";
 import { errMsg, log } from "../util.ts";
 
 /**
- * 本机控制台服务：REST API + SSE + 静态页面。
+ * 控制台服务：REST API + SSE + 静态页面。
  *
  * 安全：
- *   - 只监听 cfg.server.host（默认 127.0.0.1），经 SSH / VS Code 端口转发访问
+ *   - 监听 cfg.server.host（默认 0.0.0.0，同局域网可直接访问；如需仅限本机访问可设为 127.0.0.1）
  *   - 令牌鉴权：令牌存在 kv（server.token），`pa console` 打印一次性登录链接；
  *     /login?token= 校验后写入 HttpOnly + SameSite=Strict 的 Cookie。也接受 Authorization: Bearer
  *   - 写请求要求 JSON 且同源（Origin 与 Host 一致），防 CSRF
  */
+
+const VIRTUAL_IFACE = /^(lo|docker|br-|veth|virbr|cni|flannel|kube|podman|cilium|dummy)/i;
+const TUNNEL_IFACE = /^(utun|tun|tap|wg|tailscale|zt)/i;
+
+function isPrivateLanIpv4(ip: string): boolean {
+  const parts = ip.split(".").map(Number);
+  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
+  const [a, b] = parts;
+  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
+function isCgnatIpv4(ip: string): boolean {
+  const parts = ip.split(".").map(Number);
+  return parts.length === 4 && parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127;
+}
+
+/** 选一个最合适的局域网 IPv4（优先物理网卡上的私网地址，避开 docker/网桥/link-local）。 */
+export function detectLanIp(ifaces?: NodeJS.Dict<os.NetworkInterfaceInfo[]>): string | undefined {
+  let map = ifaces;
+  if (!map) {
+    try {
+      map = os.networkInterfaces();
+    } catch {
+      return undefined;
+    }
+  }
+  let best: { ip: string; score: number } | undefined;
+  for (const [name, list] of Object.entries(map)) {
+    for (const info of list ?? []) {
+      const family = String(info.family);
+      if (info.internal || family !== "IPv4" || !info.address || info.address === "0.0.0.0" || info.address.startsWith("169.254.")) continue;
+      let score = VIRTUAL_IFACE.test(name) ? 10 : TUNNEL_IFACE.test(name) ? 50 : 100;
+      score += isPrivateLanIpv4(info.address) ? 30 : isCgnatIpv4(info.address) ? 20 : 10;
+      if (!best || score > best.score) best = { ip: info.address, score };
+    }
+  }
+  return best?.ip;
+}
+
+export function isWildcardHost(host: string): boolean {
+  const h = host.trim().replace(/^\[|\]$/g, "");
+  return !h || h === "0.0.0.0" || h === "::";
+}
+
+export function isLoopbackHost(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  return h === "127.0.0.1" || h === "localhost" || h === "::1";
+}
+
+function formatHost(host: string): string {
+  const h = host.trim().replace(/^\[|\]$/g, "");
+  return h.includes(":") ? `[${h}]` : h;
+}
+
+/** 解析对外展示的控制台主机名：监听通配地址（0.0.0.0 / ::）时优先使用本机局域网 IP，无可用网卡时回退 127.0.0.1。 */
+export function resolveConsoleHost(host: string, ifaces?: NodeJS.Dict<os.NetworkInterfaceInfo[]>): string {
+  return isWildcardHost(host) ? (detectLanIp(ifaces) ?? "127.0.0.1") : host.trim().replace(/^\[|\]$/g, "");
+}
+
+/** 构造控制台基址（形如 http://<局域网IP>:7878）。 */
+export function consoleBaseUrl(host: string, port: number, ifaces?: NodeJS.Dict<os.NetworkInterfaceInfo[]>): string {
+  return `http://${formatHost(resolveConsoleHost(host, ifaces))}:${port}`;
+}
 
 const COOKIE = "pa_session";
 const MAX_BODY = 1024 * 1024;
@@ -304,14 +368,15 @@ export async function startServer(app: App, o: { version: string; port?: number;
       send(res, 500, { error: { code: "internal", message: errMsg(e) } } satisfies ApiError);
     });
   });
+  const bindHost = host.trim().replace(/^\[|\]$/g, "");
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(o.port ?? app.cfg.server.port, host, () => resolve());
+    server.listen(o.port ?? app.cfg.server.port, bindHost || undefined, () => resolve());
   });
   const addr = server.address();
   const port = typeof addr === "object" && addr ? addr.port : app.cfg.server.port;
-  const url = `http://${host === "0.0.0.0" ? "127.0.0.1" : host}:${port}`;
-  log("info", "控制台已启动", { url });
+  const url = consoleBaseUrl(bindHost, port);
+  log("info", "控制台已启动", { url, listen: `${formatHost(bindHost || "0.0.0.0")}:${port}` });
   return {
     url,
     close: async () => {
