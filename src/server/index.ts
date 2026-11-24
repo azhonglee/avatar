@@ -337,6 +337,33 @@ export async function startServer(app: App, o: { version: string; port?: number;
           return send(res, 200, Q.auditViews(app, url.searchParams.get("target") ?? undefined, Number(url.searchParams.get("limit") ?? 100)));
         case "commands":
           return send(res, 200, app.commands.names());
+        case "context": {
+          const c = ext("context");
+          const q = (k: string) => url.searchParams.get(k) ?? undefined;
+          switch (seg[1]) {
+            case "today":
+              return send(res, 200, c.today());
+            case "projects":
+              if (seg[2]) return send(res, 200, need(c.project(seg[2]), "项目"));
+              return send(res, 200, c.projects({ legacy: q("legacy") === "1" }));
+            case "items":
+              if (seg[2]) return send(res, 200, need(c.item(seg[2]), "事项"));
+              return send(res, 200, c.items({ status: q("status"), kind: q("kind"), project: q("project"), q: q("q") }));
+            case "knowledge":
+              return send(res, 200, c.knowledge({ q: q("q"), project: q("project") }));
+            case "updates":
+              return send(res, 200, c.updates({ days: Number(q("days") ?? 7) || 7, project: q("project") }));
+            case "people":
+              return send(res, 200, c.people());
+            case "conflicts":
+              return send(res, 200, c.conflicts((q("status") as "open" | "resolved" | undefined) ?? undefined));
+            case "drafts":
+              return send(res, 200, c.drafts(q("status")));
+            case "status":
+              return send(res, 200, c.status());
+          }
+          break;
+        }
         case "events": {
           res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-store", Connection: "keep-alive", ...SECURITY_HEADERS });
           res.write(`data: ${JSON.stringify({ type: "ping", at: Date.now() } satisfies ServerEvent)}\n\n`);

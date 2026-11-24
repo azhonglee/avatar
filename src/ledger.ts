@@ -18,7 +18,7 @@ import { isAlive } from "./util.ts";
  * （fencing），失去租约的旧执行者无法覆盖新执行者的进度。
  */
 
-export type WorkKind = "event" | "effect" | "dispatch" | "job" | "delivery";
+export type WorkKind = "event" | "effect" | "dispatch" | "job" | "delivery" | "context";
 
 export interface WorkItem<P = Record<string, unknown>> {
   seq: number;
@@ -51,10 +51,20 @@ export type Effect =
    * 飞书交互卡片：同一个 key 只有一张卡片——第一次发送，之后原地更新（messages patch）。
    * card 是完整的卡片 JSON（schema 2.0）。
    */
-  | { op: "card.upsert"; args: { key: string; card: Record<string, unknown>; kind?: NotifyKind } };
+  | { op: "card.upsert"; args: { key: string; card: Record<string, unknown>; kind?: NotifyKind } }
+  /** 以你本人身份回复一条消息（只在你确认草稿后产生） */
+  | { op: "im.reply"; args: { message_id: string; text: string; draft_id?: string } }
+  /** 以你本人身份在会话里发一条消息（只在你确认草稿后产生） */
+  | { op: "im.send"; args: { chat_id: string; text: string; draft_id?: string } }
+  /** 以你本人身份给 Meego 工作项写评论（只在你确认草稿后产生） */
+  | { op: "meego.comment"; args: { project_key: string; work_item_id: string; content: string; draft_id?: string } }
+  /** 以你本人身份在「我的文档库」里新建文档（周报草稿确认后） */
+  | { op: "doc.create"; args: { title: string; markdown: string; draft_id?: string } }
+  /** 给你自己建一条飞书任务（L2 自主动作，需在 autonomy 里开启） */
+  | { op: "task.create_own"; args: { summary: string; description: string; due?: string; item_id?: string } };
 
 /** 通知类型，对应 config.notify.types，用于免打扰与开关 */
-export type NotifyKind = "candidate" | "progress" | "result" | "failure" | "brief";
+export type NotifyKind = "candidate" | "progress" | "result" | "failure" | "brief" | "nudge";
 
 export interface Patch<P> {
   state?: string;
@@ -309,6 +319,7 @@ export class Ledger {
       return toItem<P>(this.db.prepare("SELECT * FROM work WHERE id = ?").get(item.id) as Row);
     });
     if (w.kind !== "effect") this.changed(w.id);
+    else if (w.terminal) this.bus?.emit("effect.settled", { id: w.id, ref: w.ref, state: w.state });
     return w;
   }
 

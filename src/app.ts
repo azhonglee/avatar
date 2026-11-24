@@ -215,8 +215,13 @@ export async function runDaemon(app: App): Promise<void> {
   const crons = [
     new Cron(cfg.schedules.capture, opts, guard("任务识别", () => capture.run())),
     new Cron(cfg.schedules.dispatch, opts, async () => reconcileSoon()),
-    new Cron(cfg.schedules.brief_morning, opts, guard("晨报", async () => (await sendBrief(app, "morning"), engine.kick()))),
-    new Cron(cfg.schedules.brief_evening, opts, guard("晚报", async () => (await sendBrief(app, "evening"), engine.kick()))),
+    // 启用工作上下文时，晨报 / 晚报由它的晨间卡、收尾卡代替
+    ...(app.ext.context
+      ? []
+      : [
+          new Cron(cfg.schedules.brief_morning, opts, guard("晨报", async () => (await sendBrief(app, "morning"), engine.kick()))),
+          new Cron(cfg.schedules.brief_evening, opts, guard("晚报", async () => (await sendBrief(app, "evening"), engine.kick()))),
+        ]),
     new Cron(
       "17 3 * * *",
       opts,
@@ -233,6 +238,7 @@ export async function runDaemon(app: App): Promise<void> {
         }),
     ),
   ];
+  const contextSchedule = app.ext.context?.start();
   // 心跳：控制台据此判断常驻进程是否在线
   const beat = () => store.set("daemon.heartbeat", `${ledger.owner}|${Date.now()}`);
   beat();
@@ -252,6 +258,7 @@ export async function runDaemon(app: App): Promise<void> {
     const shutdown = async (sig: string) => {
       log("info", "收到退出信号，正在停止", { sig });
       crons.forEach((c) => c.stop());
+      contextSchedule?.stop();
       reconcileSoon.cancel();
       triageSoon.cancel();
       clearInterval(heartbeat);

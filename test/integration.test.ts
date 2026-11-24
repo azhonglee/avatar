@@ -89,9 +89,9 @@ const cmd = (name: string, args: unknown) =>
   api(`/api/commands/${name}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ args }) });
 const stubState = () => JSON.parse(fs.readFileSync(STUB_STATE, "utf8")) as { tasks: Record<string, { section: string; comments: string[] }>; messages: { msg_type?: string; card?: unknown; markdown?: string }[] };
 
-test("集成：元信息展示全部 6 个模块已启用，体检返回结构化报告", async () => {
+test("集成：元信息展示全部 7 个模块已启用，体检返回结构化报告", async () => {
   const m = (await (await api("/api/meta")).json()) as Meta;
-  assert.deepEqual(m.features, { cards: true, delivery: true, usage: true, settings: true, doctor: true, candidates: true });
+  assert.deepEqual(m.features, { cards: true, delivery: true, usage: true, settings: true, doctor: true, candidates: true, context: true });
   assert.equal(m.repos[0].alias, "demo");
   const cmds = (await (await api("/api/commands")).json()) as string[];
   for (const name of ["dispatch.create", "dispatch.rework", "delivery.create_pr", "delivery.merge_local", "candidate.confirm", "candidate.reject", "work.retry"]) {

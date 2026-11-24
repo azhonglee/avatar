@@ -1,6 +1,7 @@
 import type { App } from "./app.ts";
 import { registerCandidates } from "./candidates.ts";
 import { registerCards } from "./cards/index.ts";
+import { registerContext } from "./context/index.ts";
 import { registerDelivery } from "./delivery/index.ts";
 import { registerPlatform } from "./platform.ts";
 import { registerUsage } from "./usage.ts";
@@ -15,4 +16,5 @@ export function registerModules(app: App): void {
   registerUsage(app);
   registerCandidates(app);
   registerCards(app);
+  registerContext(app); // 需在卡片之后：注册自己的卡片类型
 }

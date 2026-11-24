@@ -89,7 +89,7 @@ export function crossCheck(cfg: z.infer<typeof ConfigSchema>): Issue[] {
   ];
   for (const [p, name] of refs) if (name && !hasHarness(name)) issues.push({ path: p, message: `引用了未定义的 harness：${name}` });
   for (const [n, h] of Object.entries(cfg.harnesses)) {
-    if (!h.agent === !h.agentCommand) issues.push({ path: `harnesses.${n}`, message: "必须且只能设置 agent 或 agentCommand 之一" });
+    if (h.type === "acpx" && !h.agent === !h.agentCommand) issues.push({ path: `harnesses.${n}`, message: "acpx 类型必须且只能设置 agent 或 agentCommand 之一" });
   }
   const hasProvider = (n: string) => Object.hasOwn(cfg.delivery.providers, n);
   if (cfg.delivery.default_provider && !hasProvider(cfg.delivery.default_provider))

@@ -65,6 +65,7 @@ events: { bot_messages: true, task_updates: false, doc_comments: true, minutes: 
 schedules: { capture: "0 0 1 1 *", dispatch: "0 0 1 1 *", brief_morning: "0 0 1 1 *", brief_evening: "0 0 1 1 *" }
 engine: { tick_ms: 100, retry_base_ms: 300, lease_sec: 3 }
 server: { port: 0 }
+context: { enabled: false }
 `,
   );
 });

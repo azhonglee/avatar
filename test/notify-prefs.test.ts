@@ -63,7 +63,7 @@ function fakeApp(notifyCfg: Partial<Config["notify"]> = {}, kv: Record<string, s
 test("门控：按类型关闭、失败总是发送、未标注类型的私信照发、已有卡片原地更新不延后、读取实时配置", () => {
   const night = T("2026-01-15T15:00:00Z");
   const end = T("2026-01-16T00:00:00Z");
-  const app = fakeApp({ ...NIGHT, types: { candidate: false, progress: true, result: true, failure: false, brief: true } }, { "card.msg.dispatch:g_old": "om_1" });
+  const app = fakeApp({ ...NIGHT, types: { candidate: false, progress: true, result: true, failure: false, brief: true, nudge: true } }, { "card.msg.dispatch:g_old": "om_1" });
   const gate = notifyGate(app, () => night);
   // 按类型关闭
   assert.equal(gate("candidate", notify("x", "candidate")), false);

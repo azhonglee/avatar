@@ -56,6 +56,19 @@ const CMD_TEXT: Partial<Record<CommandName, string>> = {
   "candidate.dispatch": "派给 Agent",
   "work.retry": "重试",
   "work.acknowledge": "忽略",
+  "context.item_done": "完成",
+  "context.item_reopen": "重新打开",
+  "context.item_snooze": "稍后提醒",
+  "context.item_delegate": "交给 Agent",
+  "context.feedback": "反馈",
+  "context.conflict_resolve": "确认结论",
+  "context.draft_create": "起草",
+  "context.draft_approve": "确认发送",
+  "context.draft_discard": "丢弃草稿",
+  "context.project_mute": "静音项目",
+  "context.conv_mute": "静音会话",
+  "context.weekly_report": "起草周报",
+  "context.refresh": "刷新",
 };
 
 const EVENT_TEXT: Record<string, string> = {
@@ -84,9 +97,15 @@ interface ActionResult {
   target: string;
 }
 
+export type CardRenderer = (id: string, notice: string, cmd: string, args: Record<string, unknown>, res: { ok: boolean; message: string; target: string }) => void;
+
 export class CardService {
   app: App;
   debounceMs: number;
+  /** 其他模块的卡片：key 前缀 → 操作后的重新渲染 */
+  renderers = new Map<string, CardRenderer>();
+  /** 其他模块的卡片：key 前缀 → 表单兜底时补上的操作对象参数 */
+  targetResolvers = new Map<string, (id: string) => Record<string, unknown>>();
   private timers = new Map<string, { t: NodeJS.Timeout; fn: () => unknown }>();
   private offs: (() => void)[] = [];
 
@@ -104,6 +123,10 @@ export class CardService {
     app.ext.cards = {
       onAction: (ev) => this.onAction(ev),
       brief: (mode, text) => briefCard(mode, text, this.ctx()),
+      register: (type, render, target) => {
+        this.renderers.set(type, render);
+        if (target) this.targetResolvers.set(type, target);
+      },
     };
     app.bot.doForm = (messageId) => this.sendDoForm(messageId);
   }
@@ -455,6 +478,12 @@ export class CardService {
       }
       case "failure":
         return this.renderFailure(id, notice);
+      default: {
+        // 其他模块注册的卡片类型（如工作上下文的 ctx-item / ctx-morning）
+        const r = this.renderers.get(type);
+        if (r) return r(id, notice, cmd, args, res);
+        return;
+      }
       case "do": {
         const values = { summary: String(args.summary ?? ""), description: String(args.description ?? ""), harness: String(args.harness ?? ""), repo: String(args.repo ?? "") };
         const view = res.ok
@@ -476,6 +505,8 @@ export class CardService {
     const i = key.indexOf(":");
     const type = key.slice(0, i);
     const id = key.slice(i + 1);
+    const ext = this.targetResolvers.get(type);
+    if (ext) return ext(id);
     if (type === "dispatch") {
       const w = this.app.ledger.latest("dispatch", id);
       return w ? { id: w.id } : {};

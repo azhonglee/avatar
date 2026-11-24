@@ -9,6 +9,8 @@ export interface BusEvents {
   "work.changed": { id: string; kind: string; ref: string; state: string; terminal: boolean };
   /** 分诊识别出候选任务并已建卡 */
   "candidate.created": { signalId: string; taskGuid: string; summary: string; section: string };
+  /** 一条飞书写入（outbox effect）落定：成功、跳过或重试耗尽。ref 是产生它的工作 */
+  "effect.settled": { id: string; ref: string; state: string };
   /** 命令执行完成（审计已写入） */
   "command.executed": { name: string; source: string; ok: boolean; target: string };
 }

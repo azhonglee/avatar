@@ -32,14 +32,14 @@ export interface RenderCtx {
 // ───────── 基础组件 ─────────
 
 const pt = (content: string) => ({ tag: "plain_text", content });
-const md = (content: string, extra: El = {}): El => ({ tag: "markdown", content, ...extra });
-const grey = (s: string) => `<font color='grey'>${s}</font>`;
+export const md = (content: string, extra: El = {}): El => ({ tag: "markdown", content, ...extra });
+export const grey = (s: string) => `<font color='grey'>${s}</font>`;
 /** 卡片 markdown 里的用户文本：去掉会被当成标签/链接的字符，避免破坏版式 */
 export const esc = (s: string) => s.replace(/[<>]/g, (c) => (c === "<" ? "＜" : "＞")).replace(/\[/g, "［").replace(/\]/g, "］");
 /** 只把 http(s) 链接放进 markdown 链接里 */
 const isUrl = (s: string) => /^https?:\/\/[^\s()]+$/.test(s);
 
-function header(title: string, template: string, subtitle?: string, tag?: { text: string; color: string }): El {
+export function header(title: string, template: string, subtitle?: string, tag?: { text: string; color: string }): El {
   return {
     title: pt(truncate(title, 80)),
     ...(subtitle ? { subtitle: pt(truncate(subtitle, 80)) } : {}),
@@ -48,7 +48,7 @@ function header(title: string, template: string, subtitle?: string, tag?: { text
   };
 }
 
-function card(h: El, elements: El[], summary: string): Card {
+export function card(h: El, elements: El[], summary: string): Card {
   return {
     schema: "2.0",
     config: { update_multi: true, summary: { content: truncate(summary, 60) } },
@@ -74,12 +74,12 @@ export function button(text: string, value: ActionValue, o: { type?: BtnType; co
   };
 }
 
-function linkButton(text: string, url: string, type: BtnType = "default", fill = false): El {
+export function linkButton(text: string, url: string, type: BtnType = "default", fill = false): El {
   return { tag: "button", text: pt(text), type, ...(fill ? { width: "fill" } : {}), behaviors: [{ type: "open_url", default_url: url }] };
 }
 
 /** 一行按钮（自动换行）。第一个非危险按钮作为主按钮。 */
-function buttonRow(buttons: El[]): El {
+export function buttonRow(buttons: El[]): El {
   let primarySet = false;
   const styled = buttons.map((b) => {
     if (!primarySet && b.type === "default" && (b.behaviors as { type: string }[])[0]?.type === "callback") {
@@ -96,7 +96,7 @@ function buttonRow(buttons: El[]): El {
   };
 }
 
-function select(name: string, options: { label: string; value: string }[], o: { placeholder: string; initial?: string; required?: boolean }): El {
+export function select(name: string, options: { label: string; value: string }[], o: { placeholder: string; initial?: string; required?: boolean }): El {
   return {
     tag: "select_static",
     name,
@@ -108,7 +108,7 @@ function select(name: string, options: { label: string; value: string }[], o: { 
   };
 }
 
-function input(name: string, o: { placeholder: string; label?: string; required?: boolean; multiline?: boolean; maxLength?: number; value?: string }): El {
+export function input(name: string, o: { placeholder: string; label?: string; required?: boolean; multiline?: boolean; maxLength?: number; value?: string }): El {
   return {
     tag: "input",
     name,
@@ -131,9 +131,11 @@ export const FORM_SUBMIT: Record<string, CommandName> = {
   btn_switch: "dispatch.switch_harness",
   btn_cand_dispatch: "candidate.dispatch",
   btn_do: "dispatch.create",
+  btn_draft_send: "context.draft_approve",
+  btn_ctx_snooze: "context.item_snooze",
 };
 
-function form(name: string, fields: El[], submit: { text: string; name: keyof typeof FORM_SUBMIT; value: ActionValue; type?: BtnType }): El {
+export function form(name: string, fields: El[], submit: { text: string; name: keyof typeof FORM_SUBMIT; value: ActionValue; type?: BtnType }): El {
   return {
     tag: "form",
     name,
@@ -152,7 +154,7 @@ function form(name: string, fields: El[], submit: { text: string; name: keyof ty
   };
 }
 
-function noticeEl(notice?: string): El[] {
+export function noticeEl(notice?: string): El[] {
   return notice ? [{ tag: "hr" }, md(grey(esc(notice)), { text_size: "notation" })] : [];
 }
 

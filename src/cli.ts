@@ -17,6 +17,9 @@ const USAGE = `用法：pa <命令>
   brief [morning|evening]     生成概览并私信给你（--print 只打印不发送）
   capture                     立即识别一轮任务
   dispatch                    立即对账“派给Agent”列并执行派单（含崩溃后未完成的），等待完成
+  context run                 立即采集并理解一轮（Meego / 飞书任务 / 消息 / 妙记 / 日历），打印结果
+  context today               打印「今天」：最该处理的事、冲突、草稿、今天的会
+  context digest [morning|evening]   发送晨间卡 / 收尾卡（--print 只打印不发送）
   status                      最近 24 小时的派单、作业，以及重试中/失败的事件和飞书写入
   console [--rotate]          打印控制台登录链接（--rotate 作废旧链接）；常驻进程运行时可用
   command <名称> [JSON 参数]   执行一条命令（与控制台/卡片按钮相同），如 pa command dispatch.cancel '{"id":"…"}'
@@ -68,6 +71,8 @@ async function main(): Promise<void> {
       if (pending) console.log(`⚠️ 还有 ${pending} 条飞书写入待重试，常驻进程会继续投递`);
       return;
     }
+    case "context":
+      return context(app, rest);
     case "status":
       return void console.log(statusText(app.ledger));
     case "console": {
@@ -121,6 +126,38 @@ async function main(): Promise<void> {
       process.stdout.write(USAGE);
       process.exitCode = 2;
   }
+}
+
+async function context(app: ReturnType<typeof createApp>, rest: string[]): Promise<void> {
+  const ctx = app.ext.context;
+  if (!ctx) throw new Error("工作上下文未启用（config.yaml 里 context.enabled）");
+  const [sub, ...more] = rest;
+  if (sub === "run") {
+    const r = await ctx.runOnce();
+    for (const s of r.sources) console.log(`${s.error ? "⚠️" : "✅"} ${s.source}：${s.error || `${s.count} 条`}`);
+    console.log(`理解 ${r.convs} 个会话：新事项 ${r.created}，关闭 ${r.closed}，知识 ${r.knowledge}，动态 ${r.updates}，冲突 ${r.conflicts}，丢弃无证据 ${r.rejected}，提醒 ${r.nudged}`);
+    for (const e of r.errors) console.log(`⚠️ ${e}`);
+    return;
+  }
+  if (sub === "today") {
+    const t = ctx.today();
+    const line = (i: { title: string; project_name: string; why: string[]; kind: string }) => `- ${i.title}${i.project_name ? `（${i.project_name}）` : ""}  [${i.why.join(" · ")}]`;
+    console.log(`今天 ${t.date}\n\n先做这几件：\n${t.focus.map(line).join("\n") || "（无）"}`);
+    if (t.conflicts.length) console.log(`\n需要你判断：\n${t.conflicts.map((c) => `- ${c.topic}：${c.claims.map((x) => x.claim).join(" / ")}`).join("\n")}`);
+    if (t.drafts.length) console.log(`\n待确认草稿：\n${t.drafts.map((d) => `- ${d.target_label}`).join("\n")}`);
+    if (t.needs_review.length) console.log(`\n待确认识别：${t.needs_review.length} 件`);
+    console.log(`\n共 ${t.status.totals.projects} 个项目、${t.status.totals.open_items} 件未完成、${t.status.totals.knowledge} 条知识`);
+    return;
+  }
+  if (sub === "digest") {
+    const { values, positionals } = parseArgs({ args: more, options: { print: { type: "boolean" } }, allowPositionals: true });
+    const mode = positionals[0] === "evening" ? "evening" : "morning";
+    if (values.print) return void console.log(JSON.stringify(ctx.today(), null, 2));
+    ctx.sendDigest(mode);
+    await app.engine.drain(["effect"]);
+    return;
+  }
+  throw new Error("用法：pa context run | today | digest [morning|evening] [--print]");
 }
 
 async function doctor(app: ReturnType<typeof createApp>): Promise<void> {

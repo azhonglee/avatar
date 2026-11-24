@@ -115,6 +115,7 @@ export function meta(app: App, version: string): Meta {
       settings: !!app.ext.settings,
       doctor: !!app.ext.doctor,
       candidates: !!app.ext.candidates,
+      context: !!app.ext.context,
     },
     lark_web: cfg.lark_web,
   };
@@ -220,6 +221,16 @@ function effectSummary(e: Effect): string {
       return `私信：${e.args.markdown.split("\n")[0].slice(0, 80)}`;
     case "card.upsert":
       return `卡片：${e.args.key}`;
+    case "im.reply":
+      return `以你的身份回复：${e.args.text.split("\n")[0].slice(0, 60)}`;
+    case "im.send":
+      return `以你的身份发送：${e.args.text.split("\n")[0].slice(0, 60)}`;
+    case "meego.comment":
+      return `Meego 评论 #${e.args.work_item_id}：${e.args.content.split("\n")[0].slice(0, 60)}`;
+    case "doc.create":
+      return `新建文档：${e.args.title}`;
+    case "task.create_own":
+      return `给自己建任务：${e.args.summary}`;
     default:
       return (e as { op: string }).op;
   }

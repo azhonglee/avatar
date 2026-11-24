@@ -49,6 +49,7 @@ export interface HarnessResult {
 export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessResult> {
   const h = cfg.harnesses[run.harness];
   if (!h) throw new Error(`未定义的 harness：${run.harness}`);
+  if (h.type === "codex-exec") return runCodexExec(cfg, run, h);
   const args = ["--cwd", run.cwd, "--format", "quiet", "--timeout", String(run.timeoutSec)];
   args.push(run.tools === "write" ? "--approve-all" : run.tools === "read" ? "--approve-reads" : "--deny-all");
   args.push("--non-interactive-permissions", "deny");
@@ -126,4 +127,48 @@ export function resolveBin(bin: string): string {
 export function loadPrompt(name: string): string {
   const p = path.isAbsolute(name) ? name : path.join(ROOT, name.includes("/") ? name : `prompts/${name}`);
   return fs.readFileSync(p, "utf8");
+}
+
+/**
+ * codex-exec：直接调用本机已登录的 codex CLI（只读沙箱、不保存会话），提示词从标准输入传入，
+ * 最终回复写到临时文件读回。只用于不需要写权限的任务（理解、起草、审查）；派单执行需要 acpx。
+ */
+async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"][string]): Promise<HarnessResult> {
+  if (run.tools === "write") throw new Error(`harness ${run.harness} 是 codex-exec（只读），不能执行需要写权限的任务；请改用 acpx 类型的 harness`);
+  fs.mkdirSync(run.cwd, { recursive: true });
+  const outFile = path.join(run.cwd, `.codex-last-${process.pid}-${Date.now()}.txt`);
+  const args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--ephemeral", "--color", "never", "-o", outFile];
+  if (h.model) args.push("-m", h.model);
+  args.push(...h.extraArgs, "-");
+  const harnessEnv = Object.fromEntries(
+    Object.entries(h.env).map(([k, v]) => [k, v.replace(/\$\{(\w+)\}/g, (_, n: string) => process.env[n] ?? "")]),
+  );
+  const started = new Date().toISOString();
+  const r = await runProcess(h.cmd, args, {
+    cwd: run.cwd,
+    env: { ...process.env, ...harnessEnv },
+    input: run.prompt,
+    timeoutMs: (run.timeoutSec + 60) * 1000,
+    group: true,
+    signal: run.signal,
+    onSpawn: run.onSpawn,
+  });
+  let text = "";
+  try {
+    text = fs.readFileSync(outFile, "utf8").trim();
+    fs.rmSync(outFile, { force: true });
+  } catch {
+    text = r.stdout.trim();
+  }
+  fs.writeFileSync(
+    run.logFile,
+    [`# ${started} harness=${run.harness} type=codex-exec cwd=${run.cwd}`, `# ${h.cmd} ${args.join(" ")}`, `# exit=${r.code} timedOut=${r.timedOut}`, "## prompt", run.prompt, "## reply", text, "## stderr", r.stderr.slice(-4000)].join("\n"),
+  );
+  try {
+    usageRecorder?.(run, { stdout: r.stdout, stderr: r.stderr, code: r.code });
+  } catch {
+    // 忽略
+  }
+  const aborted = !!run.signal?.aborted;
+  return { ok: r.code === 0 && !r.timedOut && !aborted, exitCode: r.code, text, timedOut: r.timedOut, aborted };
 }

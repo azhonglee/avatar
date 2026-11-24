@@ -1,5 +1,5 @@
 import type { Board, SectionKey } from "./board.ts";
-import { deepFind } from "./util.ts";
+import { deepFind, runProcess } from "./util.ts";
 import type { Store } from "./store.ts";
 import type { Config } from "./config.ts";
 import type { Handler } from "./engine.ts";
@@ -54,6 +54,44 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
         case "card.upsert":
           await upsertCard(lark, store, cfg.owner.open_id, e.args.key, e.args.card);
           break;
+        // ── 以下只会在你确认草稿 / 开启对应自主动作后产生，均以你本人身份执行 ──
+        case "im.reply":
+          await lark.run(["im", "+messages-reply", "--message-id", e.args.message_id, "--text", "-", "--idempotency-key", item.id.slice(0, 50)], {
+            as: "user",
+            input: e.args.text,
+          });
+          break;
+        case "im.send":
+          await lark.run(["im", "+messages-send", "--chat-id", e.args.chat_id, "--text", "-", "--idempotency-key", item.id.slice(0, 50)], {
+            as: "user",
+            input: e.args.text,
+          });
+          break;
+        case "meego.comment": {
+          const r = await runProcess(cfg.bins.bytedcli, [
+            "meego", "comment", "create", "--project-key", e.args.project_key, "--work-item-id", e.args.work_item_id, "--content", e.args.content, "--json",
+          ], { timeoutMs: 60_000 });
+          if (r.code !== 0) throw new Error(`Meego 评论失败：${(r.stderr || r.stdout).trim().slice(0, 300)}`);
+          break;
+        }
+        case "doc.create": {
+          const out = await lark.run(["docs", "+create", "--doc-format", "markdown", "--title", e.args.title, "--parent-position", "my_library", "--content", "-"], {
+            as: "user",
+            input: e.args.markdown,
+          });
+          const url = String(deepFind(out, "url") ?? "");
+          if (url) store.set(`effect.result.${item.id}`, url);
+          break;
+        }
+        case "task.create_own": {
+          await store.once(`task.create_own.${e.args.item_id ?? item.id}`, async () => {
+            const args = ["task", "+create", "--summary", e.args.summary, "--description", e.args.description, "--assignee", cfg.owner.open_id];
+            if (e.args.due) args.push("--due", e.args.due);
+            const out = await lark.run(args, { as: "user" });
+            return String(deepFind(out, "guid") ?? "created");
+          });
+          break;
+        }
         default:
           throw new Error(`未知的 effect：${JSON.stringify(e)}`);
       }

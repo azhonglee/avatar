@@ -9,6 +9,13 @@ import { expandHome } from "./util.ts";
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const Harness = z.object({
+  /**
+   * 运行方式：acpx（默认，经 ACP 调任一 harness，支持工具）；
+   * codex-exec（直接调用本机已登录的 codex CLI，只读沙箱，适合「理解」这类纯文本任务，不能用于需要写权限的派单）
+   */
+  type: z.enum(["acpx", "codex-exec"]).default("acpx"),
+  /** codex-exec 使用的命令（默认 codex） */
+  cmd: z.string().default("codex"),
   /** acpx 内置或在 ~/.acpx/config.json 自定义的 agent 名，例如 claude / codex / gemini / deepseek-harness / trae */
   agent: z.string().optional(),
   /** 原始 ACP 启动命令（走 acpx --agent），与 agent 二选一 */
@@ -168,6 +175,62 @@ const Schema = z.object({
           result: z.boolean().default(true),
           failure: z.boolean().default(true),
           brief: z.boolean().default(true),
+          /** 工作上下文的实时提醒（新的高优先级请求 / 风险） */
+          nudge: z.boolean().default(true),
+        })
+        .prefault({}),
+    })
+    .prefault({}),
+  /** 工作上下文：从飞书 / Meego 等信号理解你的项目、事项、知识、动态，并主动反馈与推进 */
+  context: z
+    .object({
+      enabled: z.boolean().default(true),
+      /** 理解用哪个 harness（缺省用 roles.brain） */
+      harness: z.string().default(""),
+      /** 是否把消息内容发给模型做理解；关闭时只做确定性采集（Meego / 飞书任务直接成为事项） */
+      understand: z.boolean().default(true),
+      /** 首次采集回看天数 */
+      lookback_days: z.number().int().min(1).max(30).default(7),
+      /** 采集 + 理解的周期 */
+      schedule: z.string().default("*/10 * * * *"),
+      morning: z.string().default("30 8 * * 1-5"),
+      evening: z.string().default("30 18 * * 1-5"),
+      /** 周报草稿（M3） */
+      weekly: z.string().default("0 17 * * 5"),
+      sources: z
+        .object({
+          meego: z.boolean().default(true),
+          im: z.boolean().default(true),
+          minutes: z.boolean().default(true),
+          calendar: z.boolean().default(true),
+          tasks: z.boolean().default(true),
+        })
+        .prefault({}),
+      /** 群消息范围：spoken = @我、私聊和我发言过的群；allowlist = 只看 groups_allow 里的群（加上 @我、私聊） */
+      groups: z.enum(["spoken", "allowlist"]).default("spoken"),
+      groups_allow: z.array(z.string()).default([]),
+      /** 永远不读的会话（chat_id 或群名关键字） */
+      groups_deny: z.array(z.string()).default([]),
+      max_groups: z.number().int().min(1).max(200).default(40),
+      /** 保留哪些机器人的通知（名字或内容匹配任一正则即保留；其余机器人消息当噪音丢弃） */
+      bot_allow: z.array(z.string()).default(["Meego", "项目管理", "Codebase", "云文档", "审批", "智能纪要", "MLOps", "Bits"]),
+      /** Meego / 飞书任务创建超过这么多天且没有近期动静的，视为历史遗留 */
+      legacy_days: z.number().int().min(30).default(180),
+      /** 低于这个置信度的识别结果标为「待确认」 */
+      min_confidence: z.number().min(0).max(1).default(0.5),
+      /** 每次理解最多处理多少个会话 */
+      max_convs_per_cycle: z.number().int().min(1).default(30),
+      /** 实时提醒：新出现的高优先级请求 / 风险立刻发卡片 */
+      nudge: z.boolean().default(true),
+      /** 自主等级（M4）：只影响你自己的低风险动作；对外可见的动作永远需要你确认 */
+      autonomy: z
+        .object({
+          /** 有明确证据（你已回复 / Meego 已完成）时自动关闭事项 */
+          auto_close: z.boolean().default(true),
+          /** 自动静音历史遗留项目 */
+          mute_legacy: z.boolean().default(true),
+          /** 你承诺的事自动在飞书任务里给自己建一条待办 */
+          create_own_todo: z.boolean().default(false),
         })
         .prefault({}),
     })
@@ -258,7 +321,7 @@ export function loadConfig(file = process.env.PA_CONFIG ?? path.join(ROOT, "conf
     if (!cfg.harnesses[name]) throw new Error(`配置引用了未定义的 harness：${name}`);
   }
   for (const h of Object.values(cfg.harnesses)) {
-    if (!h.agent === !h.agentCommand) throw new Error("每个 harness 必须且只能设置 agent 或 agentCommand 之一");
+    if (h.type === "acpx" && !h.agent === !h.agentCommand) throw new Error("acpx 类型的 harness 必须且只能设置 agent 或 agentCommand 之一");
   }
   const dataDir = path.resolve(expandHome(cfg.data_dir));
   for (const sub of ["logs", "runs", "workspace", "worktrees"]) fs.mkdirSync(path.join(dataDir, sub), { recursive: true });
