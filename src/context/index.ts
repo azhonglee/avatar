@@ -101,28 +101,37 @@ export class ContextService {
       await this.ensureOwnerName();
       const created: ItemRow[] = [];
       if (this.cfg.context.understand) {
+        // 每轮最多理解 max_convs_per_cycle 个会话批次；并行跑 understand_parallel 批（会话互不重叠）
         let budget = this.cfg.context.max_convs_per_cycle;
+        const par = this.cfg.context.understand_parallel;
         while (budget > 0 && !signal?.aborted) {
-          const convs = this.store.pendingConvs(Math.min(budget, 10));
-          if (!convs.length) break;
-          try {
-            const r = await this.understander.runBatch(workId, convs, signal);
-            if (!r.convs.length) break;
-            budget -= r.convs.length;
-            rep.convs += r.convs.length;
-            rep.created += r.created.length;
-            rep.closed += r.closed.length;
-            rep.knowledge += r.knowledge;
-            rep.updates += r.updates;
-            rep.conflicts += r.conflicts;
-            rep.rejected += r.rejected;
-            created.push(...r.created);
-            for (const c of r.convs) kv.db.prepare("DELETE FROM kv WHERE k = ?").run(`ctx.fail.${c}`);
-          } catch (e) {
-            if (signal?.aborted) throw e;
-            rep.errors.push(`理解失败：${truncate(errMsg(e), 300)}`);
-            // 同一批会话连续失败 3 次就跳过，避免卡住后面的消息
-            for (const c of convs) {
+          const pending = this.store.pendingConvs(Math.min(budget, 8 * par));
+          if (!pending.length) break;
+          const groups: (typeof pending)[] = Array.from({ length: Math.min(par, pending.length) }, () => []);
+          pending.forEach((c, i) => groups[i % groups.length].push(c));
+          const results = await Promise.allSettled(groups.map((g) => this.understander.runBatch(workId, g, signal)));
+          if (signal?.aborted) throw new Error("aborted");
+          let progress = 0;
+          results.forEach((res, gi) => {
+            if (res.status === "fulfilled") {
+              const r = res.value;
+              progress += r.fresh;
+              budget -= Math.max(1, r.convs.length);
+              rep.convs += r.convs.length;
+              rep.created += r.created.length;
+              rep.closed += r.closed.length;
+              rep.knowledge += r.knowledge;
+              rep.updates += r.updates;
+              rep.conflicts += r.conflicts;
+              rep.rejected += r.rejected;
+              created.push(...r.created);
+              for (const c of r.convs) kv.db.prepare("DELETE FROM kv WHERE k = ?").run(`ctx.fail.${c}`);
+              return;
+            }
+            budget -= groups[gi].length;
+            rep.errors.push(`理解失败：${truncate(errMsg(res.reason), 300)}`);
+            // 同一会话连续失败 3 次就跳过，避免卡住后面的消息
+            for (const c of groups[gi]) {
               const n = Number(kv.get(`ctx.fail.${c.conv}`) ?? 0) + 1;
               kv.set(`ctx.fail.${c.conv}`, String(n));
               if (n >= 3) {
@@ -130,8 +139,8 @@ export class ContextService {
                 log("warn", "会话理解连续失败，已跳过", { conv: c.conv_name, skipped });
               }
             }
-            break;
-          }
+          });
+          if (!progress) break; // 本轮全部失败或没有进展：等下一轮
         }
       }
       relinkMeegoItems(this.store);

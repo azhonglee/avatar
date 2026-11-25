@@ -452,3 +452,20 @@ test("真实数据回归：标题相近的不同工作项不合并；系统项�
   assert.ok(app.ext.context!.today().focus.concat(app.ext.context!.items({})).some((i) => i.title === "提交报销"));
   assert.ok(!app.ext.context!.items({}).some((i) => i.title === "很久以前的事"), "历史遗留任务不出现");
 });
+
+test("积压的大群：从最早的待处理消息开始分批理解，超过回看窗口的旧消息也不会卡住", async () => {
+  const s3 = new ContextService(app);
+  const old = Date.now() - 9 * DAY;
+  const obs = Array.from({ length: 130 }, (_, i) => ({
+    id: `im:big_${i}`, source: "im" as const, kind: "group", conv: "oc_big", conv_name: "大群", actor_id: "ou_x", actor_name: "某人", is_me: false,
+    time: old + i * 60_000, text: `第 ${i} 条讨论`, url: "", meta: {},
+  }));
+  s3.store.addObs(obs);
+  writeFx("understand.json", {});
+  const calls0 = codexCalls().length;
+  for (let i = 0; i < 4 && s3.store.pendingConvs(50).some((c) => c.conv === "oc_big"); i++) await s3.cycle(`context:test-big-${i}`);
+  assert.ok(!s3.store.pendingConvs(50).some((c) => c.conv === "oc_big"), "全部处理完");
+  const prompts = codexCalls().slice(calls0).map((c) => c.prompt!).filter((p) => p.includes("oc_big"));
+  assert.ok(prompts.length >= 3, `分批：${prompts.length}`);
+  assert.match(prompts[0], /\[im:big_0\].*\(新\)/, "从最早的一条开始");
+});

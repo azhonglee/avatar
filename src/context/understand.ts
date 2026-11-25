@@ -115,14 +115,13 @@ export class Understander {
   /** 组装一批会话（控制总长度），返回提示词和这批涉及的观测 */
   buildBatch(convs: { conv: string; conv_name: string }[], maxChars = 24_000): { prompt: string; obs: Obs[]; fresh: string[]; convs: string[] } {
     const tz = this.cfg.owner.timezone;
-    const since = Date.now() - this.cfg.context.lookback_days * DAY;
     const sections: string[] = [];
     const all: Obs[] = [];
     const fresh: string[] = [];
     const used: string[] = [];
     let size = 0;
     for (const c of convs) {
-      const list = this.store.convObs(c.conv, since, 80);
+      const list = this.store.convWindow(c.conv);
       if (!list.length) continue;
       const lines = list.map((o) => {
         const isNew = !this.isProcessed(o.id);
@@ -201,11 +200,13 @@ export class Understander {
   }
 
   /** 跑一批：调用模型 → 解析 → 写入 */
-  async runBatch(workId: string, convs: { conv: string; conv_name: string }[], signal?: AbortSignal): Promise<ApplyResult & { convs: string[] }> {
+  async runBatch(workId: string, convs: { conv: string; conv_name: string }[], signal?: AbortSignal): Promise<ApplyResult & { convs: string[]; fresh: number }> {
     this.processedCache.clear();
     const batch = this.buildBatch(convs);
     if (!batch.fresh.length) {
-      return { ...emptyResult(), convs: batch.convs };
+      // 没有可处理的新观测（理论上不会发生）：把这些会话的待处理标掉，避免周期里反复空转
+      for (const c of batch.convs) this.store.skipConv(c);
+      return { ...emptyResult(), convs: batch.convs, fresh: 0 };
     }
     const harness = this.cfg.context.harness || this.cfg.roles.brain;
     const logFile = path.join(this.cfg.dataDir, "runs", `context-${Date.now()}.log`);
@@ -227,7 +228,7 @@ export class Understander {
       const out = parseUnderstand(r.text);
       const res = this.apply(out, batch.obs, batch.fresh);
       this.app.ledger.endStep(step, "ok", `新事项 ${res.created.length}，关闭 ${res.closed.length}，知识 ${res.knowledge}`);
-      return { ...res, convs: batch.convs };
+      return { ...res, convs: batch.convs, fresh: batch.fresh.length };
     } catch (e) {
       this.app.ledger.endStep(step, "failed", errMsg(e));
       throw e;

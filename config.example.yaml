@@ -36,6 +36,7 @@ harnesses:
   #   type: codex-exec
   #   cmd: codex               # 可写绝对路径
   #   model: ""               # 留空用 codex 默认模型
+  #   extraArgs: ["-c", "model_reasoning_effort=medium"]   # 抽取不需要最高推理强度，medium 快很多
 
 roles:
   brain: claude      # 分诊、私聊对话、知识库整理
@@ -133,6 +134,7 @@ context:
   legacy_days: 180            # Meego / 飞书任务超过这么久没动静视为历史遗留（自动静音）
   min_confidence: 0.5         # 低于它的识别结果标为「待确认」
   max_convs_per_cycle: 30
+  understand_parallel: 2      # 同时跑几批理解；首次回看积压多时可调大
   nudge: true
   autonomy:                   # 只影响你自己的低风险动作；对外可见的动作永远需要你确认草稿
     auto_close: true          # 有证据（你已回复、Meego 节点已流转）时自动关闭事项

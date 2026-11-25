@@ -278,6 +278,18 @@ export class ContextStore {
   }
 
   /** 一个会话最近的观测（包含已处理的作为背景） */
+  /**
+   * 理解窗口：这个会话最早的一批待处理观测（按时间正序，最多 maxFresh 条）+ 它们之前的若干条已处理观测作为背景。
+   * 从最早的待处理开始，保证大群 / 停机后积压的消息分几批都能处理到，不会因为只取最近 N 条而永远卡住。
+   */
+  convWindow(conv: string, maxFresh = 60, context = 12): Obs[] {
+    const fresh = this.db.prepare("SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 ORDER BY time ASC LIMIT ?").all(conv, maxFresh) as Row[];
+    if (!fresh.length) return [];
+    const t0 = Number(fresh[0].time);
+    const before = this.db.prepare("SELECT * FROM ctx_obs WHERE conv = ? AND processed = 1 AND time <= ? ORDER BY time DESC LIMIT ?").all(conv, t0, context) as Row[];
+    return [...before.reverse(), ...fresh].map((r) => this.toObs(r));
+  }
+
   convObs(conv: string, since: number, limit = 80): Obs[] {
     const rows = this.db.prepare("SELECT * FROM ctx_obs WHERE conv = ? AND time >= ? ORDER BY time DESC LIMIT ?").all(conv, since, limit) as Row[];
     return rows.map((r) => this.toObs(r)).reverse();

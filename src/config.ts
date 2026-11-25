@@ -222,6 +222,8 @@ const Schema = z.object({
       min_confidence: z.number().min(0).max(1).default(0.5),
       /** 每次理解最多处理多少个会话 */
       max_convs_per_cycle: z.number().int().min(1).default(30),
+      /** 同时跑几批理解（会话互不重叠）；首次回看积压多时调大能明显加快 */
+      understand_parallel: z.number().int().min(1).max(8).default(2),
       /** 实时提醒：新出现的高优先级请求 / 风险立刻发卡片 */
       nudge: z.boolean().default(true),
       /** 自主等级（M4）：只影响你自己的低风险动作；对外可见的动作永远需要你确认 */
