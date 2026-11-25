@@ -232,15 +232,22 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
         problems.push(`环境变量未设置：${unset.join("、")}`);
         fixes.push(`在常驻进程的环境里设置 ${unset.map(code).join("、")}（systemd 用 ${code("Environment=")} 或 ${code("EnvironmentFile=")}）`);
       }
-      if (h.type === "codex-exec") {
+      if (h.type === "codex-exec" || h.type === "doubao-cli") {
+        const bin = h.cmd || (h.type === "doubao-cli" ? "doubao" : "codex");
         let cmdPath = "";
         try {
-          cmdPath = resolveBin(h.cmd);
+          cmdPath = resolveBin(bin);
           fs.accessSync(cmdPath, fs.constants.X_OK);
         } catch {
-          return fail(`找不到启动命令 ${h.cmd}`, `安装 Codex CLI 或在 ${code(`harnesses.${name}.cmd`)} 里写绝对路径`);
+          return fail(
+            `找不到启动命令 ${bin}`,
+            h.type === "doubao-cli"
+              ? `安装豆包 CLI（doubao）或在 ${code(`harnesses.${name}.cmd`)} 里写绝对路径`
+              : `安装 Codex CLI 或在 ${code(`harnesses.${name}.cmd`)} 里写绝对路径`,
+          );
         }
-        const detail = `${cmdPath} exec（只读）${h.model ? `，模型 ${h.model}` : ""}${roles.length ? `，角色：${roles.join("、")}` : ""}（未实际调用模型）`;
+        const how = h.type === "doubao-cli" ? `${cmdPath} -p（豆包 CLI）` : `${cmdPath} exec（只读）`;
+        const detail = `${how}${h.model ? `，模型 ${h.model}` : ""}${roles.length ? `，角色：${roles.join("、")}` : ""}（未实际调用模型）`;
         return problems.length ? warn(`${detail}；${problems.join("；")}`, fixes.join("\n\n")) : ok(detail);
       }
       if (!h.agent === !h.agentCommand) return fail("必须且只能设置 agent 或 agentCommand 之一", `在设置页或配置文件的 ${code(`harnesses.${name}`)} 里修正`);

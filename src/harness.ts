@@ -50,6 +50,7 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
   const h = cfg.harnesses[run.harness];
   if (!h) throw new Error(`未定义的 harness：${run.harness}`);
   if (h.type === "codex-exec") return runCodexExec(cfg, run, h);
+  if (h.type === "doubao-cli") return runDoubaoCli(cfg, run, h);
   const args = ["--cwd", run.cwd, "--format", "quiet", "--timeout", String(run.timeoutSec)];
   args.push(run.tools === "write" ? "--approve-all" : run.tools === "read" ? "--approve-reads" : "--deny-all");
   args.push("--non-interactive-permissions", "deny");
@@ -135,6 +136,7 @@ export function loadPrompt(name: string): string {
  */
 async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"][string]): Promise<HarnessResult> {
   if (run.tools === "write") throw new Error(`harness ${run.harness} 是 codex-exec（只读），不能执行需要写权限的任务；请改用 acpx 类型的 harness`);
+  const cmd = h.cmd || "codex";
   fs.mkdirSync(run.cwd, { recursive: true });
   const outFile = path.join(run.cwd, `.codex-last-${process.pid}-${Date.now()}.txt`);
   // -o 用相对 cwd 的文件名：codex 0.169 在部分路径（如经符号链接的家目录）下打开绝对路径会报 "Not a directory"
@@ -145,7 +147,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
     Object.entries(h.env).map(([k, v]) => [k, v.replace(/\$\{(\w+)\}/g, (_, n: string) => process.env[n] ?? "")]),
   );
   const started = new Date().toISOString();
-  const r = await runProcess(h.cmd, args, {
+  const r = await runProcess(cmd, args, {
     cwd: run.cwd,
     env: { ...process.env, ...harnessEnv },
     input: run.prompt,
@@ -163,7 +165,91 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   }
   fs.writeFileSync(
     run.logFile,
-    [`# ${started} harness=${run.harness} type=codex-exec cwd=${run.cwd}`, `# ${h.cmd} ${args.join(" ")}`, `# exit=${r.code} timedOut=${r.timedOut}`, "## prompt", run.prompt, "## reply", text, "## stderr", r.stderr.slice(-4000)].join("\n"),
+    [`# ${started} harness=${run.harness} type=codex-exec cwd=${run.cwd}`, `# ${cmd} ${args.join(" ")}`, `# exit=${r.code} timedOut=${r.timedOut}`, "## prompt", run.prompt, "## reply", text, "## stderr", r.stderr.slice(-4000)].join("\n"),
+  );
+  try {
+    usageRecorder?.(run, { stdout: r.stdout, stderr: r.stderr, code: r.code });
+  } catch {
+    // 忽略
+  }
+  const aborted = !!run.signal?.aborted;
+  return { ok: r.code === 0 && !r.timedOut && !aborted, exitCode: r.code, text, timedOut: r.timedOut, aborted };
+}
+
+/**
+ * doubao-cli：直接调用本机已登录的豆包 CLI（`doubao -p -`，提示词走标准输入），
+ * 接通飞书守卫 PATH 与权限档位（write → always_allow，read → ask_risky，none → ask_always）。
+ */
+async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"][string]): Promise<HarnessResult> {
+  const cmd = h.cmd || "doubao";
+  fs.mkdirSync(run.cwd, { recursive: true });
+  const perm = run.tools === "write" ? "always_allow" : run.tools === "read" ? "ask_risky" : "ask_always";
+  const hasPermOverride = h.extraArgs.some((a) => a === "--permission-mode" || a.startsWith("--permission-mode=") || a === "--dangerously-bypass-approvals-and-sandbox");
+  const args = ["-C", run.cwd];
+  if (!hasPermOverride) args.push("--permission-mode", perm);
+  if (h.model) args.push("--model", h.model);
+  args.push(...h.extraArgs, "-p", "-");
+
+  const harnessEnv = Object.fromEntries(
+    Object.entries(h.env).map(([k, v]) => [k, v.replace(/\$\{(\w+)\}/g, (_, n: string) => process.env[n] ?? "")]),
+  );
+  let realLark = cfg.bins.lark;
+  try {
+    realLark = resolveBin(cfg.bins.lark);
+  } catch {
+    // run.lark === "none" 时不会执行真实 lark-cli
+  }
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...harnessEnv,
+    DOUBAO_CLI_NO_UPDATE_CHECK: "1",
+    PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${process.env.PATH ?? ""}`,
+    PA_GUARD_PROFILE: run.lark,
+    PA_OWNER_OPEN_ID: cfg.owner.open_id,
+    PA_LARK_REAL: realLark,
+    PA_GUARD_LOG: path.join(cfg.dataDir, "logs", "guard.log"),
+  };
+  const started = new Date().toISOString();
+  // Node.js spawn 的 stdio:"pipe" 在 Linux 上是 Unix socketpair（S_IFSOCK），doubao 会报
+  // "stdin must be a terminal, pipe or regular file"；写到 0600 临时普通文件以 FD 传入，用完立即删除。
+  const promptDir = path.join(cfg.dataDir, "runs");
+  fs.mkdirSync(promptDir, { recursive: true });
+  const promptFile = path.join(promptDir, `.doubao-in-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+  fs.writeFileSync(promptFile, run.prompt, { mode: 0o600 });
+  const fd = fs.openSync(promptFile, "r");
+  let r: Awaited<ReturnType<typeof runProcess>>;
+  try {
+    r = await runProcess(cmd, args, {
+      cwd: run.cwd,
+      env,
+      stdinFd: fd,
+      timeoutMs: (run.timeoutSec + 60) * 1000,
+      group: true,
+      signal: run.signal,
+      onSpawn: run.onSpawn,
+    });
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // ignore
+    }
+    fs.rmSync(promptFile, { force: true });
+  }
+  const text = r.stdout.trim();
+  fs.writeFileSync(
+    run.logFile,
+    [
+      `# ${started} harness=${run.harness} type=doubao-cli tools=${run.tools} lark=${run.lark} cwd=${run.cwd}`,
+      `# ${cmd} ${args.join(" ")}`,
+      `# exit=${r.code} timedOut=${r.timedOut} aborted=${!!run.signal?.aborted}`,
+      "## prompt",
+      run.prompt,
+      "## stdout",
+      r.stdout,
+      "## stderr",
+      r.stderr.slice(-4000),
+    ].join("\n"),
   );
   try {
     usageRecorder?.(run, { stdout: r.stdout, stderr: r.stderr, code: r.code });

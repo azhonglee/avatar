@@ -11,11 +11,12 @@ export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const Harness = z.object({
   /**
    * 运行方式：acpx（默认，经 ACP 调任一 harness，支持工具）；
-   * codex-exec（直接调用本机已登录的 codex CLI，只读沙箱，适合「理解」这类纯文本任务，不能用于需要写权限的派单）
+   * codex-exec（直接调用本机已登录的 codex CLI，只读沙箱，适合「理解」这类纯文本任务，不能用于需要写权限的派单）；
+   * doubao-cli（直接调用本机已登录的豆包 CLI `doubao -p -`，支持全部工具档位与飞书守卫）
    */
-  type: z.enum(["acpx", "codex-exec"]).default("acpx"),
-  /** codex-exec 使用的命令（默认 codex） */
-  cmd: z.string().default("codex"),
+  type: z.enum(["acpx", "codex-exec", "doubao-cli"]).default("acpx"),
+  /** codex-exec / doubao-cli 使用的命令（留空时按 type 默认取 codex / doubao） */
+  cmd: z.string().default(""),
   /** acpx 内置或在 ~/.acpx/config.json 自定义的 agent 名，例如 claude / codex / gemini / deepseek-harness / trae */
   agent: z.string().optional(),
   /** 原始 ACP 启动命令（走 acpx --agent），与 agent 二选一 */

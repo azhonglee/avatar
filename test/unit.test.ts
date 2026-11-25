@@ -8,6 +8,7 @@ import { KnowledgeBase } from "../src/board.ts";
 import { loadConfig } from "../src/config.ts";
 import { parseEventStderr } from "../src/events.ts";
 import { decide } from "../src/guard.ts";
+import { runHarness } from "../src/harness.ts";
 import { extractOwnerOpenId, Lark, LarkError } from "../src/lark.ts";
 import { Store } from "../src/store.ts";
 import { endOfLocalDay } from "../src/workflows/brief.ts";
@@ -323,4 +324,75 @@ test("parseEventStderr：解析多行 JSON 错误信封（含 message / hint / s
     message: "connection reset by peer",
   });
   assert.deepEqual(parseEventStderr([]), { message: "" });
+});
+
+test("doubao-cli harness：传 -C / --permission-mode / -p -，关闭更新检查并接入飞书守卫 PATH", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pa-doubao-"));
+  try {
+    const fake = path.join(tmp, "fake-doubao");
+    fs.writeFileSync(
+      fake,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const input = fs.readFileSync(0, "utf8");
+process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), input, noUpdate: process.env.DOUBAO_CLI_NO_UPDATE_CHECK, guard: process.env.PA_GUARD_PROFILE }));
+`,
+      { mode: 0o755 },
+    );
+    const cfgFile = path.join(tmp, "config.yaml");
+    fs.writeFileSync(
+      cfgFile,
+      JSON.stringify({
+        data_dir: path.join(tmp, "data"),
+        owner: { open_id: "ou_owner" },
+        harnesses: {
+          doubao: { type: "doubao-cli", cmd: fake, model: "5", extraArgs: ["--effort", "medium"] },
+          doubaoBypass: { type: "doubao-cli", cmd: fake, extraArgs: ["--dangerously-bypass-approvals-and-sandbox"] },
+        },
+        roles: { brain: "doubao" },
+      }),
+    );
+    const cfg = loadConfig(cfgFile);
+    const cwd = path.join(tmp, "work");
+    const r = await runHarness(cfg, {
+      harness: "doubao",
+      prompt: "你好豆包",
+      cwd,
+      tools: "write",
+      lark: "agent",
+      timeoutSec: 30,
+      logFile: path.join(tmp, "run1.log"),
+    });
+    assert.equal(r.ok, true);
+    const got = JSON.parse(r.text) as { argv: string[]; input: string; noUpdate: string; guard: string };
+    assert.deepEqual(got.argv, ["-C", cwd, "--permission-mode", "always_allow", "--model", "5", "--effort", "medium", "-p", "-"]);
+    assert.equal(got.input, "你好豆包");
+    assert.equal(got.noUpdate, "1");
+    assert.equal(got.guard, "agent");
+
+    const rNone = await runHarness(cfg, {
+      harness: "doubao",
+      prompt: "只读",
+      cwd,
+      tools: "none",
+      lark: "none",
+      timeoutSec: 30,
+      logFile: path.join(tmp, "run2.log"),
+    });
+    assert.ok(JSON.parse(rNone.text).argv.includes("ask_always"));
+
+    // extraArgs 显式带互斥权限参数时不重复追加 --permission-mode
+    const rBypass = await runHarness(cfg, {
+      harness: "doubaoBypass",
+      prompt: "bypass",
+      cwd,
+      tools: "write",
+      lark: "none",
+      timeoutSec: 30,
+      logFile: path.join(tmp, "run3.log"),
+    });
+    assert.ok(!JSON.parse(rBypass.text).argv.includes("--permission-mode"));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });

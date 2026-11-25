@@ -101,6 +101,8 @@ export interface RunOpts {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   input?: string;
+  /** 用已打开的文件描述符作为 stdin（普通文件 FD，避免部分程序拒绝 Node spawn 的 Unix socketpair） */
+  stdinFd?: number;
   timeoutMs?: number;
   /** 以独立进程组运行：超时/中止时结束整个进程组，崩溃后也能按 pgid 清理。 */
   group?: boolean;
@@ -116,7 +118,7 @@ export function runProcess(cmd: string, args: string[], opts: RunOpts = {}): Pro
     const child = spawn(cmd, args, {
       cwd: opts.cwd,
       env: opts.env ?? process.env,
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: [opts.stdinFd ?? "pipe", "pipe", "pipe"],
       detached: !!opts.group,
     });
     const pid = child.pid;
@@ -143,8 +145,8 @@ export function runProcess(cmd: string, args: string[], opts: RunOpts = {}): Pro
     const onAbort = () => stop();
     if (opts.signal?.aborted) stop();
     else opts.signal?.addEventListener("abort", onAbort, { once: true });
-    child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+    child.stdout?.on("data", (d: Buffer) => (stdout += d.toString()));
+    child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
     child.on("error", (e) => {
       if (pid) liveGroups.delete(pid);
       reject(e);
@@ -156,9 +158,11 @@ export function runProcess(cmd: string, args: string[], opts: RunOpts = {}): Pro
       if (pid) liveGroups.delete(pid);
       resolve({ code: code ?? -1, stdout, stderr, timedOut });
     });
-    // 子进程可能不读 stdin 就先退出（如 git），此时写入会 EPIPE；忽略它，结果以退出码为准
-    child.stdin.on("error", () => undefined);
-    if (opts.input) child.stdin.end(opts.input);
-    else child.stdin.end();
+    if (child.stdin) {
+      // 子进程可能不读 stdin 就先退出（如 git），此时写入会 EPIPE；忽略它，结果以退出码为准
+      child.stdin.on("error", () => undefined);
+      if (opts.input) child.stdin.end(opts.input);
+      else child.stdin.end();
+    }
   });
 }

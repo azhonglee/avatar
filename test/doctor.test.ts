@@ -247,8 +247,9 @@ test("doctor：codex-exec 执行者检查 cmd 可执行性，不要求 agent/age
       harnesses: {
         "codex-ro": { type: "codex-exec", cmd: fakeCmd },
         "codex-missing": { type: "codex-exec", cmd: "/no/such/codex" },
+        doubao: { type: "doubao-cli", cmd: fakeCmd },
       },
-      roles: { brain: "codex-ro" },
+      roles: { brain: "doubao" },
       context: { harness: "codex-ro" },
     }),
   );
@@ -258,6 +259,8 @@ test("doctor：codex-exec 执行者检查 cmd 可执行性，不要求 agent/age
     assert.equal(byId(r, "acpx").status, "skip", "未用到 acpx 类型时不报错");
     assert.equal(byId(r, "harness:codex-ro").status, "ok");
     assert.match(byId(r, "harness:codex-ro").detail, /工作上下文/);
+    assert.equal(byId(r, "harness:doubao").status, "ok");
+    assert.match(byId(r, "harness:doubao").detail, /豆包 CLI/);
     assert.equal(byId(r, "harness:codex-missing").status, "fail");
   } finally {
     a.store.db.close();
