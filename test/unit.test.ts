@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
+import { createApp, initApp } from "../src/app.ts";
+import { loadConfig } from "../src/config.ts";
 import { decide } from "../src/guard.ts";
+import { extractOwnerOpenId, Lark } from "../src/lark.ts";
 import { endOfLocalDay } from "../src/workflows/brief.ts";
 import { parseHarness, parseRepo, parseReview, decideRound, planReconcile, type CheckResult, pickReviewer } from "../src/workflows/dispatch.ts";
 import { parseVerdicts } from "../src/workflows/triage.ts";
@@ -119,4 +125,72 @@ test("对账计划：新卡片入队；再派与取消只给出候选，飞书�
   assert.deepEqual(plan.enqueue, ["new"], "从没派过的新卡片直接入队");
   assert.deepEqual(plan.redo, ["redo"], "再派要先按 ID 核实");
   assert.deepEqual(plan.suspects, ["w2"], "两列都没看到只是候选，要按 ID 核实才取消");
+});
+
+test("lark authStatus 与 initApp：兼容新版裸 JSON（openId）和旧版信封格式，失败时报错", async () => {
+  assert.equal(
+    extractOwnerOpenId({ identities: { bot: { openId: "ou_bot" }, user: { openId: "ou_user_1", userName: "张三" } } }),
+    "ou_user_1",
+  );
+  assert.equal(extractOwnerOpenId({ identity: "user", user: { open_id: "ou_old" } }), "ou_old");
+  assert.equal(extractOwnerOpenId({ user_open_id: "ou_legacy" }), "ou_legacy");
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pa-auth-"));
+  try {
+    const outFile = path.join(tmp, "out.json");
+    const codeFile = path.join(tmp, "code.txt");
+    const fakeLark = path.join(tmp, "fake-lark");
+    fs.writeFileSync(
+      fakeLark,
+      `#!/usr/bin/env node\nconst fs = require("node:fs");\nprocess.stdout.write(fs.readFileSync(${JSON.stringify(outFile)}, "utf8"));\nprocess.exit(Number(fs.readFileSync(${JSON.stringify(codeFile)}, "utf8")));\n`,
+      { mode: 0o755 },
+    );
+    const cfgFile = path.join(tmp, "config.yaml");
+    fs.writeFileSync(
+      cfgFile,
+      JSON.stringify({
+        data_dir: path.join(tmp, "data"),
+        bins: { lark: fakeLark },
+        harnesses: { cx: { type: "codex-exec", cmd: "codex" } },
+        roles: { brain: "cx" },
+        cards: { enabled: false },
+        context: { enabled: false },
+      }),
+    );
+
+    // 1. 新版 lark-cli：裸 JSON，无 ok/data 信封，字段为 identities.user.openId
+    fs.writeFileSync(
+      outFile,
+      JSON.stringify({
+        appId: "cli_test",
+        identities: {
+          bot: { status: "ready", available: true, message: "Bot identity: ready" },
+          user: { status: "ready", available: true, openId: "ou_bare_123", userName: "李迎忠" },
+        },
+        identity: "user",
+      }),
+    );
+    fs.writeFileSync(codeFile, "0");
+    const app = createApp(loadConfig(cfgFile));
+    app.board.init = async () => undefined;
+    app.kb.init = async () => undefined;
+    await initApp(app);
+    assert.equal(app.cfg.owner.open_id, "ou_bare_123");
+    assert.equal(app.store.get("owner.open_id"), "ou_bare_123");
+    app.store.db.close();
+
+    // 2. 旧版信封格式
+    const lark = new Lark(loadConfig(cfgFile));
+    fs.writeFileSync(outFile, JSON.stringify({ ok: true, data: { identity: "user", user: { open_id: "ou_env_456" } } }));
+    assert.equal(extractOwnerOpenId(await lark.authStatus()), "ou_env_456");
+
+    // 3. 失败返回（ok: false 或退出码非 0）
+    fs.writeFileSync(outFile, JSON.stringify({ ok: false, error: { message: "未登录" } }));
+    await assert.rejects(() => lark.authStatus(), /未登录/);
+    fs.writeFileSync(outFile, JSON.stringify({ message: "token invalid" }));
+    fs.writeFileSync(codeFile, "1");
+    await assert.rejects(() => lark.authStatus(), /token invalid/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });

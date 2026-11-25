@@ -12,11 +12,11 @@ import { card, effectHandler, notify } from "./effects.ts";
 import { Engine, type Handler } from "./engine.ts";
 import { EventSupervisor, type Subscription } from "./events.ts";
 import { loadPrompt } from "./harness.ts";
-import { Lark } from "./lark.ts";
+import { extractOwnerOpenId, Lark } from "./lark.ts";
 import { Ledger, type WorkItem } from "./ledger.ts";
 import { startServer, type ConsoleServer } from "./server/index.ts";
 import { Store } from "./store.ts";
-import { deepFind, errMsg, log, render, truncate } from "./util.ts";
+import { errMsg, log, render, truncate } from "./util.ts";
 import { BotHandler, enqueueJob, jobHandler, type JobPayload } from "./workflows/agent.ts";
 import { buildBrief } from "./workflows/brief.ts";
 import { Capture } from "./workflows/capture.ts";
@@ -121,8 +121,8 @@ function eventHandler(app: Pick<App, "cfg" | "ledger" | "capture" | "bot" | "eng
 /** 初始化：确定主人 open_id，建看板清单与分组、知识空间与节点。可重复执行。 */
 export async function initApp(app: App): Promise<void> {
   if (!app.cfg.owner.open_id) {
-    const status = await app.lark.run(["auth", "status", "--json"]);
-    const id = String(deepFind(status, "open_id") ?? deepFind(status, "user_open_id") ?? "");
+    const status = await app.lark.authStatus();
+    const id = extractOwnerOpenId(status);
     if (!id.startsWith("ou_")) {
       throw new Error(`无法从 lark-cli auth status 得到你的 open_id，请在 config.yaml 的 owner.open_id 手动填写。输出：${JSON.stringify(status)}`);
     }

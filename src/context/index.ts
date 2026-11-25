@@ -7,7 +7,7 @@ import { CommandError } from "../commands.ts";
 import { card as cardEffect, notify } from "../effects.ts";
 import type { Handler } from "../engine.ts";
 import type { Effect, NotifyKind } from "../ledger.ts";
-import { deepFind, errMsg, log, runProcess, truncate } from "../util.ts";
+import { deepFind, errMsg, log, truncate } from "../util.ts";
 import { draftCard, eveningCard, itemCard, KIND_LABEL, morningCard, type CtxRenderCtx } from "./cards.ts";
 import { Connectors, relinkMeegoItems } from "./connectors.ts";
 import { defaultDraftKind, Drafter } from "./drafts.ts";
@@ -164,10 +164,9 @@ export class ContextService {
   private async ensureOwnerName(): Promise<void> {
     if (this.app.store.get("ctx.owner_name")) return;
     try {
-      // 新版 lark-cli 的 auth status 是裸 JSON（没有 ok/data 信封）
-      const r = await runProcess(this.cfg.bins.lark, ["auth", "status", "--json"], { timeoutMs: 30_000, cwd: this.cfg.dataDir });
-      const st = JSON.parse(r.stdout.trim() || "{}") as unknown;
-      const name = String(deepFind(st, "userName") ?? deepFind(st, "user_name") ?? deepFind(st, "name") ?? "");
+      const st = await this.app.lark.authStatus();
+      const ids = (st.identities ?? {}) as Record<string, { userName?: string; user_name?: string } | undefined>;
+      const name = String(ids.user?.userName ?? ids.user?.user_name ?? deepFind(st, "userName") ?? deepFind(st, "user_name") ?? deepFind(st, "name") ?? "");
       if (name) this.app.store.set("ctx.owner_name", name);
     } catch (e) {
       log("warn", "取不到你的飞书名字", { err: errMsg(e) });

@@ -1,5 +1,5 @@
 import type { Config } from "./config.ts";
-import { runProcess } from "./util.ts";
+import { deepFind, runProcess } from "./util.ts";
 
 export class LarkError extends Error {
   exitCode: number;
@@ -52,12 +52,38 @@ export class Lark {
     );
   }
 
+  /**
+   * 读取 lark-cli auth status：新版输出裸 JSON（无 ok/data 信封），旧版与测试桩带信封，两者都兼容。
+   */
+  async authStatus(): Promise<Record<string, unknown>> {
+    const r = await runProcess(this.cfg.bins.lark, ["auth", "status", "--json"], {
+      cwd: this.cfg.dataDir,
+      timeoutMs: 30_000,
+    });
+    if (r.timedOut) throw new LarkError("lark-cli auth status 超时", 1);
+    const s = parseEnvelope(r.stdout) ?? parseEnvelope(r.stderr);
+    if (r.code !== 0 || !s || s.ok === false) {
+      const e = (s?.error ?? {}) as Record<string, string>;
+      const topMsg = typeof (s as Record<string, unknown> | undefined)?.message === "string" ? String((s as Record<string, unknown>).message) : undefined;
+      const msg = e.message ?? topMsg ?? (r.stderr.trim() || r.stdout.trim() || `exit ${r.code}`);
+      throw new LarkError(`lark-cli auth status 失败：${msg}`, r.code === 0 ? 1 : r.code, e.type, e.subtype, e.hint);
+    }
+    return (s.ok === true && s.data !== undefined && typeof s.data === "object" && s.data !== null ? s.data : s) as Record<string, unknown>;
+  }
+
   /** 以机器人身份给本人发 Markdown 私信（机器人只给主人发消息）。 */
   async notifyOwner(markdown: string, idempotencyKey?: string): Promise<void> {
     const args = ["im", "+messages-send", "--user-id", this.cfg.owner.open_id, "--markdown", "-"];
     if (idempotencyKey) args.push("--idempotency-key", idempotencyKey.slice(0, 50));
     await this.run(args, { as: "bot", input: markdown });
   }
+}
+
+/** 从 lark-cli auth status（裸 JSON 或信封解包后）里提取当前用户的 open_id。 */
+export function extractOwnerOpenId(status: Record<string, unknown>): string {
+  const ids = (status.identities ?? {}) as Record<string, { openId?: string; open_id?: string } | undefined>;
+  const id = ids.user?.openId ?? ids.user?.open_id ?? deepFind(status, "open_id") ?? deepFind(status, "user_open_id") ?? deepFind(status, "openId") ?? "";
+  return String(id);
 }
 
 function parseEnvelope(text: string): { ok?: boolean; data?: unknown; error?: unknown } | undefined {
