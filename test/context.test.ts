@@ -403,10 +403,20 @@ test("控制台 API：今天 / 项目 / 事项 / 知识 / 动态 / 人 / 草稿 
     assert.ok(((await get("/api/context/people")) as { name: string }[]).some((x) => x.name === "王五"));
     assert.ok(((await get("/api/context/drafts?status=sent")) as unknown[]).length >= 2);
     const st = (await get("/api/context/status")) as { sources: { source: string }[]; totals: { projects: number } };
-    assert.equal(st.sources.length, 5);
+    assert.equal(st.sources.length, 6);
     const res = await fetch(srv.url + "/api/context/items/nope", { headers: { Authorization: `Bearer ${token}` } });
     assert.equal(res.status, 404);
   } finally {
     await srv.close();
   }
+});
+
+test("文档评论 @我：事件落库的信号转成观测，进入理解", async () => {
+  app.store.addSignal({ id: "comment:c1:", source: "文档评论@我", text: "文档 docx/abc 的评论：@张三 这段口径请确认", link: "https://feishu.cn/docx/abc" });
+  const r = svc.connectors.pullComments();
+  assert.equal(r.count, 1);
+  const o = svc.store.obs("doc:comment:c1:")!;
+  assert.equal(o.source, "doc");
+  assert.ok(svc.store.pendingConvs(10).some((c) => c.conv === "doc:https://feishu.cn/docx/abc"));
+  assert.equal(svc.connectors.pullComments().count, 0, "游标：不重复");
 });

@@ -331,7 +331,7 @@ export type ServerEvent =
 export type CtxItemKind = "todo" | "ask_me" | "my_commitment" | "waiting_on" | "meeting_action" | "risk";
 export type CtxItemStatus = "open" | "done" | "dismissed" | "snoozed";
 export type CtxPriority = "high" | "medium" | "low";
-export type CtxSource = "meego" | "im" | "minutes" | "task" | "calendar" | "manual";
+export type CtxSource = "meego" | "im" | "minutes" | "task" | "calendar" | "doc" | "manual";
 
 export interface CtxEvidenceView {
   obs_id: string;
@@ -386,6 +386,8 @@ export interface CtxItemView {
   needs_review: boolean;
   feedback: "" | "right" | "wrong" | "unimportant";
   url: string;
+  /** 适合起草哪种草稿（空 = 不适合起草） */
+  draft_kind: "" | CtxDraftKind;
 }
 
 export interface CtxItemDetail extends CtxItemView {

@@ -266,7 +266,7 @@ export class ContextStore {
   }
 
   /** 待理解的会话（按最早未处理观测排序），排除静音会话 */
-  pendingConvs(limit: number, sources: string[] = ["im", "minutes"]): { conv: string; conv_name: string; n: number }[] {
+  pendingConvs(limit: number, sources: string[] = ["im", "minutes", "doc"]): { conv: string; conv_name: string; n: number }[] {
     const q = `SELECT conv, MAX(conv_name) AS conv_name, COUNT(*) AS n, MIN(time) AS t FROM ctx_obs
                WHERE processed = 0 AND source IN (${sources.map(() => "?").join(",")}) AND conv NOT IN (SELECT conv FROM ctx_mute_conv)
                GROUP BY conv ORDER BY t LIMIT ?`;
@@ -274,7 +274,7 @@ export class ContextStore {
   }
 
   pendingCount(): number {
-    return (this.db.prepare("SELECT COUNT(*) AS n FROM ctx_obs WHERE processed = 0 AND source IN ('im','minutes')").get() as { n: number }).n;
+    return (this.db.prepare("SELECT COUNT(*) AS n FROM ctx_obs WHERE processed = 0 AND source IN ('im','minutes','doc')").get() as { n: number }).n;
   }
 
   /** 一个会话最近的观测（包含已处理的作为背景） */

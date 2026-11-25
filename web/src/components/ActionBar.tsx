@@ -20,6 +20,19 @@ export const ACTION_LABEL: Record<CommandName, string> = {
   "work.retry": "重试",
   "work.acknowledge": "忽略",
   "job.run": "立即运行",
+  "context.refresh": "立即刷新",
+  "context.item_done": "完成",
+  "context.item_reopen": "重新打开",
+  "context.item_snooze": "稍后提醒",
+  "context.item_delegate": "交给 Agent",
+  "context.feedback": "反馈",
+  "context.project_mute": "静音项目",
+  "context.conv_mute": "静音会话",
+  "context.conflict_resolve": "确认结论",
+  "context.draft_create": "起草",
+  "context.draft_approve": "确认发送",
+  "context.draft_discard": "丢弃草稿",
+  "context.weekly_report": "起草周报",
 };
 
 const PRIMARY = new Set<string>(["delivery.create_pr", "dispatch.rework"]);

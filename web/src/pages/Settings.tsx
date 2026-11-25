@@ -11,7 +11,7 @@ import { useToast } from "../lib/toast.tsx";
 type Obj = Record<string, any>;
 
 /** 可编辑的顶层配置段（只把改动过的段整段发回去）。 */
-const EDITABLE = ["roles", "dispatch", "acceptance", "budget", "notify", "schedules", "delivery"] as const;
+const EDITABLE = ["context", "roles", "dispatch", "acceptance", "budget", "notify", "schedules", "delivery"] as const;
 
 export function getIn(o: unknown, path: string): any {
   return path.split(".").reduce<any>((v, k) => (v && typeof v === "object" ? v[k] : undefined), o);
@@ -378,7 +378,8 @@ const NOTIFY_TYPES: { key: string; label: string; hint: string }[] = [
   { key: "progress", label: "派单进度", hint: "开始执行、进入验收等阶段变化" },
   { key: "result", label: "验收结果", hint: "通过 / 需介入 / 出错" },
   { key: "failure", label: "失败告警", hint: "事件或飞书写入重试耗尽、作业中断" },
-  { key: "brief", label: "晨报 / 晚报", hint: "每天的分区摘要" },
+  { key: "brief", label: "晨报 / 晚报", hint: "每天的分区摘要（启用工作上下文时为晨间卡 / 收尾卡）" },
+  { key: "nudge", label: "实时提醒", hint: "新出现的紧急请求、风险、快到期的承诺" },
 ];
 
 const SCHEDULES: { key: string; label: string; hint: string }[] = [
@@ -389,6 +390,7 @@ const SCHEDULES: { key: string; label: string; hint: string }[] = [
 ];
 
 const PATH_LABEL: Record<string, string> = {
+  context: "工作上下文",
   roles: "执行者",
   dispatch: "派单",
   acceptance: "验收",
@@ -621,6 +623,48 @@ export function SettingsForm({ view, onSaved }: { view: SettingsView; onSaved: (
             <p className="muted small">没有配置单价，只记录耗时。</p>
           )}
         </Section>
+
+        {!!view.config.context && (
+          <Section id="context" title="工作上下文" keys={["context"]} hot={hot} dirty={isDirty("context")} desc="从 Meego、飞书消息、妙记、日历和飞书任务里识别你的项目、事项、知识和动态。对外可见的动作永远需要你确认。">
+            <div className="toggles">
+              <Toggle path="context.understand" label="理解消息内容" hint="把采集到的消息交给模型抽取事项；关闭后只采集 Meego 与飞书任务" />
+              <Toggle path="context.nudge" label="实时提醒" hint="新出现的紧急请求 / 风险立刻发卡片" />
+            </div>
+            <h3 className="group-title">来源</h3>
+            <div className="toggles">
+              <Toggle path="context.sources.meego" label="Meego 待办" />
+              <Toggle path="context.sources.im" label="飞书消息" hint="@我、私聊、我发言过的群" />
+              <Toggle path="context.sources.minutes" label="妙记" />
+              <Toggle path="context.sources.calendar" label="日历" />
+              <Toggle path="context.sources.tasks" label="飞书任务" />
+              <Toggle path="context.sources.docs" label="文档评论 @我" hint="需开启事件 drive.notice.comment_add_v1" />
+            </div>
+            <div className="form-grid">
+              <Select path="context.harness" label="理解用的执行者" options={[{ value: "", label: "跟随「大脑」" }, ...Object.keys(view.config.harnesses ?? {}).map((h) => ({ value: h, label: h }))]} />
+              <Select
+                path="context.groups"
+                label="群消息范围"
+                options={[
+                  { value: "spoken", label: "我发言过的群" },
+                  { value: "allowlist", label: "只看白名单里的群" },
+                ]}
+              />
+              <Num path="context.max_groups" label="最多读几个群" min={1} />
+              <Num path="context.min_confidence" label="待确认阈值" min={0} step={0.05} hint="识别把握低于它的事项标为「待确认」" />
+              <Num path="context.legacy_days" label="历史遗留天数" min={30} suffix="天" hint="Meego / 飞书任务超过这么久没动静视为历史遗留" />
+              <Text path="context.schedule" label="采集周期" hint="cron；改后需重启" />
+              <Text path="context.morning" label="晨间卡" hint="cron；改后需重启" />
+              <Text path="context.evening" label="收尾卡" hint="cron；改后需重启" />
+              <Text path="context.weekly" label="周报草稿" hint="cron；改后需重启" />
+            </div>
+            <h3 className="group-title">自主等级（只影响你自己的低风险动作）</h3>
+            <div className="toggles">
+              <Toggle path="context.autonomy.auto_close" label="有证据时自动关闭事项" hint="例如你已在群里回复、Meego 节点已流转" />
+              <Toggle path="context.autonomy.mute_legacy" label="自动静音历史遗留项目" />
+              <Toggle path="context.autonomy.create_own_todo" label="把你的承诺建成飞书任务" hint="只建给你自己" />
+            </div>
+          </Section>
+        )}
 
         <Section id="notify" title="通知" keys={["notify"]} hot={hot} dirty={isDirty("notify")}>
           <div className="form-grid">

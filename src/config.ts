@@ -204,6 +204,8 @@ const Schema = z.object({
           minutes: z.boolean().default(true),
           calendar: z.boolean().default(true),
           tasks: z.boolean().default(true),
+          /** 文档评论 @我（来自 drive.notice.comment_add_v1 事件，需在 events.doc_comments 开启） */
+          docs: z.boolean().default(true),
         })
         .prefault({}),
       /** 群消息范围：spoken = @我、私聊和我发言过的群；allowlist = 只看 groups_allow 里的群（加上 @我、私聊） */

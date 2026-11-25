@@ -130,6 +130,7 @@ export class Connectors {
     await step("im", s.im, () => this.pullIm());
     await step("minutes", s.minutes, () => this.pullMinutes());
     await step("calendar", s.calendar, () => this.pullCalendar());
+    await step("docs", s.docs, async () => this.pullComments());
     return out;
   }
 
@@ -423,6 +424,33 @@ export class Connectors {
     }
     const n = this.store.addObs(obs);
     this.setKv("cursor.minutes", String(now));
+    return { count: n };
+  }
+
+  // ───────── 文档评论 @我：事件已落在 signals 表（capture.onComment），这里转成观测 ─────────
+
+  pullComments(): { count: number } {
+    const since = Number(this.kv("cursor.comments") ?? 0);
+    const rows = this.store.db
+      .prepare("SELECT id, text, link, at FROM signals WHERE id LIKE 'comment:%' AND at > ? ORDER BY at LIMIT 200")
+      .all(since) as { id: string; text: string; link: string; at: number }[];
+    if (!rows.length) return { count: 0 };
+    const obs: Obs[] = rows.map((r) => ({
+      id: `doc:${r.id}`,
+      source: "doc",
+      kind: "doc_comment",
+      conv: `doc:${r.link}`,
+      conv_name: `文档评论：${r.link.split("/").slice(-2).join("/")}`,
+      actor_id: "",
+      actor_name: "文档评论@我",
+      is_me: false,
+      time: r.at,
+      text: textOf(r.text).slice(0, 2000),
+      url: r.link,
+      meta: {},
+    }));
+    const n = this.store.addObs(obs);
+    this.setKv("cursor.comments", String(Math.max(...rows.map((r) => r.at))));
     return { count: n };
   }
 

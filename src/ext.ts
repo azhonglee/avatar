@@ -73,6 +73,8 @@ export interface Extensions {
     status(): CtxStatus;
     /** 常驻进程里启动定时采集、晨间 / 收尾卡、周报草稿 */
     start(): { stop(): void };
+    /** 尽快跑一轮（例如收到文档评论 @我 事件后） */
+    refresh(): void;
     /** 立即跑一轮采集 + 理解（命令行用） */
     runOnce(): Promise<CtxCycleReport>;
     /** 发晨间 / 收尾卡（命令行、定时任务用） */

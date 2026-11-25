@@ -15,7 +15,7 @@ const META: Meta = {
   roles: { brain: "claude", reviewer: "codex", default_harness: "codex" },
   repos: [{ alias: "demo", path: "/tmp/demo", verify: "npm test" }],
   providers: [{ name: "github", type: "github" }],
-  features: { cards: true, delivery: true, usage: true, settings: true, doctor: true, candidates: true },
+  features: { cards: true, delivery: true, usage: true, settings: true, doctor: true, candidates: true, context: false },
   lark_web: "https://feishu.cn",
 };
 

@@ -31,6 +31,12 @@ harnesses:
   #     ANTHROPIC_BASE_URL: <方舟的 Anthropic 兼容地址>
   #     ANTHROPIC_AUTH_TOKEN: ${ARK_API_KEY}
 
+  # Codex CLI 直连（codex exec，只读沙箱、无工具）：适合「工作上下文」的理解与起草，不需要 acpx
+  # codex-ro:
+  #   type: codex-exec
+  #   cmd: codex               # 可写绝对路径
+  #   model: ""               # 留空用 codex 默认模型
+
 roles:
   brain: claude      # 分诊、私聊对话、知识库整理
   reviewer: codex    # 派单结果的交叉审查；留空则不审查（此时结果按 acceptance.on_unverified 处理）
@@ -104,13 +110,41 @@ notify:
     result: true
     failure: true
     brief: true
+    nudge: true               # 工作上下文的实时提醒（新出现的紧急请求 / 风险）
+
+# 工作上下文：从 Meego、飞书消息、妙记、日历、飞书任务、文档评论里识别你的项目 / 事项 / 知识 / 动态 / 人，
+# 每天给你晨间卡、收尾卡，紧急的事实时提醒，并起草回复 / 跟进 / Meego 评论 / 周报（你确认后才以你本人身份发出）。
+# ⚠️ 隐私：开启 understand 后，采集到的消息内容会发给 context.harness（缺省 roles.brain）对应的模型服务。
+context:
+  enabled: true
+  harness: ""                 # 理解与起草用哪个 harness；留空用 roles.brain。例如上面的 codex-ro
+  understand: true            # false：只采集 Meego 与飞书任务，不把消息内容发给模型
+  lookback_days: 7            # 第一次运行回看几天
+  schedule: "*/10 * * * *"    # 采集 + 理解周期
+  morning: "30 8 * * 1-5"     # 晨间卡（启用后代替原来的晨报）
+  evening: "30 18 * * 1-5"    # 收尾卡（代替晚报）
+  weekly: "0 17 * * 5"        # 周报草稿
+  sources: { meego: true, im: true, minutes: true, calendar: true, tasks: true, docs: true }
+  groups: spoken              # spoken：@我、私聊和我发言过的群；allowlist：只看 groups_allow 里的群
+  groups_allow: []
+  groups_deny: []             # 永远不读的会话（chat_id 或群名关键字）
+  max_groups: 40
+  bot_allow: [Meego, 项目管理, Codebase, 云文档, 审批, 智能纪要, MLOps, Bits]   # 保留哪些机器人的通知，其余当噪音
+  legacy_days: 180            # Meego / 飞书任务超过这么久没动静视为历史遗留（自动静音）
+  min_confidence: 0.5         # 低于它的识别结果标为「待确认」
+  max_convs_per_cycle: 30
+  nudge: true
+  autonomy:                   # 只影响你自己的低风险动作；对外可见的动作永远需要你确认草稿
+    auto_close: true          # 有证据（你已回复、Meego 节点已流转）时自动关闭事项
+    mute_legacy: true
+    create_own_todo: false    # 把你的承诺建成飞书任务（只建给你自己）
 
 capture:
   min_confidence: 0.6        # ≥ 该值进“待确认”
   auto_inbox_confidence: 0.9 # ≥ 该值直接进 Inbox
   lookback_hours: 24         # 第一次运行回看多久的消息
 
-schedules:                   # cron 表达式，按 owner.timezone
+schedules:                   # cron 表达式，按 owner.timezone（启用工作上下文时 capture / brief_* 不再使用）
   capture: "*/15 * * * *"
   dispatch: "*/5 * * * *"
   brief_morning: "30 8 * * 1-5"

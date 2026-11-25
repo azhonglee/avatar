@@ -14,7 +14,7 @@ function makeMeta(features?: Partial<Meta["features"]>): Meta {
     roles: { brain: "claude", reviewer: "codex", default_harness: "codex" },
     repos: [],
     providers: [],
-    features: { cards: false, delivery: false, usage: true, settings: true, doctor: true, candidates: true, ...features },
+    features: { cards: false, delivery: false, usage: true, settings: true, doctor: true, candidates: true, context: false, ...features },
     lark_web: "https://feishu.cn",
   };
 }

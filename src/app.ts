@@ -196,7 +196,10 @@ export async function runDaemon(app: App): Promise<void> {
   );
   const triageSoon = debounce(2000, guard("任务识别", () => capture.process()));
   hooks.onTaskUpdate = reconcileSoon;
-  hooks.onSignals = triageSoon;
+  // 启用工作上下文时，新信号（文档评论 @我、妙记）交给它理解，不再走候选任务分诊
+  const ctxRefresh = app.ext.context?.refresh;
+  const ctxSoon = ctxRefresh ? debounce(5000, async () => ctxRefresh()) : undefined;
+  hooks.onSignals = ctxSoon ?? triageSoon;
 
   engine.start();
   const subs: Subscription[] = [];
@@ -213,7 +216,8 @@ export async function runDaemon(app: App): Promise<void> {
   const opts = { timezone: cfg.owner.timezone, protect: true };
   const slot = (c: Cron) => (c.currentRun() ?? new Date()).toISOString().slice(0, 16);
   const crons = [
-    new Cron(cfg.schedules.capture, opts, guard("任务识别", () => capture.run())),
+    // 启用工作上下文时，消息由它采集与理解，不再跑候选任务识别
+    ...(app.ext.context ? [] : [new Cron(cfg.schedules.capture, opts, guard("任务识别", () => capture.run()))]),
     new Cron(cfg.schedules.dispatch, opts, async () => reconcileSoon()),
     // 启用工作上下文时，晨报 / 晚报由它的晨间卡、收尾卡代替
     ...(app.ext.context
@@ -261,6 +265,7 @@ export async function runDaemon(app: App): Promise<void> {
       contextSchedule?.stop();
       reconcileSoon.cancel();
       triageSoon.cancel();
+      ctxSoon?.cancel();
       clearInterval(heartbeat);
       await server?.close();
       await events.stop();

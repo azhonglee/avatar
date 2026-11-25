@@ -659,6 +659,7 @@ export function registerContext(app: App): ContextService | undefined {
     drafts: (status) => (svc.syncDrafts(), svc.store).drafts(status ? { status: status.split(",") as never } : {}).map((d) => svc.views.draftView(d)),
     status: () => svc.views.status(svc.running),
     start: () => svc.start(),
+    refresh: () => void svc.enqueue(`cycle:hint-${Math.floor(Date.now() / 60_000)}`, { task: "cycle" }),
     runOnce: () => svc.runOnce(),
     sendDigest: (mode) => svc.sendDigest(mode),
   };

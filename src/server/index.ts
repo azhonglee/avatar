@@ -228,6 +228,8 @@ export async function startServer(app: App, o: { version: string; port?: number;
       broadcast({ type: "candidate", signal_id: e.signalId });
     }),
     app.bus.on("command.executed", (e) => broadcast({ type: "command", name: e.name, ok: e.ok, target: e.target })),
+    // 飞书写入落定（如草稿已发送）：控制台据此刷新对应资源
+    app.bus.on("effect.settled", (e) => broadcast({ type: "work", id: e.id, kind: "effect", ref: e.ref, state: e.state, terminal: true })),
   ];
   // 跨进程变化（命令行、另一个进程）：轮询账本的最后更新时间
   let lastMax = 0;

@@ -10,8 +10,10 @@ export function eventTags(e: ServerEvent): string[] | "all" {
         case "dispatch":
           return ["overview", "dispatches", `dispatch:${e.id}`, `card:${e.ref}`, "usage"];
         case "effect":
-          // 飞书写入：ref 是产生它的工作（派单 id 等）
-          return ["health", "overview", `dispatch:${e.ref}`];
+          // 飞书写入：ref 是产生它的工作（派单 id 等；工作上下文的草稿是 ctx-draft:<id>）
+          return e.ref.startsWith("ctx-") || e.ref.startsWith("context:") ? ["context", "health"] : ["health", "overview", `dispatch:${e.ref}`];
+        case "context":
+          return ["context"];
         case "delivery":
           return ["overview", "dispatches", `dispatch:${e.ref}`, "health"];
         case "job":

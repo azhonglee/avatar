@@ -14,6 +14,7 @@ import type {
   CtxToday,
   CtxUpdateView,
 } from "../api/types.ts";
+import { defaultDraftKind } from "./drafts.ts";
 import type { ContextStore, DraftRow, ItemRow, ProjectRow } from "./store.ts";
 
 /**
@@ -138,6 +139,7 @@ export class ContextViews {
       needs_review: !!it.meta.needs_review,
       feedback: it.feedback,
       url: String(it.meta.url ?? "") || this.store.lastEvidenceObs("item", it.id)?.url || "",
+      draft_kind: it.status === "open" ? (defaultDraftKind(it) ?? "") : "",
     };
   }
 
@@ -247,7 +249,7 @@ export class ContextViews {
 
   status(running: boolean): CtxStatus {
     const kv = this.app.store;
-    const sources = ["meego", "tasks", "im", "minutes", "calendar"].map((s) => {
+    const sources = ["meego", "tasks", "im", "minutes", "calendar", "docs"].map((s) => {
       const r = JSON.parse(kv.get(`ctx.source.${s}`) ?? "null") as { at?: number; count?: number; error?: string } | null;
       return { source: s, last_pull: r?.at ?? null, last_count: r?.count ?? 0, error: r?.error ?? "" };
     });

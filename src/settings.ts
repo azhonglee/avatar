@@ -23,9 +23,9 @@ import { errMsg, log } from "./util.ts";
 
 export const MASK = "******";
 
-const HOT = new Set(["notify", "budget", "acceptance", "capture", "dispatch", "delivery", "cards", "lark_web", "applink_host"]);
-/** 热加载分组里仍需重启的字段（引擎并发上限在启动时确定） */
-const COLD_PATHS = new Set(["dispatch.max_parallel"]);
+const HOT = new Set(["notify", "budget", "acceptance", "capture", "dispatch", "delivery", "cards", "lark_web", "applink_host", "context"]);
+/** 热加载分组里仍需重启的字段（引擎并发上限、定时任务、模块开关在启动时确定） */
+const COLD_PATHS = new Set(["dispatch.max_parallel", "context.enabled", "context.schedule", "context.morning", "context.evening", "context.weekly"]);
 const FORBIDDEN = ["data_dir", "bins"];
 
 type Obj = Record<string, unknown>;
@@ -85,6 +85,7 @@ export function crossCheck(cfg: z.infer<typeof ConfigSchema>): Issue[] {
     ["roles.brain", cfg.roles.brain],
     ["roles.reviewer", cfg.roles.reviewer],
     ["dispatch.default_harness", cfg.dispatch.default_harness],
+    ["context.harness", cfg.context.harness],
     ...Object.entries(cfg.jobs).map(([n, j]) => [`jobs.${n}.harness`, j.harness ?? ""] as [string, string]),
   ];
   for (const [p, name] of refs) if (name && !hasHarness(name)) issues.push({ path: p, message: `引用了未定义的 harness：${name}` });
@@ -111,6 +112,7 @@ export function crossCheck(cfg: z.infer<typeof ConfigSchema>): Issue[] {
   const crons: [string, string][] = [
     ...Object.entries(cfg.schedules).map(([k, v]) => [`schedules.${k}`, v] as [string, string]),
     ...Object.entries(cfg.jobs).map(([n, j]) => [`jobs.${n}.cron`, j.cron] as [string, string]),
+    ...(["schedule", "morning", "evening", "weekly"] as const).map((k) => [`context.${k}`, cfg.context[k]] as [string, string]),
   ];
   for (const [p, expr] of crons) {
     try {
@@ -119,6 +121,13 @@ export function crossCheck(cfg: z.infer<typeof ConfigSchema>): Issue[] {
       issues.push({ path: p, message: `无效的 cron 表达式「${expr}」：${errMsg(e)}` });
     }
   }
+  cfg.context.bot_allow.forEach((p, i) => {
+    try {
+      new RegExp(p);
+    } catch {
+      issues.push({ path: `context.bot_allow.${i}`, message: `无效的正则：${p}` });
+    }
+  });
   if (cfg.capture.auto_inbox_confidence < cfg.capture.min_confidence)
     issues.push({ path: "capture.auto_inbox_confidence", message: "直接进 Inbox 的置信度不能低于进“待确认”的置信度" });
   return issues;

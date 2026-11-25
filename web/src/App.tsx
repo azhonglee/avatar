@@ -7,6 +7,10 @@ import { LiveProvider, useServerEvents, type LiveState } from "./lib/events.ts";
 import { MetaProvider } from "./lib/meta.ts";
 import { useQuery } from "./lib/query.ts";
 import { CandidatesPage } from "./pages/Candidates.tsx";
+import { DraftsPage, KnowledgePage, PeoplePage, UpdatesPage } from "./pages/ContextMisc.tsx";
+import { ItemDetailPage, ItemsPage } from "./pages/Items.tsx";
+import { ProjectDetailPage, ProjectsPage } from "./pages/Projects.tsx";
+import { TodayPage } from "./pages/Today.tsx";
 import { DispatchDetailPage } from "./pages/DispatchDetail.tsx";
 import { DispatchesPage } from "./pages/Dispatches.tsx";
 import { HealthPage } from "./pages/Health.tsx";
@@ -24,17 +28,29 @@ interface NavItem {
   icon: string;
   show: (m: Meta) => boolean;
   end?: boolean;
+  /** 启用工作上下文时，派单相关的页面收进“更多” */
+  more?: boolean;
 }
 
+const ctx = (m: Meta) => !!m.features.context;
+
 const NAV: NavItem[] = [
-  { to: "/", label: "概览", icon: "◎", show: () => true, end: true },
-  { to: "/dispatches", label: "派单", icon: "➤", show: () => true },
-  { to: "/candidates", label: "候选任务", icon: "✦", show: (m) => m.features.candidates },
-  { to: "/jobs", label: "作业", icon: "⏱", show: () => true },
-  { to: "/health", label: "健康", icon: "♥", show: () => true },
-  { to: "/usage", label: "花费", icon: "$", show: (m) => m.features.usage },
-  { to: "/settings", label: "设置", icon: "⚙", show: (m) => m.features.settings },
-  { to: "/setup", label: "初始化向导", icon: "✓", show: (m) => m.features.doctor },
+  { to: "/", label: "今天", icon: "☀", show: ctx, end: true },
+  { to: "/projects", label: "项目", icon: "◇", show: ctx },
+  { to: "/items", label: "事项", icon: "☐", show: ctx },
+  { to: "/knowledge", label: "知识", icon: "❖", show: ctx },
+  { to: "/updates", label: "动态", icon: "~", show: ctx },
+  { to: "/people", label: "人", icon: "☺", show: ctx },
+  { to: "/drafts", label: "草稿", icon: "✎", show: ctx },
+  { to: "/", label: "概览", icon: "◎", show: (m) => !ctx(m), end: true },
+  { to: "/overview", label: "派单概览", icon: "◎", show: ctx, more: true },
+  { to: "/dispatches", label: "派单", icon: "➤", show: () => true, more: true },
+  { to: "/candidates", label: "候选任务", icon: "✦", show: (m) => m.features.candidates, more: true },
+  { to: "/jobs", label: "作业", icon: "⏱", show: () => true, more: true },
+  { to: "/health", label: "健康", icon: "♥", show: () => true, more: true },
+  { to: "/usage", label: "花费", icon: "$", show: (m) => m.features.usage, more: true },
+  { to: "/settings", label: "设置", icon: "⚙", show: (m) => m.features.settings, more: true },
+  { to: "/setup", label: "初始化向导", icon: "✓", show: (m) => m.features.doctor, more: true },
 ];
 
 const LIVE_LABEL: Record<LiveState, string> = {
@@ -79,12 +95,13 @@ function Shell({ meta, live }: { meta: Meta; live: LiveState }) {
           </span>
           <div>
             <div className="brand-name">Avatar</div>
-            <div className="brand-sub">个人 Agent 控制台</div>
+            <div className="brand-sub">{ctx(meta) ? "你的工作上下文" : "个人 Agent 控制台"}</div>
           </div>
         </div>
         <ul>
-          {NAV.filter((n) => n.show(meta)).map((n) => (
-            <li key={n.to}>
+          {NAV.filter((n) => n.show(meta)).map((n, i, all) => (
+            <li key={`${n.to}-${n.label}`}>
+              {ctx(meta) && n.more && !all[i - 1]?.more && <div className="nav-group">更多</div>}
               <NavLink to={n.to} end={n.end} className={({ isActive }) => `nav-link ${isActive ? "nav-active" : ""}`}>
                 <span className="nav-icon" aria-hidden>
                   {n.icon}
@@ -108,7 +125,17 @@ function Shell({ meta, live }: { meta: Meta; live: LiveState }) {
       {menu && <div className="nav-scrim" onClick={() => setMenu(false)} aria-hidden />}
       <main id="main" className="main" tabIndex={-1}>
         <Routes>
-          <Route path="/" element={<OverviewPage />} />
+          <Route path="/" element={ctx(meta) ? <TodayPage /> : <OverviewPage />} />
+          <Route path="/overview" element={<OverviewPage />} />
+          <Route path="/today" element={<Navigate to="/" replace />} />
+          <Route path="/projects" element={<ProjectsPage />} />
+          <Route path="/projects/:id" element={<ProjectDetailPage />} />
+          <Route path="/items" element={<ItemsPage />} />
+          <Route path="/items/:id" element={<ItemDetailPage />} />
+          <Route path="/knowledge" element={<KnowledgePage />} />
+          <Route path="/updates" element={<UpdatesPage />} />
+          <Route path="/people" element={<PeoplePage />} />
+          <Route path="/drafts" element={<DraftsPage />} />
           <Route path="/dispatches" element={<DispatchesPage />} />
           <Route path="/dispatches/:id" element={<DispatchDetailPage />} />
           <Route path="/candidates" element={<CandidatesPage />} />

@@ -132,7 +132,8 @@ test("集成：候选任务 → 发出交互卡片 → 经 API 确认 → 移到
   app.store.addSignal({ id: "msg:int_1", source: "群聊@我", text: "@主人 请评审 Q4 预算", link: "https://feishu.cn/x" });
   app.store.setVerdict("msg:int_1", "task(0.82)", taskGuid);
   app.bus.emit("candidate.created", { signalId: "msg:int_1", taskGuid, summary: "评审 Q4 预算", section: "pending" });
-  await new Promise((r) => setTimeout(r, 50));
+  // 建卡是异步的（先读任务信息）：等卡片进入 outbox，而不是固定睡一段时间（负载高时会不稳定）
+  for (let i = 0; i < 100 && !app.ledger.list({ kinds: ["effect"], ref: "card:candidate:msg:int_1", limit: 1 }).length; i++) await new Promise((r) => setTimeout(r, 20));
   await app.engine.drain(["effect"]);
   assert.ok(stubState().messages.some((m) => m.msg_type === "interactive" && JSON.stringify(m.card).includes("评审 Q4 预算")));
 
