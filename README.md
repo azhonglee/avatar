@@ -1,8 +1,10 @@
 # personal-agent (Avatar)
 
-飞书个人 superagent：在远程开发机上静默运行，识别和追踪任务、整理知识库、早晚提醒，并通过 [acpx](https://github.com/openclaw/acpx)（ACP）把工作派给 Claude Code / Codex / Gemini / DeepSeek Harness / Doubao 等不同 harness，执行后经确定性校验与另一 harness 交叉审查；提供**飞书交互卡片**（日常高频操作）与**本机 Web 控制台**（时间线、实时日志、diff、设置与健康管理），并打通到 PR / MR / 本地快进合并的交付闭环。
+飞书个人 superagent，替你维护一份始终最新的**工作上下文**：从飞书消息、Meego、妙记、日历、飞书任务和文档评论里识别你的项目、事项、知识、动态和人，每天告诉你先做什么、谁在等你、你答应过什么、哪里说法不一致，并帮你推进——起草回复 / 跟进 / Meego 评论 / 周报，**你确认后才以你本人身份发出**。需要动手的事可以一键交给 Claude Code / Codex / Gemini 等 harness 执行（经 [acpx](https://github.com/openclaw/acpx)），执行后经确定性校验与交叉审查，打通到 PR / MR / 本地合并。
 
-设计文档：[总体方案](docs/方案.md) · [可靠性设计](docs/可靠性设计.md) · [产品化架构](docs/产品化架构.md)。
+入口是**飞书交互卡片**（晨间卡、收尾卡、实时提醒、草稿）和**本机 Web 控制台**（今天 · 项目 · 事项 · 知识 · 动态 · 人 · 草稿；派单、健康、花费、设置在「更多」里）。
+
+设计文档：[工作上下文](docs/工作上下文.md) · [总体方案](docs/方案.md) · [可靠性设计](docs/可靠性设计.md) · [产品化架构](docs/产品化架构.md)。
 
 ## 快速开始
 
@@ -26,7 +28,10 @@ bin/pa doctor                          # 逐项体检（缺项附修复指引）
 bin/pa init                            # 建「Agent 看板」任务清单和「个人知识库」空间
 bin/pa publish-doc docs/方案.md --parent 项目   # 把方案发布成飞书文档
 
-# 4. 常驻运行 & 打开控制台
+# 4. 先试一轮工作上下文（会把消息内容发给 context.harness 对应的模型，见 docs/工作上下文.md）
+bin/pa context run && bin/pa context today
+
+# 5. 常驻运行 & 打开控制台
 bin/pa run                             # 前台试跑；常驻见 deploy/
 bin/pa console                         # 打印带令牌的控制台登录链接（默认 http://<局域网IP>:7878）
 ```
@@ -37,7 +42,10 @@ bin/pa console                         # 打印带令牌的控制台登录链接
 
 | 你做什么 | 发生什么 |
 |---|---|
-| 什么都不做 | 每 15 分钟识别 @我/私聊/评论/妙记里的任务 → 发出**候选任务卡片**（「是任务 / 不是任务 / 派给 Agent」，反馈会校准后续分诊）；工作日 8:30、18:30 发早晚报卡片；周五整理知识库 |
+| 什么都不做 | 每 10 分钟采集 Meego / 消息 / 妙记 / 日历 / 飞书任务 / 文档评论并理解（每条结论都带原文证据）；工作日 8:30 发**晨间卡**（先做这几件、需要你判断的冲突、今天的会、24 小时变化），18:30 发**收尾卡**；新出现的紧急请求或风险**实时提醒**；周五起草周报 |
+| 在卡片或控制台上处理事项 | 「完成 / 稍后 / 不对 / 不重要」；「不对」会作为校准样例让之后的识别更准。冲突选一个说法为准，会沉淀为项目的决策知识 |
+| 让我帮你推进 | 「起草」回复 / 跟进 / Meego 评论 / 周报 → 草稿卡片里可直接修改 → 「以我的身份发送」。不确认就什么都不会发出 |
+| 交给 Agent | 事项详情里「交给 Agent」新建派单，描述附上上下文和原文链接 |
 | 派单（拖卡片 / 私聊 `/do` / 控制台） | 私聊 `/do` 弹出派单表单卡片（不用记格式），也可拖卡片进「派给Agent」或从控制台新建。同一任务在飞书只有一张**派单卡片**，随阶段原地更新；完成后先跑仓库 `verify` 命令再由另一 harness 交叉审查。**通过验收**进「待验收」，否则进「需人工介入」 |
 | 验收交付（卡片或控制台） | 一键「创建 PR」（GitHub / GitLab / 公司 Codebase）、「合并到本地分支」（仅快进）、「带意见返工」、「换执行者重试」或「放弃」（保留期内可恢复） |
 | 把进行中的卡片拖走 / 点取消 | 按任务 ID 核实后取消这次派单并结束 harness 进程组，改动保留在 worktree |
@@ -48,6 +56,7 @@ bin/pa console                         # 打印带令牌的控制台登录链接
 
 ```
 pa doctor | init | run | brief [morning|evening] [--print] | capture | dispatch | status
+pa context run | today | digest [morning|evening] [--print]   工作上下文：采集理解一轮 / 看今天 / 发晨间卡
 pa console [--rotate]                  打印控制台登录链接（--rotate 作废旧令牌）
 pa command <名称> [JSON 参数]          通过统一命令层执行操作（与卡片/控制台按钮一致）
 pa job <名称> | ask <文字> | publish-doc <file.md> [--title] [--parent 节点名]
@@ -75,6 +84,8 @@ src/
   notify-prefs.ts   通知偏好（免打扰时段、按类型开关、失败告警不拦截）
   usage.ts          acpx 用量解析、按天/执行者/任务统计、每日与单任务预算守卫
   candidates.ts     候选任务反馈、准确率统计、分诊校准闭环
+  context/          工作上下文：connectors（采集）· understand（带证据的理解）· store（ctx_* 图谱）·
+                    views（排序与视图）· drafts（起草）· cards（晨间卡 / 收尾卡 / 提醒 / 草稿）· index（周期、命令、自主等级）
   config.ts / lark.ts / guard.ts / harness.ts / events.ts / board.ts / store.ts
   workflows/        triage.ts / capture.ts / dispatch.ts / brief.ts / agent.ts
 web/                React + Vite + TypeScript 本机控制台 SPA + scripts/demo-server.ts
@@ -87,6 +98,7 @@ test/               后端单元/引擎/集成/端到端测试（桩程序，不
 
 - **能重启就能续跑**：所有工作和飞书写操作都记在本地 SQLite 账本里，租约过期或持有者进程已死即被接管，从 git 检查点继续。详见 [docs/可靠性设计.md](docs/可靠性设计.md)。
 - **完成 = 达标**：派单是否进「待验收」由验收关卡决定（确定性校验 + 结构化审查），未通过/无校验/审查器故障进「需人工介入」。
+- **对外动作只在你确认后发生**：工作上下文的理解与起草都没有工具、没有写权限，消息内容按不可信数据处理；回复 / 评论 / 建文档只在你确认草稿后经 outbox 以你本人身份执行。开启理解会把消息内容发给所选模型服务（`context.understand: false` 可关闭）。
 - **飞书权限守卫**：分诊和 worker 不能调用 `lark-cli`；superagent 作业只放行读和白名单写操作，审计记入 `<data_dir>/logs/guard.log`。机器人和卡片按钮只响应主人本人。
 - **控制台鉴权与边界**：默认监听 `0.0.0.0`（可设为 `127.0.0.1` 仅限本机），访问需令牌（HttpOnly + SameSite=Strict Cookie），写请求校验同源与 JSON，禁止经 API 修改 `data_dir` / `bins`，日志读取限定在 `data_dir` 内。
 - 守卫不是操作系统级沙箱：`--approve-all` 的 worker 仍可在开发机上执行命令，请只在你信任的仓库上派单。
