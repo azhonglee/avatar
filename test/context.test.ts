@@ -128,7 +128,8 @@ test("一轮周期：消息去噪 → 理解（无证据的结论被丢弃）→
       ],
     },
     tasks: [],
-    calendar: [{ summary: "Ark 周会", start_time: { datetime: iso(Date.now() + HOUR) }, end_time: { datetime: iso(Date.now() + 2 * HOUR) }, app_link: "https://applink.feishu.cn/cal/1" }],
+    // 正在进行的会：start 始终早于今天 24:00，end 始终晚于一小时前（23 点跑测试也不会跨到明天）
+    calendar: [{ summary: "Ark 周会", start_time: { datetime: iso(Date.now() - 10 * 60_000) }, end_time: { datetime: iso(Date.now() + 50 * 60_000) }, app_link: "https://applink.feishu.cn/cal/1" }],
   });
   writeFx("understand.json", {
     projects: [{ name: "Ark v2 发布", refs: ["meego:1001"], stage: "灰度中", my_role: "负责人" }],
@@ -552,4 +553,40 @@ test("冲突去重：换个说法的同一问题合并成一条；已有冲突�
   svc.store.db.prepare("INSERT INTO ctx_conflict (id, project_id, topic, claims, status, created) VALUES ('cfl_dup', ?, ?, '[]', 'open', ?)").run(p.id, "国内 stg Kafka 主副本切换是否阻断 Files API 产物登记", Date.now());
   assert.ok(svc.store.mergeConflicts() >= 1);
   assert.ok(!svc.store.conflict("cfl_dup"));
+});
+
+test("环境故障不误跳会话：harness 启动失败（ENOENT）连续 4 轮仍保留待处理消息", async () => {
+  const s4 = new ContextService(app);
+  s4.store.addObs([
+    {
+      id: "im:env_fail_1",
+      source: "im",
+      kind: "p2p",
+      conv: "oc_env_fail",
+      conv_name: "私聊：测试环境故障",
+      actor_id: "ou_x",
+      actor_name: "测试",
+      is_me: false,
+      time: Date.now(),
+      text: "请帮我看一下这个问题",
+      url: "",
+      meta: {},
+    },
+  ]);
+  const origCmd = app.cfg.harnesses.cx.cmd;
+  app.cfg.harnesses.cx.cmd = "/no/such/codex-bin";
+  try {
+    for (let i = 0; i < 4; i++) {
+      const r = await s4.cycle(`context:env-fail-${i}`);
+      assert.ok(r.errors.some((e) => /ENOENT/.test(e)), r.errors.join(";"));
+    }
+    assert.ok(s4.store.pendingConvs(50).some((c) => c.conv === "oc_env_fail"), "环境故障不该跳过会话");
+    assert.equal(app.store.get("ctx.fail.oc_env_fail"), undefined);
+  } finally {
+    app.cfg.harnesses.cx.cmd = origCmd;
+  }
+  writeFx("understand.json", {});
+  const okRun = await s4.cycle("context:env-recover");
+  assert.equal(okRun.errors.filter((e) => !/meego/.test(e)).length, 0);
+  assert.ok(!s4.store.pendingConvs(50).some((c) => c.conv === "oc_env_fail"), "环境恢复后正常理解完");
 });

@@ -73,6 +73,14 @@ export const UnderstandOut = z.object({
 });
 export type UnderstandOut = z.infer<typeof UnderstandOut>;
 
+/** 模型有输出但不是合法 JSON / 校验不通过：属于会话内容或格式问题，多次失败可跳过；与进程启动失败 / 超时等环境故障区分。 */
+export class UnderstandParseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnderstandParseError";
+  }
+}
+
 /** 从模型回复里取 JSON 对象（容忍代码块和前后文字）；validate 不通过时试下一个候选 */
 export function extractJson(text: string, validate: (v: unknown) => unknown = (v) => v): unknown {
   const blocks = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)].map((m) => m[1]).reverse();
@@ -86,7 +94,7 @@ export function extractJson(text: string, validate: (v: unknown) => unknown = (v
       // 试下一个
     }
   }
-  throw new Error(`模型输出不是合法的 JSON：${truncate(text, 300)}`);
+  throw new UnderstandParseError(`模型输出不是合法的 JSON：${truncate(text, 300)}`);
 }
 
 export function parseUnderstand(text: string): UnderstandOut {

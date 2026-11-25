@@ -232,3 +232,34 @@ roles: { brain: claude }
   assert.match(out, /pa init/);
   assert.match(out, /⚠️ {1,2}验收方式/);
 });
+
+test("doctor：codex-exec 执行者检查 cmd 可执行性，不要求 agent/agentCommand 或 acpx", async () => {
+  const dir = path.join(tmp, "codex-exec");
+  fs.mkdirSync(dir);
+  const fakeCmd = path.join(dir, "fake-codex");
+  fs.writeFileSync(fakeCmd, "#!/usr/bin/env sh\necho 0.1.0\n", { mode: 0o755 });
+  const cfgFile = path.join(dir, "config.yaml");
+  fs.writeFileSync(
+    cfgFile,
+    JSON.stringify({
+      data_dir: path.join(dir, "data"),
+      bins: { lark: path.join(STUBS, "lark-cli"), acpx: "/no/such/acpx" },
+      harnesses: {
+        "codex-ro": { type: "codex-exec", cmd: fakeCmd },
+        "codex-missing": { type: "codex-exec", cmd: "/no/such/codex" },
+      },
+      roles: { brain: "codex-ro" },
+      context: { harness: "codex-ro" },
+    }),
+  );
+  const a = createApp(loadConfig(cfgFile));
+  try {
+    const r = await runDoctor(a);
+    assert.equal(byId(r, "acpx").status, "skip", "未用到 acpx 类型时不报错");
+    assert.equal(byId(r, "harness:codex-ro").status, "ok");
+    assert.match(byId(r, "harness:codex-ro").detail, /工作上下文/);
+    assert.equal(byId(r, "harness:codex-missing").status, "fail");
+  } finally {
+    a.store.db.close();
+  }
+});

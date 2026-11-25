@@ -12,7 +12,7 @@ import { draftCard, eveningCard, itemCard, KIND_LABEL, morningCard, type CtxRend
 import { Connectors, relinkMeegoItems } from "./connectors.ts";
 import { defaultDraftKind, Drafter } from "./drafts.ts";
 import { ContextStore, type ItemRow } from "./store.ts";
-import { splitProject, Understander, type SplitResult } from "./understand.ts";
+import { splitProject, Understander, UnderstandParseError, type SplitResult } from "./understand.ts";
 import { ContextViews, startOfDay } from "./views.ts";
 
 /**
@@ -129,14 +129,18 @@ export class ContextService {
               return;
             }
             budget -= groups[gi].length;
-            rep.errors.push(`理解失败：${truncate(errMsg(res.reason), 300)}`);
-            // 同一会话连续失败 3 次就跳过，避免卡住后面的消息
-            for (const c of groups[gi]) {
-              const n = Number(kv.get(`ctx.fail.${c.conv}`) ?? 0) + 1;
-              kv.set(`ctx.fail.${c.conv}`, String(n));
-              if (n >= 3) {
-                const skipped = this.store.skipConv(c.conv);
-                log("warn", "会话理解连续失败，已跳过", { conv: c.conv_name, skipped });
+            const reason = truncate(errMsg(res.reason), 300);
+            rep.errors.push(`理解失败：${reason}`);
+            log("warn", "理解批次失败", { err: reason, convs: groups[gi].map((c) => c.conv_name) });
+            // 只在模型输出无法解析时按会话累计失败并在第 3 次跳过；spawn ENOENT / 超时 / 无输出等环境故障保留待处理，修复后继续跑
+            if (res.reason instanceof UnderstandParseError) {
+              for (const c of groups[gi]) {
+                const n = Number(kv.get(`ctx.fail.${c.conv}`) ?? 0) + 1;
+                kv.set(`ctx.fail.${c.conv}`, String(n));
+                if (n >= 3) {
+                  const skipped = this.store.skipConv(c.conv);
+                  log("warn", "会话理解连续失败，已跳过", { conv: c.conv_name, skipped, err: reason });
+                }
               }
             }
           });

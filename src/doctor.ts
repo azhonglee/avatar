@@ -198,10 +198,12 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
   });
 
   add("acpx", "acpx（调用各 harness）", async () => {
+    const needsAcpx = Object.values(cfg.harnesses).some((h) => h.type === "acpx");
     try {
       const v = await probe(cfg.bins.acpx);
       return ok(`${v.path}（${v.version}）`);
     } catch (e) {
+      if (!needsAcpx) return skip("未安装 acpx；当前配置未用到 acpx 类型的执行者");
       return fail(errMsg(e), `安装：\n\n${code("npm i -g acpx")}\n\n如果装在非默认位置，在配置里设置 ${code("bins.acpx")}`);
     }
   });
@@ -216,15 +218,12 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
   };
   for (const [name, h] of Object.entries(cfg.harnesses)) {
     add(`harness:${name}`, `执行者 ${name}`, async () => {
-      if (!h.agent === !h.agentCommand) return fail("必须且只能设置 agent 或 agentCommand 之一", `在设置页或配置文件的 ${code(`harnesses.${name}`)} 里修正`);
       const roles = [
         cfg.roles.brain === name && "brain",
         cfg.roles.reviewer === name && "reviewer",
         (cfg.dispatch.default_harness || cfg.roles.brain) === name && "默认执行者",
+        cfg.context.enabled && (cfg.context.harness || cfg.roles.brain) === name && "工作上下文",
       ].filter(Boolean);
-      const how = h.agent ? `acpx ${h.agent}${acpxAgents().has(h.agent) ? "（~/.acpx/config.json 自定义）" : ""}` : `acpx --agent '${h.agentCommand}'`;
-      const detail = `${how}${h.model ? `，模型 ${h.model}` : ""}${roles.length ? `，角色：${roles.join("、")}` : ""}（未实际调用模型）`;
-      if (!(await probeOk(cfg.bins.acpx))) return skip(`acpx 不可用，跳过：${detail}`);
       const problems: string[] = [];
       const fixes: string[] = [];
       const refs = [...new Set(Object.values(h.env).flatMap((v) => [...v.matchAll(/\$\{(\w+)\}/g)].map((m) => m[1])))];
@@ -233,6 +232,21 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
         problems.push(`环境变量未设置：${unset.join("、")}`);
         fixes.push(`在常驻进程的环境里设置 ${unset.map(code).join("、")}（systemd 用 ${code("Environment=")} 或 ${code("EnvironmentFile=")}）`);
       }
+      if (h.type === "codex-exec") {
+        let cmdPath = "";
+        try {
+          cmdPath = resolveBin(h.cmd);
+          fs.accessSync(cmdPath, fs.constants.X_OK);
+        } catch {
+          return fail(`找不到启动命令 ${h.cmd}`, `安装 Codex CLI 或在 ${code(`harnesses.${name}.cmd`)} 里写绝对路径`);
+        }
+        const detail = `${cmdPath} exec（只读）${h.model ? `，模型 ${h.model}` : ""}${roles.length ? `，角色：${roles.join("、")}` : ""}（未实际调用模型）`;
+        return problems.length ? warn(`${detail}；${problems.join("；")}`, fixes.join("\n\n")) : ok(detail);
+      }
+      if (!h.agent === !h.agentCommand) return fail("必须且只能设置 agent 或 agentCommand 之一", `在设置页或配置文件的 ${code(`harnesses.${name}`)} 里修正`);
+      const how = h.agent ? `acpx ${h.agent}${acpxAgents().has(h.agent) ? "（~/.acpx/config.json 自定义）" : ""}` : `acpx --agent '${h.agentCommand}'`;
+      const detail = `${how}${h.model ? `，模型 ${h.model}` : ""}${roles.length ? `，角色：${roles.join("、")}` : ""}（未实际调用模型）`;
+      if (!(await probeOk(cfg.bins.acpx))) return skip(`acpx 不可用，跳过：${detail}`);
       if (h.agentCommand) {
         const bin = h.agentCommand.trim().split(/\s+/)[0];
         try {
