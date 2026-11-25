@@ -3243,3 +3243,25 @@ textarea {
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+
+.proj-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.proj-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.proj-children {
+  margin-left: 22px;
+  padding-left: 14px;
+  border-left: 2px solid var(--border);
+}
+
+.proj-sub .proj-name {
+  font-size: 14px;
+}

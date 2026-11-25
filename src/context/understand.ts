@@ -28,6 +28,10 @@ export const UnderstandOut = z.object({
         my_role: z.string().default(""),
         stage: z.string().default(""),
         health: lowerEnum(["ok", "risk", "blocked", "unknown"], "unknown"),
+        /** 上级项目（名称或 ID）；顶层项目留空 */
+        parent: z.string().default(""),
+        /** archived：明确停止 / 结束的项目 */
+        status: lowerEnum(["active", "archived"], "active"),
       }),
     )
     .default([]),
@@ -64,25 +68,29 @@ export const UnderstandOut = z.object({
   updates: z.array(z.object({ project: z.string().default(""), time: z.string().default(""), summary: z.string(), evidence: z.array(Ev).default([]) })).default([]),
   people: z.array(z.object({ name: z.string(), open_id: z.string().default(""), relation: z.string().default(""), projects: z.array(z.string()).default([]) })).default([]),
   conflicts: z
-    .array(z.object({ project: z.string().default(""), topic: z.string(), claims: z.array(z.object({ claim: z.string(), obs_id: z.string().default(""), quote: z.string().default("") })).default([]) }))
+    .array(z.object({ ref: z.string().default(""), project: z.string().default(""), topic: z.string(), claims: z.array(z.object({ claim: z.string(), obs_id: z.string().default(""), quote: z.string().default("") })).default([]) }))
     .default([]),
 });
 export type UnderstandOut = z.infer<typeof UnderstandOut>;
 
-/** 从模型回复里取 JSON 对象（容忍代码块和前后文字） */
-export function parseUnderstand(text: string): UnderstandOut {
+/** 从模型回复里取 JSON 对象（容忍代码块和前后文字）；validate 不通过时试下一个候选 */
+export function extractJson(text: string, validate: (v: unknown) => unknown = (v) => v): unknown {
   const blocks = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)].map((m) => m[1]).reverse();
   const first = text.indexOf("{");
   const last = text.lastIndexOf("}");
   if (first >= 0 && last > first) blocks.push(text.slice(first, last + 1));
   for (const b of blocks) {
     try {
-      return UnderstandOut.parse(JSON.parse(b));
+      return validate(JSON.parse(b));
     } catch {
       // 试下一个
     }
   }
-  throw new Error(`理解结果不是合法的 JSON：${truncate(text, 300)}`);
+  throw new Error(`模型输出不是合法的 JSON：${truncate(text, 300)}`);
+}
+
+export function parseUnderstand(text: string): UnderstandOut {
+  return extractJson(text, (v) => UnderstandOut.parse(v)) as UnderstandOut;
 }
 
 export interface ApplyResult {
@@ -144,10 +152,12 @@ export class Understander {
       owner_name: this.app.store.get("ctx.owner_name") ?? "主人",
       now: new Date().toLocaleString("zh-CN", { timeZone: tz }),
       timezone: tz,
-      projects: projects.length ? projects.map((p) => projectLine(p)).join("\n") : "（暂无，按需新建）",
+      projects: projects.length ? projectTree(projects) : "（暂无，按需新建）",
       meego: this.unlinkedMeego() || "（无）",
       items: related.length ? related.map((i) => itemLine(i, this.store)).join("\n") : "（无）",
       feedback: this.feedbackText() || "（暂无）",
+      not_important: this.cfg.context.not_important.length ? this.cfg.context.not_important.map((x) => `- ${x}`).join("\n") : "（无）",
+      conflicts: this.store.conflicts("open").slice(0, 30).map((c) => `- [${c.id}] ${c.topic}（${this.store.project(c.project_id)?.name ?? "无项目"}）`).join("\n") || "（无）",
       conversations: sections.join("\n\n"),
     });
     return { prompt, obs: all, fresh, convs: used };
@@ -251,10 +261,32 @@ export class Understander {
     };
 
     this.store.tx(() => {
-      for (const p of out.projects) {
+      // 先建顶层（被别人引用为上级的），再建子项目
+      const parentNames = new Set(out.projects.map((p) => p.parent.trim()).filter(Boolean));
+      const ordered = [...out.projects].sort((a, b) => Number(!!a.parent.trim()) - Number(!!b.parent.trim()) || Number(parentNames.has(b.name)) - Number(parentNames.has(a.name)));
+      for (const p of ordered) {
         if (!p.name.trim()) continue;
+        let parentId: string | undefined;
+        const pk = p.parent.trim();
+        if (pk && pk !== p.name.trim() && pk !== p.ref) {
+          const parent = resolveProject(pk, Date.now()) ?? this.store.upsertProject({ name: pk }, Date.now());
+          batchProjects.set(pk, parent);
+          // 只允许两层：上级本身是子项目时挂到它的上级
+          parentId = parent.parent_id || parent.id;
+        }
         const row = this.store.upsertProject(
-          { id: p.ref && this.store.project(p.ref) ? p.ref : undefined, name: p.name.trim(), aliases: p.aliases, refs: p.refs.map((r) => r.trim()).filter(Boolean), description: p.description, my_role: p.my_role, stage: p.stage, health: p.health as ProjectRow["health"] },
+          {
+            id: p.ref && this.store.project(p.ref) ? p.ref : undefined,
+            name: p.name.trim(),
+            aliases: p.aliases,
+            refs: p.refs.map((r) => r.trim()).filter(Boolean),
+            description: p.description,
+            my_role: p.my_role,
+            stage: p.stage,
+            health: p.health as ProjectRow["health"],
+            ...(parentId ? { parent_id: parentId } : {}),
+            ...(p.status === "archived" ? { status: "archived" as const } : {}),
+          },
           Date.now(),
         );
         batchProjects.set(p.name, row);
@@ -342,7 +374,7 @@ export class Understander {
         const claims = c.claims.filter((cl) => byId.has(cl.obs_id)).map((cl) => ({ claim: cl.claim, obs_id: cl.obs_id, quote: cl.quote, time: byId.get(cl.obs_id)!.time }));
         if (claims.length < 2) continue;
         const project = resolveProject(c.project, Date.now());
-        this.store.addConflict({ project_id: project?.id ?? "", topic: c.topic, claims });
+        this.store.addConflict({ project_id: project?.id ?? "", topic: c.topic, claims, ref: c.ref || undefined });
         res.conflicts++;
       }
     });
@@ -352,8 +384,104 @@ export class Understander {
   }
 }
 
+const SplitOut = z.object({
+  subprojects: z
+    .array(
+      z.object({
+        ref: z.string().default(""),
+        name: z.string(),
+        description: z.string().default(""),
+        stage: z.string().default(""),
+        my_role: z.string().default(""),
+        health: lowerEnum(["ok", "risk", "blocked", "unknown"], "unknown"),
+        members: z.array(z.string()).default([]),
+      }),
+    )
+    .default([]),
+});
+
+export interface SplitResult {
+  project: string;
+  subprojects: { id: string; name: string; moved: number }[];
+  left: number;
+}
+
+/** 拆分子项目：把一个大项目下的事项 / 知识 / 动态 / 冲突交给模型归类成子项目，校验 ID 后移动 */
+export async function splitProject(u: Understander, workId: string, projectId: string, signal?: AbortSignal): Promise<SplitResult> {
+  const { store, app } = u;
+  const cfg = app.cfg;
+  const p = store.project(projectId);
+  if (!p) throw new Error(`没有这个项目：${projectId}`);
+  if (p.parent_id) throw new Error("只能拆分顶层项目");
+  const items = store.items({ project_id: p.id, limit: 400 }).filter((i) => i.status === "open" || i.status === "snoozed" || (i.closed_at ?? 0) > Date.now() - 14 * DAY);
+  const knowledge = store.knowledge({ project_id: p.id, limit: 200 });
+  const updates = store.updates({ project_id: p.id, limit: 200 });
+  const conflicts = store.conflicts().filter((c) => c.project_id === p.id);
+  const kindOf = new Map<string, "items" | "knowledge" | "updates" | "conflicts">();
+  const lines: string[] = [];
+  for (const i of items) (kindOf.set(i.id, "items"), lines.push(`[${i.id}] 事项（${i.kind}，${i.status}）｜${truncate(i.title, 80)}`));
+  for (const k of knowledge) (kindOf.set(k.id, "knowledge"), lines.push(`[${k.id}] 知识｜${truncate(k.title, 80)}`));
+  for (const x of updates) (kindOf.set(x.id, "updates"), lines.push(`[${x.id}] 动态｜${truncate(x.summary, 80)}`));
+  for (const c of conflicts) (kindOf.set(c.id, "conflicts"), lines.push(`[${c.id}] 冲突｜${truncate(c.topic, 80)}`));
+  if (lines.length < 6) throw new Error("这个项目下的内容太少，不需要拆分");
+  const children = store.children(p.id);
+  const prompt = render(loadPrompt("context-split.md"), {
+    owner_name: app.store.get("ctx.owner_name") ?? "主人",
+    now: new Date().toLocaleString("zh-CN", { timeZone: cfg.owner.timezone }),
+    project: `${p.name}：${p.stage || p.description || ""}`,
+    children: children.length ? children.map((c) => `- [${c.id}] ${c.name}：${c.stage || c.description}`).join("\n") : "（无）",
+    entries: lines.join("\n"),
+  });
+  const harness = cfg.context.harness || cfg.roles.brain;
+  const logFile = path.join(cfg.dataDir, "runs", `context-split-${Date.now()}.log`);
+  const step = app.ledger.startStep({ work_id: workId, name: "split", harness, log: logFile });
+  try {
+    const r = await runHarness(cfg, { harness, prompt, cwd: path.join(cfg.dataDir, "workspace", "context"), tools: "none", lark: "none", timeoutSec: 900, logFile, signal, stepId: step });
+    if (!r.text) throw new Error(`拆分 harness 无输出（exit ${r.exitCode}${r.timedOut ? "，超时" : ""}）`);
+    const out = extractJson(r.text, (v) => SplitOut.parse(v)) as z.infer<typeof SplitOut>;
+    const res: SplitResult = { project: p.name, subprojects: [], left: 0 };
+    const used = new Set<string>();
+    store.tx(() => {
+      for (const s of out.subprojects) {
+        const members = s.members.filter((id) => kindOf.has(id) && !used.has(id));
+        if (!s.name.trim() || members.length < 2) continue;
+        members.forEach((id) => used.add(id));
+        const existing = s.ref ? children.find((c) => c.id === s.ref) : undefined;
+        const child = store.upsertProject(
+          { id: existing?.id, name: s.name.trim(), description: s.description, stage: s.stage, my_role: s.my_role, health: s.health as ProjectRow["health"], parent_id: p.id },
+          Date.now(),
+        );
+        // 名字撞上别的项目时也强制挂到这个上级下面
+        if (child.parent_id !== p.id && child.id !== p.id) store.setProject(child.id, { parent_id: p.id });
+        const ids = { items: [] as string[], knowledge: [] as string[], updates: [] as string[], conflicts: [] as string[] };
+        for (const id of members) ids[kindOf.get(id)!].push(id);
+        const moved = store.moveTo(child.id, ids);
+        res.subprojects.push({ id: child.id, name: child.name, moved });
+      }
+    });
+    res.left = lines.length - used.size;
+    app.ledger.endStep(step, "ok", `拆成 ${res.subprojects.length} 个子项目，留在原项目 ${res.left} 条`);
+    return res;
+  } catch (e) {
+    app.ledger.endStep(step, "failed", errMsg(e));
+    throw e;
+  }
+}
+
 function emptyResult(): ApplyResult {
   return { projects: 0, created: [], closed: [], updated: 0, knowledge: 0, updates: 0, people: 0, conflicts: 0, rejected: 0 };
+}
+
+/** 已知项目按两层树列出：顶层在前，子项目缩进在下 */
+function projectTree(projects: ProjectRow[]): string {
+  const ids = new Set(projects.map((p) => p.id));
+  const tops = projects.filter((p) => !p.parent_id || !ids.has(p.parent_id));
+  const lines: string[] = [];
+  for (const t of tops) {
+    lines.push(projectLine(t));
+    for (const c of projects.filter((p) => p.parent_id === t.id)) lines.push(`  ${projectLine(c)}`);
+  }
+  return lines.join("\n");
 }
 
 function projectLine(p: ProjectRow): string {

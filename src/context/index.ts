@@ -12,7 +12,7 @@ import { draftCard, eveningCard, itemCard, KIND_LABEL, morningCard, type CtxRend
 import { Connectors, relinkMeegoItems } from "./connectors.ts";
 import { defaultDraftKind, Drafter } from "./drafts.ts";
 import { ContextStore, type ItemRow } from "./store.ts";
-import { Understander } from "./understand.ts";
+import { splitProject, Understander, type SplitResult } from "./understand.ts";
 import { ContextViews, startOfDay } from "./views.ts";
 
 /**
@@ -29,7 +29,7 @@ import { ContextViews, startOfDay } from "./views.ts";
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 
-type CtxPayload = { task: "cycle" } | { task: "draft"; item_id: string; kind?: CtxDraftKind } | { task: "weekly"; days: number };
+type CtxPayload = { task: "cycle" } | { task: "draft"; item_id: string; kind?: CtxDraftKind } | { task: "weekly"; days: number } | { task: "split"; project_id: string };
 
 export class ContextService {
   app: App;
@@ -144,6 +144,8 @@ export class ContextService {
         }
       }
       relinkMeegoItems(this.store);
+      this.store.mergeConflicts();
+      this.markNotImportant();
       this.syncDrafts();
       rep.nudged = this.nudge(created);
       this.autonomy(created);
@@ -172,15 +174,34 @@ export class ContextService {
     }
   }
 
+  /** 你说不重要的类型（context.not_important）：标题匹配的未关闭事项自动降为不重要 */
+  markNotImportant(): number {
+    const res = this.cfg.context.not_important.flatMap((p) => {
+      try {
+        return [new RegExp(p, "i")];
+      } catch {
+        return [];
+      }
+    });
+    if (!res.length) return 0;
+    let n = 0;
+    for (const it of this.store.items({ status: ["open", "snoozed"], limit: 5000 })) {
+      if (it.feedback || !res.some((re) => re.test(it.title))) continue;
+      this.store.setItemField(it.id, { feedback: "unimportant", meta: { auto_unimportant: true } });
+      n++;
+    }
+    return n;
+  }
+
   /** 实时提醒：新出现的、近期的、高优先级的请求 / 风险 / 快到期的承诺。每轮最多 3 条。 */
   nudge(created: ItemRow[], now = Date.now()): number {
     if (!this.cfg.context.nudge) return 0;
     const picks = created
       .map((c) => this.store.item(c.id))
-      .filter((it): it is ItemRow => !!it && it.status === "open" && !it.nudged_at && !it.meta.needs_review && !it.meta.legacy && it.last_seen >= now - 6 * HOUR)
+      .filter((it): it is ItemRow => !!it && it.status === "open" && !it.nudged_at && !it.meta.needs_review && !it.meta.legacy && !it.feedback && it.last_seen >= now - 6 * HOUR)
       .filter((it) => {
         const p = this.store.project(it.project_id);
-        if (p && (p.muted || p.status !== "active")) return false;
+        if (this.store.hidden(p)) return false;
         const urgent = (it.kind === "ask_me" || it.kind === "risk") && it.priority === "high";
         const dueSoon = !!it.due && it.due < now + 2 * DAY && (it.kind === "ask_me" || it.kind === "my_commitment");
         return urgent || dueSoon;
@@ -326,6 +347,11 @@ export class ContextService {
           this.renderDraft(d.id);
           return;
         }
+        if (p.task === "split") {
+          const r = await splitProject(this.understander, item.id, p.project_id, ctx.signal);
+          this.app.ledger.transition(item, { state: "done", terminal: true, payload: { ...p, result: r } as never });
+          return;
+        }
         if (p.task === "weekly") {
           const d = await this.drafter.weekly(p.days);
           this.app.ledger.transition(item, { state: "done", terminal: true, payload: { ...p, draft_id: d.id } as never });
@@ -337,7 +363,8 @@ export class ContextService {
       onExhausted: (item, err) => {
         const p = item.payload;
         if (p.task === "cycle") return { patch: { state: "errored" } };
-        return { patch: { state: "errored" }, effects: [notify(`⚠️ ${p.task === "draft" ? "起草" : "周报草稿"}没有成功：${truncate(err, 300)}`, "failure")] };
+        const what = p.task === "draft" ? "起草" : p.task === "split" ? "拆分子项目" : "周报草稿";
+        return { patch: { state: "errored" }, effects: [notify(`⚠️ ${what}没有成功：${truncate(err, 300)}`, "failure")] };
       },
     };
   }
@@ -368,6 +395,18 @@ export class ContextService {
         crons.forEach((x) => x.stop());
       },
     };
+  }
+
+  /** 立即拆分一个项目（命令行用） */
+  async splitNow(key: string): Promise<SplitResult> {
+    const p = this.store.findProject(key);
+    if (!p) throw new Error(`没有找到项目：${key}`);
+    const id = `split:${p.id}:${Date.now()}`;
+    this.enqueue(id, { task: "split", project_id: p.id });
+    await this.app.engine.drain(["context"]);
+    const w = this.app.ledger.get<{ result?: SplitResult }>(`context:${id}`);
+    if (w?.payload.result) return w.payload.result;
+    throw new Error(`拆分没有完成：${w?.state ?? "未知"}${w?.error ? `（${w.error}）` : ""}`);
   }
 
   async runOnce(): Promise<CtxCycleReport> {
@@ -554,6 +593,22 @@ export function registerContext(app: App): ContextService | undefined {
   });
 
   commands.register({
+    name: "context.project_split",
+    title: "把项目拆成子项目",
+    schema: z.object({ id }),
+    target: (a) => a.id,
+    run: async (a) => {
+      const p = svc.store.project(a.id);
+      if (!p) throw new CommandError("not_found", "没有这个项目");
+      if (p.parent_id) throw new CommandError("invalid", "只能拆分顶层项目");
+      const busy = ledger.list({ kinds: ["context"], states: ["pending"], ref: "split", limit: 20 }).some((w) => (w.payload as { project_id?: string }).project_id === p.id && !w.terminal);
+      if (busy) return ok("正在拆分中", p.id);
+      svc.enqueue(`split:${p.id}:${Date.now()}`, { task: "split", project_id: p.id });
+      return ok(`正在把「${p.name}」拆成子项目，完成后页面会自动刷新`, p.id);
+    },
+  });
+
+  commands.register({
     name: "context.conv_mute",
     title: "不再读取某个会话",
     schema: z.object({ conv: id, muted: z.boolean(), name: z.string().optional() }),
@@ -670,6 +725,7 @@ export function registerContext(app: App): ContextService | undefined {
     start: () => svc.start(),
     refresh: () => void svc.enqueue(`cycle:hint-${Math.floor(Date.now() / 60_000)}`, { task: "cycle" }),
     runOnce: () => svc.runOnce(),
+    split: (key) => svc.splitNow(key),
     sendDigest: (mode) => svc.sendDigest(mode),
   };
   return svc;

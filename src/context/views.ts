@@ -73,7 +73,10 @@ export function scoreItem(it: ItemRow, project: ProjectRow | undefined, tz: stri
     s -= 15;
     why.push("识别把握不大");
   }
-  if (it.feedback === "unimportant") s -= 40;
+  if (it.feedback === "unimportant") {
+    s -= 40;
+    why.push(it.meta.auto_unimportant ? "你设为不重要的类型" : "你标记为不重要");
+  }
   if (project && (project.muted || project.status !== "active")) s -= 100;
   if (it.meta.legacy) s -= 100;
   return { score: s, why };
@@ -150,7 +153,7 @@ export class ContextViews {
       .items({ status: ["open"], limit: 3000 })
       .filter((it) => {
         const p = this.proj(it.project_id);
-        return !it.meta.legacy && (!p || (p.status === "active" && !p.muted)) && it.feedback !== "wrong";
+        return !it.meta.legacy && !this.store.hidden(p) && it.feedback !== "wrong";
       })
       .map((it) => this.itemView(it, now))
       .sort((a, b) => b.score - a.score);
@@ -173,11 +176,18 @@ export class ContextViews {
     };
   }
 
+  /** 项目及其子项目的 id */
+  private family(p: ProjectRow): string[] {
+    return p.parent_id ? [p.id] : [p.id, ...this.store.children(p.id).map((c) => c.id)];
+  }
+
   projectSummary(p: ProjectRow): CtxProjectSummary {
-    const items = this.store.items({ status: ["open"], project_id: p.id, limit: 2000 }).filter((i) => !i.meta.legacy);
+    const ids = this.family(p);
+    const items = ids.flatMap((id) => this.store.items({ status: ["open"], project_id: id, limit: 2000 })).filter((i) => !i.meta.legacy);
     const high = items.filter((i) => i.priority === "high" || i.kind === "risk").length;
     const overdue = items.some((i) => i.due && i.due < Date.now());
     const health = p.health !== "unknown" ? p.health : high || overdue ? "risk" : items.length ? "ok" : "unknown";
+    const parent = p.parent_id ? this.proj(p.parent_id) : undefined;
     return {
       id: p.id,
       name: p.name,
@@ -191,13 +201,17 @@ export class ContextViews {
       high_items: high,
       last_activity: p.last_activity,
       refs: p.refs,
+      parent_id: p.parent_id,
+      parent_name: parent?.name ?? "",
+      children: ids.length - 1,
     };
   }
 
   projects(includeLegacy = false): CtxProjectSummary[] {
     this.projectCache.clear();
     return this.store
-      .projects({ includeLegacy })
+      .projects({ includeLegacy: true })
+      .filter((p) => includeLegacy || !this.store.hidden(p))
       .map((p) => this.projectSummary(p))
       .sort((a, b) => Number(a.muted) - Number(b.muted) || b.high_items - a.high_items || b.last_activity - a.last_activity);
   }
@@ -226,18 +240,24 @@ export class ContextViews {
     this.projectCache.clear();
     const p = this.store.project(id);
     if (!p) return undefined;
-    const items = this.store
-      .items({ project_id: id, limit: 500 })
+    const ids = this.family(p);
+    const names = new Set(ids.map((x) => this.proj(x)?.name ?? ""));
+    const items = ids
+      .flatMap((pid) => this.store.items({ project_id: pid, limit: 500 }))
       .map((it) => this.itemView(it))
       .sort((a, b) => Number(a.status !== "open") - Number(b.status !== "open") || b.score - a.score);
-    const people = this.people().filter((x) => x.projects.includes(p.name));
+    const people = this.people().filter((x) => x.projects.some((n) => names.has(n)));
     return {
       ...this.projectSummary(p),
+      subprojects: p.parent_id ? [] : this.store.children(p.id).map((c) => this.projectSummary(c)),
       items,
-      knowledge: this.store.knowledge({ project_id: id }).map((k) => this.knowledgeView(k)),
-      updates: this.store.updates({ project_id: id, limit: 50 }).map((u) => this.updateView(u)),
+      knowledge: ids.flatMap((pid) => this.store.knowledge({ project_id: pid })).map((k) => this.knowledgeView(k)),
+      updates: ids
+        .flatMap((pid) => this.store.updates({ project_id: pid, limit: 50 }))
+        .sort((a, b) => b.time - a.time)
+        .map((u) => this.updateView(u)),
       people,
-      conflicts: this.store.conflicts().filter((c) => c.project_id === id).map((c) => this.conflictView(c)),
+      conflicts: this.store.conflicts().filter((c) => ids.includes(c.project_id)).map((c) => this.conflictView(c)),
     };
   }
 

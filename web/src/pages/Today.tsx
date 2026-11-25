@@ -169,7 +169,7 @@ export function TodayPage() {
                     <ul className="proj-mini">
                       {t.projects.slice(0, 8).map((p) => (
                         <li key={p.id}>
-                          <Link to={projectHref(p.id)}>{p.name}</Link>
+                          <Link to={projectHref(p.id)}>{p.parent_name ? `${p.parent_name} · ${p.name}` : p.name}</Link>
                           <span className="spacer" />
                           {p.open_items > 0 && <span className="muted small">{p.open_items} 件</span>}
                           <HealthPill p={p} />

@@ -31,40 +31,78 @@ export function ProjectsPage() {
         }
       />
       <QueryView q={q} what="项目">
-        {(list) =>
-          list.length ? (
-            <div className="proj-grid">
-              {list.map((p) => (
-                <section key={p.id} className={`card proj-card ${p.muted || p.status !== "active" ? "proj-dim" : ""}`}>
-                  <div className="card-body">
-                    <div className="row-between">
-                      <Link to={projectHref(p.id)} className="proj-name">
-                        {p.name}
-                      </Link>
-                      <HealthPill p={p} />
-                    </div>
-                    {p.stage && <div className="small">{p.stage}</div>}
-                    {p.description && <div className="muted small clamp2">{p.description}</div>}
-                    <div className="row-gap small muted">
-                      {p.my_role && <span>我：{p.my_role}</span>}
-                      <span>{p.open_items} 件未完成</span>
-                      {p.high_items > 0 && <Pill tone="warn">{p.high_items} 件紧急 / 风险</Pill>}
-                      <RelTime ts={p.last_activity} prefix="活跃于 " />
-                      <span className="spacer" />
-                      <MuteButton p={p} />
-                    </div>
+        {(list) => {
+          if (!list.length)
+            return (
+              <Empty title="还没有识别出项目" icon="◇">
+                采集并理解消息后，这里会列出你参与的项目。
+              </Empty>
+            );
+          // 两层：顶层项目下面列出它的子项目
+          const ids = new Set(list.map((p) => p.id));
+          const tops = list.filter((p) => !p.parent_id || !ids.has(p.parent_id));
+          return (
+            <div className="proj-groups">
+              {tops.map((t) => {
+                const kids = list.filter((p) => p.parent_id === t.id);
+                return (
+                  <div key={t.id} className="proj-group">
+                    <ProjectCard p={t} />
+                    {kids.length > 0 && (
+                      <div className="proj-grid proj-children">
+                        {kids.map((c) => (
+                          <ProjectCard key={c.id} p={c} />
+                        ))}
+                      </div>
+                    )}
                   </div>
-                </section>
-              ))}
+                );
+              })}
             </div>
-          ) : (
-            <Empty title="还没有识别出项目" icon="◇">
-              采集并理解消息后，这里会列出你参与的项目。
-            </Empty>
-          )
-        }
+          );
+        }}
       </QueryView>
     </div>
+  );
+}
+
+function ProjectCard({ p }: { p: CtxProjectSummary }) {
+  return (
+    <section className={`card proj-card ${p.muted || p.status !== "active" ? "proj-dim" : ""} ${p.parent_id ? "proj-sub" : ""}`}>
+      <div className="card-body">
+        <div className="row-between">
+          <Link to={projectHref(p.id)} className="proj-name">
+            {p.name}
+          </Link>
+          <HealthPill p={p} />
+        </div>
+        {p.stage && <div className="small">{p.stage}</div>}
+        {p.description && <div className="muted small clamp2">{p.description}</div>}
+        <div className="row-gap small muted">
+          {p.my_role && <span>我：{p.my_role}</span>}
+          <span>{p.open_items} 件未完成</span>
+          {p.children > 0 && <span>{p.children} 个子项目</span>}
+          {p.high_items > 0 && <Pill tone="warn">{p.high_items} 件紧急 / 风险</Pill>}
+          <RelTime ts={p.last_activity} prefix="活跃于 " />
+          <span className="spacer" />
+          <MuteButton p={p} />
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function SplitButton({ id, hasChildren }: { id: string; hasChildren: boolean }) {
+  const cmd = useCommand();
+  return (
+    <button
+      className="btn btn-sm"
+      title="让模型按工作线把这个项目下的事项、知识、动态归类成子项目；可以重复执行"
+      disabled={cmd.isPending(`split:${id}`)}
+      onClick={() => void cmd.run("context.project_split", { id }, { key: `split:${id}` })}
+    >
+      {hasChildren ? "重新整理子项目" : "拆分子项目"}
+    </button>
   );
 }
 
@@ -76,9 +114,6 @@ export function ProjectDetailPage() {
   const [tab, setTab] = useState<Tab>("items");
   return (
     <div className="page page-detail">
-      <div className="crumbs small">
-        <Link to="/projects">项目</Link> /
-      </div>
       <QueryView q={q} what="项目">
         {(p) => {
           const open = p.items.filter((i) => i.status === "open" || i.status === "snoozed");
@@ -93,6 +128,14 @@ export function ProjectDetailPage() {
           ];
           return (
             <>
+              <div className="crumbs small">
+                <Link to="/projects">项目</Link> /{" "}
+                {p.parent_id && (
+                  <>
+                    <Link to={projectHref(p.parent_id)}>{p.parent_name}</Link> /
+                  </>
+                )}
+              </div>
               <PageHeader
                 title={
                   <span className="row-gap">
@@ -100,8 +143,20 @@ export function ProjectDetailPage() {
                   </span>
                 }
                 subtitle={[p.stage, p.my_role && `我：${p.my_role}`, p.description].filter(Boolean).join(" · ")}
-                actions={<MuteButton p={p} />}
+                actions={
+                  <div className="row-gap">
+                    {!p.parent_id && <SplitButton id={p.id} hasChildren={p.subprojects.length > 0} />}
+                    <MuteButton p={p} />
+                  </div>
+                }
               />
+              {p.subprojects.length > 0 && (
+                <div className="proj-grid">
+                  {p.subprojects.map((c) => (
+                    <ProjectCard key={c.id} p={c} />
+                  ))}
+                </div>
+              )}
               {p.refs.length > 0 && (
                 <div className="row-gap small muted">
                   关联：
@@ -111,8 +166,8 @@ export function ProjectDetailPage() {
                 </div>
               )}
               <Card actions={<Tabs label="项目内容" value={tab} onChange={setTab} items={tabs} />}>
-                {tab === "items" && <ItemList items={open} showProject={false} empty={<Empty title="没有进行中的事项" icon="✓" />} />}
-                {tab === "done" && <ItemList items={closed} showProject={false} empty={<Empty title="还没有完成的事项" />} />}
+                {tab === "items" && <ItemList items={open} showProject={p.subprojects.length > 0} empty={<Empty title="没有进行中的事项" icon="✓" />} />}
+                {tab === "done" && <ItemList items={closed} showProject={p.subprojects.length > 0} empty={<Empty title="还没有完成的事项" />} />}
                 {tab === "knowledge" &&
                   (p.knowledge.length ? (
                     <ul className="know-list">

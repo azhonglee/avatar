@@ -95,12 +95,14 @@ if (role === "bytedcli") {
 if (role === "codex") {
   const prompt = stdin();
   const out = flag("-o");
-  const kind = prompt.includes("维护个人工作上下文") ? "understand" : "draft";
+  const kind = prompt.includes("维护个人工作上下文") ? "understand" : prompt.includes("整理工作上下文里的项目结构") ? "split" : "draft";
   logCall({ kind, prompt });
   let text;
   if (kind === "understand") {
     const raw = path.join(dir, "understand.txt");
     text = fs.existsSync(raw) ? fs.readFileSync(raw, "utf8") : "```json\n" + JSON.stringify(read("understand.json", {})) + "\n```";
+  } else if (kind === "split") {
+    text = "```json\n" + JSON.stringify(read("split.json", { subprojects: [] })) + "\n```";
   } else {
     const f = path.join(dir, "draft.txt");
     text = fs.existsSync(f) ? fs.readFileSync(f, "utf8") : "好的，今天下班前给你结论。";

@@ -37,6 +37,8 @@ export interface ProjectRow {
   /** 用户手动设置过静音 / 状态，自动规则不再改 */
   pinned: boolean;
   health: "ok" | "risk" | "blocked" | "unknown";
+  /** 上级项目（两层：产品 / 大项目 → 子项目）；空 = 顶层 */
+  parent_id: string;
   created: number;
   updated: number;
   last_activity: number;
@@ -144,6 +146,31 @@ export function norm(s: string): string {
     .trim();
 }
 
+function grams(s: string): Set<string> {
+  const n = norm(s);
+  const g = new Set<string>();
+  for (let i = 0; i < n.length - 1; i++) g.add(n.slice(i, i + 2));
+  if (n.length === 1) g.add(n);
+  return g;
+}
+
+/** 重合度（字符二元组 交集 / 较短一方）：长句换个说法时比 Jaccard 更稳，用于冲突去重 */
+export function overlap(a: string, b: string): number {
+  const x = grams(a);
+  const y = grams(b);
+  if (!x.size || !y.size) return 0;
+  let inter = 0;
+  for (const g of x) if (y.has(g)) inter++;
+  return inter / Math.min(x.size, y.size);
+}
+
+/** 两个冲突是不是同一个问题：同一项目，且话题高度重合或引用了同一条消息 */
+export function sameConflict(a: { project_id: string; topic: string; claims: { obs_id: string }[] }, b: { project_id: string; topic: string; claims: { obs_id: string }[] }): boolean {
+  if (a.project_id !== b.project_id) return false;
+  if (a.claims.some((x) => x.obs_id && b.claims.some((y) => y.obs_id === x.obs_id))) return true;
+  return similarity(a.topic, b.topic) >= 0.5 || overlap(a.topic, b.topic) >= 0.5;
+}
+
 /** 标题相似度（字符二元组 Jaccard），中文友好 */
 export function similarity(a: string, b: string): number {
   const grams = (s: string) => {
@@ -214,10 +241,17 @@ export class ContextStore {
         status TEXT NOT NULL DEFAULT 'proposed', error TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL, updated INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS ctx_mute_conv (conv TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', at INTEGER NOT NULL);
     `);
+    // 迁移：子项目
+    const cols = new Set((db.prepare("PRAGMA table_info(ctx_project)").all() as { name: string }[]).map((c) => c.name));
+    if (!cols.has("parent_id")) db.exec("ALTER TABLE ctx_project ADD COLUMN parent_id TEXT NOT NULL DEFAULT ''");
   }
 
+  private txDepth = 0;
+  /** 事务（可嵌套：内层直接并入外层） */
   tx<T>(fn: () => T): T {
+    if (this.txDepth) return fn();
     this.db.exec("BEGIN IMMEDIATE");
+    this.txDepth++;
     try {
       const r = fn();
       this.db.exec("COMMIT");
@@ -225,6 +259,8 @@ export class ContextStore {
     } catch (e) {
       this.db.exec("ROLLBACK");
       throw e;
+    } finally {
+      this.txDepth--;
     }
   }
 
@@ -313,7 +349,7 @@ export class ContextStore {
   // ───────── 项目 ─────────
 
   private toProject(r: Row): ProjectRow {
-    return { ...(r as unknown as ProjectRow), aliases: j(r.aliases, []), refs: j(r.refs, []), muted: !!r.muted, pinned: !!r.pinned };
+    return { ...(r as unknown as ProjectRow), aliases: j(r.aliases, []), refs: j(r.refs, []), muted: !!r.muted, pinned: !!r.pinned, parent_id: String(r.parent_id ?? "") };
   }
 
   projects(o: { includeLegacy?: boolean } = {}): ProjectRow[] {
@@ -352,7 +388,7 @@ export class ContextStore {
       const refs = [...new Set([...hit.refs, ...(p.refs ?? [])])].slice(0, 50);
       this.db
         .prepare(
-          `UPDATE ctx_project SET aliases = ?, refs = ?, description = ?, my_role = ?, stage = ?, health = ?, status = ?, updated = ?, last_activity = MAX(last_activity, ?) WHERE id = ?`,
+          `UPDATE ctx_project SET aliases = ?, refs = ?, description = ?, my_role = ?, stage = ?, health = ?, status = ?, parent_id = ?, updated = ?, last_activity = MAX(last_activity, ?) WHERE id = ?`,
         )
         .run(
           JSON.stringify(aliases),
@@ -362,6 +398,7 @@ export class ContextStore {
           p.stage || hit.stage,
           p.health || hit.health,
           hit.pinned ? hit.status : (p.status ?? hit.status),
+          p.parent_id !== undefined && p.parent_id !== hit.id && !hit.pinned ? p.parent_id : hit.parent_id,
           now,
           activityAt,
           hit.id,
@@ -371,19 +408,48 @@ export class ContextStore {
     const id = p.id || newId("prj");
     this.db
       .prepare(
-        `INSERT INTO ctx_project (id, name, aliases, refs, description, my_role, stage, status, muted, health, created, updated, last_activity)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO ctx_project (id, name, aliases, refs, description, my_role, stage, status, muted, health, parent_id, created, updated, last_activity)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(id, p.name, JSON.stringify(p.aliases ?? []), JSON.stringify(p.refs ?? []), p.description ?? "", p.my_role ?? "", p.stage ?? "", p.status ?? "active", p.muted ? 1 : 0, p.health ?? "unknown", now, now, activityAt);
+      .run(id, p.name, JSON.stringify(p.aliases ?? []), JSON.stringify(p.refs ?? []), p.description ?? "", p.my_role ?? "", p.stage ?? "", p.status ?? "active", p.muted ? 1 : 0, p.health ?? "unknown", p.parent_id ?? "", now, now, activityAt);
     return this.project(id)!;
   }
 
-  setProject(id: string, patch: { status?: ProjectRow["status"]; muted?: boolean; pinned?: boolean; health?: ProjectRow["health"] }): void {
+  setProject(id: string, patch: { status?: ProjectRow["status"]; muted?: boolean; pinned?: boolean; health?: ProjectRow["health"]; parent_id?: string }): void {
     const p = this.project(id);
     if (!p) return;
     this.db
-      .prepare("UPDATE ctx_project SET status = ?, muted = ?, pinned = ?, health = ?, updated = ? WHERE id = ?")
-      .run(patch.status ?? p.status, (patch.muted ?? p.muted) ? 1 : 0, (patch.pinned ?? p.pinned) ? 1 : 0, patch.health ?? p.health, Date.now(), id);
+      .prepare("UPDATE ctx_project SET status = ?, muted = ?, pinned = ?, health = ?, parent_id = ?, updated = ? WHERE id = ?")
+      .run(patch.status ?? p.status, (patch.muted ?? p.muted) ? 1 : 0, (patch.pinned ?? p.pinned) ? 1 : 0, patch.health ?? p.health, patch.parent_id ?? p.parent_id, Date.now(), id);
+  }
+
+  /** 子项目 */
+  children(id: string): ProjectRow[] {
+    return (this.db.prepare("SELECT * FROM ctx_project WHERE parent_id = ? ORDER BY last_activity DESC").all(id) as Row[]).map((r) => this.toProject(r));
+  }
+
+  /** 项目实际是否可见：自己或上级被静音 / 不再活跃都算隐藏 */
+  hidden(p: ProjectRow | undefined): boolean {
+    if (!p) return false;
+    if (p.muted || p.status !== "active") return true;
+    const parent = p.parent_id ? this.project(p.parent_id) : undefined;
+    return !!parent && (parent.muted || parent.status !== "active");
+  }
+
+  /** 把事项 / 知识 / 动态 / 冲突挪到另一个项目（拆分子项目用） */
+  moveTo(projectId: string, ids: { items?: string[]; knowledge?: string[]; updates?: string[]; conflicts?: string[] }): number {
+    let n = 0;
+    const run = (table: string, list: string[] = []) => {
+      const st = this.db.prepare(`UPDATE ${table} SET project_id = ? WHERE id = ?`);
+      for (const id of list) n += Number(st.run(projectId, id).changes);
+    };
+    this.tx(() => {
+      run("ctx_item", ids.items);
+      run("ctx_knowledge", ids.knowledge);
+      run("ctx_update", ids.updates);
+      run("ctx_conflict", ids.conflicts);
+    });
+    return n;
   }
 
   // ───────── 事项 ─────────
@@ -610,8 +676,9 @@ export class ContextStore {
 
   // ───────── 冲突 ─────────
 
-  addConflict(c: { project_id: string; topic: string; claims: ConflictRow["claims"] }): ConflictRow {
-    const open = this.conflicts("open").find((x) => x.project_id === c.project_id && similarity(x.topic, c.topic) >= 0.5);
+  addConflict(c: { project_id: string; topic: string; claims: ConflictRow["claims"]; ref?: string }): ConflictRow {
+    const byRef = c.ref ? this.conflicts("open").find((x) => x.id === c.ref) : undefined;
+    const open = byRef ?? this.conflicts("open").find((x) => sameConflict(x, c));
     if (open) {
       const claims = [...open.claims];
       for (const cl of c.claims) if (!claims.some((x) => x.obs_id === cl.obs_id)) claims.push(cl);
@@ -630,6 +697,25 @@ export class ContextStore {
 
   conflict(id: string): ConflictRow | undefined {
     return this.conflicts().find((c) => c.id === id);
+  }
+
+  /** 合并说的是同一件事的未解决冲突（说法并到最早的那条），返回合并掉的条数 */
+  mergeConflicts(): number {
+    const open = this.conflicts("open").sort((a, b) => a.created - b.created);
+    const gone = new Set<string>();
+    for (let i = 0; i < open.length; i++) {
+      const keep = open[i];
+      if (gone.has(keep.id)) continue;
+      for (let k = i + 1; k < open.length; k++) {
+        const dup = open[k];
+        if (gone.has(dup.id) || !sameConflict(keep, dup)) continue;
+        for (const cl of dup.claims) if (!keep.claims.some((x) => x.obs_id === cl.obs_id && x.claim === cl.claim)) keep.claims.push(cl);
+        this.db.prepare("UPDATE ctx_conflict SET claims = ? WHERE id = ?").run(JSON.stringify(keep.claims), keep.id);
+        this.db.prepare("DELETE FROM ctx_conflict WHERE id = ?").run(dup.id);
+        gone.add(dup.id);
+      }
+    }
+    return gone.size;
   }
 
   resolveConflict(id: string, resolution: string): void {

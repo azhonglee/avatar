@@ -469,3 +469,87 @@ test("积压的大群：从最早的待处理消息开始分批理解，超过�
   assert.ok(prompts.length >= 3, `分批：${prompts.length}`);
   assert.match(prompts[0], /\[im:big_0\].*\(新\)/, "从最早的一条开始");
 });
+
+test("子项目：理解时归到最具体的子项目；上级项目汇总子项目的内容；静音上级时子项目一起隐藏", async () => {
+  const lark = JSON.parse(fs.readFileSync(path.join(CTX, "lark.json"), "utf8"));
+  lark.fail = [];
+  lark.at_me.push(msg("om_s1", { content: "@张三 独立沙箱周四能发吗？", create_time: iso(Date.now()) }));
+  lark.at_me.push(msg("om_s2", { content: "@张三 文档阅读权限申请麻烦通过下", create_time: iso(Date.now()) }));
+  writeFx("lark.json", lark);
+  fs.rmSync(path.join(CTX, "understand.txt"), { force: true });
+  writeFx("understand.json", {
+    projects: [
+      { name: "独立沙箱", parent: "Ark v2 发布", stage: "周四发布", health: "risk" },
+      { name: "Goal 项目", status: "archived" },
+    ],
+    items: [
+      { title: "确认独立沙箱周四能否发布", kind: "ask_me", project: "独立沙箱", priority: "high", evidence: [{ obs_id: "im:om_s1", quote: "独立沙箱周四能发吗" }] },
+      { title: "处理产品文档的阅读申请", kind: "ask_me", project: "Ark v2 发布", priority: "high", evidence: [{ obs_id: "im:om_s2", quote: "阅读权限申请" }] },
+    ],
+  });
+  const r = await runOnce();
+  assert.deepEqual(r.errors.filter((e) => !/meego/.test(e)), []);
+  const parent = svc.store.findProject("Ark v2 发布")!;
+  const child = svc.store.findProject("独立沙箱")!;
+  assert.equal(child.parent_id, parent.id);
+  assert.equal(svc.store.findProject("Goal 项目")!.status, "archived", "明确停止的项目归档");
+  const detail = app.ext.context!.project(parent.id)!;
+  assert.ok(detail.subprojects.some((s) => s.name === "独立沙箱"));
+  assert.ok(detail.items.some((i) => i.title === "确认独立沙箱周四能否发布" && i.project_name === "独立沙箱"), "上级详情汇总子项目事项");
+  const sum = app.ext.context!.projects({}).find((p) => p.id === child.id)!;
+  assert.equal(sum.parent_name, "Ark v2 发布");
+  assert.match(codexCalls().at(-1)!.prompt!, /两层：上级项目 \/ 子项目/);
+  assert.match(codexCalls().at(-1)!.prompt!, /- 阅读申请/, "不重要的类型告诉模型");
+
+  // 「不重要」的类型：自动降级、排在后面、不提醒
+  const readReq = itemBy(/阅读申请/)!;
+  assert.equal(readReq.feedback, "unimportant");
+  assert.ok(readReq.why.includes("你设为不重要的类型"));
+  assert.ok(effects(`card:ctx-item:${readReq.id}`).length === 0, "不重要的事不发实时提醒");
+  const sandbox = itemBy(/^确认独立沙箱/)!;
+  const focus = app.ext.context!.today().focus.map((i) => i.id);
+  assert.ok(!focus.includes(readReq.id) || focus.indexOf(readReq.id) > focus.indexOf(sandbox.id));
+
+  await exec("context.project_mute", { id: parent.id, muted: true });
+  assert.ok(!app.ext.context!.items({}).some((i) => i.project_id === child.id), "上级静音，子项目的事项也不出现");
+  await exec("context.project_mute", { id: parent.id, muted: false });
+});
+
+test("拆分子项目：模型归类后移动事项 / 知识 / 动态，只认这个项目里的 ID", async () => {
+  const parent = svc.store.findProject("Ark v2 发布")!;
+  const items = svc.store.items({ project_id: parent.id, limit: 100 });
+  const know = svc.store.knowledge({ project_id: parent.id });
+  assert.ok(items.length >= 3);
+  writeFx("split.json", {
+    subprojects: [
+      { name: "计费改造", stage: "排期中", members: [items[0].id, items[1].id, "itm_not_here"] },
+      { name: "太小的子项目", members: [items[2].id] },
+      ...(know.length ? [{ ref: svc.store.findProject("独立沙箱")!.id, name: "独立沙箱", members: [know[0].id, items[2].id] }] : []),
+    ],
+  });
+  const r = await app.ext.context!.split("Ark v2 发布");
+  const billing = svc.store.findProject("计费改造")!;
+  assert.equal(billing.parent_id, parent.id);
+  assert.equal(svc.store.item(items[0].id)!.project_id, billing.id);
+  assert.ok(!svc.store.findProject("太小的子项目"), "少于两条内容的不建");
+  assert.ok(r.subprojects.some((s) => s.name === "计费改造" && s.moved === 2), JSON.stringify(r));
+  assert.match(codexCalls().at(-1)!.prompt!, new RegExp(`\\[${items[0].id}\\]`));
+  await assert.rejects(exec("context.project_split", { id: billing.id }), /只能拆分顶层项目/);
+});
+
+test("冲突去重：换个说法的同一问题合并成一条；已有冲突用 ref 追加说法", () => {
+  const p = svc.store.findProject("Ark v2 发布")!;
+  const mk = (topic: string, a: string, b: string) => svc.store.addConflict({ project_id: p.id, topic, claims: [{ claim: "阻断", obs_id: a, quote: "", time: 1 }, { claim: "没影响", obs_id: b, quote: "", time: 2 }] });
+  const c1 = mk("北京预发 Kafka 的 LeaderEpoch 异常是否实际阻断 Files API 产物登记", "im:k1", "im:k2");
+  const c2 = mk("国内 stg 的 Kafka 主副本切换是否持续阻断 Files API 产物登记", "im:k3", "im:k4");
+  assert.equal(c2.id, c1.id, "同一个问题");
+  assert.equal(svc.store.conflict(c1.id)!.claims.length, 4);
+  const c3 = svc.store.addConflict({ project_id: p.id, topic: "完全不同的说法", claims: [{ claim: "x", obs_id: "im:k5", quote: "", time: 3 }], ref: c1.id });
+  assert.equal(c3.id, c1.id, "ref 追加");
+  const other = mk("独立沙箱的发布时间", "im:k6", "im:k7");
+  assert.notEqual(other.id, c1.id, "不同问题不合并");
+  // 历史数据里已经重复的：周期里合并
+  svc.store.db.prepare("INSERT INTO ctx_conflict (id, project_id, topic, claims, status, created) VALUES ('cfl_dup', ?, ?, '[]', 'open', ?)").run(p.id, "国内 stg Kafka 主副本切换是否阻断 Files API 产物登记", Date.now());
+  assert.ok(svc.store.mergeConflicts() >= 1);
+  assert.ok(!svc.store.conflict("cfl_dup"));
+});

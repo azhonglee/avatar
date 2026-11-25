@@ -89,7 +89,7 @@ const today = (): CtxToday => {
     drafts: [draft],
     meetings: [{ start: Date.now() + 3600_000, end: Date.now() + 7200_000, summary: "Ark 周会", url: "" }],
     changes: [{ id: "upd_1", project_id: "prj_1", project_name: "Ark v2 发布", time: Date.now() - 1800_000, summary: "上线时间从周五改到下周一", evidence: [] }],
-    projects: [{ id: "prj_1", name: "Ark v2 发布", description: "", my_role: "负责人", stage: "灰度中", status: "active", muted: false, health: "risk", open_items: 2, high_items: 1, last_activity: Date.now(), refs: [] }],
+    projects: [{ id: "prj_1", name: "Ark v2 发布", description: "", my_role: "负责人", stage: "灰度中", status: "active", muted: false, health: "risk", open_items: 2, high_items: 1, last_activity: Date.now(), refs: [], parent_id: "", parent_name: "", children: 0 }],
     status: {
       last_cycle: Date.now() - 300_000,
       last_error: "",

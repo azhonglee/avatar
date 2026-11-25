@@ -20,6 +20,7 @@ const USAGE = `用法：pa <命令>
   context run                 立即采集并理解一轮（Meego / 飞书任务 / 消息 / 妙记 / 日历），打印结果
   context today               打印「今天」：最该处理的事、冲突、草稿、今天的会
   context digest [morning|evening]   发送晨间卡 / 收尾卡（--print 只打印不发送）
+  context split <项目>        把一个大项目拆成子项目（模型归类，可重复执行）
   status                      最近 24 小时的派单、作业，以及重试中/失败的事件和飞书写入
   console [--rotate]          打印控制台登录链接（--rotate 作废旧链接）；常驻进程运行时可用
   command <名称> [JSON 参数]   执行一条命令（与控制台/卡片按钮相同），如 pa command dispatch.cancel '{"id":"…"}'
@@ -149,6 +150,14 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
     console.log(`\n共 ${t.status.totals.projects} 个项目、${t.status.totals.open_items} 件未完成、${t.status.totals.knowledge} 条知识`);
     return;
   }
+  if (sub === "split") {
+    if (!more[0]) throw new Error("用法：pa context split <项目名或 ID>");
+    const r = await ctx.split(more.join(" "));
+    console.log(`「${r.project}」拆成 ${r.subprojects.length} 个子项目：`);
+    for (const s of r.subprojects) console.log(`- ${s.name}（${s.moved} 条）`);
+    console.log(`留在原项目：${r.left} 条`);
+    return;
+  }
   if (sub === "digest") {
     const { values, positionals } = parseArgs({ args: more, options: { print: { type: "boolean" } }, allowPositionals: true });
     const mode = positionals[0] === "evening" ? "evening" : "morning";
@@ -157,7 +166,7 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
     await app.engine.drain(["effect"]);
     return;
   }
-  throw new Error("用法：pa context run | today | digest [morning|evening] [--print]");
+  throw new Error("用法：pa context run | today | split <项目> | digest [morning|evening] [--print]");
 }
 
 async function doctor(app: ReturnType<typeof createApp>): Promise<void> {

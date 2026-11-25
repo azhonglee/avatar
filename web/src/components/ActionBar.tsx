@@ -33,6 +33,7 @@ export const ACTION_LABEL: Record<CommandName, string> = {
   "context.draft_approve": "确认发送",
   "context.draft_discard": "丢弃草稿",
   "context.weekly_report": "起草周报",
+  "context.project_split": "拆分子项目",
 };
 
 const PRIMARY = new Set<string>(["delivery.create_pr", "dispatch.rework"]);

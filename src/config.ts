@@ -222,6 +222,11 @@ const Schema = z.object({
       min_confidence: z.number().min(0).max(1).default(0.5),
       /** 每次理解最多处理多少个会话 */
       max_convs_per_cycle: z.number().int().min(1).default(30),
+      /**
+       * 你说「不重要」的事项类型：标题匹配任一正则的事项自动降为不重要（仍保留，排在最后），
+       * 也会告诉模型按低优先级输出。
+       */
+      not_important: z.array(z.string()).default(["阅读申请", "权限申请", "编辑权限", "审批待办", "临期权限", "权限.*续期"]),
       /** 同时跑几批理解（会话互不重叠）；首次回看积压多时调大能明显加快 */
       understand_parallel: z.number().int().min(1).max(8).default(2),
       /** 实时提醒：新出现的高优先级请求 / 风险立刻发卡片 */

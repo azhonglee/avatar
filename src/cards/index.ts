@@ -69,6 +69,7 @@ const CMD_TEXT: Partial<Record<CommandName, string>> = {
   "context.conv_mute": "静音会话",
   "context.weekly_report": "起草周报",
   "context.refresh": "刷新",
+  "context.project_split": "拆分子项目",
 };
 
 const EVENT_TEXT: Record<string, string> = {

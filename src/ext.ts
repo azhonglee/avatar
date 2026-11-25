@@ -77,6 +77,8 @@ export interface Extensions {
     refresh(): void;
     /** 立即跑一轮采集 + 理解（命令行用） */
     runOnce(): Promise<CtxCycleReport>;
+    /** 立即把项目拆成子项目（命令行用） */
+    split(key: string): Promise<{ project: string; subprojects: { id: string; name: string; moved: number }[]; left: number }>;
     /** 发晨间 / 收尾卡（命令行、定时任务用） */
     sendDigest(mode: "morning" | "evening"): void;
   };

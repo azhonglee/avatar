@@ -275,7 +275,8 @@ export type CommandName =
   | "context.draft_create"
   | "context.draft_approve"
   | "context.draft_discard"
-  | "context.weekly_report";
+  | "context.weekly_report"
+  | "context.project_split";
 
 export interface CommandArgs {
   "dispatch.create": { summary: string; description?: string; harness?: string; repo?: string };
@@ -306,6 +307,7 @@ export interface CommandArgs {
   "context.draft_approve": { id: string; content?: string };
   "context.draft_discard": { id: string };
   "context.weekly_report": { days?: number };
+  "context.project_split": { id: string };
 }
 
 export interface CommandResult {
@@ -358,6 +360,11 @@ export interface CtxProjectSummary {
   high_items: number;
   last_activity: number;
   refs: string[];
+  /** 上级项目（空 = 顶层） */
+  parent_id: string;
+  parent_name: string;
+  /** 子项目个数 */
+  children: number;
 }
 
 export interface CtxItemView {
@@ -455,6 +462,8 @@ export interface CtxDraftView {
 }
 
 export interface CtxProjectDetail extends CtxProjectSummary {
+  /** 子项目（顶层项目的详情里，items / knowledge / updates / conflicts 含子项目的内容） */
+  subprojects: CtxProjectSummary[];
   items: CtxItemView[];
   knowledge: CtxKnowledgeView[];
   updates: CtxUpdateView[];

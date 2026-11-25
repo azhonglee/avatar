@@ -135,6 +135,7 @@ context:
   min_confidence: 0.5         # 低于它的识别结果标为「待确认」
   max_convs_per_cycle: 30
   understand_parallel: 2      # 同时跑几批理解；首次回看积压多时可调大
+  not_important: [阅读申请, 权限申请, 编辑权限, 审批待办, 临期权限, "权限.*续期"]   # 你说不重要的事项类型（标题正则）：自动降为不重要，排在最后、不提醒
   nudge: true
   autonomy:                   # 只影响你自己的低风险动作；对外可见的动作永远需要你确认草稿
     auto_close: true          # 有证据（你已回复、Meego 节点已流转）时自动关闭事项
