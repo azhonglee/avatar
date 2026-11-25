@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { createApp, initApp } from "../src/app.ts";
 import { KnowledgeBase } from "../src/board.ts";
 import { loadConfig } from "../src/config.ts";
+import { parseEventStderr } from "../src/events.ts";
 import { decide } from "../src/guard.ts";
 import { extractOwnerOpenId, Lark, LarkError } from "../src/lark.ts";
 import { Store } from "../src/store.ts";
@@ -297,4 +298,29 @@ test("KnowledgeBase.init：建空间无权限自动回退到我的文档库（�
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+test("parseEventStderr：解析多行 JSON 错误信封（含 message / hint / subtype），普通文本回退最后一行", () => {
+  const jsonLines = [
+    "[event] connecting...",
+    "{",
+    '  "ok": false,',
+    '  "identity": "user",',
+    '  "error": {',
+    '    "type": "validation",',
+    '    "subtype": "failed_precondition",',
+    '    "message": "EventKey task.task.update_user_access_v2 requires event types not subscribed in console",',
+    '    "hint": "subscribe these event types by scanning: https://open.feishu.cn/page/launcher?clientID=cli_x"',
+    "  }",
+    "}",
+  ];
+  assert.deepEqual(parseEventStderr(jsonLines), {
+    message: "EventKey task.task.update_user_access_v2 requires event types not subscribed in console",
+    hint: "subscribe these event types by scanning: https://open.feishu.cn/page/launcher?clientID=cli_x",
+    subtype: "failed_precondition",
+  });
+  assert.deepEqual(parseEventStderr(["line 1", "  connection reset by peer  ", ""]), {
+    message: "connection reset by peer",
+  });
+  assert.deepEqual(parseEventStderr([]), { message: "" });
 });
