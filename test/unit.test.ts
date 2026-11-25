@@ -4,9 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { createApp, initApp } from "../src/app.ts";
+import { KnowledgeBase } from "../src/board.ts";
 import { loadConfig } from "../src/config.ts";
 import { decide } from "../src/guard.ts";
-import { extractOwnerOpenId, Lark } from "../src/lark.ts";
+import { extractOwnerOpenId, Lark, LarkError } from "../src/lark.ts";
+import { Store } from "../src/store.ts";
 import { endOfLocalDay } from "../src/workflows/brief.ts";
 import { parseHarness, parseRepo, parseReview, decideRound, planReconcile, type CheckResult, pickReviewer } from "../src/workflows/dispatch.ts";
 import { parseVerdicts } from "../src/workflows/triage.ts";
@@ -190,6 +192,108 @@ test("lark authStatus 与 initApp：兼容新版裸 JSON（openId）和旧版信
     fs.writeFileSync(outFile, JSON.stringify({ message: "token invalid" }));
     fs.writeFileSync(codeFile, "1");
     await assert.rejects(() => lark.authStatus(), /token invalid/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("KnowledgeBase.init：建空间无权限自动回退到我的文档库（建根节点并幂等）；支持 space_id 与 enabled=false", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pa-kb-"));
+  const makeCfg = (kb: Record<string, unknown> = {}) => {
+    const f = path.join(tmp, `cfg-${Math.random().toString(36).slice(2)}.yaml`);
+    fs.writeFileSync(
+      f,
+      JSON.stringify({
+        data_dir: path.join(tmp, `data-${Math.random().toString(36).slice(2)}`),
+        harnesses: { cx: { type: "codex-exec", cmd: "codex" } },
+        roles: { brain: "cx" },
+        kb: { space_name: "个人知识库", nodes: ["00 Inbox", "项目"], ...kb },
+      }),
+    );
+    return loadConfig(f);
+  };
+  try {
+    // 1. +space-create 无权限 → 回退到 my_library，建根节点和子节点，二次运行幂等
+    const cfg1 = makeCfg();
+    const store1 = new Store(cfg1.dataDir);
+    const calls1: string[][] = [];
+    const createdNodes: { space: string; parent: string; title: string; token: string }[] = [];
+    const fakeLark1 = {
+      async run(args: string[]) {
+        calls1.push(args);
+        const cmd = `${args[0]} ${args[1]}`;
+        const flag = (k: string) => (args.includes(k) ? args[args.indexOf(k) + 1] : "");
+        if (cmd === "wiki +space-list") return { spaces: [] };
+        if (cmd === "wiki +space-create") throw new LarkError("lark-cli wiki +space-create 失败：user lacks permission for the requested resource", 1);
+        if (cmd === "wiki spaces") return { space: { space_id: "7319320097204846595", space_type: "my_library" } };
+        if (cmd === "wiki +node-list") {
+          const sp = flag("--space-id");
+          const parent = flag("--parent-node-token");
+          return { nodes: createdNodes.filter((n) => n.space === sp && n.parent === parent).map((n) => ({ node_token: n.token, title: n.title })) };
+        }
+        if (cmd === "wiki +node-create") {
+          const title = flag("--title");
+          const token = `nd_${createdNodes.length + 1}_${title}`;
+          createdNodes.push({ space: flag("--space-id"), parent: flag("--parent-node-token"), title, token });
+          return { node: { node_token: token, title } };
+        }
+        throw new Error(`unexpected: ${args.join(" ")}`);
+      },
+    } as unknown as Lark;
+
+    const kb1 = new KnowledgeBase(cfg1, fakeLark1, store1);
+    await kb1.init();
+    assert.equal(store1.get("kb.space"), "7319320097204846595");
+    assert.equal(store1.get("kb.space_mode"), "my_library");
+    const root = store1.get("kb.root")!;
+    assert.ok(root.startsWith("nd_1_个人知识库"));
+    assert.equal(createdNodes.length, 3);
+    assert.equal(createdNodes[1].parent, root);
+    assert.equal(createdNodes[2].parent, root);
+    assert.ok(calls1[0].includes("--page-all"), "+space-list 带 --page-all");
+
+    const before = calls1.length;
+    await kb1.init();
+    assert.equal(createdNodes.length, 3, "幂等：不重复建根节点和子节点");
+    assert.equal(calls1.slice(before).length, 1, "只做一次 +node-list 检查");
+    store1.db.close();
+
+    // 2. kb.space_id = "sp_custom"：直接用指定空间，不建额外根节点
+    const cfg2 = makeCfg({ space_id: "sp_custom" });
+    const store2 = new Store(cfg2.dataDir);
+    const calls2: string[][] = [];
+    const fakeLark2 = {
+      async run(args: string[]) {
+        calls2.push(args);
+        if (args[1] === "+node-list") return { nodes: [] };
+        if (args[1] === "+node-create") return { node: { node_token: `t_${args[args.indexOf("--title") + 1]}` } };
+        throw new Error(`unexpected: ${args.join(" ")}`);
+      },
+    } as unknown as Lark;
+    await new KnowledgeBase(cfg2, fakeLark2, store2).init();
+    assert.equal(store2.get("kb.space"), "sp_custom");
+    assert.equal(store2.get("kb.root"), "");
+    assert.ok(calls2.every((c) => !c.includes("--parent-node-token")));
+    store2.db.close();
+
+    // 3. kb.enabled = false：跳过不调飞书
+    const cfg3 = makeCfg({ enabled: false });
+    const store3 = new Store(cfg3.dataDir);
+    await new KnowledgeBase(cfg3, { async run() { throw new Error("should not call"); } } as unknown as Lark, store3).init();
+    assert.equal(store3.get("kb.space"), undefined);
+    store3.db.close();
+
+    // 4. 非权限类错误（如网络故障）仍抛出，不静默回退
+    const cfg4 = makeCfg();
+    const store4 = new Store(cfg4.dataDir);
+    const fakeLark4 = {
+      async run(args: string[]) {
+        if (args[1] === "+space-list") return { spaces: [] };
+        throw new LarkError("lark-cli wiki +space-create 失败：network timeout", 1);
+      },
+    } as unknown as Lark;
+    await assert.rejects(() => new KnowledgeBase(cfg4, fakeLark4, store4).init(), /network timeout/);
+    store4.db.close();
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

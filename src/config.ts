@@ -66,6 +66,9 @@ const Schema = z.object({
     .prefault({}),
   kb: z
     .object({
+      enabled: z.boolean().default(true),
+      /** 指定已有的知识空间 ID（可填 "my_library" 用我的文档库）；留空按 space_name 查找或新建，新建无权限时自动回退到我的文档库 */
+      space_id: z.string().default(""),
       space_name: z.string().default("个人知识库"),
       nodes: z.array(z.string()).default(["00 Inbox", "会议纪要", "项目", "主题", "变更日志"]),
       /** 妙记生成后，让 brain 把它整理成知识库里的会议纪要（agent 作业，见 prompts/kb-minutes.md） */

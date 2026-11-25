@@ -46,10 +46,14 @@ async function main(): Promise<void> {
   switch (cmd) {
     case "doctor":
       return doctor(app);
-    case "init":
+    case "init": {
       await initApp(app);
-      console.log(`✅ 初始化完成\n主人 open_id：${cfg.owner.open_id}\n看板清单：${app.store.get("board.tasklist")}\n知识空间：${app.store.get("kb.space")}`);
+      const kbSpace = app.store.get("kb.space");
+      const kbRoot = app.store.get("kb.root");
+      const kbInfo = !cfg.kb.enabled ? "已关闭" : kbRoot ? `${kbSpace}（我的文档库 / 根节点 ${kbRoot}）` : (kbSpace ?? "未初始化");
+      console.log(`✅ 初始化完成\n主人 open_id：${cfg.owner.open_id}\n看板清单：${app.store.get("board.tasklist")}\n知识空间：${kbInfo}`);
       return;
+    }
     case "run":
       return runDaemon(app);
     case "brief": {

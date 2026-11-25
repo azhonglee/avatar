@@ -96,7 +96,7 @@ function eventHandler(app: Pick<App, "cfg" | "ledger" | "capture" | "bot" | "eng
         case "minutes.minute.generated_v1": {
           if (await capture.onMinutes(ev)) hooks.onSignals();
           const token = String(ev.minute_token ?? "");
-          if (cfg.kb.minutes_notes && token) {
+          if (cfg.kb.enabled && cfg.kb.minutes_notes && token) {
             const task = render(loadPrompt("kb-minutes.md"), { minute_token: token, title: String(ev.title ?? "") });
             if (enqueueJob(ledger, `kb-minutes:${token}`, { name: "kb-minutes", task, notify: false })) engine.kick();
           }

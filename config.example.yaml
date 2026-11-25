@@ -161,6 +161,8 @@ events:                      # 需在飞书开发者后台「事件与回调 →
   card_actions: true         # card.action.trigger：飞书交互卡片按钮 / 表单回调
 
 kb:
+  enabled: true
+  space_id: ""                # 可填已有知识空间 ID 或 "my_library"；留空按 space_name 查找/新建，无新建权限时自动回退到我的文档库
   space_name: 个人知识库
   nodes: ["00 Inbox", "会议纪要", "项目", "主题", "变更日志"]
   minutes_notes: true

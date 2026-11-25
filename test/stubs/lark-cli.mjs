@@ -100,6 +100,8 @@ if (key.startsWith("event consume")) {
     }
     case "wiki +space-list":
       ok({ items: [] });
+    case "wiki spaces get":
+      ok({ space: { space_id: params.space_id === "my_library" ? "sp_my_library" : params.space_id, name: "My Document Library" } });
     case "wiki +space-create":
       ok({ space: { space_id: "sp_kb", name: flag("--name") } });
     case "wiki +node-list":

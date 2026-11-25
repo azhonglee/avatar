@@ -188,11 +188,13 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
   });
 
   add("kb", "个人知识库", async () => {
+    if (!cfg.kb.enabled) return skip("知识库未启用（kb.enabled = false）");
     const space = store.get("kb.space");
     if (!space) return warn("知识空间尚未创建：会议纪要整理、知识库作业会失败", `运行 ${code("bin/pa init")}`);
     const missing = cfg.kb.nodes.filter((n) => !store.get(`kb.node.${n}`));
     if (missing.length) return warn(`缺少节点：${missing.join("、")}`, `运行 ${code("bin/pa init")} 补建`);
-    return ok(`「${cfg.kb.space_name}」（${space}）`);
+    const root = store.get("kb.root");
+    return ok(root ? `「${cfg.kb.space_name}」（我的文档库 ${space} / 节点 ${root}）` : `「${cfg.kb.space_name}」（${space}）`);
   });
 
   add("acpx", "acpx（调用各 harness）", async () => {
