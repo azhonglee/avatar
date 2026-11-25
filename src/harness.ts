@@ -137,7 +137,8 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   if (run.tools === "write") throw new Error(`harness ${run.harness} 是 codex-exec（只读），不能执行需要写权限的任务；请改用 acpx 类型的 harness`);
   fs.mkdirSync(run.cwd, { recursive: true });
   const outFile = path.join(run.cwd, `.codex-last-${process.pid}-${Date.now()}.txt`);
-  const args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--ephemeral", "--color", "never", "-o", outFile];
+  // -o 用相对 cwd 的文件名：codex 0.169 在部分路径（如经符号链接的家目录）下打开绝对路径会报 "Not a directory"
+  const args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--ephemeral", "--color", "never", "-o", path.basename(outFile)];
   if (h.model) args.push("-m", h.model);
   args.push(...h.extraArgs, "-");
   const harnessEnv = Object.fromEntries(
