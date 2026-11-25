@@ -20,6 +20,12 @@ type Raw = Record<string, any>;
 
 /** "2026-11-24 11:19" / ISO / 秒 / 毫秒 → 毫秒（无时区的本地时间按 owner.timezone 解释） */
 export function parseTime(v: unknown, tz = "Asia/Shanghai"): number {
+  const t = parseTimeRaw(v, tz);
+  // 2000 年以前的时间都是占位值（Meego 未排期时返回 1970-01-01、飞书任务的 "0"）
+  return t < 946_684_800_000 ? 0 : t;
+}
+
+function parseTimeRaw(v: unknown, tz: string): number {
   if (v === undefined || v === null || v === "") return 0;
   if (typeof v === "number") return v < 1e12 ? v * 1000 : v;
   const s = String(v).trim();
@@ -163,10 +169,14 @@ export class Connectors {
       const latest = Math.max(0, ...items.map((x) => Math.max(parseTime(x.schedule?.end_time), parseTime(x.schedule?.start_time))));
       const legacy = latest > 0 ? latest < legacyCut : items.length > 30;
       const spaceProject = this.store.upsertProject(
-        { name: `Meego · ${space}`, description: `Meego 空间「${space}」里分配给你的节点待办`, status: legacy ? "legacy" : "active", muted: legacy && this.cfg.context.autonomy.mute_legacy },
+        { id: hashId("sys_meego", space), name: `Meego · ${space}`, description: `Meego 空间「${space}」里分配给你的节点待办`, status: legacy ? "legacy" : "active", muted: legacy && this.cfg.context.autonomy.mute_legacy },
         latest || now,
       );
-      if (legacy && this.cfg.context.autonomy.mute_legacy && !spaceProject.pinned) this.store.setProject(spaceProject.id, { status: "legacy", muted: true });
+      // 每次按最新快照重新判断（你手动静音 / 恢复过的不再自动改）
+      if (!spaceProject.pinned) {
+        if (legacy && this.cfg.context.autonomy.mute_legacy) this.store.setProject(spaceProject.id, { status: "legacy", muted: true });
+        else if (!legacy && spaceProject.status === "legacy") this.store.setProject(spaceProject.id, { status: "active", muted: false });
+      }
       for (const x of items) {
         const w = x.work_item_info ?? {};
         const node = x.node_info?.node_name ?? "";
@@ -229,8 +239,8 @@ export class Connectors {
     const tasks = arr(data, "items");
     const now = Date.now();
     const legacyCut = now - this.cfg.context.legacy_days * DAY;
-    const active = this.store.upsertProject({ name: "飞书任务", description: "分配给你的飞书任务" });
-    const legacy = this.store.upsertProject({ name: "飞书任务（历史）", description: "很久以前创建、长期未处理的飞书任务", status: "legacy", muted: this.cfg.context.autonomy.mute_legacy });
+    const active = this.store.upsertProject({ id: "sys_tasks", name: "飞书任务", description: "分配给你的飞书任务" });
+    const legacy = this.store.upsertProject({ id: "sys_tasks_legacy", name: "飞书任务（历史）", description: "很久以前创建、长期未处理的飞书任务", status: "legacy", muted: this.cfg.context.autonomy.mute_legacy });
     const seen = new Set<string>();
     for (const t of tasks) {
       const key = `task:${t.guid}`;

@@ -323,14 +323,18 @@ export class ContextStore {
     const all = this.projects({ includeLegacy: true });
     return (
       all.find((p) => norm(p.name) === k || p.aliases.some((a) => norm(a) === k) || p.refs.some((r) => norm(r) === k)) ??
-      all.find((p) => k.length >= 4 && (norm(p.name).includes(k) || k.includes(norm(p.name))) && similarity(p.name, key) > 0.5)
+      // 模糊匹配只用于模型识别出的项目；系统项目（Meego 空间、飞书任务，id 以 sys_ 开头）只按精确名称匹配
+      all.find((p) => !p.id.startsWith("sys_") && k.length >= 4 && (norm(p.name).includes(k) || k.includes(norm(p.name))) && similarity(p.name, key) > 0.5)
     );
   }
 
   /** 创建或合并项目（名称 / 别名 / 引用任一命中即合并） */
   upsertProject(p: Partial<ProjectRow> & { name: string }, activityAt = Date.now()): ProjectRow {
     const now = Date.now();
-    const hit = (p.id && this.project(p.id)) || this.findProject(p.name) || (p.refs ?? []).map((r) => this.findProject(r)).find(Boolean) || (p.aliases ?? []).map((a) => this.findProject(a)).find(Boolean);
+    // 指定了 sys_ 开头的 id：只按 id 匹配（不存在就用这个 id 新建），避免和名字相近的项目合并
+    const hit = p.id?.startsWith("sys_")
+      ? this.project(p.id)
+      : (p.id && this.project(p.id)) || this.findProject(p.name) || (p.refs ?? []).map((r) => this.findProject(r)).find(Boolean) || (p.aliases ?? []).map((a) => this.findProject(a)).find(Boolean);
     if (hit) {
       const aliases = [...new Set([...hit.aliases, ...(p.aliases ?? []), ...(norm(p.name) !== norm(hit.name) ? [p.name] : [])])].slice(0, 20);
       const refs = [...new Set([...hit.refs, ...(p.refs ?? [])])].slice(0, 50);
@@ -427,7 +431,11 @@ export class ContextStore {
   upsertItem(p: Partial<ItemRow> & { title: string; kind: CtxItemKind }, seenAt = Date.now()): { item: ItemRow; created: boolean } {
     const now = Date.now();
     const hit =
-      (p.strong_key && this.itemByKey(p.strong_key)) || (p.id && this.item(p.id)) || (p.project_id && this.similarOpenItem(p.project_id, p.title, p.kind)) || undefined;
+      (p.strong_key && this.itemByKey(p.strong_key)) ||
+      (p.id && this.item(p.id)) ||
+      // 有强标识（Meego 节点、飞书任务）的事项只按强标识合并：标题相近的不同工作项不能合成一件
+      (!p.strong_key && p.project_id && this.similarOpenItem(p.project_id, p.title, p.kind)) ||
+      undefined;
     if (hit) {
       let status = p.status ?? hit.status;
       if (hit.user_locked && (hit.status === "done" || hit.status === "dismissed")) status = hit.status;

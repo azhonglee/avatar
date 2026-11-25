@@ -420,3 +420,35 @@ test("文档评论 @我：事件落库的信号转成观测，进入理解", asy
   assert.ok(svc.store.pendingConvs(10).some((c) => c.conv === "doc:https://feishu.cn/docx/abc"));
   assert.equal(svc.connectors.pullComments().count, 0, "游标：不重复");
 });
+
+test("真实数据回归：标题相近的不同工作项不合并；系统项目不和名字相近的项目合并；1970 占位日期不算逾期", async () => {
+  const s2 = new ContextService(app);
+  writeFx("meego.json", {
+    list: [
+      { ...meegoItem(5001, "MA 端到端评测基础能力", "评测", Date.now() + 9 * DAY, "STG冒烟测试"), schedule: { start_time: "1970-01-01", end_time: "1970-01-01" } },
+      meegoItem(5002, "MA 评测质量准出与对比", "评测", Date.now() + 9 * DAY, "STG冒烟测试"),
+      meegoItem(5003, "MA 端到端评测基础能力二期", "评测-二组", Date.now() + 9 * DAY, "STG冒烟测试"),
+    ],
+  });
+  await s2.connectors.pullMeego();
+  const titles = app.ext.context!.items({ status: "all", q: "STG冒烟测试" }).map((i) => i.title);
+  assert.equal(titles.filter((t) => t.startsWith("MA ")).length, 3, titles.join(","));
+  const placeholder = itemBy(/^MA 端到端评测基础能力｜/)!;
+  assert.equal(placeholder.due, null, "1970-01-01 是未排期");
+  assert.ok(!placeholder.why.includes("已逾期"));
+  assert.notEqual(svc.store.findProject("Meego · 评测")!.id, svc.store.findProject("Meego · 评测-二组")!.id);
+
+  const lark = JSON.parse(fs.readFileSync(path.join(CTX, "lark.json"), "utf8"));
+  lark.tasks = [
+    { guid: "t_new", summary: "提交报销", created_at: iso(Date.now() - DAY), due_at: "0", url: "https://applink.feishu.cn/t/1" },
+    { guid: "t_old", summary: "很久以前的事", created_at: iso(Date.now() - 400 * DAY), due_at: "0", url: "https://applink.feishu.cn/t/2" },
+  ];
+  writeFx("lark.json", lark);
+  await s2.connectors.pullTasks();
+  const active = svc.store.project("sys_tasks")!;
+  const old = svc.store.project("sys_tasks_legacy")!;
+  assert.equal(active.status, "active");
+  assert.equal(old.status, "legacy");
+  assert.ok(app.ext.context!.today().focus.concat(app.ext.context!.items({})).some((i) => i.title === "提交报销"));
+  assert.ok(!app.ext.context!.items({}).some((i) => i.title === "很久以前的事"), "历史遗留任务不出现");
+});
