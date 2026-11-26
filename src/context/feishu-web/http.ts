@@ -183,6 +183,14 @@ export async function fetchWithJar(jar: RecordingCookieJar, opts: HttpRequestOpt
     const cookie = jar.cookieHeader(currentUrl);
     if (cookie) reqHeaders["Cookie"] = cookie;
     else delete reqHeaders["Cookie"];
+    // 每次重定向跳（含同主机 307/302 轮换 swp_csrf_token 或切路径）均按目标 URL 重新派生 x-csrf-token
+    if (hop > 0 && hadCsrfHeader) {
+      for (const k of Object.keys(reqHeaders)) {
+        if (k.toLowerCase() === "x-csrf-token") delete reqHeaders[k];
+      }
+      const destCsrf = jar.cookieValue(currentUrl, "swp_csrf_token");
+      if (destCsrf) reqHeaders["x-csrf-token"] = destCsrf;
+    }
 
     const reqSnap = jar.snapshot();
     const res = await singleRequest(currentUrl, method, reqHeaders, body, timeoutMs, maxBytes, opts.signal);
@@ -206,10 +214,6 @@ export async function fetchWithJar(jar: RecordingCookieJar, opts: HttpRequestOpt
       const cleaned: Record<string, string> = {};
       for (const [k, v] of Object.entries(headers)) {
         if (!CROSS_HOST_STRIP_HEADERS.has(k.toLowerCase())) cleaned[k] = v;
-      }
-      if (hadCsrfHeader) {
-        const destCsrf = jar.cookieValue(nextUrl, "swp_csrf_token");
-        if (destCsrf) cleaned["x-csrf-token"] = destCsrf;
       }
       headers = cleaned;
     }

@@ -384,21 +384,21 @@ export class ContextStore {
    * 按账号隔离条件：
    *   - `undefined`：调用方未启用账号隔离过滤（单账号/非 pw 场景）；
    *   - `null` 或 `""`：工作区当前无有效个人 Web 绑定（例如 owner.open_id 已变更或未绑定）→ 严格拦截所有 `pw:*` 观测；
-   *   - 非空原生账号 ID：仅允许归属该账号（或无归属旧记录）的 `pw:*` 观测进入窗口。
+   *   - 非空原生账号 ID：严格精确匹配 `native_owner_id = ?`，隔离无主/历史遗留无归属 `pw:*` 记录，绝不混入新账号窗口。
    */
   private ownerClause(activeNativeOwner?: string | null): { sql: string; args: string[] } {
     if (activeNativeOwner === undefined) return { sql: "", args: [] };
     if (!activeNativeOwner) return { sql: " AND id NOT LIKE 'pw:%'", args: [] };
     return {
-      sql: " AND (id NOT LIKE 'pw:%' OR COALESCE(json_extract(meta, '$.native_owner_id'), '') IN ('', ?))",
+      sql: " AND (id NOT LIKE 'pw:%' OR COALESCE(json_extract(meta, '$.native_owner_id'), '') = ?)",
       args: [activeNativeOwner],
     };
   }
 
-  /** 检查库中是否已存在归属其他个人 Web 账号的观测（用于阻止在脏数据目录上原地换号） */
+  /** 检查库中是否已存在归属其他账号（或缺少 native_owner_id 无法证明归属当前账号）的个人 Web 观测 */
   hasOtherNativeOwnerObs(ownerId: string): boolean {
     const r = this.db
-      .prepare("SELECT 1 FROM ctx_obs WHERE id LIKE 'pw:%' AND COALESCE(json_extract(meta, '$.native_owner_id'), '') NOT IN ('', ?) LIMIT 1")
+      .prepare("SELECT 1 FROM ctx_obs WHERE id LIKE 'pw:%' AND COALESCE(json_extract(meta, '$.native_owner_id'), '') != ? LIMIT 1")
       .get(ownerId);
     return !!r;
   }
@@ -553,13 +553,18 @@ export class ContextStore {
     });
   }
 
-  /** 跨进程会话理解占坑：防止常驻进程快通道与命令行 `pa context run` 并发理解同一会话（配合 renewConv 心跳保活覆盖整次模型调用） */
+  /** 跨进程会话理解占坑：绑定唯一 holder 令牌与进程 proc_owner，避免旧进程接管失效后误续租或误释放新进程占坑 */
   claimConv(conv: string, holder: string, procOwner: string, ttlMs = 120_000, now = Date.now()): boolean {
     return this.tx(() => {
       const cur = this.db.prepare("SELECT holder, proc_owner, expires_at FROM ctx_conv_claim WHERE conv = ?").get(conv) as
         | { holder: string; proc_owner: string; expires_at: number }
         | undefined;
-      if (cur && cur.holder !== holder && cur.expires_at > now && !isDeadOwner(cur.proc_owner, procOwner)) {
+      if (
+        cur &&
+        !(cur.holder === holder && cur.proc_owner === procOwner) &&
+        cur.expires_at > now &&
+        !isDeadOwner(cur.proc_owner, procOwner)
+      ) {
         return false;
       }
       this.db
@@ -569,13 +574,21 @@ export class ContextStore {
     });
   }
 
-  renewConv(conv: string, holder: string, ttlMs = 120_000, now = Date.now()): boolean {
-    const r = this.db.prepare("UPDATE ctx_conv_claim SET expires_at = ? WHERE conv = ? AND holder = ?").run(now + ttlMs, conv, holder);
+  renewConv(conv: string, holder: string, procOwner?: string, ttlMs = 120_000, now = Date.now()): boolean {
+    const r = procOwner
+      ? this.db
+          .prepare("UPDATE ctx_conv_claim SET expires_at = ? WHERE conv = ? AND holder = ? AND proc_owner = ?")
+          .run(now + ttlMs, conv, holder, procOwner)
+      : this.db.prepare("UPDATE ctx_conv_claim SET expires_at = ? WHERE conv = ? AND holder = ?").run(now + ttlMs, conv, holder);
     return Number(r.changes) > 0;
   }
 
-  releaseConv(conv: string, holder: string): void {
-    this.db.prepare("DELETE FROM ctx_conv_claim WHERE conv = ? AND holder = ?").run(conv, holder);
+  releaseConv(conv: string, holder: string, procOwner?: string): void {
+    if (procOwner) {
+      this.db.prepare("DELETE FROM ctx_conv_claim WHERE conv = ? AND holder = ? AND proc_owner = ?").run(conv, holder, procOwner);
+    } else {
+      this.db.prepare("DELETE FROM ctx_conv_claim WHERE conv = ? AND holder = ?").run(conv, holder);
+    }
   }
 
   muteConv(conv: string, name: string, muted: boolean): void {
@@ -852,11 +865,11 @@ export class ContextStore {
     return this.db.prepare("SELECT * FROM ctx_evidence WHERE entity = ? AND entity_id = ? ORDER BY time DESC LIMIT ?").all(entity, entityId, limit) as unknown as EvidenceRow[];
   }
 
-  /** 事项最近一次证据所在的会话（起草回复时用） */
+  /** 事项最近一次有效（未撤回）证据所在的会话（起草回复时用） */
   lastEvidenceObs(entity: string, entityId: string, filter?: (o: Obs) => boolean): Obs | undefined {
     for (const e of this.evidence(entity, entityId, 50)) {
       const o = this.obs(e.obs_id);
-      if (o && (!filter || filter(o))) return o;
+      if (o && o.meta.withdrawn !== true && (!filter || filter(o))) return o;
     }
     return undefined;
   }

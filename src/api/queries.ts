@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { Cron } from "croner";
+import { tryGit } from "../delivery/git.ts";
 import type { App } from "../app.ts";
 import { availableActions } from "../core-commands.ts";
 import type { Effect, WorkItem } from "../ledger.ts";
-import { runProcess } from "../util.ts";
 import type { DispatchPayload } from "../workflows/dispatch.ts";
 import type {
   AuditView,
@@ -247,7 +247,7 @@ export async function dispatchDetail(app: App, id: string): Promise<DispatchDeta
   const s = summarize(app, w);
   const latest = app.ledger.latest("dispatch", w.ref);
   let diffStat = "";
-  if (p.base && p.cwd && fs.existsSync(p.cwd)) diffStat = (await runProcess("git", ["-C", p.cwd, "diff", "--stat", p.base])).stdout.trim();
+  if (p.base && p.cwd && fs.existsSync(p.cwd)) diffStat = (await tryGit(p.cwd, ["diff", "--stat", p.base])).stdout.trim();
   return {
     ...s,
     description: p.description ?? "",
@@ -285,9 +285,9 @@ export async function dispatchDiff(app: App, id: string): Promise<DiffView | und
   if (!p.base || !p.cwd || !fs.existsSync(p.cwd)) return { base: p.base ?? "", head: "", stat: "", patch: "", truncated: false };
   // 与基线比较（含尚未提交的已跟踪文件改动）；只读，不改动索引
   const [head, stat, patch] = await Promise.all([
-    runProcess("git", ["-C", p.cwd, "rev-parse", "HEAD"]),
-    runProcess("git", ["-C", p.cwd, "diff", "--stat", p.base]),
-    runProcess("git", ["-C", p.cwd, "diff", "--no-color", p.base]),
+    tryGit(p.cwd, ["rev-parse", "HEAD"]),
+    tryGit(p.cwd, ["diff", "--stat", p.base]),
+    tryGit(p.cwd, ["diff", "--no-color", p.base]),
   ]);
   return {
     base: p.base,

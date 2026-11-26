@@ -305,12 +305,27 @@ export class Connectors {
     });
   }
 
-  private async resolveCurrentChatName(chatId: string): Promise<string> {
+  private pollingPolicySignature(): string {
+    const mutes = this.store
+      .mutedConvs()
+      .map((m) => `${m.conv}=${m.name}`)
+      .sort()
+      .join("|");
+    const deny = [...this.cfg.context.groups_deny].map((s) => s.trim()).sort().join("|");
+    const allow = [...this.cfg.context.groups_allow].map((s) => s.trim()).sort().join("|");
+    return `${this.cfg.context.sources.im ? 1 : 0};${this.cfg.context.groups};${allow};${deny};${mutes}`;
+  }
+
+  private async resolveCurrentChatMeta(chatId: string): Promise<{ name: string; chatType: "p2p" | "group" | "" } | undefined> {
     try {
       const res = (await this.lark(["im", "chats", "get", "--params", JSON.stringify({ chat_id: chatId })], 15_000)) as Record<string, unknown>;
-      return String(deepFind(res, "name") ?? "").trim();
+      const name = String(deepFind(res, "name") ?? "").trim();
+      const rawMode = String(deepFind(res, "chat_mode") ?? deepFind(res, "chat_type") ?? "").trim().toLowerCase();
+      const chatType: "p2p" | "group" | "" =
+        rawMode === "p2p" ? "p2p" : rawMode === "group" || rawMode === "topic" || rawMode === "topic_group" ? "group" : "";
+      return { name, chatType };
     } catch {
-      return "";
+      return undefined;
     }
   }
 
@@ -400,15 +415,14 @@ export class Connectors {
         "messages",
       );
 
-    const nativeExcl = this.nativeExclusions ? await this.nativeExclusions() : undefined;
-    let atMeBlocked = !!nativeExcl?.groupsInconclusive;
-    let p2pBlocked = !!nativeExcl?.dmsInconclusive;
-    let mineBlocked = !!nativeExcl?.groupsInconclusive;
-    let groupsBlocked = !!nativeExcl?.groupsInconclusive;
+    let policySig = this.pollingPolicySignature();
+    let nativeExcl = this.nativeExclusions ? await this.nativeExclusions() : undefined;
 
-    const raws: { m: Raw; kind: string; stream: "at_me" | "p2p" | "mine" | "group" }[] = [];
+    type StreamKind = "at_me" | "p2p" | "mine" | "group";
+    const raws: { m: Raw; kind: string; stream: StreamKind; fallbackGroupName?: string }[] = [];
     for (const m of await searchFrom(sinceAtMe, ["--is-at-me"])) raws.push({ m, kind: "at_me", stream: "at_me" });
-    if (!nativeExcl?.dmsInconclusive) {
+    const fetchedP2p = !nativeExcl?.dmsInconclusive;
+    if (fetchedP2p) {
       // 保留查询条件已知的 chat_type="p2p"，防止接口缺省单行 chat_type 时落入群聊分支
       for (const m of await searchFrom(sinceP2p, ["--chat-type", "p2p"])) {
         raws.push({ m: { ...m, chat_type: m.chat_type || "p2p" }, kind: "p2p", stream: "p2p" });
@@ -443,90 +457,203 @@ export class Connectors {
           .filter(([id, v]) => this.classifyExclusion(id, v.name, "group", nativeExcl, false) === "allowed")
           .sort((a, b) => b[1].at - a[1].at)
           .slice(0, this.cfg.context.max_groups);
-    const needsCurrentGroupName = this.hasNameDenyPatterns() || !!(nativeExcl && nativeExcl.confirmedGroupNames.size > 0);
-    for (const [chatId, v] of ranked) {
-      const cur = Number(this.kv(`cursor.chat.${chatId}`) ?? 0) || sinceGroups;
-      try {
-        const data = await this.lark(["im", "+chat-messages-list", "--chat-id", chatId, "--start", isoLocal(cur - 60_000), "--end", end, "--order", "asc", "--page-all", "--page-limit", "4", "--no-reactions"]);
-        let chatInconclusive = false;
-        let freshChatName: string | undefined;
-        for (const m of arr(data, "messages")) {
-          const rowChatName = String(m.chat_name ?? "").trim();
-          let effectiveName = rowChatName;
-          if (!effectiveName) {
-            if (needsCurrentGroupName) {
-              // 存在群名排除/原生静音规则时，绝不用 spoken_groups 的陈旧历史群名放行改名群；必须实时解析当前群名，失败则按 inconclusive 暂缓
-              if (freshChatName === undefined) {
-                freshChatName = await this.resolveCurrentChatName(chatId);
-                if (freshChatName && spoken[chatId]) spoken[chatId].name = freshChatName;
-              }
-              effectiveName = freshChatName;
-            } else {
-              effectiveName = v.name;
-            }
-          } else if (spoken[chatId]) {
-            spoken[chatId].name = effectiveName;
-          }
-          const enriched = { ...m, chat_name: effectiveName, chat_type: m.chat_type || "group" };
-          const rowExcl = this.classifyExclusion(String(enriched.chat_id ?? chatId), effectiveName, String(enriched.chat_type ?? "group"), nativeExcl);
-          if (rowExcl === "inconclusive") {
-            chatInconclusive = true;
-            continue;
-          }
-          raws.push({ m: enriched, kind: "group", stream: "group" });
-        }
-        if (!chatInconclusive) this.setKv(`cursor.chat.${chatId}`, String(now));
-      } catch {
-        // 单个群失败下轮重试
-      }
-    }
-    this.setKv("spoken_groups", JSON.stringify(spoken));
 
-    let dropped = 0;
-    const obs: Obs[] = [];
-    const seen = new Set<string>();
-    for (const { m, kind, stream } of raws) {
-      const id = String(m.message_id ?? m.id ?? "");
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      const senderType = String(m.sender?.sender_type ?? m.sender?.type ?? m.sender_type ?? "");
-      if (senderType === "app" && !this.botAllowed(m)) {
-        dropped++;
-        continue;
-      }
-      const chatType = String(m.chat_type ?? "");
-      const excl = this.classifyExclusion(String(m.chat_id ?? ""), String(m.chat_name ?? ""), chatType, nativeExcl);
-      if (excl === "denied") {
-        dropped++;
-        continue;
-      }
-      if (excl === "inconclusive") {
-        // 仅挂起受阻塞流对应的独立游标：已知 p2p 私聊由 cursor.im.p2p 统一兜底补拉，不拖累无关群聊和发言人游标推进
-        if (stream === "p2p" || chatType.trim().toLowerCase() === "p2p") {
-          p2pBlocked = true;
-        } else if (stream === "at_me") {
-          atMeBlocked = true;
-        } else if (stream === "mine") {
-          mineBlocked = true;
-        } else {
-          groupsBlocked = true;
+    const chatPollState = new Map<string, { startCur: number; hadPriorCursor: boolean; fetchFailed: boolean; hadInconclusiveRow: boolean }>();
+    for (const [chatId, v] of ranked) {
+      const priorRaw = this.kv(`cursor.chat.${chatId}`);
+      const hadPriorCursor = !!priorRaw && Number(priorRaw) > 0;
+      const startCur = (hadPriorCursor ? Number(priorRaw) : 0) || sinceGroups;
+      const st = { startCur, hadPriorCursor, fetchFailed: false, hadInconclusiveRow: false };
+      chatPollState.set(chatId, st);
+      try {
+        const data = await this.lark([
+          "im",
+          "+chat-messages-list",
+          "--chat-id",
+          chatId,
+          "--start",
+          isoLocal(startCur - 60_000),
+          "--end",
+          end,
+          "--order",
+          "asc",
+          "--page-all",
+          "--page-limit",
+          "4",
+          "--no-reactions",
+        ]);
+        for (const m of arr(data, "messages")) {
+          raws.push({
+            m: { ...m, chat_id: m.chat_id || chatId, chat_type: m.chat_type || "group" },
+            kind: "group",
+            stream: "group",
+            fallbackGroupName: v.name,
+          });
         }
-        continue;
+      } catch {
+        st.fetchFailed = true;
       }
-      const o = this.toObs(m, kind, me);
-      if (o) obs.push(o);
     }
-    // 私聊没有会话名：用对方名字
-    const p2pName = new Map<string, string>();
-    for (const o of obs) if (o.meta.chat_type === "p2p" && !o.is_me && o.actor_name) p2pName.set(o.conv, o.actor_name);
-    for (const o of obs) if (o.meta.chat_type === "p2p") o.conv_name = `私聊：${p2pName.get(o.conv) ?? o.conv_name}`;
-    const n = this.store.addObs(obs);
-    if (!atMeBlocked) this.setKv("cursor.im.at_me", String(now));
-    if (!p2pBlocked) this.setKv("cursor.im.p2p", String(now));
-    if (!mineBlocked) this.setKv("cursor.im.mine", String(now));
-    if (!groupsBlocked) this.setKv("cursor.im.groups", String(now));
-    if (!atMeBlocked && !p2pBlocked && !mineBlocked && !groupsBlocked) this.setKv("cursor.im", String(now));
-    return { count: n, dropped };
+
+    // 先按 message_id 合并多路搜索/群拉取的字段（避免搜索命中缺 chat_name 提前占坑导致后续带完整元数据的群行被去重丢弃）
+    const kindRank: Record<string, number> = { at_me: 4, p2p: 3, mine: 2, group: 1 };
+    const mergedById = new Map<
+      string,
+      { m: Raw; kind: string; streams: Set<StreamKind>; fallbackGroupName: string }
+    >();
+    for (const row of raws) {
+      const id = String(row.m.message_id ?? row.m.id ?? "");
+      if (!id) continue;
+      const existing = mergedById.get(id);
+      if (!existing) {
+        mergedById.set(id, {
+          m: { ...row.m },
+          kind: row.kind,
+          streams: new Set([row.stream]),
+          fallbackGroupName: row.fallbackGroupName ?? "",
+        });
+      } else {
+        existing.streams.add(row.stream);
+        if (!existing.m.chat_id && row.m.chat_id) existing.m.chat_id = row.m.chat_id;
+        if (!String(existing.m.chat_name ?? "").trim() && String(row.m.chat_name ?? "").trim()) {
+          existing.m.chat_name = row.m.chat_name;
+        }
+        if (!String(existing.m.chat_type ?? "").trim() && String(row.m.chat_type ?? "").trim()) {
+          existing.m.chat_type = row.m.chat_type;
+        }
+        if (!existing.fallbackGroupName && row.fallbackGroupName) {
+          existing.fallbackGroupName = row.fallbackGroupName;
+        }
+        if ((kindRank[row.kind] ?? 0) > (kindRank[existing.kind] ?? 0)) {
+          existing.kind = row.kind;
+        }
+      }
+    }
+
+    const metaCache = new Map<string, { name: string; chatType: "p2p" | "group" | "" } | null>();
+    const getChatMeta = async (chatId: string) => {
+      if (metaCache.has(chatId)) return metaCache.get(chatId) ?? undefined;
+      const resolved = await this.resolveCurrentChatMeta(chatId);
+      metaCache.set(chatId, resolved ?? null);
+      return resolved;
+    };
+
+    // 提交前检测静音/排除策略是否在分页拉取期间变更；若变更则刷新原生排除快照并在原子事务内复核提交
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const latestSig = this.pollingPolicySignature();
+      if (latestSig !== policySig) {
+        policySig = latestSig;
+        nativeExcl = this.nativeExclusions ? await this.nativeExclusions() : undefined;
+      }
+
+      let atMeBlocked = !!nativeExcl?.groupsInconclusive;
+      let p2pBlocked = !!nativeExcl?.dmsInconclusive || !fetchedP2p;
+      let mineBlocked = !!nativeExcl?.groupsInconclusive;
+      let groupsBlocked = !!nativeExcl?.groupsInconclusive;
+      for (const st of chatPollState.values()) st.hadInconclusiveRow = false;
+
+      const needsCurrentName = this.hasNameDenyPatterns() || !!(nativeExcl && nativeExcl.confirmedGroupNames.size > 0);
+      const needsTypeLookup = !!(nativeExcl?.dmsInconclusive || nativeExcl?.groupsInconclusive);
+
+      let dropped = 0;
+      const obs: Obs[] = [];
+
+      for (const entry of mergedById.values()) {
+        const m = { ...entry.m };
+        const senderType = String(m.sender?.sender_type ?? m.sender?.type ?? m.sender_type ?? "");
+        if (senderType === "app" && !this.botAllowed(m)) {
+          dropped++;
+          continue;
+        }
+        const chatId = String(m.chat_id ?? "");
+        let chatType = String(m.chat_type ?? "").trim();
+        let chatName = String(m.chat_name ?? "").trim();
+
+        // 对缺失 chat_name（有名称/原生静音规则）或缺失 chat_type（受限状态）的命中实时查一次 im chats get，不凭陈旧 spoken_groups 放行
+        const shouldLookupMeta =
+          !!chatId &&
+          chatType.toLowerCase() !== "p2p" &&
+          ((!chatName && needsCurrentName) || (!chatType && (needsTypeLookup || needsCurrentName)));
+        if (shouldLookupMeta) {
+          const fresh = await getChatMeta(chatId);
+          if (fresh) {
+            if (!chatName && fresh.name) chatName = fresh.name;
+            if (!chatType && fresh.chatType) chatType = fresh.chatType;
+          }
+        }
+        if (!chatName && !needsCurrentName && entry.fallbackGroupName) {
+          chatName = entry.fallbackGroupName;
+        }
+        if (chatName && chatId && spoken[chatId]) {
+          spoken[chatId].name = chatName;
+        }
+        m.chat_name = chatName;
+        m.chat_type = chatType;
+
+        const excl = this.classifyExclusion(chatId, chatName, chatType, nativeExcl);
+        if (excl === "denied") {
+          dropped++;
+          continue;
+        }
+        if (excl === "inconclusive") {
+          const isKnownDm = chatType.toLowerCase() === "p2p";
+          if (isKnownDm) {
+            p2pBlocked = true;
+          } else {
+            for (const s of entry.streams) {
+              if (s === "p2p") p2pBlocked = true;
+              else if (s === "at_me") atMeBlocked = true;
+              else if (s === "mine") mineBlocked = true;
+              else if (s === "group") {
+                const st = chatPollState.get(chatId);
+                if (st) st.hadInconclusiveRow = true;
+                else groupsBlocked = true;
+              }
+            }
+          }
+          continue;
+        }
+        const o = this.toObs(m, entry.kind, me);
+        if (o) obs.push(o);
+      }
+
+      // 私聊没有会话名：用对方名字
+      const p2pName = new Map<string, string>();
+      for (const o of obs) if (o.meta.chat_type === "p2p" && !o.is_me && o.actor_name) p2pName.set(o.conv, o.actor_name);
+      for (const o of obs) if (o.meta.chat_type === "p2p") o.conv_name = `私聊：${p2pName.get(o.conv) ?? o.conv_name}`;
+
+      // 原子事务提交前最后一次核对策略签名：若在元信息查询期间策略再度变化则重试，绝不提交过期的观测或游标
+      const commitRes = this.store.tx(() => {
+        if (this.pollingPolicySignature() !== policySig) {
+          return { committed: false as const, count: 0 };
+        }
+        if (!this.cfg.context.sources.im) {
+          return { committed: true as const, count: 0 };
+        }
+        const n = this.store.addObs(obs);
+        this.setKv("spoken_groups", JSON.stringify(spoken));
+        for (const [chatId, st] of chatPollState) {
+          if (st.fetchFailed || st.hadInconclusiveRow || nativeExcl?.groupsInconclusive) {
+            // 首次拉取该群即受阻时，持久化原始起点 startCur，防止随后推进 cursor.im.groups 跳过未拉到的历史消息
+            if (!st.hadPriorCursor) this.setKv(`cursor.chat.${chatId}`, String(st.startCur));
+          } else {
+            this.setKv(`cursor.chat.${chatId}`, String(now));
+          }
+        }
+        if (!atMeBlocked) this.setKv("cursor.im.at_me", String(now));
+        if (!p2pBlocked) this.setKv("cursor.im.p2p", String(now));
+        if (!mineBlocked) this.setKv("cursor.im.mine", String(now));
+        if (!groupsBlocked) this.setKv("cursor.im.groups", String(now));
+        if (!atMeBlocked && !p2pBlocked && !mineBlocked && !groupsBlocked) this.setKv("cursor.im", String(now));
+        return { committed: true as const, count: n };
+      });
+      if (commitRes.committed) {
+        return { count: commitRes.count, dropped };
+      }
+    }
+
+    // 连续两轮策略均在提交瞬间变更：本轮安全跳过落库与游标推进，留待下轮按最新策略重试
+    return { count: 0, dropped: 0 };
   }
 
   // ───────── 妙记 → 观测 ─────────

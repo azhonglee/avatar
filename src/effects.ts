@@ -1,5 +1,5 @@
 import type { Board, SectionKey } from "./board.ts";
-import { computePwReplyCid } from "./context/personal-web.ts";
+import { computePwReplyCid, hasWorkspaceOwnerMismatch } from "./context/personal-web.ts";
 import { deepFind, runProcess } from "./util.ts";
 import type { Store } from "./store.ts";
 import type { Config } from "./config.ts";
@@ -33,6 +33,16 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
     maxAttempts: cfg.engine.effect_attempts,
     async run(item) {
       const e = item.payload;
+      // 若工作区 owner.open_id 与已绑定的个人 Web 主人不一致，严禁向新主人投递旧主人的上下文卡片、提醒、草稿或自主任务
+      const isContextEffect =
+        item.ref.startsWith("card:ctx-") ||
+        item.ref.startsWith("ctx-draft:") ||
+        (item.ref.startsWith("context:") && item.ref !== "context:pw-needs-login") ||
+        e.op === "pw.reply" ||
+        (e.op === "card.upsert" && e.args.key.startsWith("ctx-"));
+      if (isContextEffect && hasWorkspaceOwnerMismatch(store, cfg.owner.open_id)) {
+        throw new Error("当前工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已阻断上下文通知与外部动作投递以防跨账号泄漏");
+      }
       if (e.op === "notify" || e.op === "card.upsert") {
         const g = hooks.gate?.(e.args.kind, e);
         if (g === false) return void ledger.transition(item, { state: "skipped", terminal: true });

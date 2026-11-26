@@ -6,13 +6,34 @@ import type { Profile } from "./guard.ts";
 import { runProcess } from "./util.ts";
 
 const FEISHU_WEB_KEY_CRED = "feishu-web-key";
+/** Linux kernel tmpfs magic number (`linux/magic.h`: `TMPFS_MAGIC`). */
+const LINUX_TMPFS_MAGIC = 0x01021994;
+
+/** 检测目录是否位于易失性内存文件系统（tmpfs），绝不把无关 systemd 凭据复制到磁盘介质的 /tmp */
+function findVolatileTmpfsBase(env: NodeJS.ProcessEnv): string | undefined {
+  const candidates = [env.XDG_RUNTIME_DIR?.trim(), "/dev/shm"].filter((d): d is string => !!d);
+  for (const dir of candidates) {
+    try {
+      const st = fs.statfsSync(dir);
+      if (st.type === LINUX_TMPFS_MAGIC) {
+        fs.accessSync(dir, fs.constants.W_OK | fs.constants.X_OK);
+        return dir;
+      }
+    } catch {
+      // 跳过不可访问或非 tmpfs 目录
+    }
+  }
+  return undefined;
+}
 
 /**
- * 构造传给子模型进程的基础环境：
+ * 构造传给子模型或仓库校验进程的基础环境：
  *   - 始终剥离所有 `PA_FEISHU_WEB_*` 环境变量（凭据路径与静态加密密钥）；
  *   - 若 `CREDENTIALS_DIRECTORY` 不包含 `feishu-web-key`，原样保留（不破坏无关的 systemd 凭据）；
- *   - 若 `CREDENTIALS_DIRECTORY` 包含 `feishu-web-key`，则只将无关凭据复制到 0700 临时目录（0400 文件权限）供子进程读取，
- *     并在子进程结束后立即清理（若目录内仅有 `feishu-web-key`，则移除 `CREDENTIALS_DIRECTORY`）。
+ *   - 若 `CREDENTIALS_DIRECTORY` 仅包含 `feishu-web-key`，直接移除 `CREDENTIALS_DIRECTORY`；
+ *   - 若 `CREDENTIALS_DIRECTORY` 同时包含 `feishu-web-key` 与无关凭据：
+ *     仅在检测到内核级内存 tmpfs（`$XDG_RUNTIME_DIR` 或 `/dev/shm`）时，将无关凭据以 0400 投影到 0700 易失目录并在结束及进程退出时清理；
+ *     绝不将任何无关凭据落盘写入磁盘 `os.tmpdir()`（无可用 tmpfs 时按安全策略移除 `CREDENTIALS_DIRECTORY`）。
  */
 export function prepareHarnessEnv(env: NodeJS.ProcessEnv = process.env): { env: NodeJS.ProcessEnv; cleanup: () => void } {
   const clean: NodeJS.ProcessEnv = {};
@@ -43,25 +64,425 @@ export function prepareHarnessEnv(env: NodeJS.ProcessEnv = process.env): { env: 
     return { env: clean, cleanup: () => undefined };
   }
 
-  const filteredDir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-creds-"));
+  const volatileBase = findVolatileTmpfsBase(env);
+  if (!volatileBase) {
+    // 无内核级易失 tmpfs 时绝不向磁盘 TMPDIR 复制无关密钥，按 fail-closed 移除 CREDENTIALS_DIRECTORY
+    delete clean.CREDENTIALS_DIRECTORY;
+    return { env: clean, cleanup: () => undefined };
+  }
+
+  const filteredDir = fs.mkdtempSync(path.join(volatileBase, "pa-creds-"));
   fs.chmodSync(filteredDir, 0o700);
-  for (const entry of others) {
-    const src = path.join(credDir, entry.name);
-    const dst = path.join(filteredDir, entry.name);
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    process.off("exit", cleanup);
     try {
-      const st = fs.statSync(src);
-      if (st.isFile()) {
-        fs.writeFileSync(dst, fs.readFileSync(src), { mode: 0o400 });
-      }
+      fs.rmSync(filteredDir, { recursive: true, force: true });
     } catch {
-      // 跳过不可读或特殊节点
+      // ignore
     }
+  };
+  process.once("exit", cleanup);
+  try {
+    for (const entry of others) {
+      const src = path.join(credDir, entry.name);
+      const dst = path.join(filteredDir, entry.name);
+      try {
+        const st = fs.statSync(src);
+        if (st.isFile()) {
+          fs.writeFileSync(dst, fs.readFileSync(src), { mode: 0o400 });
+        }
+      } catch {
+        // 跳过不可读或特殊节点
+      }
+    }
+  } catch (err) {
+    cleanup();
+    throw err;
   }
   clean.CREDENTIALS_DIRECTORY = filteredDir;
-  return {
-    env: clean,
-    cleanup: () => fs.rmSync(filteredDir, { recursive: true, force: true }),
+  return { env: clean, cleanup };
+}
+
+/**
+ * 合并 harness.env：仅从过滤后的基础环境展开 `${VAR}`，且禁止通过覆写还原被过滤的 `PA_FEISHU_WEB_*` 或含 `feishu-web-key` 的 `CREDENTIALS_DIRECTORY`。
+ */
+export function mergeHarnessEnv(
+  sanitizedBase: NodeJS.ProcessEnv,
+  overrides: Record<string, string>,
+  originalCredDir = process.env.CREDENTIALS_DIRECTORY?.trim(),
+): NodeJS.ProcessEnv {
+  const expanded: NodeJS.ProcessEnv = {};
+  const credWasFiltered = !!originalCredDir && sanitizedBase.CREDENTIALS_DIRECTORY !== originalCredDir;
+  for (const [k, rawVal] of Object.entries(overrides)) {
+    if (k.startsWith("PA_FEISHU_WEB_")) continue;
+    const val = rawVal.replace(/\$\{(\w+)\}/g, (_, n: string) => sanitizedBase[n] ?? "");
+    if (k === "CREDENTIALS_DIRECTORY") {
+      const candidate = val.trim();
+      if (!candidate) continue;
+      if (credWasFiltered) {
+        if (path.resolve(candidate) === path.resolve(originalCredDir)) continue;
+        try {
+          if (fs.realpathSync(candidate) === fs.realpathSync(originalCredDir)) continue;
+        } catch {
+          // 路径不存在或不可解析时继续用后续检查兜底
+        }
+      }
+      if (fs.existsSync(path.join(candidate, FEISHU_WEB_KEY_CRED))) continue;
+    }
+    expanded[k] = val;
+  }
+  return { ...sanitizedBase, ...expanded };
+}
+
+function stripTomlComment(line: string): string {
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inDouble) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inDouble = false;
+    } else if (inSingle) {
+      if (ch === "'") inSingle = false;
+    } else if (ch === '"') {
+      inDouble = true;
+    } else if (ch === "'") {
+      inSingle = true;
+    } else if (ch === "#") {
+      return line.slice(0, i);
+    }
+  }
+  return line;
+}
+
+function parseTomlPath(raw: string): string[] {
+  const parts: string[] = [];
+  let i = 0;
+  const s = raw.trim();
+  while (i < s.length) {
+    while (i < s.length && (s[i] === " " || s[i] === "\t")) i++;
+    if (i >= s.length) break;
+    if (s[i] === '"' || s[i] === "'") {
+      const q = s[i++];
+      let out = "";
+      let closed = false;
+      while (i < s.length) {
+        const ch = s[i++];
+        if (q === '"' && ch === "\\" && i < s.length) {
+          out += s[i++];
+          continue;
+        }
+        if (ch === q) {
+          closed = true;
+          break;
+        }
+        out += ch;
+      }
+      if (!closed) throw new Error(`TOML 路径引号未闭合：${raw}`);
+      parts.push(out);
+    } else {
+      let start = i;
+      while (i < s.length && s[i] !== "." && s[i] !== " " && s[i] !== "\t") i++;
+      const seg = s.slice(start, i).trim();
+      if (!seg) throw new Error(`TOML 路径非法：${raw}`);
+      parts.push(seg);
+    }
+    while (i < s.length && (s[i] === " " || s[i] === "\t")) i++;
+    if (i < s.length) {
+      if (s[i] !== ".") throw new Error(`TOML 路径分隔符非法：${raw}`);
+      i++;
+    }
+  }
+  return parts;
+}
+
+function parseTomlStringValue(raw: string): string | undefined {
+  const t = raw.trim();
+  if (t.startsWith('"""') || t.startsWith("'''")) return undefined;
+  if (t.startsWith('"') && t.endsWith('"') && t.length >= 2) {
+    try {
+      return JSON.parse(t) as string;
+    } catch {
+      return undefined;
+    }
+  }
+  if (t.startsWith("'") && t.endsWith("'") && t.length >= 2) {
+    return t.slice(1, -1);
+  }
+  return undefined;
+}
+
+function isSimpleSingleLineTomlValue(raw: string): boolean {
+  const t = raw.trim();
+  if (!t || t.startsWith('"""') || t.startsWith("'''")) return false;
+  if (t.startsWith('"') || t.startsWith("'")) return parseTomlStringValue(t) !== undefined;
+  if (t === "true" || t === "false") return true;
+  if (/^[+-]?\d[\d_]*(\.\d[\d_]*)?([eE][+-]?\d+)?$/.test(t)) return true;
+  if (t.startsWith("[")) return t.endsWith("]");
+  if (t.startsWith("{")) return t.endsWith("}");
+  return false;
+}
+
+function formatTomlKeySegment(seg: string): string {
+  return /^[A-Za-z0-9_-]+$/.test(seg) ? seg : JSON.stringify(seg);
+}
+
+const SAFE_CODEX_PROVIDER_SUBTABLES = new Set(["http_headers", "env_http_headers", "query_params"]);
+const BUILTIN_CODEX_PROVIDERS = new Set(["openai", "oss"]);
+const SAFE_CODEX_SCALAR_KEYS = ["model_reasoning_effort", "service_tier", "openai_base_url", "chatgpt_base_url", "oss_provider"] as const;
+
+function parseCliConfigAssignment(expr: string): { key: string; value: string } | undefined {
+  const eq = expr.indexOf("=");
+  if (eq <= 0) return undefined;
+  return { key: expr.slice(0, eq).trim(), value: expr.slice(eq + 1).trim() };
+}
+
+function redactCodexLogArgs(args: string[]): string[] {
+  return args.map((a) =>
+    /^(model_providers\.[^=]+\.(?:http_headers|query_params)\.[^=]+)=/.test(a)
+      ? a.replace(/=.*$/, "=<redacted>")
+      : a,
+  );
+}
+
+/**
+ * 为 `codex-exec` 的 `tools: "none"` 模式构造工具隔离参数时，从用户的 `$CODEX_HOME/config.toml`
+ * 仅提取安全的模型与供应商配置（`model` / `model_provider` / `model_reasoning_effort` / `service_tier` /
+ * `openai_base_url` / `chatgpt_base_url` / `oss_provider` 与选中供应商对应的 `[model_providers.<name>]`），
+ * 彻底忽略 `mcp_servers` / `plugins` / `hooks` / `apps` / `projects`。
+ * 若用户配置指定了自定义供应商或 profile 但无法安全解析，按 fail-closed 抛错，绝不把私聊消息发往默认供应商。
+ */
+export function extractSafeCodexProviderArgs(
+  env: NodeJS.ProcessEnv,
+  extraArgs: string[],
+  hasExplicitModel: boolean,
+): string[] {
+  const codexHome = env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex");
+  const configPath = path.join(codexHome, "config.toml");
+
+  // 检测 extraArgs 中是否已显式传入 model_provider、model、provider 字段或 profile
+  let extraHasModelProvider = false;
+  let extraProvider: string | undefined;
+  const extraProviderDefs = new Set<string>();
+  let extraHasModel = hasExplicitModel;
+  let cliProfile = "";
+  const inspectConfigExpr = (expr: string) => {
+    const parsed = parseCliConfigAssignment(expr);
+    if (!parsed) return;
+    if (parsed.key === "model_provider") {
+      extraHasModelProvider = true;
+      extraProvider = parseTomlStringValue(parsed.value) ?? parsed.value.replace(/^["']|["']$/g, "");
+    } else if (parsed.key === "model") {
+      extraHasModel = true;
+    } else if (parsed.key.startsWith("model_providers.")) {
+      try {
+        const segs = parseTomlPath(parsed.key);
+        if (segs[0] === "model_providers" && segs[1]) extraProviderDefs.add(segs[1]);
+      } catch {
+        // ignore
+      }
+    }
   };
+  for (let i = 0; i < extraArgs.length; i++) {
+    const a = extraArgs[i];
+    if (a === "-m" || a === "--model" || a.startsWith("--model=")) extraHasModel = true;
+    if (a === "-p" || a === "--profile") {
+      cliProfile = extraArgs[i + 1] ?? "";
+    } else if (a.startsWith("--profile=")) {
+      cliProfile = a.slice("--profile=".length);
+    }
+    if (a === "-c" || a === "--config") {
+      inspectConfigExpr(extraArgs[i + 1] ?? "");
+    } else if (a.startsWith("--config=")) {
+      inspectConfigExpr(a.slice("--config=".length));
+    }
+  }
+
+  if (cliProfile) {
+    throw new Error(
+      `codex-exec tools="none" 模式已禁用用户配置文件以避免加载 MCP/工具，暂不支持通过 --profile ${cliProfile} 叠加外部配置；请在 config.yaml 的 harnesses.<name> 中直接配置 model 与 -c model_provider=...`,
+    );
+  }
+
+  if (!fs.existsSync(configPath)) return [];
+  const rawContent = fs.readFileSync(configPath, "utf8");
+  const top = new Map<string, string>();
+  const profiles = new Map<string, Map<string, string>>();
+  const providerTables = new Map<string, { fields: Map<string, string>; subtables: Map<string, Map<string, string>> }>();
+  let curSection: string[] = [];
+  let unparseableTop = "";
+  const unparseableProviders = new Set<string>();
+  const unparseableProfiles = new Set<string>();
+
+  const ensureProvider = (name: string) => {
+    let entry = providerTables.get(name);
+    if (!entry) {
+      entry = { fields: new Map(), subtables: new Map() };
+      providerTables.set(name, entry);
+    }
+    return entry;
+  };
+  const markUnparseable = (section: string[], line: string) => {
+    if (section[0] === "model_providers") {
+      if (section[1]) unparseableProviders.add(section[1]);
+      else unparseableTop = line;
+    } else if (section[0] === "profiles") {
+      if (section[1]) unparseableProfiles.add(section[1]);
+      else unparseableTop = line;
+    } else {
+      unparseableTop = line;
+    }
+  };
+
+  for (const rawLine of rawContent.split(/\r?\n/)) {
+    const line = stripTomlComment(rawLine).trim();
+    if (!line) continue;
+    if (line.startsWith("[[") && line.endsWith("]]")) {
+      curSection = ["__array_table__"];
+      continue;
+    }
+    if (line.startsWith("[") && line.endsWith("]")) {
+      const inner = line.slice(1, -1);
+      try {
+        curSection = parseTomlPath(inner);
+      } catch {
+        if (/\b(?:model_providers|profiles)\b/.test(inner)) unparseableTop = line;
+        curSection = ["__invalid__"];
+      }
+      continue;
+    }
+    const eq = line.indexOf("=");
+    if (eq <= 0) {
+      if (curSection[0] === "model_providers" || curSection[0] === "profiles") {
+        markUnparseable(curSection, line);
+      }
+      continue;
+    }
+    const keyPart = line.slice(0, eq).trim();
+    const valPart = line.slice(eq + 1).trim();
+    let keySegments: string[];
+    try {
+      keySegments = parseTomlPath(keyPart);
+    } catch {
+      if (curSection[0] === "model_providers" || curSection[0] === "profiles") {
+        markUnparseable(curSection, line);
+      }
+      continue;
+    }
+    const fullPath = [...curSection, ...keySegments];
+    const inSensitiveSection = fullPath[0] === "model_providers" || fullPath[0] === "profiles";
+    // 顶层内联表 model_providers = { ... } / profiles = { ... } 无法安全拆解，一律按不可解析标记
+    if (fullPath.length === 1 && (fullPath[0] === "model_providers" || fullPath[0] === "profiles")) {
+      unparseableTop = line;
+      continue;
+    }
+    if (!isSimpleSingleLineTomlValue(valPart)) {
+      if (
+        inSensitiveSection ||
+        (fullPath.length === 1 &&
+          (fullPath[0] === "model_provider" ||
+            fullPath[0] === "profile" ||
+            fullPath[0] === "model" ||
+            fullPath[0] === "openai_base_url" ||
+            fullPath[0] === "chatgpt_base_url"))
+      ) {
+        markUnparseable(fullPath, line);
+      }
+      continue;
+    }
+    if (fullPath.length === 1) {
+      top.set(fullPath[0], valPart);
+    } else if (fullPath[0] === "profiles" && fullPath.length === 3) {
+      const pName = fullPath[1];
+      let pMap = profiles.get(pName);
+      if (!pMap) {
+        pMap = new Map();
+        profiles.set(pName, pMap);
+      }
+      pMap.set(fullPath[2], valPart);
+    } else if (fullPath[0] === "model_providers" && fullPath.length === 3) {
+      ensureProvider(fullPath[1]).fields.set(fullPath[2], valPart);
+    } else if (fullPath[0] === "model_providers" && fullPath.length === 4 && SAFE_CODEX_PROVIDER_SUBTABLES.has(fullPath[2])) {
+      const p = ensureProvider(fullPath[1]);
+      let sub = p.subtables.get(fullPath[2]);
+      if (!sub) {
+        sub = new Map();
+        p.subtables.set(fullPath[2], sub);
+      }
+      sub.set(fullPath[3], valPart);
+    }
+  }
+
+  if (unparseableTop) {
+    throw new Error(
+      "检测到 Codex config.toml 的供应商或 profile 配置包含无法安全提取的多行/内联表语法；为避免私聊误发往默认供应商，已中止 tools=none 执行",
+    );
+  }
+
+  const profileRaw = top.get("profile");
+  const activeProfileName = profileRaw ? parseTomlStringValue(profileRaw) : undefined;
+  if (profileRaw && !activeProfileName) {
+    throw new Error("无法解析 Codex config.toml 中的 profile 配置；为避免误发往默认供应商，已中止 tools=none 执行");
+  }
+  const activeProfile = activeProfileName ? profiles.get(activeProfileName) : undefined;
+  if (activeProfileName && (!activeProfile || unparseableProfiles.has(activeProfileName))) {
+    throw new Error(
+      `Codex config.toml 指定了 profile "${activeProfileName}"，但未能安全解析对应的 [profiles.${activeProfileName}]；为避免将私聊发往默认供应商，已中止执行`,
+    );
+  }
+
+  const effectiveRaw = (key: string): string | undefined => activeProfile?.get(key) ?? top.get(key);
+  const selectedProviderRaw = effectiveRaw("model_provider");
+  const selectedProvider = selectedProviderRaw ? parseTomlStringValue(selectedProviderRaw) : undefined;
+
+  if (selectedProviderRaw && !selectedProvider) {
+    throw new Error("无法解析 Codex config.toml 中的 model_provider；为避免将私聊发往默认供应商，已中止执行");
+  }
+
+  const effectiveProvider = extraProvider ?? selectedProvider ?? "openai";
+  if (unparseableProviders.has(effectiveProvider)) {
+    throw new Error(
+      `检测到 Codex config.toml 中 [model_providers.${effectiveProvider}] 包含无法安全提取的多行/复杂语法；为避免私聊误发往默认供应商，已中止 tools=none 执行`,
+    );
+  }
+
+  const out: string[] = [];
+  const modelRaw = effectiveRaw("model");
+  if (!extraHasModel && modelRaw) {
+    out.push("-c", `model=${modelRaw}`);
+  }
+  for (const scalarKey of SAFE_CODEX_SCALAR_KEYS) {
+    const v = effectiveRaw(scalarKey);
+    if (v) out.push("-c", `${scalarKey}=${v}`);
+  }
+
+  if (selectedProvider && !extraHasModelProvider) {
+    out.push("-c", `model_provider=${JSON.stringify(selectedProvider)}`);
+  }
+
+  const providerTable = providerTables.get(effectiveProvider);
+  if (!providerTable && !BUILTIN_CODEX_PROVIDERS.has(effectiveProvider) && !extraProviderDefs.has(effectiveProvider)) {
+    throw new Error(
+      `Codex config.toml 指定了自定义供应商 "${effectiveProvider}"，但未能解析对应的 [model_providers.${effectiveProvider}] 配置；为避免私聊误发往默认供应商，已中止执行`,
+    );
+  }
+  if (providerTable) {
+    const pKey = formatTomlKeySegment(effectiveProvider);
+    for (const [k, v] of providerTable.fields) {
+      out.push("-c", `model_providers.${pKey}.${formatTomlKeySegment(k)}=${v}`);
+    }
+    for (const [subName, subMap] of providerTable.subtables) {
+      for (const [k, v] of subMap) {
+        out.push("-c", `model_providers.${pKey}.${subName}.${formatTomlKeySegment(k)}=${v}`);
+      }
+    }
+  }
+  return out;
 }
 
 export interface HarnessRun {
@@ -121,23 +542,20 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
   else args.push(h.agent!, "exec", "--file", "-");
 
   fs.mkdirSync(run.cwd, { recursive: true });
-  // harness.env 的值支持 ${VAR} 引用守护进程的环境变量，密钥不必写进配置文件
-  const harnessEnv = Object.fromEntries(
-    Object.entries(h.env).map(([k, v]) => [k, v.replace(/\$\{(\w+)\}/g, (_, n: string) => process.env[n] ?? "")]),
-  );
+  // 先解析可执行路径再准备临时凭据环境，确保 resolveBin 异常不会泄漏易失目录
+  const realLark = resolveBin(cfg.bins.lark);
   const baseEnv = prepareHarnessEnv();
-  const env: NodeJS.ProcessEnv = {
-    ...baseEnv.env,
-    ...harnessEnv,
-    PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${process.env.PATH ?? ""}`,
-    PA_GUARD_PROFILE: run.lark,
-    PA_OWNER_OPEN_ID: cfg.owner.open_id,
-    PA_LARK_REAL: resolveBin(cfg.bins.lark),
-    PA_GUARD_LOG: path.join(cfg.dataDir, "logs", "guard.log"),
-  };
   const started = new Date().toISOString();
   let r: Awaited<ReturnType<typeof runProcess>>;
   try {
+    const env: NodeJS.ProcessEnv = {
+      ...mergeHarnessEnv(baseEnv.env, h.env),
+      PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${process.env.PATH ?? ""}`,
+      PA_GUARD_PROFILE: run.lark,
+      PA_OWNER_OPEN_ID: cfg.owner.open_id,
+      PA_LARK_REAL: realLark,
+      PA_GUARD_LOG: path.join(cfg.dataDir, "logs", "guard.log"),
+    };
     r = await runProcess(cfg.bins.acpx, args, {
       cwd: run.cwd,
       env,
@@ -210,43 +628,44 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   if (!isolatedTmp) fs.mkdirSync(execCwd, { recursive: true });
   const outFile = path.join(execCwd, `.codex-last-${process.pid}-${Date.now()}.txt`);
   // -o 用相对 cwd 的文件名：codex 0.169 在部分路径（如经符号链接的家目录）下打开绝对路径会报 "Not a directory"
-  const args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--ephemeral", "--color", "never", "-o", path.basename(outFile)];
-  if (run.tools === "none") {
-    // 彻底隔离用户配置（包括 ~/.codex/config.toml 中配置的任意 MCP Server / 插件 / 钩子）与执行规则，仅保留认证，并关闭全部内置工具
-    args.push(
-      "--ignore-user-config",
-      "--ignore-rules",
-      "--disable", "shell_tool",
-      "--disable", "unified_exec",
-      "--disable", "apps",
-      "--disable", "browser_use",
-      "--disable", "computer_use",
-      "--disable", "view_image",
-      "--disable", "image_generation",
-      "--disable", "plugins",
-      "--disable", "remote_plugin",
-      "--disable", "sleep_tool",
-      "--disable", "hooks",
-      "--disable", "multi_agent",
-      "--disable", "code_mode",
-      "--disable", "code_mode_host",
-      "-c", "sandbox_permissions=[]",
-      "-c", 'web_search="disabled"',
-    );
-  }
-  if (h.model) args.push("-m", h.model);
-  args.push(...h.extraArgs, "-");
-  const harnessEnv = Object.fromEntries(
-    Object.entries(h.env).map(([k, v]) => [k, v.replace(/\$\{(\w+)\}/g, (_, n: string) => process.env[n] ?? "")]),
-  );
   const baseEnv = prepareHarnessEnv();
   const started = new Date().toISOString();
   let r: Awaited<ReturnType<typeof runProcess>>;
   let text = "";
+  let args: string[] = [];
   try {
+    const finalEnv = mergeHarnessEnv(baseEnv.env, h.env);
+    args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--ephemeral", "--color", "never", "-o", path.basename(outFile)];
+    if (run.tools === "none") {
+      // 彻底隔离用户配置（包括 ~/.codex/config.toml 中配置的任意 MCP Server / 插件 / 钩子）与执行规则，仅保留认证及提取后的安全供应商/模型参数
+      const safeProviderArgs = extractSafeCodexProviderArgs(finalEnv, h.extraArgs, !!h.model);
+      args.push(
+        "--ignore-user-config",
+        "--ignore-rules",
+        ...safeProviderArgs,
+        "--disable", "shell_tool",
+        "--disable", "unified_exec",
+        "--disable", "apps",
+        "--disable", "browser_use",
+        "--disable", "computer_use",
+        "--disable", "view_image",
+        "--disable", "image_generation",
+        "--disable", "plugins",
+        "--disable", "remote_plugin",
+        "--disable", "sleep_tool",
+        "--disable", "hooks",
+        "--disable", "multi_agent",
+        "--disable", "code_mode",
+        "--disable", "code_mode_host",
+        "-c", "sandbox_permissions=[]",
+        "-c", 'web_search="disabled"',
+      );
+    }
+    if (h.model) args.push("-m", h.model);
+    args.push(...h.extraArgs, "-");
     r = await runProcess(cmd, args, {
       cwd: execCwd,
-      env: { ...baseEnv.env, ...harnessEnv },
+      env: finalEnv,
       input: run.prompt,
       timeoutMs: (run.timeoutSec + 60) * 1000,
       group: true,
@@ -265,7 +684,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   }
   fs.writeFileSync(
     run.logFile,
-    [`# ${started} harness=${run.harness} type=codex-exec tools=${run.tools} cwd=${execCwd}`, `# ${cmd} ${args.join(" ")}`, `# exit=${r.code} timedOut=${r.timedOut}`, "## prompt", run.prompt, "## reply", text, "## stderr", r.stderr.slice(-4000)].join("\n"),
+    [`# ${started} harness=${run.harness} type=codex-exec tools=${run.tools} cwd=${execCwd}`, `# ${cmd} ${redactCodexLogArgs(args).join(" ")}`, `# exit=${r.code} timedOut=${r.timedOut}`, "## prompt", run.prompt, "## reply", text, "## stderr", r.stderr.slice(-4000)].join("\n"),
   );
   try {
     usageRecorder?.(run, { stdout: r.stdout, stderr: r.stderr, code: r.code });
@@ -290,26 +709,12 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   if (h.model) args.push("--model", h.model);
   args.push(...h.extraArgs, "-p", "-");
 
-  const harnessEnv = Object.fromEntries(
-    Object.entries(h.env).map(([k, v]) => [k, v.replace(/\$\{(\w+)\}/g, (_, n: string) => process.env[n] ?? "")]),
-  );
   let realLark = cfg.bins.lark;
   try {
     realLark = resolveBin(cfg.bins.lark);
   } catch {
     // run.lark === "none" 时不会执行真实 lark-cli
   }
-  const baseEnv = prepareHarnessEnv();
-  const env: NodeJS.ProcessEnv = {
-    ...baseEnv.env,
-    ...harnessEnv,
-    DOUBAO_CLI_NO_UPDATE_CHECK: "1",
-    PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${process.env.PATH ?? ""}`,
-    PA_GUARD_PROFILE: run.lark,
-    PA_OWNER_OPEN_ID: cfg.owner.open_id,
-    PA_LARK_REAL: realLark,
-    PA_GUARD_LOG: path.join(cfg.dataDir, "logs", "guard.log"),
-  };
   const started = new Date().toISOString();
   // Node.js spawn 的 stdio:"pipe" 在 Linux 上是 Unix socketpair（S_IFSOCK），doubao 会报
   // "stdin must be a terminal, pipe or regular file"；写到 0600 临时普通文件以 FD 传入，用完立即删除。
@@ -318,8 +723,18 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   const promptFile = path.join(promptDir, `.doubao-in-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
   fs.writeFileSync(promptFile, run.prompt, { mode: 0o600 });
   const fd = fs.openSync(promptFile, "r");
+  const baseEnv = prepareHarnessEnv();
   let r: Awaited<ReturnType<typeof runProcess>>;
   try {
+    const env: NodeJS.ProcessEnv = {
+      ...mergeHarnessEnv(baseEnv.env, h.env),
+      DOUBAO_CLI_NO_UPDATE_CHECK: "1",
+      PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${process.env.PATH ?? ""}`,
+      PA_GUARD_PROFILE: run.lark,
+      PA_OWNER_OPEN_ID: cfg.owner.open_id,
+      PA_LARK_REAL: realLark,
+      PA_GUARD_LOG: path.join(cfg.dataDir, "logs", "guard.log"),
+    };
     r = await runProcess(cmd, args, {
       cwd: run.cwd,
       env,

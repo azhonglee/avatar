@@ -3,9 +3,10 @@ import path from "node:path";
 import { z } from "zod";
 import type { Board, BoardTask } from "../board.ts";
 import { repoSpec, type Config } from "../config.ts";
+import { tryGit } from "../delivery/git.ts";
 import { comment, move } from "../effects.ts";
 import { checkpoint, type Ctx, type Handler } from "../engine.ts";
-import { loadPrompt, runHarness } from "../harness.ts";
+import { loadPrompt, prepareHarnessEnv, runHarness } from "../harness.ts";
 import type { Effect, Ledger, WorkItem } from "../ledger.ts";
 import type { Store } from "../store.ts";
 import { errMsg, log, render, runProcess, truncate } from "../util.ts";
@@ -474,9 +475,11 @@ export class Dispatcher {
     const name = `校验命令 \`${p.verify}\``;
     const logFile = path.join(this.logDir(p.guid), `verify-${p.round}-${ctx.attempt}.log`);
     const step = this.ledger.startStep({ work_id: it.id, name: `verify#${p.round}`, log: logFile });
+    const baseEnv = prepareHarnessEnv();
     try {
       const r = await runProcess("bash", ["-lc", p.verify], {
         cwd: p.cwd,
+        env: baseEnv.env,
         timeoutMs: this.cfg.acceptance.verify_timeout_sec * 1000,
         group: true,
         signal: ctx.signal,
@@ -493,6 +496,8 @@ export class Dispatcher {
       this.ledger.endStep(step, "failed", String(e));
       checkpoint(ctx);
       return { kind: "command", name, status: "error", detail: `无法运行：${String(e)}` };
+    } finally {
+      baseEnv.cleanup();
     }
   }
 
@@ -551,7 +556,7 @@ export class Dispatcher {
     const baseKey = `worktree.${t.guid}.base`;
     if (!fs.existsSync(cwd)) {
       const head = await git(spec.path, ["rev-parse", "HEAD"]);
-      const hasBranch = (await runProcess("git", ["-C", spec.path, "rev-parse", "--verify", "--quiet", branch])).code === 0;
+      const hasBranch = (await tryGit(spec.path, ["rev-parse", "--verify", "--quiet", branch])).code === 0;
       await git(spec.path, hasBranch ? ["worktree", "add", cwd, branch] : ["worktree", "add", "-b", branch, cwd]);
       if (!this.store.get(baseKey)) this.store.set(baseKey, head.trim());
     }
@@ -573,10 +578,8 @@ export function formatReview(r: Review): string {
   return [r.summary, ...issues].filter(Boolean).join("\n") || (r.verdict === "approve" ? "没有发现问题" : "需修改");
 }
 
-const GIT_ID = ["-c", "user.name=personal-agent", "-c", "user.email=personal-agent@localhost"];
-
 async function git(cwd: string, args: string[]): Promise<string> {
-  const r = await runProcess("git", ["-C", cwd, ...GIT_ID, ...args]);
+  const r = await tryGit(cwd, args);
   if (r.code !== 0) throw new Error(`git ${args.join(" ")} 失败：${r.stderr.trim()}`);
   return r.stdout;
 }
@@ -584,15 +587,15 @@ async function git(cwd: string, args: string[]): Promise<string> {
 /** 有改动就提交（含新文件）；没有改动什么都不做。 */
 async function autoCommit(cwd: string, message: string): Promise<void> {
   await git(cwd, ["add", "-A"]);
-  const dirty = (await runProcess("git", ["-C", cwd, "diff", "--cached", "--quiet"])).code !== 0;
+  const dirty = (await tryGit(cwd, ["diff", "--cached", "--quiet"])).code !== 0;
   if (dirty) await git(cwd, ["commit", "-q", "--no-verify", "-m", message]);
 }
 
 /** 相对创建 worktree 时的基线（每轮结束都已自动提交，所以比较到 HEAD 即可）。 */
 async function gitDiff(cwd: string, base: string): Promise<string> {
-  return (await runProcess("git", ["-C", cwd, "diff", base, "HEAD"])).stdout;
+  return (await tryGit(cwd, ["diff", base, "HEAD"])).stdout;
 }
 
 async function gitDiffStat(cwd: string, base: string): Promise<string> {
-  return (await runProcess("git", ["-C", cwd, "diff", "--stat", base, "HEAD"])).stdout.trim();
+  return (await tryGit(cwd, ["diff", "--stat", base, "HEAD"])).stdout.trim();
 }

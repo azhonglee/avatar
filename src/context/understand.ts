@@ -223,12 +223,13 @@ export class Understander {
       .join("\n");
   }
 
-  /** 跑一批：调用模型 → 解析 → 写入 */
+  /** 跑一批：调用模型 → 解析 → 应用前二次策略复核 → 原子写入 */
   async runBatch(
     workId: string,
     convs: { conv: string; conv_name: string; target_obs_id?: string }[],
     signal?: AbortSignal,
     activeNativeOwner?: string | null,
+    validateBeforeApply?: (batchConvs: { conv: string; conv_name: string }[]) => Promise<Set<string>>,
   ): Promise<ApplyResult & { convs: string[]; fresh: number }> {
     this.processedCache.clear();
     const batch = this.buildBatch(convs, 24_000, activeNativeOwner);
@@ -255,7 +256,9 @@ export class Understander {
       });
       if (!r.text) throw new Error(`理解 harness 无输出（exit ${r.exitCode}${r.timedOut ? "，超时" : ""}）`);
       const out = parseUnderstand(r.text);
-      const res = this.apply(out, batch.obs, batch.fresh);
+      const usedMeta = batch.convs.map((id) => ({ conv: id, conv_name: convs.find((c) => c.conv === id)?.conv_name ?? "" }));
+      const disallowedConvs = validateBeforeApply ? await validateBeforeApply(usedMeta) : undefined;
+      const res = this.apply(out, batch.obs, batch.fresh, disallowedConvs);
       this.app.ledger.endStep(step, "ok", `新事项 ${res.created.length}，关闭 ${res.closed.length}，知识 ${res.knowledge}`);
       return { ...res, convs: batch.convs, fresh: batch.fresh.length };
     } catch (e) {
@@ -266,10 +269,12 @@ export class Understander {
 
   /**
    * 写入模型结果（原子事务内校验）：
-   *   - 证据必须指向这批里真实存在的观测，且在提交时刻未被编辑、撤回或静音，否则丢弃（防幻觉及推理期并发编辑/撤回误触发提醒或任务）；
+   *   - 证据必须指向这批里真实存在的观测，且在提交时刻未被编辑、撤回、静音或因原生规则变更而被禁止（disallowedConvs）；
+   *   - 若某条结论同时引用了有效观测 A 与被撤回/编辑的观测 B 而整条被拒，保留有效观测 A 仍为待处理（keepPendingIds），
+   *     避免 A 被静默吞掉永不重试；
    *   - 仅当整批 fresh 观测中仍有未过期观测时才应用结果，并在同一事务内按修订标记已处理。
    */
-  apply(out: UnderstandOut, obs: Obs[], fresh: string[]): ApplyResult {
+  apply(out: UnderstandOut, obs: Obs[], fresh: string[], disallowedConvs?: Set<string>): ApplyResult {
     const res = emptyResult();
     const byId = new Map(obs.map((o) => [o.id, o]));
     const auto = this.cfg.context.autonomy;
@@ -283,7 +288,7 @@ export class Understander {
     };
 
     this.store.tx(() => {
-      // 在同一 BEGIN IMMEDIATE 事务内核对本批观测当前修订、撤回状态与会话静音状态
+      // 在同一 BEGIN IMMEDIATE 事务内核对本批观测当前修订、撤回状态、会话静音状态及策略复核结果
       const stillValidIds = new Set<string>();
       const curStmt = this.store.db.prepare("SELECT conv, text, meta FROM ctx_obs WHERE id = ?");
       const mutedCache = new Map<string, boolean>();
@@ -296,8 +301,9 @@ export class Understander {
         return v;
       };
       for (const o of obs) {
+        if (disallowedConvs?.has(o.conv)) continue;
         const cur = curStmt.get(o.id) as { conv: string; text: string; meta: string } | undefined;
-        if (!cur || isConvMuted(cur.conv)) continue;
+        if (!cur || disallowedConvs?.has(cur.conv) || isConvMuted(cur.conv)) continue;
         let curMeta: Record<string, unknown> = {};
         try {
           curMeta = cur.meta ? (JSON.parse(cur.meta) as Record<string, unknown>) : {};
@@ -311,15 +317,22 @@ export class Understander {
 
       const validFreshIds = fresh.filter((id) => stillValidIds.has(id));
       if (fresh.length > 0 && validFreshIds.length === 0) {
-        // 本批全部新观测在推理期间都已被编辑、撤回或静音：整体放弃旧模型输出，绝不落库或触发提醒
+        // 本批全部新观测在推理期间都已被编辑、撤回、静音或策略失效：整体放弃旧模型输出，绝不落库或触发提醒
         res.rejected += out.items.length + out.knowledge.length + out.updates.length;
         return;
       }
 
+      // 记录因部分引用证据失效而被拒的结论中所包含的“仍有效观测”，令其保留 pending 供下轮按最新上下文重试
+      const keepPendingIds = new Set<string>();
       const validEv = (evs: { obs_id: string; quote: string }[]) => {
         const inBatch = evs.filter((e) => byId.has(e.obs_id));
         if (!inBatch.length) return [];
-        if (inBatch.some((e) => !stillValidIds.has(e.obs_id))) return [];
+        if (inBatch.some((e) => !stillValidIds.has(e.obs_id))) {
+          for (const e of inBatch) {
+            if (stillValidIds.has(e.obs_id)) keepPendingIds.add(e.obs_id);
+          }
+          return [];
+        }
         return inBatch;
       };
 
@@ -434,7 +447,12 @@ export class Understander {
 
       for (const c of out.conflicts) {
         const inBatchClaims = c.claims.filter((cl) => byId.has(cl.obs_id));
-        if (inBatchClaims.some((cl) => !stillValidIds.has(cl.obs_id))) continue;
+        if (inBatchClaims.some((cl) => !stillValidIds.has(cl.obs_id))) {
+          for (const cl of inBatchClaims) {
+            if (stillValidIds.has(cl.obs_id)) keepPendingIds.add(cl.obs_id);
+          }
+          continue;
+        }
         const claims = inBatchClaims.map((cl) => ({ claim: cl.claim, obs_id: cl.obs_id, quote: cl.quote, time: byId.get(cl.obs_id)!.time }));
         if (claims.length < 2) continue;
         const project = resolveProject(c.project, Date.now());
@@ -443,10 +461,12 @@ export class Understander {
       }
 
       this.store.markProcessed(
-        validFreshIds.flatMap((id) => {
-          const o = byId.get(id);
-          return o ? [{ id, rev: obsRevision(o) }] : [];
-        }),
+        validFreshIds
+          .filter((id) => !keepPendingIds.has(id))
+          .flatMap((id) => {
+            const o = byId.get(id);
+            return o ? [{ id, rev: obsRevision(o) }] : [];
+          }),
       );
     });
     // 把 Meego 待办挂到具体项目

@@ -3,7 +3,7 @@ import { parseArgs } from "node:util";
 import { createApp, initApp, runConfiguredJob, runDaemon, runDispatchOnce, sendBrief } from "./app.ts";
 import { loadConfig } from "./config.ts";
 import { beginLogin, FeishuWebClient, pollLogin, renderQrSvg, renderQrTerminal, WebLoginStore } from "./context/feishu-web/index.ts";
-import { saveWorkspaceBinding, verifyWorkspaceOwnerBinding } from "./context/personal-web.ts";
+import { BOUND_OWNER_KV_KEY, BOUND_WORKSPACE_OWNER_KV_KEY, commitWorkspaceLogin, verifyWorkspaceOwnerBinding } from "./context/personal-web.ts";
 import { decide, type Profile } from "./guard.ts";
 import { consoleBaseUrl, isLoopbackHost, resolveConsoleHost, serverToken } from "./server/index.ts";
 import { formatReport, runDoctor } from "./doctor.ts";
@@ -200,6 +200,17 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
         "执行 pa context web-login 前必须配置静态加密密钥（设置环境变量 PA_FEISHU_WEB_KEY 或通过 systemd LoadCredential 提供 CREDENTIALS_DIRECTORY/feishu-web-key），拒绝明文写入会话 Cookie",
       );
     }
+    // 扫码前预检首次绑定 / 工作区主人变更确认参数，避免用户扫码批准后才被告知缺少 --allow-unverified-owner 而重复登录
+    const boundNative = (app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
+    const boundWs = (app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
+    const cfgWs = app.cfg.owner.open_id.trim();
+    const needsFirstBindConfirm = !boundNative || (!!cfgWs && boundWs !== cfgWs) || (!!boundWs && boundWs !== cfgWs);
+    if (needsFirstBindConfirm && !values["allow-unverified-owner"]) {
+      throw new Error(
+        `当前工作区尚未完成个人 Web 账号绑定或 owner.open_id 已变更（配置: ${cfgWs || "未配置"}，已绑定: ${boundWs || "未绑定"}）。` +
+          "由于飞书网页原生账号 ID 与开放平台 open_id 无法跨应用强校验，请确认将使用本人飞书 App 扫码后，追加 --allow-unverified-owner 重新执行：pa context web-login --allow-unverified-owner",
+      );
+    }
     console.log("正在向飞书申请个人 Web 登录二维码…");
     const challenge = await beginLogin();
     console.log("\n" + renderQrTerminal(challenge.qrCode) + "\n");
@@ -226,26 +237,14 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
         allowNameMismatch: !!values["allow-name-mismatch"],
         allowUnverifiedOwner: !!values["allow-unverified-owner"],
       });
-      if (ctrl.signal.aborted) throw new Error("扫码登录已取消");
       const store = new WebLoginStore(app.cfg.dataDir);
-      const saved = store.save(login);
-      saveWorkspaceBinding(app.store, saved.owner_id, app.cfg.owner.open_id);
-      // 清除此前 web-logout 或旧会话残留的 needs_login 错误状态，避免守护进程未启动时 web-status / doctor 误报过期
-      app.store.set(
-        "ctx.personal_web.state",
-        JSON.stringify({
-          state: "stopped",
-          owner_id: saved.owner_id,
-          owner_name: saved.owner_name,
-          session_id: saved.session_id ?? "",
-          since: Date.now(),
-          last_message_at: null,
-          last_error: "",
-        }),
-      );
-      if (saved.owner_name && !app.store.get("ctx.owner_name")) app.store.set("ctx.owner_name", saved.owner_name);
-      console.log(`✅ 个人 Web 登录成功：${login.owner_name || "(无昵称)"}（ID: ${login.owner_id}）`);
-      console.log(`凭据已以 0600 权限保存到：${store.file}`);
+      const saved = commitWorkspaceLogin(app, login, {
+        forceSwitch: !!values["force-switch-account"],
+        allowUnverifiedOwner: !!values["allow-unverified-owner"],
+        signal: ctrl.signal,
+      });
+      console.log(`✅ 个人 Web 登录成功：${saved.owner_name || "(无昵称)"}（ID: ${saved.owner_id}）`);
+      console.log(`凭据已以 AES-256-GCM (0600) 保存到：${store.file}`);
       if (!app.cfg.context.enabled || !app.cfg.context.personal_web.enabled) {
         console.log("提示：在 config.yaml 里把 context.enabled 与 context.personal_web.enabled 设为 true 并重启 `pa run` 即可开启秒级实时接收。");
       } else {

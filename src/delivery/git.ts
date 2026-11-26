@@ -1,12 +1,20 @@
+import { prepareHarnessEnv } from "../harness.ts";
 import { runProcess, type ProcResult } from "../util.ts";
 
-/** 交付用到的 git 操作。所有命令都显式指定 -C 目录，不依赖进程当前目录；不弹交互式认证提示。 */
+/** 交付用到的 git 操作。所有命令都显式指定 -C 目录，不依赖进程当前目录；不弹交互式认证提示，并剥离个人 Web 凭据环境。 */
 
 const GIT_ID = ["-c", "user.name=personal-agent", "-c", "user.email=personal-agent@localhost"];
-const ENV = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
 
 export async function tryGit(cwd: string, args: string[]): Promise<ProcResult> {
-  return runProcess("git", ["-C", cwd, ...GIT_ID, ...args], { env: ENV, timeoutMs: 300_000 });
+  const baseEnv = prepareHarnessEnv();
+  try {
+    return await runProcess("git", ["-C", cwd, ...GIT_ID, ...args], {
+      env: { ...baseEnv.env, GIT_TERMINAL_PROMPT: "0" },
+      timeoutMs: 300_000,
+    });
+  } finally {
+    baseEnv.cleanup();
+  }
 }
 
 export async function git(cwd: string, args: string[]): Promise<string> {

@@ -6,7 +6,7 @@ import type { App } from "./app.ts";
 import type { DoctorCheck, DoctorReport } from "./api/types.ts";
 import { repoSpec } from "./config.ts";
 import { WebLoginStore } from "./context/feishu-web/index.ts";
-import { resolveBin } from "./harness.ts";
+import { prepareHarnessEnv, resolveBin } from "./harness.ts";
 import { consoleBaseUrl, isLoopbackHost } from "./server/index.ts";
 import { validateConfig } from "./settings.ts";
 import { deepFind, errMsg, runProcess, truncate } from "./util.ts";
@@ -88,7 +88,13 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
     if (!p) {
       p = (async () => {
         const full = resolveBin(bin);
-        const r = await runProcess(full, args, { timeoutMs: cmdTimeout });
+        const baseEnv = prepareHarnessEnv();
+        let r: Awaited<ReturnType<typeof runProcess>>;
+        try {
+          r = await runProcess(full, args, { env: baseEnv.env, timeoutMs: cmdTimeout });
+        } finally {
+          baseEnv.cleanup();
+        }
         if (r.timedOut) throw new Error(`${bin} ${args.join(" ")} 超时`);
         if (r.code !== 0) throw new Error(`${bin} ${args.join(" ")} 退出码 ${r.code}：${truncate((r.stderr || r.stdout).trim(), 200)}`);
         return { path: full, version: (r.stdout.trim() || r.stderr.trim()).split("\n")[0] };
@@ -288,7 +294,13 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
       const fixPath = `检查 ${code(`dispatch.repos.${alias}`)} 的路径是否正确`;
       if (!fs.existsSync(spec.path)) return fail(`路径不存在：${spec.path}`, fixPath);
       if (!(await probeOk("git"))) return skip(`git 不可用，跳过：${spec.path}`);
-      const r = await runProcess(resolveBin("git"), ["-C", spec.path, "rev-parse", "--is-inside-work-tree"], { timeoutMs: cmdTimeout });
+      const baseEnv = prepareHarnessEnv();
+      let r: Awaited<ReturnType<typeof runProcess>>;
+      try {
+        r = await runProcess(resolveBin("git"), ["-C", spec.path, "rev-parse", "--is-inside-work-tree"], { env: baseEnv.env, timeoutMs: cmdTimeout });
+      } finally {
+        baseEnv.cleanup();
+      }
       if (r.code !== 0 || r.stdout.trim() !== "true") return fail(`${spec.path} 不是 git 仓库`, `${fixPath}，或在该目录运行 ${code("git init")}`);
       return ok(`${spec.path}${spec.verify ? `，校验命令：${code(spec.verify)}` : "，未配置校验命令"}`);
     });
@@ -359,26 +371,29 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
       );
     }
     const inspected = new WebLoginStore(cfg.dataDir).inspect();
+    const pw = app.ext.context?.status().personal_web;
     if (inspected.status === "missing_key") {
+      if (pw && pw.logged_in && pw.state === "listening") {
+        return ok(`${pw.owner_name || pw.owner_id}（常驻进程在线监听中；当前 shell 未注入解密密钥，未在本地解密凭据文件）`);
+      }
       return warn(
-        "检测到已加密的个人 Web 凭据，但当前环境缺少解密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）",
+        `检测到已加密的个人 Web 凭据，但当前环境缺少解密密钥（常驻状态：${pw?.state ?? "未知"}）`,
         "请在常驻服务环境中提供 PA_FEISHU_WEB_KEY 或通过 systemd LoadCredential 配置 feishu-web-key",
       );
     }
     if (inspected.status === "plaintext_rejected") {
       return warn(
         "检测到未加密的明文个人 Web 凭据，已按安全策略拒绝加载",
-        `配置加密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）后运行 ${code("bin/pa context web-login")} 重新扫码加密保存`,
+        `配置加密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）后运行 ${code("bin/pa context web-login --allow-unverified-owner")} 重新扫码加密保存`,
       );
     }
     const login = inspected.status === "ok" ? inspected.login : undefined;
     if (!login) {
       return warn(
         "已启用但尚未扫码登录（期间仍由每 10 分钟的飞书轮询兜底）",
-        `配置加密密钥后运行 ${code("bin/pa context web-login")} 使用本人飞书 App 扫码登录`,
+        `配置加密密钥后运行 ${code("bin/pa context web-login --allow-unverified-owner")} 使用本人飞书 App 扫码登录`,
       );
     }
-    const pw = app.ext.context?.status().personal_web;
     const state = pw?.state ?? "idle";
     const lastError = pw?.last_error ?? "";
     if (state === "needs_login") {

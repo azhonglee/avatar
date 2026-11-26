@@ -111,6 +111,18 @@ export function saveWorkspaceBinding(store: Store, nativeOwnerId: string, worksp
   }
 }
 
+/**
+ * 判断当前 config.yaml 的 owner.open_id 是否与已绑定的个人 Web 工作区主人发生冲突：
+ * 只要工作区曾绑定过个人 Web（BOUND_OWNER_KV_KEY 或 BOUND_WORKSPACE_OWNER_KV_KEY 非空）且与当前 cfg.owner.open_id 不一致，
+ * 即必须阻断旧主人派生的视图（今天/项目/事项/草稿）与全部通知/卡片投递，防止旧主人的私聊摘要泄漏给新主人。
+ */
+export function hasWorkspaceOwnerMismatch(store: Store, cfgOwnerOpenId: string): boolean {
+  const boundNative = (store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
+  const boundWs = (store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
+  if (!boundNative && !boundWs) return false;
+  return boundWs !== cfgOwnerOpenId.trim();
+}
+
 /** 统一计算 pw.reply 幂等键（CID）与规范化正文哈希，供 effects / drafts / personal-web 共用（DRY） */
 export function computePwReplyCid(params: {
   draft_id?: string;
@@ -231,6 +243,20 @@ export class PersonalWebBridge {
     return boundNative;
   }
 
+  /** 轻量同步策略签名（静音表 + groups_deny + allowlist + sources.im + 工作区主人绑定），用于检测长耗时异步/推理期间策略是否变更 */
+  policySignature(): string {
+    const mutes = this.store
+      .mutedConvs()
+      .map((m) => `${m.conv}=${m.name}`)
+      .sort()
+      .join("|");
+    const deny = [...this.cfg.context.groups_deny].map((s) => s.trim()).sort().join("|");
+    const allow = [...this.cfg.context.groups_allow].map((s) => s.trim()).sort().join("|");
+    const bound = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
+    const boundWs = (this.app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
+    return `${this.cfg.context.sources.im ? 1 : 0};${this.cfg.context.groups};${allow};${deny};${mutes};${bound};${boundWs};${this.cfg.owner.open_id.trim()}`;
+  }
+
   private loadSavedState(): PersistedState | undefined {
     const raw = this.app.store.get(STATE_KV_KEY);
     if (!raw) return undefined;
@@ -260,12 +286,18 @@ export class PersonalWebBridge {
   }
 
   status(now = Date.now()): CtxPersonalWebStatus {
-    const login = this.loginStore.load();
+    const inspected = this.loginStore.inspect();
+    const login = inspected.status === "ok" ? inspected.login : undefined;
     const saved = this.loadSavedState() ?? this.state;
     const enabled = this.cfg.context.personal_web.enabled;
-    const loggedIn = !!login;
+    const daemonLive = this.isDaemonLive(now);
+    const localKeyMissing = inspected.status === "missing_key";
+    // 若交互式 shell 未注入 systemd 凭据密钥（missing_key），但常驻进程本身在线且处于有效状态，
+    // 将常驻运行态与本地密钥可读性分开判断，避免把在线 listening 误报成 needs_login
+    const daemonHealthyWithoutLocalKey = localKeyMissing && daemonLive && saved.state !== "needs_login" && !!saved.owner_id;
+    const loggedIn = !!login || daemonHealthyWithoutLocalKey;
     const staleSavedSession =
-      loggedIn &&
+      !!login &&
       saved.state === "needs_login" &&
       ((!!login.session_id && saved.session_id !== login.session_id) ||
         (!!saved.owner_id && saved.owner_id !== login.owner_id));
@@ -277,7 +309,10 @@ export class PersonalWebBridge {
       lastError = "";
     } else if (!loggedIn) {
       state = "needs_login";
-    } else if (ACTIVE_STATES.has(state as ListenerState) && !this.isDaemonLive(now)) {
+      if (localKeyMissing && !lastError) {
+        lastError = "当前环境缺少解密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）";
+      }
+    } else if (ACTIVE_STATES.has(state as ListenerState) && !daemonLive) {
       state = "stopped";
     }
     return {
@@ -544,15 +579,14 @@ export class PersonalWebBridge {
         { as: "user", timeoutMs: 15_000 },
       )) as Record<string, unknown>;
       const rawName = String(deepFind(res, "name") ?? "").trim();
-      const rawMode = String(deepFind(res, "chat_mode") ?? deepFind(res, "chat_type") ?? "").toLowerCase();
+      const rawMode = String(deepFind(res, "chat_mode") ?? deepFind(res, "chat_type") ?? "").trim().toLowerCase();
+      // 仅凭明确识别的 chat_mode/chat_type 归类，绝不因展示名非空就将未知会话误判为 group 从而放行私聊
       const chatType: OpenChatExclusionMeta["chatType"] =
         rawMode === "p2p"
           ? "p2p"
           : rawMode === "group" || rawMode === "topic" || rawMode === "topic_group"
             ? "group"
-            : rawName
-              ? "group"
-              : "unknown";
+            : "unknown";
       const meta: OpenChatExclusionMeta = {
         name: rawName,
         chatType,
@@ -679,6 +713,10 @@ export class PersonalWebBridge {
       }
       if (kind === "group") {
         if (resolved.meta.chatType === "p2p") continue;
+        if (resolved.meta.chatType === "unknown") {
+          if (chatName && resolved.meta.name && norm(chatName) === norm(resolved.meta.name)) return true;
+          throw new Error(`排除规则 ${ocId} 无法识别会话类型，按 fail-closed 暂缓入库`);
+        }
         if (!resolved.meta.name) {
           throw new Error(`排除规则 ${ocId} 缺少群名称，无法与当前个人 Web 群聊区分，按 fail-closed 暂缓入库`);
         }
@@ -693,6 +731,10 @@ export class PersonalWebBridge {
             }
             resolved = freshOc;
             if (resolved.meta.chatType === "p2p") continue;
+            if (resolved.meta.chatType === "unknown") {
+              if (chatName && resolved.meta.name && norm(chatName) === norm(resolved.meta.name)) return true;
+              throw new Error(`排除规则 ${ocId} 无法识别会话类型，按 fail-closed 暂缓入库`);
+            }
             if (!resolved.meta.name) {
               throw new Error(`排除规则 ${ocId} 缺少群名称，无法与当前个人 Web 群聊区分，按 fail-closed 暂缓入库`);
             }
@@ -703,7 +745,7 @@ export class PersonalWebBridge {
         }
       } else {
         if (resolved.meta.chatType === "group") continue;
-        throw new Error(`存在开放平台私聊排除规则 (${ocId})，个人 Web 私聊无法映射其 open chat_id，按 fail-closed 暂缓入库`);
+        throw new Error(`存在开放平台私聊或未知类型排除规则 (${ocId})，个人 Web 私聊无法映射其 open chat_id，按 fail-closed 暂缓入库`);
       }
     }
     return false;
@@ -838,27 +880,30 @@ export class PersonalWebBridge {
     if (recordedType === "group" && effectiveName && nativeExcl.confirmedGroupNames.has(norm(effectiveName))) {
       return "excluded";
     }
-    // 当会话类型未知，或存在名称/原生群排除规则需核验当前最新群名时，避免直接凭陈旧库标签放行
-    if (recordedType === "unknown" && (nativeExcl.dmsInconclusive || nativeExcl.groupsInconclusive || nativeExcl.confirmedGroupNames.size > 0 || nameRules.length > 0)) {
+    const hasNameBasedRules = nativeExcl.confirmedGroupNames.size > 0 || nameRules.length > 0;
+    // 对未知类型会话，以及在存在关键词/原生静音规则时的已知群会话，均强制拉取当前最新群名后再放行模型（防止入库后改名逃逸）
+    const mustRefreshOpenChat =
+      (recordedType === "unknown" && (nativeExcl.dmsInconclusive || nativeExcl.groupsInconclusive || hasNameBasedRules)) ||
+      (recordedType === "group" && hasNameBasedRules);
+    if (mustRefreshOpenChat) {
       const fresh = await this.resolveOpenChatMeta(conv, { force: true });
-      if (fresh) {
-        if (fresh.meta.chatType === "p2p") recordedType = "dm";
-        else if (fresh.meta.chatType === "group") recordedType = "group";
-        if (fresh.meta.name) effectiveName = fresh.meta.name;
-      }
+      if (!fresh) return "uncertain";
+      if (fresh.meta.chatType === "p2p") recordedType = "dm";
+      else if (fresh.meta.chatType === "group") recordedType = "group";
+      effectiveName = fresh.meta.name;
     }
     if (recordedType === "dm") return nativeExcl.dmsInconclusive ? "uncertain" : "allowed";
     if (recordedType === "unknown") {
       if (effectiveName && nativeExcl.confirmedGroupNames.has(norm(effectiveName))) return "excluded";
       if (effectiveName && nameRules.some((d) => effectiveName.includes(d))) return "excluded";
       if (nativeExcl.dmsInconclusive || nativeExcl.groupsInconclusive) return "uncertain";
-      if ((nativeExcl.confirmedGroupNames.size > 0 || nameRules.length > 0) && !effectiveName) return "uncertain";
+      if (hasNameBasedRules) return "uncertain";
       return "allowed";
     }
     if (effectiveName && nativeExcl.confirmedGroupNames.has(norm(effectiveName))) return "excluded";
     if (effectiveName && nameRules.some((d) => effectiveName.includes(d))) return "excluded";
     if (nativeExcl.groupsInconclusive) return "uncertain";
-    if (nativeExcl.confirmedGroupNames.size > 0 && !effectiveName) return "uncertain";
+    if (hasNameBasedRules && !effectiveName) return "uncertain";
     return "allowed";
   }
 
@@ -1363,6 +1408,43 @@ export class PersonalWebBridge {
   }
 
   /**
+   * 原子抢占发送状态（SQLite BEGIN IMMEDIATE CAS）：
+   *   - 仅当当前无记录或处于明确未创建状态（rejected）时才写入 `sending`；
+   *   - 若另一进程已在异步校验期间抢先写入了 `sending` / `created` / `verified`，绝不覆盖，原样返回已有记录交调用方安全分流。
+   */
+  private claimDeliveryForSend(rec: DeliveryRecord): { ok: true } | { ok: false; existing: DeliveryRecord } {
+    this.app.store.db.exec("BEGIN IMMEDIATE");
+    try {
+      const cur = this.loadDelivery(rec.cid);
+      if (cur) {
+        if (
+          (cur.owner_id && cur.owner_id !== rec.owner_id) ||
+          cur.chat_id !== rec.chat_id ||
+          cur.message_id !== rec.message_id ||
+          cur.text_hash !== rec.text_hash
+        ) {
+          this.app.store.db.exec("ROLLBACK");
+          throw new Error("个人 Web 回复幂等键（CID）与草稿内容或账号冲突，拒绝发送");
+        }
+        if (cur.state !== "rejected") {
+          this.app.store.db.exec("ROLLBACK");
+          return { ok: false, existing: cur };
+        }
+      }
+      this.saveDelivery(rec);
+      this.app.store.db.exec("COMMIT");
+      return { ok: true };
+    } catch (err) {
+      try {
+        this.app.store.db.exec("ROLLBACK");
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
+  }
+
+  /**
    * 核验共享的 send_replies 发送权限：
    * 先查本进程配置；若配置来自磁盘文件且文件消失/不可 stat，按 fail-closed 中止新发送；
    * 若磁盘 config.yaml 被另一进程（如 Web 控制台）修改过，同步读取磁盘最新配置防止跨进程陈旧放行。
@@ -1502,9 +1584,7 @@ export class PersonalWebBridge {
             if (client.owner().id !== args.owner_id) {
               throw new Error("发送前检测到客户端账号不匹配，已中止发送");
             }
-            sendMeta = { rootId, parentId, threaded };
-            enteredSend = true;
-            this.saveDelivery({
+            const claimed = this.claimDeliveryForSend({
               cid: args.cid,
               owner_id: args.owner_id,
               chat_id: args.chat_id,
@@ -1516,6 +1596,11 @@ export class PersonalWebBridge {
               state: "sending",
               updated_at: Date.now(),
             });
+            if (!claimed.ok) {
+              throw new DeliveryAlreadyClaimedError(claimed.existing);
+            }
+            sendMeta = { rootId, parentId, threaded };
+            enteredSend = true;
           },
           onCreated: ({ replyId, rootId, parentId, threaded }) => {
             createdOnServer = true;
@@ -1536,19 +1621,53 @@ export class PersonalWebBridge {
         },
       );
     } catch (err) {
+      if (err instanceof DeliveryAlreadyClaimedError) {
+        const cur = err.existing;
+        if (cur.state === "verified" && cur.reply_id) {
+          return { replyId: cur.reply_id, rootId: cur.root_id, parentId: cur.parent_id, threadId: "", verified: true };
+        }
+        if (cur.state === "created" && cur.reply_id) {
+          const verified = await client.verifyReplyReadback({
+            replyId: cur.reply_id,
+            chatId: cur.chat_id,
+            rootId: cur.root_id,
+            parentId: cur.parent_id,
+            cid: cur.cid,
+            text: normalizedText,
+            threaded: cur.threaded,
+          });
+          this.saveDelivery({ ...cur, state: "verified", updated_at: Date.now() });
+          return verified;
+        }
+        throw new Error("该个人 Web 回复已由另一进程抢占发送或结果不明确，为避免重复发送已中止");
+      }
       if (enteredSend && !createdOnServer && sendMeta && isDefinitiveNonCreationError(err)) {
-        this.saveDelivery({
-          cid: args.cid,
-          owner_id: args.owner_id,
-          chat_id: args.chat_id,
-          message_id: args.message_id,
-          root_id: sendMeta.rootId,
-          parent_id: sendMeta.parentId,
-          text_hash: textHash,
-          threaded: sendMeta.threaded,
-          state: "rejected",
-          updated_at: Date.now(),
-        });
+        // 仅在仍为 sending 时转为 rejected，避免覆盖已进入 created/verified 的记录
+        this.app.store.db.exec("BEGIN IMMEDIATE");
+        try {
+          const cur = this.loadDelivery(args.cid);
+          if (!cur || cur.state === "sending") {
+            this.saveDelivery({
+              cid: args.cid,
+              owner_id: args.owner_id,
+              chat_id: args.chat_id,
+              message_id: args.message_id,
+              root_id: sendMeta.rootId,
+              parent_id: sendMeta.parentId,
+              text_hash: textHash,
+              threaded: sendMeta.threaded,
+              state: "rejected",
+              updated_at: Date.now(),
+            });
+          }
+          this.app.store.db.exec("COMMIT");
+        } catch {
+          try {
+            this.app.store.db.exec("ROLLBACK");
+          } catch {
+            // ignore
+          }
+        }
       }
       throw err;
     }
@@ -1556,6 +1675,15 @@ export class PersonalWebBridge {
     const latest = this.loadDelivery(args.cid);
     if (latest) this.saveDelivery({ ...latest, state: "verified", reply_id: res.replyId, updated_at: Date.now() });
     return res;
+  }
+}
+
+class DeliveryAlreadyClaimedError extends Error {
+  readonly existing: DeliveryRecord;
+  constructor(existing: DeliveryRecord) {
+    super(`delivery ${existing.cid} already claimed (${existing.state})`);
+    this.name = "DeliveryAlreadyClaimedError";
+    this.existing = existing;
   }
 }
 
@@ -1668,4 +1796,82 @@ export async function verifyWorkspaceOwnerBinding(
         "请核对手机飞书确为本人账号后，追加 --allow-unverified-owner 重新执行 pa context web-login。",
     );
   }
+}
+
+/**
+ * 在跨进程凭据文件锁 + SQLite BEGIN IMMEDIATE 写事务双重串行化保护下提交登录与工作区绑定：
+ *   - 再次核验当前工作区绑定、旧账号/无归属观测及中止信号（避免两路并发首次登录互覆或换号窗口内落入旧观测）；
+ *   - 同步写入加密凭据、绑定键与初始状态，任一步失败则原子回滚 SQLite，不产生凭据与绑定割裂。
+ */
+export function commitWorkspaceLogin(
+  app: App,
+  login: WebLogin,
+  opts: { forceSwitch?: boolean; allowUnverifiedOwner?: boolean; signal?: AbortSignal } = {},
+): WebLogin {
+  const loginStore = new WebLoginStore(app.cfg.dataDir);
+  return loginStore.commitWithLock((write) => {
+    if (opts.signal?.aborted) {
+      throw new Error("扫码登录已取消");
+    }
+    app.store.db.exec("BEGIN IMMEDIATE");
+    try {
+      const boundId = (app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim() || loginStore.load()?.owner_id || "";
+      const configuredOpenId = app.cfg.owner.open_id.trim();
+      const boundWorkspaceOpenId = (app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
+
+      if (boundId && boundId !== login.owner_id) {
+        if (!opts.forceSwitch) {
+          throw new Error(
+            `提交绑定时检测到本工作区已被其他个人 Web 账号 (${boundId}) 绑定，拒绝覆写；如需更换账号请使用全新的 data_dir。`,
+          );
+        }
+        const ctxStore = new ContextStore(app.store.db);
+        if (ctxStore.hasOtherNativeOwnerObs(login.owner_id)) {
+          throw new Error(
+            `提交绑定时检测到当前数据目录包含其他账号或无归属的个人 Web 历史观测，拒绝原地换号；请使用全新的 data_dir。`,
+          );
+        }
+      }
+
+      const sameNativeOwner = !!boundId && boundId === login.owner_id;
+      const sameWorkspaceOwner = !configuredOpenId || !boundWorkspaceOpenId || boundWorkspaceOpenId === configuredOpenId;
+      const isAlreadyVerifiedRelogin = sameNativeOwner && sameWorkspaceOwner && (!configuredOpenId || !!boundWorkspaceOpenId);
+      if (!isAlreadyVerifiedRelogin && !opts.allowUnverifiedOwner) {
+        throw new Error(
+          `首次绑定或变更工作区主人时必须显式传入 --allow-unverified-owner 确认账号归属，拒绝静默提交绑定。`,
+        );
+      }
+
+      if (opts.signal?.aborted) {
+        throw new Error("扫码登录已取消");
+      }
+
+      const saved = write(login);
+      saveWorkspaceBinding(app.store, saved.owner_id, configuredOpenId);
+      app.store.set(
+        STATE_KV_KEY,
+        JSON.stringify({
+          state: "stopped",
+          owner_id: saved.owner_id,
+          owner_name: saved.owner_name,
+          session_id: saved.session_id ?? "",
+          since: Date.now(),
+          last_message_at: null,
+          last_error: "",
+        }),
+      );
+      if (saved.owner_name && !app.store.get("ctx.owner_name")) {
+        app.store.set("ctx.owner_name", saved.owner_name);
+      }
+      app.store.db.exec("COMMIT");
+      return saved;
+    } catch (err) {
+      try {
+        app.store.db.exec("ROLLBACK");
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
+  });
 }

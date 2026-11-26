@@ -271,13 +271,13 @@ export class FeishuWebClient {
     if (latest) this.deviceId = latest;
   }
 
-  /** 同步磁盘上更新版本的同会话 Cookie（例如其他进程刚完成了 Cookie 轮换） */
+  /** 同步磁盘上更新版本的同会话 Cookie（保留本客户端在途未落盘且不冲突的轮换 Cookie，防止被无关更新回滚） */
   syncFromDisk(login: WebLogin): void {
     if (login.owner_id !== this.ownerId) return;
     if (this.sessionId && login.session_id && login.session_id !== this.sessionId) return;
     const nextVer = login.cookie_version ?? 1;
     if (nextVer <= this.cookieVersion) return;
-    this.jar.syncFromRecords(login.cookies);
+    this.jar.syncFromRecords(login.cookies, Date.now(), { preservePendingDelta: true });
     this.cookieVersion = nextVer;
     this.refreshDeviceIdFromJar();
     if (login.owner_name) this.ownerName = login.owner_name;
@@ -301,26 +301,38 @@ export class FeishuWebClient {
     this.onSessionConfirmed = cb;
   }
 
+  private hasPendingCookieDelta(): boolean {
+    const d = this.jar.peekDelta();
+    return d.upserts.length > 0 || d.deletes.length > 0;
+  }
+
   private notifySessionConfirmed(): boolean {
     if (!this.onSessionConfirmed) {
       this.jar.clearDelta();
       return true;
     }
+    const delta = this.jar.peekDelta();
+    let res: WebLogin | boolean | null | void;
     try {
-      const delta = this.jar.peekDelta();
-      const res = this.onSessionConfirmed(this.session(), delta);
-      if (res === false || res === null) return false;
-      if (res && typeof res === "object") {
-        this.cookieVersion = res.cookie_version ?? this.cookieVersion;
-        this.jar.syncFromRecords(res.cookies);
-      } else {
-        this.jar.clearDelta();
-      }
-      return true;
-    } catch {
-      // observer errors must not break protocol loop
-      return true;
+      res = this.onSessionConfirmed(this.session(), delta);
+    } catch (err) {
+      // 保留未落盘增量以便重试，并对外显式暴露持久化失败（绝不把 Cookie 原文写入错误信息）
+      throw new WebHttpError(
+        "transport",
+        "持久化个人 Web 轮换后的会话凭据失败（凭据文件被锁定、缺少密钥或不可写）",
+        undefined,
+        err instanceof Error ? err.name : undefined,
+      );
     }
+    if (res === false || res === null) return false;
+    if (res && typeof res === "object") {
+      this.cookieVersion = res.cookie_version ?? this.cookieVersion;
+      this.jar.syncFromRecords(res.cookies);
+      this.refreshDeviceIdFromJar();
+    } else {
+      this.jar.clearDelta();
+    }
+    return true;
   }
 
   async verifyOwner(signal?: AbortSignal): Promise<void> {
@@ -330,6 +342,11 @@ export class FeishuWebClient {
     }
     if (profile.name) this.ownerName = profile.name;
     if (profile.openId) this.ownerOpenId = profile.openId;
+    if (this.hasPendingCookieDelta()) {
+      if (!this.notifySessionConfirmed()) {
+        throw new WebHttpError("aborted", "本地凭据已被登出或更新");
+      }
+    }
   }
 
   // ───────── Gateway RPCs ─────────
@@ -370,7 +387,7 @@ export class FeishuWebClient {
       throw new WebHttpError("http_error", `个人 Web 网关请求被拒绝 (HTTP ${res.status})`, res.status);
     }
     const unpacked = unwrapGatewayPayload(res.body);
-    if (res.cookiesUpdated) this.notifySessionConfirmed();
+    if (res.cookiesUpdated || this.hasPendingCookieDelta()) this.notifySessionConfirmed();
     return unpacked;
   }
 
@@ -758,8 +775,14 @@ export class FeishuWebClient {
             return;
           }
           if (p.name) this.ownerName = p.name;
-          if (!this.notifySessionConfirmed()) {
-            keepaliveFatal = new WebHttpError("aborted", "本地凭据已被登出或更新");
+          try {
+            if (!this.notifySessionConfirmed()) {
+              keepaliveFatal = new WebHttpError("aborted", "本地凭据已被登出或更新");
+              ws.close();
+            }
+          } catch (persistErr) {
+            onWarn?.(persistErr instanceof Error ? persistErr.message : "保活持久化个人 Web 会话凭据失败");
+            keepaliveFatal = persistErr instanceof Error ? persistErr : new WebHttpError("transport", "保活持久化个人 Web 会话凭据失败");
             ws.close();
           }
         })

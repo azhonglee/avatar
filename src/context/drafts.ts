@@ -36,7 +36,7 @@ export class Drafter {
     return this.app.cfg;
   }
 
-  /** 草稿的发送目标：回复哪条消息 / 发到哪个会话 / 评论哪个 Meego 工作项（起草本身不发消息，允许为个人 Web 实时消息先起草） */
+  /** 草稿的发送目标：回复哪条消息 / 发到哪个会话 / 评论哪个 Meego 工作项（起草本身不发消息；严格跳过已撤回及无主/跨账号个人 Web 证据） */
   target(it: ItemRow, kind: CtxDraftKind): { target: Record<string, string>; label: string; conv?: Obs } {
     if (kind === "meego_comment") {
       const key = String(it.meta.project_key ?? "");
@@ -44,13 +44,23 @@ export class Drafter {
       if (!key || !id) throw new Error("这个事项没有关联 Meego 工作项");
       return { target: { project_key: key, work_item_id: id, url: String(it.meta.url ?? "") }, label: `Meego #${id} 评论` };
     }
-    const fromOther = this.store.lastEvidenceObs("item", it.id, (o) => o.source === "im" && !o.is_me);
-    const any = fromOther ?? this.store.lastEvidenceObs("item", it.id, (o) => o.source === "im");
+    const activeNativeOwner = this.activeBoundNativeOwner();
+    const isEligibleImObs = (o: Obs): boolean => {
+      if (o.source !== "im" || o.meta.withdrawn === true) return false;
+      if (o.id.startsWith("pw:") || o.meta.transport === "personal_web") {
+        const obsOwner = String(o.meta.native_owner_id ?? "").trim();
+        return !!activeNativeOwner && obsOwner === activeNativeOwner;
+      }
+      return true;
+    };
+    const fromOther = this.store.lastEvidenceObs("item", it.id, (o) => isEligibleImObs(o) && !o.is_me);
+    const any = fromOther ?? this.store.lastEvidenceObs("item", it.id, isEligibleImObs);
     if (!any) throw new Error("找不到这个事项对应的飞书会话，没法起草消息");
     if (kind === "reply" && fromOther) {
       if (fromOther.meta.transport === "personal_web") {
         if (fromOther.meta.native_message_id && fromOther.meta.native_chat_id) {
-          const nativeOwnerId = String(fromOther.meta.native_owner_id ?? this.app.store.get(BOUND_OWNER_KV_KEY) ?? "");
+          const nativeOwnerId = String(fromOther.meta.native_owner_id ?? "").trim();
+          if (!nativeOwnerId) throw new Error("该个人 Web 消息缺少归属账号标识（native_owner_id），拒绝起草");
           return {
             target: {
               transport: "personal_web",
@@ -82,7 +92,8 @@ export class Drafter {
     }
     if (any.meta.transport === "personal_web") {
       if (any.meta.native_message_id && any.meta.native_chat_id) {
-        const nativeOwnerId = String(any.meta.native_owner_id ?? this.app.store.get(BOUND_OWNER_KV_KEY) ?? "");
+        const nativeOwnerId = String(any.meta.native_owner_id ?? "").trim();
+        if (!nativeOwnerId) throw new Error("该个人 Web 会话缺少归属账号标识（native_owner_id），拒绝起草");
         return {
           target: {
             transport: "personal_web",
@@ -209,9 +220,9 @@ export class Drafter {
         throw new Error("该个人 Web 草稿缺少原会话或原消息 ID，无法发送");
       }
       const currentBound = this.activeBoundNativeOwner();
-      const ownerId = d.target.native_owner_id || String(obs?.meta.native_owner_id ?? "") || currentBound || "";
+      const ownerId = (d.target.native_owner_id || String(obs?.meta.native_owner_id ?? "")).trim();
       if (!ownerId) {
-        throw new Error("该个人 Web 草稿缺少绑定账号 ID，拒绝发送");
+        throw new Error("该个人 Web 草稿缺少明确的归属账号 ID，拒绝发送");
       }
       if (!currentBound) {
         throw new Error("当前工作区尚未完成有效个人 Web 账号绑定或工作区主人已变更，拒绝发送");

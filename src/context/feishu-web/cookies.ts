@@ -259,8 +259,13 @@ export class RecordingCookieJar {
     this.dirtyBaseValues.clear();
   }
 
-  /** 用磁盘上更新版本的同会话 Cookie 快照刷新内存罐（不丢失调用后继续收到的新 Cookie） */
-  syncFromRecords(cookies: CookieRecord[], nowMs = Date.now()): void {
+  /**
+   * 用磁盘上更新版本的同会话 Cookie 快照刷新内存罐：
+   *   - 默认（刚完成持久化后调用）清空本地增量；
+   *   - `preservePendingDelta: true`（后台 watcher 同步磁盘更新时调用）将本进程尚未落盘的增量按 `dirtyBaseValues` 做 3-way 合并：
+   *     若磁盘未改该键则保留本进程刚轮换的新 Cookie（避免重定向途中的 session 轮换被无关 Cookie 同步回滚），同键冲突则采纳磁盘更新值。
+   */
+  syncFromRecords(cookies: CookieRecord[], nowMs = Date.now(), opts: { preservePendingDelta?: boolean } = {}): void {
     const next = new Map<string, CookieRecord>();
     for (const c of cookies) {
       const domain = c.domain.replace(/^\.+/, "").toLowerCase();
@@ -276,6 +281,43 @@ export class RecordingCookieJar {
       };
       next.set(this.keyOf(normalized), normalized);
     }
+    if (opts.preservePendingDelta) {
+      const survivingUpserts = new Map<string, CookieRecord>();
+      const survivingDeletes = new Set<string>();
+      const survivingBases = new Map<string, string | null>();
+
+      for (const key of this.dirtyDeletes) {
+        const diskVal = next.get(key)?.value ?? null;
+        const baseVal = this.dirtyBaseValues.get(key);
+        if (baseVal !== undefined && diskVal === baseVal) {
+          next.delete(key);
+          survivingDeletes.add(key);
+          survivingBases.set(key, baseVal);
+        }
+      }
+      for (const [key, rec] of this.dirtyUpserts) {
+        if (isExpired(rec, nowMs)) continue;
+        const diskVal = next.get(key)?.value ?? null;
+        const baseVal = this.dirtyBaseValues.get(key);
+        if (baseVal !== undefined && diskVal === baseVal) {
+          next.set(key, { ...rec });
+          survivingUpserts.set(key, { ...rec });
+          survivingBases.set(key, baseVal);
+        }
+      }
+
+      this.values.clear();
+      for (const [k, v] of next) this.values.set(k, v);
+      this.syncGeneration++;
+      this.dirtyUpserts.clear();
+      for (const [k, v] of survivingUpserts) this.dirtyUpserts.set(k, v);
+      this.dirtyDeletes.clear();
+      for (const k of survivingDeletes) this.dirtyDeletes.add(k);
+      this.dirtyBaseValues.clear();
+      for (const [k, v] of survivingBases) this.dirtyBaseValues.set(k, v);
+      return;
+    }
+
     this.values.clear();
     for (const [k, v] of next) this.values.set(k, v);
     this.syncGeneration++;
@@ -546,6 +588,11 @@ export class WebLoginStore {
 
   save(login: WebLogin): WebLogin {
     return this.withLock(() => this.writeUnlocked(login, 1));
+  }
+
+  /** 在持跨进程凭据文件锁期间执行自定义校验并原子写入，用于串行化工作区绑定核验与凭据替换 */
+  commitWithLock<T>(fn: (write: (login: WebLogin) => WebLogin) => T): T {
+    return this.withLock(() => fn((login) => this.writeUnlocked(login, 1)));
   }
 
   /**
