@@ -128,8 +128,12 @@ export class Understander {
     return this.app.cfg;
   }
 
-  /** 组装一批会话（控制总长度），返回提示词和这批涉及的观测；支持按 target_obs_id 定位快通道窗口 */
-  buildBatch(convs: { conv: string; conv_name: string; target_obs_id?: string }[], maxChars = 24_000): { prompt: string; obs: Obs[]; fresh: string[]; convs: string[] } {
+  /** 组装一批会话（控制总长度），返回提示词和这批涉及的观测；支持按 target_obs_id 定位快通道窗口与按当前绑定 Web 账号隔离 */
+  buildBatch(
+    convs: { conv: string; conv_name: string; target_obs_id?: string }[],
+    maxChars = 24_000,
+    activeNativeOwner?: string,
+  ): { prompt: string; obs: Obs[]; fresh: string[]; convs: string[] } {
     const tz = this.cfg.owner.timezone;
     const sections: string[] = [];
     const all: Obs[] = [];
@@ -137,7 +141,9 @@ export class Understander {
     const used: string[] = [];
     let size = 0;
     for (const c of convs) {
-      const list = c.target_obs_id ? this.store.convWindowAround(c.conv, c.target_obs_id) : this.store.convWindow(c.conv);
+      const list = c.target_obs_id
+        ? this.store.convWindowAround(c.conv, c.target_obs_id, 60, 12, activeNativeOwner)
+        : this.store.convWindow(c.conv, 60, 12, activeNativeOwner);
       if (!list.length) continue;
       const lines = list.map((o) => {
         const isNew = !this.isProcessed(o.id);
@@ -218,9 +224,14 @@ export class Understander {
   }
 
   /** 跑一批：调用模型 → 解析 → 写入 */
-  async runBatch(workId: string, convs: { conv: string; conv_name: string; target_obs_id?: string }[], signal?: AbortSignal): Promise<ApplyResult & { convs: string[]; fresh: number }> {
+  async runBatch(
+    workId: string,
+    convs: { conv: string; conv_name: string; target_obs_id?: string }[],
+    signal?: AbortSignal,
+    activeNativeOwner?: string,
+  ): Promise<ApplyResult & { convs: string[]; fresh: number }> {
     this.processedCache.clear();
-    const batch = this.buildBatch(convs);
+    const batch = this.buildBatch(convs, 24_000, activeNativeOwner);
     if (!batch.fresh.length) {
       // 没有可处理的新观测（理论上不会发生）：把这些会话的待处理标掉，避免周期里反复空转
       for (const c of batch.convs) this.store.skipConv(c);

@@ -32,8 +32,8 @@ const DAY = 24 * HOUR;
 
 type CtxPayload =
   | { task: "cycle" }
-  | { task: "fast"; conv: string; conv_name: string; trigger_obs_id: string; anchor?: FastAnchor }
-  | { task: "draft"; item_id: string; kind?: CtxDraftKind }
+  | { task: "fast"; conv: string; conv_name: string; trigger_obs_id: string; anchor?: FastAnchor; anchors?: FastAnchor[] }
+  | { task: "draft"; item_id: string; kind?: CtxDraftKind; auto?: boolean }
   | { task: "weekly"; days: number }
   | { task: "split"; project_id: string };
 
@@ -62,6 +62,7 @@ export class ContextService {
           conv_name: t.conv_name,
           trigger_obs_id: t.trigger_obs_id,
           anchor: t.anchor,
+          anchors: t.anchors,
         });
       },
       onReconnect: () => {
@@ -137,36 +138,58 @@ export class ContextService {
       await this.ensureOwnerName();
       const created: ItemRow[] = [];
       if (this.cfg.context.understand) {
-        // 每轮最多理解 max_convs_per_cycle 个会话批次；并行跑 understand_parallel 批（通过 SQLite 租约跨进程互斥）
+        // 每轮最多理解 max_convs_per_cycle 个会话批次；并行跑 understand_parallel 批（通过 SQLite 租约+心跳跨进程互斥）
         let budget = this.cfg.context.max_convs_per_cycle;
         const par = this.cfg.context.understand_parallel;
+        const activeSources = [
+          ...(this.cfg.context.sources.im ? ["im"] : []),
+          ...(this.cfg.context.sources.minutes ? ["minutes"] : []),
+          ...(this.cfg.context.sources.docs ? ["doc"] : []),
+        ];
+        const activeNativeOwner = this.personalWeb.activeBoundNativeOwner();
+        // 每轮周期只解析一次原生排除规则快照，避免按候选会话 N×M 重复调用网关
+        const nativeExclSnapshot = await this.personalWeb.resolveNativeExclusionsForPolling();
         const skippedInCycle = new Set<string>();
         while (budget > 0 && !signal?.aborted) {
-          const candidates = this.store
-            .pendingConvs(Math.min(budget, 8 * par) + skippedInCycle.size + 8)
-            .filter((c) => !skippedInCycle.has(c.conv));
-          const eligible: typeof candidates = [];
-          for (const c of candidates) {
-            if (eligible.length >= Math.min(budget, 8 * par)) break;
-            const decision = await this.personalWeb.checkConvAllowedForUnderstand(c.conv, c.conv_name);
-            if (decision !== "allowed") {
-              skippedInCycle.add(c.conv);
-              continue;
+          const targetCount = Math.min(budget, 8 * par);
+          const eligible: { conv: string; conv_name: string; n: number }[] = [];
+          const scanned = new Set<string>(skippedInCycle);
+          // 持续翻页跳过被排除/占用的会话，直到凑满目标批次或待处理队列真正耗尽，避免后续会议/文档饿死
+          while (eligible.length < targetCount && !signal?.aborted) {
+            const page = this.store.pendingConvs(Math.max(targetCount * 2, 16), activeSources, {
+              excludeConvs: scanned,
+              activeNativeOwner,
+            });
+            if (!page.length) break;
+            for (const c of page) {
+              if (eligible.length >= targetCount) break;
+              scanned.add(c.conv);
+              const decision = await this.personalWeb.checkConvAllowedForUnderstand(c.conv, c.conv_name, nativeExclSnapshot);
+              if (decision !== "allowed") {
+                skippedInCycle.add(c.conv);
+                continue;
+              }
+              if (!this.store.claimConv(c.conv, workId, this.app.ledger.owner)) {
+                skippedInCycle.add(c.conv);
+                continue;
+              }
+              eligible.push(c);
             }
-            if (!this.store.claimConv(c.conv, workId, this.app.ledger.owner)) {
-              skippedInCycle.add(c.conv);
-              continue;
-            }
-            eligible.push(c);
           }
           if (!eligible.length) break;
           const pending = eligible;
           const groups: (typeof pending)[] = Array.from({ length: Math.min(par, pending.length) }, () => []);
           pending.forEach((c, i) => groups[i % groups.length].push(c));
+          // 定期续租，确保长耗时模型调用（最长 900s）期间会话占坑不会提前过期被其他进程抢占
+          const claimHeartbeat = setInterval(() => {
+            for (const c of pending) this.store.renewConv(c.conv, workId);
+          }, 30_000);
+          claimHeartbeat.unref?.();
           let results: PromiseSettledResult<Awaited<ReturnType<Understander["runBatch"]>>>[];
           try {
-            results = await Promise.allSettled(groups.map((g) => this.understander.runBatch(workId, g, signal)));
+            results = await Promise.allSettled(groups.map((g) => this.understander.runBatch(workId, g, signal, activeNativeOwner)));
           } finally {
+            clearInterval(claimHeartbeat);
             for (const c of pending) this.store.releaseConv(c.conv, workId);
           }
           if (signal?.aborted) throw new Error("aborted");
@@ -231,7 +254,7 @@ export class ContextService {
    */
   async fastCycle(
     workId: string,
-    p: { conv: string; conv_name: string; trigger_obs_id: string; anchor?: FastAnchor },
+    p: { conv: string; conv_name: string; trigger_obs_id: string; anchor?: FastAnchor; anchors?: FastAnchor[] },
     signal?: AbortSignal,
   ): Promise<{ busy?: boolean; fresh: number; created: number; nudged: number; pre_drafted: number }> {
     if (
@@ -247,19 +270,26 @@ export class ContextService {
     if (!this.store.claimConv(p.conv, workId, this.app.ledger.owner)) {
       return { busy: true, fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
     }
+    const claimHeartbeat = setInterval(() => {
+      this.store.renewConv(p.conv, workId);
+    }, 30_000);
+    claimHeartbeat.unref?.();
+    const activeNativeOwner = this.personalWeb.activeBoundNativeOwner();
     try {
       await this.ensureOwnerName();
-      if (p.anchor) {
-        await this.personalWeb.hydrateContext(p.anchor, p.conv, p.conv_name, signal);
+      const anchors = p.anchors?.length ? p.anchors : p.anchor ? [p.anchor] : [];
+      if (anchors.length) {
+        await this.personalWeb.hydrateContext(anchors, p.conv, p.conv_name, signal);
       }
       const eligAfter = await this.personalWeb.checkConvAllowedForUnderstand(p.conv, p.conv_name);
       if (eligAfter !== "allowed") return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
-      const window = this.store.convWindowAround(p.conv, p.trigger_obs_id);
+      const window = this.store.convWindowAround(p.conv, p.trigger_obs_id, 60, 12, activeNativeOwner);
       if (!window.length) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
       const r = await this.understander.runBatch(
         workId,
         [{ conv: p.conv, conv_name: p.conv_name, target_obs_id: p.trigger_obs_id }],
         signal,
+        activeNativeOwner,
       );
       relinkMeegoItems(this.store);
       this.store.mergeConflicts();
@@ -268,7 +298,7 @@ export class ContextService {
       const nudged = this.nudge(r.created);
       this.autonomy(r.created);
 
-      // 可选：为高优先级「别人在等你」自动预起草回复草稿（只起草，绝不自动发送；跳过静音/隐藏项目）
+      // 可选：为高优先级「别人在等你」自动预起草回复草稿（标记 auto: true，执行前二次复核开关与会话排除；永远不自动发送）
       let preDrafted = 0;
       if (this.cfg.context.personal_web.pre_draft) {
         for (const c of r.created) {
@@ -276,11 +306,12 @@ export class ContextService {
           if (!it || it.status !== "open" || it.kind !== "ask_me" || it.priority !== "high") continue;
           if (this.store.hidden(this.store.project(it.project_id))) continue;
           if (it.meta.needs_review || it.feedback === "unimportant" || !this.draftable(it)) continue;
-          if (this.enqueue(`draft:${it.id}:reply:fast`, { task: "draft", item_id: it.id, kind: "reply" })) preDrafted++;
+          if (this.enqueue(`draft:${it.id}:reply:fast`, { task: "draft", item_id: it.id, kind: "reply", auto: true })) preDrafted++;
         }
       }
       return { fresh: r.fresh, created: r.created.length, nudged, pre_drafted: preDrafted };
     } finally {
+      clearInterval(claimHeartbeat);
       this.store.releaseConv(p.conv, workId);
     }
   }
@@ -474,6 +505,39 @@ export class ContextService {
           return;
         }
         if (p.task === "draft") {
+          if (p.auto) {
+            // 自动预起草执行前复核当前开关、项目静音及目标会话排除规则，防止入队后用户关闭或静音仍把消息送给模型
+            if (
+              !this.cfg.context.understand ||
+              !this.cfg.context.sources.im ||
+              !this.cfg.context.personal_web.enabled ||
+              !this.cfg.context.personal_web.pre_draft
+            ) {
+              this.app.ledger.transition(item, { state: "skipped", terminal: true });
+              return;
+            }
+            const it = this.store.item(p.item_id);
+            if (!it || it.status !== "open" || it.feedback === "unimportant" || this.store.hidden(this.store.project(it.project_id))) {
+              this.app.ledger.transition(item, { state: "skipped", terminal: true });
+              return;
+            }
+            const k = p.kind ?? defaultDraftKind(it);
+            if (k && k !== "weekly_report") {
+              try {
+                const { conv } = this.drafter.target(it, k);
+                if (conv) {
+                  const elig = await this.personalWeb.checkConvAllowedForUnderstand(conv.conv, conv.conv_name);
+                  if (elig !== "allowed") {
+                    this.app.ledger.transition(item, { state: "skipped", terminal: true });
+                    return;
+                  }
+                }
+              } catch {
+                this.app.ledger.transition(item, { state: "skipped", terminal: true });
+                return;
+              }
+            }
+          }
           const d = await this.drafter.forItem(p.item_id, p.kind);
           this.app.ledger.transition(item, { state: "done", terminal: true, payload: { ...p, draft_id: d.id } as never });
           this.renderDraft(d.id);

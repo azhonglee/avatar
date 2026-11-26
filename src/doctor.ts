@@ -374,6 +374,12 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
         `运行 ${code("bin/pa context web-login")} 重新扫码登录`,
       );
     }
+    if (state === "publication_blocked") {
+      return warn(
+        `消息入库受阻，已暂缓确认推送（${lastError || "请检查数据库或排除规则"}）`,
+        "检查常驻进程日志确认数据库写入与排除规则解析是否正常",
+      );
+    }
     return ok(`${login.owner_name || login.owner_id}（已登录，当前状态：${state}）`);
   });
 

@@ -131,9 +131,10 @@ export class Drafter {
     const { target, label, conv } = this.target(it, k);
     const tz = this.cfg.owner.timezone;
     const p = this.store.project(it.project_id);
+    const activeNativeOwner = this.app.store.get(BOUND_OWNER_KV_KEY) ?? undefined;
     const convText = conv
       ? this.store
-          .convObs(conv.conv, Date.now() - 7 * DAY, 30)
+          .convObs(conv.conv, Date.now() - 7 * DAY, 30, activeNativeOwner)
           .map((o) => `${fmt(o.time, tz)} ${o.is_me ? "【我】" : o.actor_name}: ${truncate(o.text, 300)}`)
           .join("\n")
       : "（无）";

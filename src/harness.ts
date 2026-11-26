@@ -1,8 +1,19 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { ROOT, type Config } from "./config.ts";
 import type { Profile } from "./guard.ts";
 import { runProcess } from "./util.ts";
+
+/** 从传给子模型进程的环境里剥离个人 Web 凭据路径与加密密钥，避免任意 harness 读到主人的飞书会话 */
+function sanitizeBaseEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const clean: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (k === "CREDENTIALS_DIRECTORY" || k.startsWith("PA_FEISHU_WEB_")) continue;
+    clean[k] = v;
+  }
+  return clean;
+}
 
 export interface HarnessRun {
   harness: string;
@@ -66,7 +77,7 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
     Object.entries(h.env).map(([k, v]) => [k, v.replace(/\$\{(\w+)\}/g, (_, n: string) => process.env[n] ?? "")]),
   );
   const env: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...sanitizeBaseEnv(),
     ...harnessEnv,
     PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${process.env.PATH ?? ""}`,
     PA_GUARD_PROFILE: run.lark,
@@ -137,35 +148,54 @@ export function loadPrompt(name: string): string {
 async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"][string]): Promise<HarnessResult> {
   if (run.tools === "write") throw new Error(`harness ${run.harness} 是 codex-exec（只读），不能执行需要写权限的任务；请改用 acpx 类型的 harness`);
   const cmd = h.cmd || "codex";
-  fs.mkdirSync(run.cwd, { recursive: true });
-  const outFile = path.join(run.cwd, `.codex-last-${process.pid}-${Date.now()}.txt`);
+  // tools === "none"（处理不可信聊天文本的理解/起草）：在 dataDir 之外的空临时目录运行并彻底关闭 shell/执行工具与磁盘全读权限，
+  // 避免模型经文件系统越界读取 dataDir 下的会话凭据或状态库。
+  const isolatedTmp = run.tools === "none" ? fs.mkdtempSync(path.join(os.tmpdir(), "pa-codex-none-")) : undefined;
+  const execCwd = isolatedTmp ?? run.cwd;
+  if (!isolatedTmp) fs.mkdirSync(execCwd, { recursive: true });
+  const outFile = path.join(execCwd, `.codex-last-${process.pid}-${Date.now()}.txt`);
   // -o 用相对 cwd 的文件名：codex 0.169 在部分路径（如经符号链接的家目录）下打开绝对路径会报 "Not a directory"
   const args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--ephemeral", "--color", "never", "-o", path.basename(outFile)];
+  if (run.tools === "none") {
+    args.push(
+      "--disable", "shell_tool",
+      "--disable", "unified_exec",
+      "--disable", "apps",
+      "--disable", "browser_use",
+      "--disable", "computer_use",
+      "-c", "sandbox_permissions=[]",
+    );
+  }
   if (h.model) args.push("-m", h.model);
   args.push(...h.extraArgs, "-");
   const harnessEnv = Object.fromEntries(
     Object.entries(h.env).map(([k, v]) => [k, v.replace(/\$\{(\w+)\}/g, (_, n: string) => process.env[n] ?? "")]),
   );
   const started = new Date().toISOString();
-  const r = await runProcess(cmd, args, {
-    cwd: run.cwd,
-    env: { ...process.env, ...harnessEnv },
-    input: run.prompt,
-    timeoutMs: (run.timeoutSec + 60) * 1000,
-    group: true,
-    signal: run.signal,
-    onSpawn: run.onSpawn,
-  });
+  let r: Awaited<ReturnType<typeof runProcess>>;
   let text = "";
   try {
-    text = fs.readFileSync(outFile, "utf8").trim();
-    fs.rmSync(outFile, { force: true });
-  } catch {
-    text = r.stdout.trim();
+    r = await runProcess(cmd, args, {
+      cwd: execCwd,
+      env: { ...sanitizeBaseEnv(), ...harnessEnv },
+      input: run.prompt,
+      timeoutMs: (run.timeoutSec + 60) * 1000,
+      group: true,
+      signal: run.signal,
+      onSpawn: run.onSpawn,
+    });
+    try {
+      text = fs.readFileSync(outFile, "utf8").trim();
+      fs.rmSync(outFile, { force: true });
+    } catch {
+      text = r.stdout.trim();
+    }
+  } finally {
+    if (isolatedTmp) fs.rmSync(isolatedTmp, { recursive: true, force: true });
   }
   fs.writeFileSync(
     run.logFile,
-    [`# ${started} harness=${run.harness} type=codex-exec cwd=${run.cwd}`, `# ${cmd} ${args.join(" ")}`, `# exit=${r.code} timedOut=${r.timedOut}`, "## prompt", run.prompt, "## reply", text, "## stderr", r.stderr.slice(-4000)].join("\n"),
+    [`# ${started} harness=${run.harness} type=codex-exec tools=${run.tools} cwd=${execCwd}`, `# ${cmd} ${args.join(" ")}`, `# exit=${r.code} timedOut=${r.timedOut}`, "## prompt", run.prompt, "## reply", text, "## stderr", r.stderr.slice(-4000)].join("\n"),
   );
   try {
     usageRecorder?.(run, { stdout: r.stdout, stderr: r.stderr, code: r.code });
@@ -200,7 +230,7 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
     // run.lark === "none" 时不会执行真实 lark-cli
   }
   const env: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...sanitizeBaseEnv(),
     ...harnessEnv,
     DOUBAO_CLI_NO_UPDATE_CHECK: "1",
     PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${process.env.PATH ?? ""}`,

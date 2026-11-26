@@ -289,6 +289,17 @@ export class BinaryWebSocket {
         this.protocolError("WebSocket 帧包含未协商的保留位");
         return;
       }
+      // RFC 6455 §5.1：服务端发给客户端的帧绝不能设置掩码位
+      if (masked) {
+        this.protocolError("WebSocket 服务端帧非法设置掩码位");
+        return;
+      }
+      // RFC 6455 §5.5：控制帧（opcode >= 0x8）不得分片且载荷长度不得超过 125 字节
+      const isControl = (opcode & 0x08) !== 0;
+      if (isControl && (!fin || len > 125)) {
+        this.protocolError("WebSocket 控制帧违反 RFC 6455 约束（禁止分片且长度不得超过 125 字节）");
+        return;
+      }
 
       if (len === 126) {
         if (this.rx.length < 4) return;
@@ -310,15 +321,10 @@ export class BinaryWebSocket {
         return;
       }
 
-      const maskLen = masked ? 4 : 0;
-      if (this.rx.length < offset + maskLen + len) return;
+      if (this.rx.length < offset + len) return;
 
       this.rx.skip(offset);
-      const mask = masked ? this.rx.take(4) : undefined;
       const payload = this.rx.take(len);
-      if (mask) {
-        for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
-      }
 
       this.handleFrame(fin, opcode, payload);
     }

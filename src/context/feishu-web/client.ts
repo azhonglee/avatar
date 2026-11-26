@@ -262,6 +262,15 @@ export class FeishuWebClient {
     return this.cookieVersion;
   }
 
+  private refreshDeviceIdFromJar(): void {
+    const messengerUrl = new URL(this.endpoints.messengerUrl);
+    const accountsUrl = new URL(this.endpoints.accountsOrigin + "/");
+    const latest =
+      this.jar.cookieValue(messengerUrl, "passport_web_did") ||
+      this.jar.cookieValue(accountsUrl, "passport_web_did");
+    if (latest) this.deviceId = latest;
+  }
+
   /** 同步磁盘上更新版本的同会话 Cookie（例如其他进程刚完成了 Cookie 轮换） */
   syncFromDisk(login: WebLogin): void {
     if (login.owner_id !== this.ownerId) return;
@@ -270,6 +279,7 @@ export class FeishuWebClient {
     if (nextVer <= this.cookieVersion) return;
     this.jar.syncFromRecords(login.cookies);
     this.cookieVersion = nextVer;
+    this.refreshDeviceIdFromJar();
     if (login.owner_name) this.ownerName = login.owner_name;
     if (login.owner_open_id) this.ownerOpenId = login.owner_open_id;
   }
@@ -588,6 +598,7 @@ export class FeishuWebClient {
   // ───────── Frontier WSS Push Listener ─────────
 
   async buildSocketUrl(signal?: AbortSignal): Promise<string> {
+    this.refreshDeviceIdFromJar();
     const url = `${this.endpoints.ticketUrl}?local_device_id=${encodeURIComponent(this.deviceId)}`;
     const res = await fetchWithJar(this.jar, {
       method: "GET",

@@ -88,9 +88,12 @@ function arr(o: any, key: string): any[] {
 }
 
 export interface NativePollingExclusions {
-  excludedGroupNames: Set<string>;
-  excludeAllGroups: boolean;
-  excludeAllDms: boolean;
+  /** 已确认排除的群名（norm 后） */
+  confirmedGroupNames: Set<string>;
+  /** 存在无法实时解析的原生群排除规则（例如无在线 Web 客户端或 readChat 暂时失败）：需暂缓群入库且保留游标以便恢复后重试 */
+  groupsInconclusive: boolean;
+  /** 存在原生私聊排除规则或类型未知的无法解析排除规则：需暂缓私聊入库且保留游标 */
+  dmsInconclusive: boolean;
 }
 
 export class Connectors {
@@ -295,28 +298,33 @@ export class Connectors {
     });
   }
 
-  private denied(chatId: string, chatName: string, chatType = "", nativeExcl?: NativePollingExclusions, requireName = true): boolean {
-    if (chatId && this.store.isConvMutedById(chatId)) return true;
+  private classifyExclusion(
+    chatId: string,
+    chatName: string,
+    chatType = "",
+    nativeExcl?: NativePollingExclusions,
+    requireName = true,
+  ): "allowed" | "denied" | "inconclusive" {
+    if (chatId && this.store.isConvMutedById(chatId)) return "denied";
     if (
       this.cfg.context.groups_deny.some((raw) => {
         const d = raw.trim();
         if (!d) return false;
         if (chatId === d) return true;
-        if (!d.startsWith("oc_") && !d.startsWith("pw_chat:") && !/^\d+$/.test(d) && chatName && chatName.includes(d)) return true;
+        // 仅 oc_* 与 pw_chat:* 视作会话 ID；纯数字（如 "2024"）保持原有群名关键词排除语义
+        if (!d.startsWith("oc_") && !d.startsWith("pw_chat:") && chatName && chatName.includes(d)) return true;
         return false;
       })
     ) {
-      return true;
+      return "denied";
     }
-    if (!nativeExcl) return false;
+    if (!nativeExcl) return "allowed";
     const isDm = chatType === "p2p";
-    if (isDm) return nativeExcl.excludeAllDms;
-    if (nativeExcl.excludeAllGroups) return true;
-    if (nativeExcl.excludedGroupNames.size > 0) {
-      if (!chatName) return requireName; // 存在原生群排除规则且消息仍无群名时按 fail-closed 拦截；白名单预筛若尚未拉到群名则延后到单条消息入库前校验
-      if (nativeExcl.excludedGroupNames.has(norm(chatName))) return true;
-    }
-    return false;
+    if (isDm) return nativeExcl.dmsInconclusive ? "inconclusive" : "allowed";
+    if (chatName && nativeExcl.confirmedGroupNames.has(norm(chatName))) return "denied";
+    if (nativeExcl.groupsInconclusive) return "inconclusive";
+    if (nativeExcl.confirmedGroupNames.size > 0 && !chatName && requireName) return "inconclusive";
+    return "allowed";
   }
 
   private toObs(m: Raw, kind: string, me: string): Obs | undefined {
@@ -372,6 +380,7 @@ export class Connectors {
     for (const [id, v] of Object.entries(spoken)) if (v.at < now - lookback) delete spoken[id];
     this.setKv("spoken_groups", JSON.stringify(spoken));
     const nativeExcl = this.nativeExclusions ? await this.nativeExclusions() : undefined;
+    let hadInconclusive = !!(nativeExcl?.groupsInconclusive || nativeExcl?.dmsInconclusive);
     const groups =
       this.cfg.context.groups === "allowlist"
         ? Object.fromEntries(
@@ -382,16 +391,27 @@ export class Connectors {
               .map((id) => [id, { name: spoken[id]?.name ?? "", at: now }]),
           )
         : spoken;
-    const ranked = Object.entries(groups)
-      .filter(([id, v]) => !this.denied(id, v.name, "group", nativeExcl, false))
-      .sort((a, b) => b[1].at - a[1].at)
-      .slice(0, this.cfg.context.max_groups);
+    const ranked = nativeExcl?.groupsInconclusive
+      ? []
+      : Object.entries(groups)
+          .filter(([id, v]) => this.classifyExclusion(id, v.name, "group", nativeExcl, false) === "allowed")
+          .sort((a, b) => b[1].at - a[1].at)
+          .slice(0, this.cfg.context.max_groups);
     for (const [chatId, v] of ranked) {
       const cur = Number(this.kv(`cursor.chat.${chatId}`) ?? 0) || since;
       try {
         const data = await this.lark(["im", "+chat-messages-list", "--chat-id", chatId, "--start", isoLocal(cur - 60_000), "--end", end, "--order", "asc", "--page-all", "--page-limit", "4", "--no-reactions"]);
-        for (const m of arr(data, "messages")) raws.push({ m: { ...m, chat_name: m.chat_name || v.name, chat_type: m.chat_type || "group" }, kind: "group" });
-        this.setKv(`cursor.chat.${chatId}`, String(now));
+        let chatInconclusive = false;
+        for (const m of arr(data, "messages")) {
+          const enriched = { ...m, chat_name: m.chat_name || v.name, chat_type: m.chat_type || "group" };
+          if (this.classifyExclusion(String(enriched.chat_id ?? chatId), String(enriched.chat_name ?? ""), String(enriched.chat_type ?? "group"), nativeExcl) === "inconclusive") {
+            chatInconclusive = true;
+            hadInconclusive = true;
+            continue;
+          }
+          raws.push({ m: enriched, kind: "group" });
+        }
+        if (!chatInconclusive) this.setKv(`cursor.chat.${chatId}`, String(now));
       } catch {
         // 单个群失败下轮重试
       }
@@ -409,8 +429,14 @@ export class Connectors {
         dropped++;
         continue;
       }
-      if (this.denied(String(m.chat_id ?? ""), String(m.chat_name ?? ""), String(m.chat_type ?? ""), nativeExcl)) {
+      const excl = this.classifyExclusion(String(m.chat_id ?? ""), String(m.chat_name ?? ""), String(m.chat_type ?? ""), nativeExcl);
+      if (excl === "denied") {
         dropped++;
+        continue;
+      }
+      if (excl === "inconclusive") {
+        // 排除规则无法实时确认：不入库也不当成正常丢弃，并保留 cursor.im 供恢复后补拉
+        hadInconclusive = true;
         continue;
       }
       const o = this.toObs(m, kind, me);
@@ -421,7 +447,7 @@ export class Connectors {
     for (const o of obs) if (o.meta.chat_type === "p2p" && !o.is_me && o.actor_name) p2pName.set(o.conv, o.actor_name);
     for (const o of obs) if (o.meta.chat_type === "p2p") o.conv_name = `私聊：${p2pName.get(o.conv) ?? o.conv_name}`;
     const n = this.store.addObs(obs);
-    this.setKv("cursor.im", String(now));
+    if (!hadInconclusive) this.setKv("cursor.im", String(now));
     return { count: n, dropped };
   }
 

@@ -373,12 +373,51 @@ export class ContextStore {
     return { ...(r as unknown as Obs), is_me: !!r.is_me, meta: j(r.meta, {}) };
   }
 
-  /** 待理解的会话（按最早未处理观测排序），严格按会话 ID 排除静音会话 */
-  pendingConvs(limit: number, sources: string[] = ["im", "minutes", "doc"]): { conv: string; conv_name: string; n: number }[] {
+  /** 按账号隔离条件：对个人 Web（pw:*）观测，只允许归属当前绑定账号（或无归属旧记录）的观测进入窗口，防止换号后混入旧账号私聊与【我】标记 */
+  private ownerClause(activeNativeOwner?: string): { sql: string; args: string[] } {
+    if (!activeNativeOwner) return { sql: "", args: [] };
+    return {
+      sql: " AND (id NOT LIKE 'pw:%' OR COALESCE(json_extract(meta, '$.native_owner_id'), '') IN ('', ?))",
+      args: [activeNativeOwner],
+    };
+  }
+
+  /** 检查库中是否已存在归属其他个人 Web 账号的观测（用于阻止在脏数据目录上原地换号） */
+  hasOtherNativeOwnerObs(ownerId: string): boolean {
+    const r = this.db
+      .prepare("SELECT 1 FROM ctx_obs WHERE id LIKE 'pw:%' AND COALESCE(json_extract(meta, '$.native_owner_id'), '') NOT IN ('', ?) LIMIT 1")
+      .get(ownerId);
+    return !!r;
+  }
+
+  /** 撤回一条待处理观测（例如范围外群的 @我 消息被编辑移除了 @我），避免旧触发文本继续送给模型 */
+  retirePendingObs(id: string): boolean {
+    return this.tx(() => {
+      const cur = this.db.prepare("SELECT processed, meta FROM ctx_obs WHERE id = ?").get(id) as
+        | { processed: number; meta: string }
+        | undefined;
+      if (!cur || cur.processed !== 0) return false;
+      const m = j<Record<string, unknown>>(cur.meta, {});
+      m.withdrawn = true;
+      this.db.prepare("UPDATE ctx_obs SET processed = 1, meta = ? WHERE id = ? AND processed = 0").run(JSON.stringify(m), id);
+      return true;
+    });
+  }
+
+  /** 待理解的会话（按最早未处理观测排序），支持分页跳过排除列表并按当前绑定 Web 账号隔离 */
+  pendingConvs(
+    limit: number,
+    sources: string[] = ["im", "minutes", "doc"],
+    opts: { excludeConvs?: Iterable<string>; activeNativeOwner?: string } = {},
+  ): { conv: string; conv_name: string; n: number }[] {
+    if (!sources.length) return [];
+    const excluded = opts.excludeConvs ? [...opts.excludeConvs] : [];
+    const owner = this.ownerClause(opts.activeNativeOwner);
+    const exclSql = excluded.length ? ` AND conv NOT IN (${excluded.map(() => "?").join(",")})` : "";
     const q = `SELECT conv, MAX(conv_name) AS conv_name, COUNT(*) AS n, MIN(time) AS t FROM ctx_obs
-               WHERE processed = 0 AND source IN (${sources.map(() => "?").join(",")}) AND conv NOT IN (SELECT conv FROM ctx_mute_conv)
+               WHERE processed = 0 AND source IN (${sources.map(() => "?").join(",")}) AND conv NOT IN (SELECT conv FROM ctx_mute_conv)${exclSql}${owner.sql}
                GROUP BY conv ORDER BY t LIMIT ?`;
-    return this.db.prepare(q).all(...sources, limit) as { conv: string; conv_name: string; n: number }[];
+    return this.db.prepare(q).all(...sources, ...excluded, ...owner.args, limit) as { conv: string; conv_name: string; n: number }[];
   }
 
   pendingCount(): number {
@@ -389,34 +428,42 @@ export class ContextStore {
    * 理解窗口：这个会话最早的一批待处理观测（按时间正序，最多 maxFresh 条）+ 它们之前的若干条已处理观测作为背景。
    * 从最早的待处理开始，保证大群 / 停机后积压的消息分几批都能处理到，不会因为只取最近 N 条而永远卡住。
    */
-  convWindow(conv: string, maxFresh = 60, context = 12): Obs[] {
-    const fresh = this.db.prepare("SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 ORDER BY time ASC, id ASC LIMIT ?").all(conv, maxFresh) as Row[];
+  convWindow(conv: string, maxFresh = 60, context = 12, activeNativeOwner?: string): Obs[] {
+    const owner = this.ownerClause(activeNativeOwner);
+    const fresh = this.db
+      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0${owner.sql} ORDER BY time ASC, id ASC LIMIT ?`)
+      .all(conv, ...owner.args, maxFresh) as Row[];
     if (!fresh.length) return [];
     const t0 = Number(fresh[0].time);
-    const before = this.db.prepare("SELECT * FROM ctx_obs WHERE conv = ? AND processed = 1 AND time <= ? ORDER BY time DESC, id DESC LIMIT ?").all(conv, t0, context) as Row[];
+    const before = this.db
+      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 1 AND time <= ?${owner.sql} ORDER BY time DESC, id DESC LIMIT ?`)
+      .all(conv, t0, ...owner.args, context) as Row[];
     return [...before.reverse(), ...fresh].map((r) => this.toObs(r));
   }
 
   /**
    * 快通道理解窗口：
-   *   - 若触发消息（targetObsId）已被常规周期或前序作业处理完，直接返回空数组，避免陈旧快通道作业空耗模型处理无关积压；
-   *   - 否则保证包含触发消息及其后防抖期内的新消息（最多 maxFresh 条），附带前序背景，并显式补齐其话题根消息与引用父消息锚点。
+   *   - 若触发消息（targetObsId）已被常规周期或前序作业处理完（或已撤回/不属于当前账号），直接返回空数组；
+   *   - 否则包含触发消息及其前后待处理消息（最多 maxFresh 条）、紧贴触发前的最近背景，并为批次中**所有**待处理话题消息补齐 root/parent 锚点。
    */
-  convWindowAround(conv: string, targetObsId: string, maxFresh = 60, context = 12): Obs[] {
-    const target = this.db.prepare("SELECT * FROM ctx_obs WHERE id = ? AND conv = ? AND processed = 0").get(targetObsId, conv) as Row | undefined;
+  convWindowAround(conv: string, targetObsId: string, maxFresh = 60, context = 12, activeNativeOwner?: string): Obs[] {
+    const owner = this.ownerClause(activeNativeOwner);
+    const target = this.db
+      .prepare(`SELECT * FROM ctx_obs WHERE id = ? AND conv = ? AND processed = 0${owner.sql}`)
+      .get(targetObsId, conv, ...owner.args) as Row | undefined;
     if (!target) return [];
     const targetTime = Number(target.time);
     const after = this.db
-      .prepare("SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 AND time >= ? ORDER BY time ASC, id ASC LIMIT ?")
-      .all(conv, targetTime, maxFresh) as Row[];
+      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 AND time >= ?${owner.sql} ORDER BY time ASC, id ASC LIMIT ?`)
+      .all(conv, targetTime, ...owner.args, maxFresh) as Row[];
     const hasTarget = after.some((r) => String(r.id) === String(target.id));
     let fresh = hasTarget ? after : [target, ...after.slice(0, Math.max(0, maxFresh - 1))];
     const rem = maxFresh - fresh.length;
     if (rem > 0) {
       const seen = new Set(fresh.map((r) => String(r.id)));
       const earlierPending = this.db
-        .prepare("SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 AND time <= ? ORDER BY time DESC, id DESC LIMIT ?")
-        .all(conv, targetTime, rem + seen.size) as Row[];
+        .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 AND time <= ?${owner.sql} ORDER BY time DESC, id DESC LIMIT ?`)
+        .all(conv, targetTime, ...owner.args, rem + seen.size) as Row[];
       const extra = earlierPending.filter((r) => !seen.has(String(r.id))).slice(0, rem).reverse();
       fresh = [...extra, ...fresh];
     }
@@ -425,24 +472,28 @@ export class ContextStore {
     // 独立拉取紧贴触发消息之前的最近背景（以 targetTime 为锚点而非最早积压 t0，防止刚补读的近邻背景被旧积压挤出）
     const beforeTrigger = (
       this.db
-        .prepare("SELECT * FROM ctx_obs WHERE conv = ? AND time <= ? ORDER BY time DESC, id DESC LIMIT ?")
-        .all(conv, targetTime, context + includedIds.size) as Row[]
+        .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND time <= ?${owner.sql} ORDER BY time DESC, id DESC LIMIT ?`)
+        .all(conv, targetTime, ...owner.args, context + includedIds.size) as Row[]
     )
       .filter((r) => !includedIds.has(String(r.id)))
       .slice(0, context);
     beforeTrigger.forEach((r) => includedIds.add(String(r.id)));
 
-    // 显式补齐话题根消息与被引用父消息锚点（即使早于最近 context 条也能被模型看到）
-    const targetMeta = j<Record<string, unknown>>(target.meta, {});
+    // 显式补齐本批次所有待处理消息的话题根消息与引用父消息锚点（避免防抖合并多话题 @我 时丢失任一话题上下文）
     const anchors: Row[] = [];
-    for (const rawId of [String(targetMeta.native_root_id ?? ""), String(targetMeta.native_parent_id ?? "")]) {
-      if (!rawId) continue;
-      const anchorObsId = `pw:${rawId}`;
-      if (includedIds.has(anchorObsId)) continue;
-      const row = this.db.prepare("SELECT * FROM ctx_obs WHERE id = ? AND conv = ?").get(anchorObsId, conv) as Row | undefined;
-      if (row) {
-        anchors.push(row);
-        includedIds.add(String(row.id));
+    for (const f of fresh) {
+      const meta = j<Record<string, unknown>>(f.meta, {});
+      for (const rawId of [String(meta.native_root_id ?? ""), String(meta.native_parent_id ?? "")]) {
+        if (!rawId) continue;
+        const anchorObsId = `pw:${rawId}`;
+        if (includedIds.has(anchorObsId)) continue;
+        const row = this.db
+          .prepare(`SELECT * FROM ctx_obs WHERE id = ? AND conv = ?${owner.sql}`)
+          .get(anchorObsId, conv, ...owner.args) as Row | undefined;
+        if (row) {
+          anchors.push(row);
+          includedIds.add(String(row.id));
+        }
       }
     }
     const combined = [...anchors, ...beforeTrigger, ...fresh];
@@ -450,8 +501,11 @@ export class ContextStore {
     return combined.map((r) => this.toObs(r));
   }
 
-  convObs(conv: string, since: number, limit = 80): Obs[] {
-    const rows = this.db.prepare("SELECT * FROM ctx_obs WHERE conv = ? AND time >= ? ORDER BY time DESC LIMIT ?").all(conv, since, limit) as Row[];
+  convObs(conv: string, since: number, limit = 80, activeNativeOwner?: string): Obs[] {
+    const owner = this.ownerClause(activeNativeOwner);
+    const rows = this.db
+      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND time >= ?${owner.sql} ORDER BY time DESC LIMIT ?`)
+      .all(conv, since, ...owner.args, limit) as Row[];
     return rows.map((r) => this.toObs(r)).reverse();
   }
 
@@ -483,8 +537,8 @@ export class ContextStore {
     });
   }
 
-  /** 跨进程会话理解占坑：防止常驻进程快通道与命令行 `pa context run` 并发理解同一会话 */
-  claimConv(conv: string, holder: string, procOwner: string, ttlMs = 15 * 60_000, now = Date.now()): boolean {
+  /** 跨进程会话理解占坑：防止常驻进程快通道与命令行 `pa context run` 并发理解同一会话（配合 renewConv 心跳保活覆盖整次模型调用） */
+  claimConv(conv: string, holder: string, procOwner: string, ttlMs = 120_000, now = Date.now()): boolean {
     return this.tx(() => {
       const cur = this.db.prepare("SELECT holder, proc_owner, expires_at FROM ctx_conv_claim WHERE conv = ?").get(conv) as
         | { holder: string; proc_owner: string; expires_at: number }
@@ -497,6 +551,10 @@ export class ContextStore {
         .run(conv, holder, procOwner, now + ttlMs);
       return true;
     });
+  }
+
+  renewConv(conv: string, holder: string, ttlMs = 120_000, now = Date.now()): void {
+    this.db.prepare("UPDATE ctx_conv_claim SET expires_at = ? WHERE conv = ? AND holder = ?").run(now + ttlMs, conv, holder);
   }
 
   releaseConv(conv: string, holder: string): void {

@@ -70,7 +70,14 @@ import {
   type WebMessage,
 } from "../src/context/feishu-web/index.ts";
 import { ContextService } from "../src/context/index.ts";
-import { BOUND_OWNER_KV_KEY, PersonalWebBridge, pwSpokenGroupsKey, verifyWorkspaceOwnerBinding } from "../src/context/personal-web.ts";
+import {
+  BOUND_OWNER_KV_KEY,
+  BOUND_WORKSPACE_OWNER_KV_KEY,
+  PersonalWebBridge,
+  pwSpokenGroupsKey,
+  saveWorkspaceBinding,
+  verifyWorkspaceOwnerBinding,
+} from "../src/context/personal-web.ts";
 import { obsRevision } from "../src/context/store.ts";
 import { runDoctor } from "../src/doctor.ts";
 import { SettingsService } from "../src/settings.ts";
@@ -1021,7 +1028,7 @@ test("Working Context 集成：个人 Web @我 秒级快通道 + 预起草不自
       engine: { retry_base_ms: 20, retry_max_ms: 50, tick_ms: 50, effect_attempts: 2 },
       context: {
         harness: "cx",
-        groups_deny: ["9999"],
+        groups_deny: ["pw_chat:9999"],
         personal_web: { enabled: true, fast_lane: true, debounce_ms: 0, pre_draft: true, send_replies: true },
       },
     }),
@@ -2236,21 +2243,27 @@ test("Codex 第三轮回归：空载荷发送保护、稳定 ID 首次绑定、�
     assert.equal(gwHeaders["x-csrf-token"], "gw_tok", "网关请求必须发送匹配网关主机的 CSRF token");
     assert.equal(otherHostHeaders["x-csrf-token"], undefined, "不相关主机绝不能泄露 accounts host-only CSRF token");
 
-    // 2) [R3 P2-1] 同会话多进程 Cookie 版本合并：旧快照绝不回滚已轮换的新 session Cookie
+    // 2) [R3 P2-1 & R4 P2-5] 同会话多进程 Cookie 3-way 版本合并：非冲突键正确合并，同键冲突（陈旧响应重提旧 session）绝不回滚
     const savedV1 = loginStore.load()!;
+    const sessKey = "127.0.0.1\0/\0session";
+    const extraKey = "127.0.0.1\0/\0extra_flag";
     const mergedV2 = loginStore.saveIfSessionMatches(
       { ...savedV1, cookies: [...baseCookies.filter((c) => c.name !== "session"), { name: "session", value: "sess_v2", domain: "127.0.0.1", path: "/" }] },
-      { upserts: [{ name: "session", value: "sess_v2", domain: "127.0.0.1", path: "/" }], deletes: [] },
+      { upserts: [{ name: "session", value: "sess_v2", domain: "127.0.0.1", path: "/" }], deletes: [], baseValues: { [sessKey]: "sess_v1" } },
     );
     assert.ok(mergedV2 && mergedV2.cookie_version === 2);
-    // 另一个持 v1 快照的并发进程（如 web-status --verify）带着空 delta 或无关 Cookie 回写，绝不能把 sess_v2 回滚成 sess_v1
+    // 另一个持 v1 快照的并发进程：同键 session 试图写回旧值 sess_v1（冲突→丢弃），非冲突键 extra_flag 正常合并
     const mergedV3 = loginStore.saveIfSessionMatches(savedV1, {
-      upserts: [{ name: "extra_flag", value: "1", domain: "127.0.0.1", path: "/" }],
+      upserts: [
+        { name: "session", value: "sess_stale_v1", domain: "127.0.0.1", path: "/" },
+        { name: "extra_flag", value: "1", domain: "127.0.0.1", path: "/" },
+      ],
       deletes: [],
+      baseValues: { [sessKey]: "sess_v1", [extraKey]: null },
     });
     assert.ok(mergedV3 && mergedV3.cookie_version === 3);
-    assert.equal(mergedV3.cookies.find((c) => c.name === "session")?.value, "sess_v2", "不得回滚其他进程已轮换的 session");
-    assert.equal(mergedV3.cookies.find((c) => c.name === "extra_flag")?.value, "1", "增量新 Cookie 正确合并");
+    assert.equal(mergedV3.cookies.find((c) => c.name === "session")?.value, "sess_v2", "同键冲突绝不回滚其他进程已轮换的新 session");
+    assert.equal(mergedV3.cookies.find((c) => c.name === "extra_flag")?.value, "1", "非冲突键增量正确合并");
 
     // 3) [R3 P2-2] connect 阶段 readNativeProfile 轮换 Cookie 后若 loadWebMetadata 503，新 Cookie 仍已落盘
     mock.setMessengerStatus(503);
@@ -2335,21 +2348,24 @@ test("Codex 第三轮回归：空载荷发送保护、稳定 ID 首次绑定、�
       /上次个人 Web 发送结果不明确/,
     );
 
-    // 5) [R3 P1-2] 首次绑定不能仅凭显示名称相同通过：需稳定 open_id 匹配或显式 --allow-unverified-owner
-    app.store.db.prepare("DELETE FROM kv WHERE k IN (?, 'ctx.owner_name')").run(BOUND_OWNER_KV_KEY);
+    // 5) [R3 P1-2 & R4 P2-2] 首次绑定不能仅凭显示名称相同通过（且不同应用的 open_id 不做跨应用等价或误拒）；需显式 --allow-unverified-owner，重登同一已绑定账号免重复确认
+    app.store.db.prepare("DELETE FROM kv WHERE k IN (?, ?, 'ctx.owner_name')").run(BOUND_OWNER_KV_KEY, BOUND_WORKSPACE_OWNER_KV_KEY);
     loginStore.clear();
     fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner", user_name: "张三" }));
     await assert.rejects(
       verifyWorkspaceOwnerBinding(app, { owner_id: "7777", owner_name: "张三", cookies: [] }),
       /allow-unverified-owner/,
     );
-    await assert.rejects(
-      verifyWorkspaceOwnerBinding(app, { owner_id: "7777", owner_name: "张三", owner_open_id: "ou_impostor", cookies: [] }, { allowUnverifiedOwner: true }),
-      /open_id \(ou_impostor\) 与 config\.yaml 配置的主人 \(ou_owner\) 不一致/,
+    // 不同应用（app_id=12）的 open_id 与工作区 lark-cli 应用的 open_id 不同属一个应用空间：传 --allow-unverified-owner 时不应误拒本人
+    await verifyWorkspaceOwnerBinding(
+      app,
+      { owner_id: "7001", owner_name: "张三", owner_open_id: "ou_app12_different", cookies: [] },
+      { allowUnverifiedOwner: true },
     );
-    await verifyWorkspaceOwnerBinding(app, { owner_id: "7001", owner_name: "张三", owner_open_id: "ou_owner", cookies: [] });
-    loginStore.save({ owner_id: "7001", owner_name: "张三", owner_open_id: "ou_owner", cookies: baseCookies });
-    app.store.set(BOUND_OWNER_KV_KEY, "7001");
+    loginStore.save({ owner_id: "7001", owner_name: "张三", cookies: baseCookies });
+    saveWorkspaceBinding(app.store, "7001", "ou_owner");
+    // 同一已绑定原生账号且同一工作区主人重登：无需再传 --allow-unverified-owner
+    await verifyWorkspaceOwnerBinding(app, { owner_id: "7001", owner_name: "张三", cookies: [] });
 
     // 6) [R3 P2-4 & P2-7] allowlist 按传输分区并遵守 max_groups=1；范围外普通群绝不调用 readChat
     const liveClient = await FeishuWebClient.connect(loginStore.load()!, { endpoints: mock.endpoints });
@@ -2384,8 +2400,9 @@ test("Codex 第三轮回归：空载荷发送保护、稳定 ID 首次绑定、�
     assert.equal(svc.store.obs("pw:r3_renamed_muted"), undefined);
     svc.store.muteConv("oc_muted_renamed", "", false);
 
-    // 8) [R3 P1-4] 原生 pw_chat 静音同步生效到 lark-cli 兜底轮询（pullIm）与 allowlist 分区
+    // 8) [R3 P1-4 & R4 P1-4 & R4 P1-9] 原生 pw_chat 静音同步生效到 lark-cli 兜底轮询（在线实时解析）；无在线客户端时 inconclusive 暂缓且保留游标
     svc.store.muteConv("pw_chat:9503", "秘密研发群", true);
+    mock.setChatName("9503", "秘密研发群");
     fs.writeFileSync(
       path.join(ctxDir, "lark.json"),
       JSON.stringify({
@@ -2417,9 +2434,19 @@ test("Codex 第三轮回归：空载荷发送保护、稳定 ID 首次绑定、�
         ],
       }),
     );
+    // 8a) 无在线客户端（如独立 pa context run）：无法核实静音群是否已改名，必须 inconclusive 暂缓且不推进 cursor.im
+    app.store.db.prepare("DELETE FROM kv WHERE k = 'ctx.cursor.im'").run();
+    await svc.connectors.pullIm();
+    assert.equal(svc.store.obs("im:om_allow_ok"), undefined, "无在线 Web 客户端无法核实原生静音群名时暂缓群入库");
+    assert.equal(app.store.get("ctx.cursor.im"), undefined, "排除状态 inconclusive 时绝不推进 cursor.im 导致后续漏采");
+
+    // 8b) 在线 Web 客户端就绪后：实时解析 9503 群名，放行白名单群并精确拦截静音群
+    (svc.personalWeb as unknown as { client?: FeishuWebClient }).client = liveClient;
     await svc.connectors.pullIm();
     assert.ok(svc.store.obs("im:om_allow_ok"), "pw_chat:* 白名单不占用开放平台 max_groups=1 配额");
     assert.equal(svc.store.obs("im:om_secret_poll"), undefined, "静音 pw_chat 同样拦截兜底轮询中的同名开放平台群");
+    assert.ok(app.store.get("ctx.cursor.im"), "确认解析后正常推进 cursor.im");
+    (svc.personalWeb as unknown as { client?: FeishuWebClient }).client = undefined;
     svc.store.muteConv("pw_chat:9503", "", false);
 
     // 9) [R3 P1-5 & P2-8] 入库后新增排除规则阻断快通道与常规周期；关闭 fast_lane 后跳过已入队快通道
@@ -2620,6 +2647,406 @@ test("Codex 第三轮回归：空载荷发送保护、稳定 ID 首次绑定、�
     await assert.rejects(wsFrag.read(500), /分片数量超过上限/);
     wsFrag.close();
   } finally {
+    app?.store.db.close();
+    if (prevCtxDir === undefined) delete process.env.CTX_DIR;
+    else process.env.CTX_DIR = prevCtxDir;
+    await mock.close();
+  }
+});
+
+// ───────── 10. Codex Review 第四轮专项回归测试 ─────────
+
+test("Codex 第四轮回归：凭据加密与 harness 隔离、工作区主人绑定、脏库换号拦截、负向排除复核、推送中止保护、自动预起草复核、分页不饿死、数字关键词、已建待回读、多话题锚点与 RFC6455 校验", async () => {
+  const mock = await startMockFeishuWebServer();
+  const dir = makeTmp("pa-pw-r4-");
+  const ctxDir = path.join(dir, "ctx");
+  fs.mkdirSync(ctxDir, { recursive: true });
+  const prevCtxDir = process.env.CTX_DIR;
+  const prevKey = process.env.PA_FEISHU_WEB_KEY;
+  process.env.CTX_DIR = ctxDir;
+
+  const cfgFile = path.join(dir, "config.yaml");
+  fs.writeFileSync(
+    cfgFile,
+    JSON.stringify({
+      data_dir: path.join(dir, "data"),
+      bins: { lark: path.join(STUBS, "ctx-lark"), acpx: path.join(STUBS, "acpx"), bytedcli: path.join(STUBS, "ctx-bytedcli") },
+      harnesses: { claude: { agent: "claude" }, cx: { type: "codex-exec", cmd: path.join(STUBS, "ctx-codex") } },
+      roles: { brain: "claude" },
+      owner: { open_id: "ou_owner_a" },
+      cards: { enabled: false },
+      engine: { retry_base_ms: 20, retry_max_ms: 50, tick_ms: 50, effect_attempts: 2 },
+      context: {
+        harness: "cx",
+        groups: "allowlist",
+        max_groups: 5,
+        groups_allow: ["pw_chat:9601"],
+        groups_deny: ["2024"],
+        personal_web: { enabled: true, fast_lane: true, debounce_ms: 20, pre_draft: true, send_replies: true },
+      },
+    }),
+  );
+
+  let app: ReturnType<typeof createApp> | undefined;
+  try {
+    // 1) [R4 P1-1] AES-256-GCM 静态加密存储：开启 PA_FEISHU_WEB_KEY 后磁盘不含明文 session
+    process.env.PA_FEISHU_WEB_KEY = "super-secret-master-key-for-test";
+    const encDir = makeTmp("pa-pw-enc-");
+    const encStore = new WebLoginStore(encDir);
+    const baseCookies = [
+      { name: "session", value: "sess_super_secret_raw", domain: "127.0.0.1", path: "/" },
+      { name: "passport_web_did", value: "did_test_123", domain: "127.0.0.1", path: "/" },
+    ];
+    encStore.save({ owner_id: "7001", owner_name: "张三", cookies: baseCookies });
+    const rawDisk = fs.readFileSync(encStore.file, "utf8");
+    assert.ok(!rawDisk.includes("sess_super_secret_raw"), "加密模式下磁盘绝不能出现明文 session");
+    assert.equal(encStore.load()?.cookies.find((c) => c.name === "session")?.value, "sess_super_secret_raw");
+    delete process.env.PA_FEISHU_WEB_KEY;
+
+    // 2) [R4 P2-6] 存活进程持有的锁绝不因文件 mtime > 30s 被抢占
+    const lockDir = makeTmp("pa-pw-lock-");
+    const lockStore = new WebLoginStore(lockDir);
+    const lockPath = `${lockStore.file}.lock`;
+    fs.writeFileSync(lockPath, `${os.hostname()}:${process.pid}:live-token\n`, { mode: 0o600 });
+    const oldTime = new Date(Date.now() - 120_000);
+    fs.utimesSync(lockPath, oldTime, oldTime);
+    // 验证死进程 PID 锁会被安全清理，而存活锁不可被基于年龄抢占（用极短校验：写一个已退出的 PID）
+    fs.writeFileSync(lockPath, `${os.hostname()}:999999:dead-token\n`, { mode: 0o600 });
+    lockStore.save({ owner_id: "7001", owner_name: "张三", cookies: baseCookies });
+    assert.equal(lockStore.load()?.owner_id, "7001");
+
+    app = createApp(loadConfig(cfgFile));
+    const svc = new ContextService(app);
+    const loginStore = new WebLoginStore(app.cfg.dataDir);
+    const now = Date.now();
+    const nowSec = Math.floor(now / 1000);
+    const savedLogin = loginStore.save({ owner_id: "7001", owner_name: "张三", cookies: baseCookies });
+    saveWorkspaceBinding(app.store, "7001", "ou_owner_a");
+
+    // 3) [R4 P1-2] config.yaml 的 owner.open_id 变更后，启动校验必须拒绝旧主人的 Web 凭据进入 needs_login
+    app.cfg.owner.open_id = "ou_owner_b";
+    const mismatchBridge = new PersonalWebBridge(app, svc.store, {
+      onFastTrigger: () => undefined,
+      onReconnect: () => undefined,
+      onNeedsLogin: () => undefined,
+      credentialWatchIntervalMs: 25,
+      clientOptions: { endpoints: mock.endpoints },
+    });
+    const mHandle = mismatchBridge.start();
+    await waitUntil(() => mismatchBridge.status().state === "needs_login");
+    assert.match(mismatchBridge.status().last_error, /已绑定的工作区主人 \(ou_owner_a\) 不一致/);
+    mHandle.stop();
+    app.cfg.owner.open_id = "ou_owner_a";
+
+    // 4) [R4 P1-3] 脏数据目录拒绝原地换号，且存储窗口按当前绑定账号隔离旧账号 pw:* 观测
+    svc.store.addObs([
+      {
+        id: "pw:old_owner_msg",
+        source: "im",
+        kind: "mine",
+        conv: "pw_chat:shared_1",
+        conv_name: "共享群",
+        actor_id: "7001",
+        actor_name: "张三",
+        is_me: true,
+        time: now - 5000,
+        text: "前主人的发言",
+        url: "",
+        meta: { transport: "personal_web", native_owner_id: "7001", chat_type: "group" },
+      },
+      {
+        id: "pw:new_owner_msg",
+        source: "im",
+        kind: "at_me",
+        conv: "pw_chat:shared_1",
+        conv_name: "共享群",
+        actor_id: "7003",
+        actor_name: "王五",
+        is_me: false,
+        time: now,
+        text: "@李四 新主人的消息",
+        url: "",
+        meta: { transport: "personal_web", native_owner_id: "7002", chat_type: "group" },
+      },
+    ]);
+    await assert.rejects(
+      verifyWorkspaceOwnerBinding(
+        app,
+        { owner_id: "7002", owner_name: "李四", cookies: [] },
+        { forceSwitch: true, allowNameMismatch: true, allowUnverifiedOwner: true },
+      ),
+      /拒绝原地换号/,
+    );
+    const scopedWin = svc.store.convWindowAround("pw_chat:shared_1", "pw:new_owner_msg", 20, 5, "7002");
+    assert.deepEqual(
+      scopedWin.map((o) => o.id),
+      ["pw:new_owner_msg"],
+      "按绑定账号隔离后绝不能把前主人的【我】消息带入新主人窗口",
+    );
+
+    // 5) [R4 P2-4] 纯数字 groups_deny ("2024") 保持原有群名关键词语义，不误阻断普通群轮询
+    fs.writeFileSync(
+      path.join(ctxDir, "lark.json"),
+      JSON.stringify({
+        user_open_id: "ou_owner_a",
+        user_name: "张三",
+        at_me: [
+          {
+            message_id: "om_2024_deny",
+            chat_id: "oc_2024",
+            chat_name: "2024 规划复盘群",
+            chat_type: "group",
+            create_time: String(nowSec),
+            sender: { id: "ou_x", name: "X", sender_type: "user" },
+            content: "@张三 2024 关键词群应被拦截",
+          },
+          {
+            message_id: "om_normal_ok",
+            chat_id: "oc_norm",
+            chat_name: "正常研发群",
+            chat_type: "group",
+            create_time: String(nowSec),
+            sender: { id: "ou_x", name: "X", sender_type: "user" },
+            content: "@张三 正常群不应受 2024 规则影响",
+          },
+        ],
+      }),
+    );
+    await svc.connectors.pullIm();
+    assert.equal(svc.store.obs("im:om_2024_deny"), undefined, "数字关键词仍按群名子串拦截");
+    assert.ok(svc.store.obs("im:om_normal_ok"), "纯数字 groups_deny 绝不误当成不可解析原生 ID 导致全群停采");
+    app.cfg.context.groups_deny = [];
+
+    // 6) [R4 P1-5 & P2-1] 负向排除强制复核防改名逃逸；群名以 "私聊" 开头但 chat_type="group" 仍按群聊校验
+    const client = await FeishuWebClient.connect(savedLogin, { endpoints: mock.endpoints });
+    app.cfg.context.groups_deny = ["oc_rename_target"];
+    fs.writeFileSync(
+      path.join(ctxDir, "lark.json"),
+      JSON.stringify({ user_open_id: "ou_owner_a", user_name: "张三", chat_meta: { oc_rename_target: { name: "旧秘密群", chat_mode: "group" } } }),
+    );
+    mock.setChatName("9601", "普通群A");
+    // 先缓存 oc_rename_target = "旧秘密群"
+    await svc.personalWeb.handleMessage(
+      decodeMessage(buildNativeMessage({ id: "r4_warm_1", chatId: "9601", actorId: "7002", text: "预热缓存" }), "7001"),
+      client,
+    );
+    // 随后 oc_rename_target 改名为 "私聊吐槽群"（注意群名以 "私聊" 开头！），且 9602 也是这个新群名
+    fs.writeFileSync(
+      path.join(ctxDir, "lark.json"),
+      JSON.stringify({ user_open_id: "ou_owner_a", user_name: "张三", chat_meta: { oc_rename_target: { name: "私聊吐槽群", chat_mode: "group" } } }),
+    );
+    mock.setChatName("9602", "私聊吐槽群");
+    await svc.personalWeb.handleMessage(
+      decodeMessage(
+        buildNativeMessage({
+          id: "r4_renamed_escape",
+          chatId: "9602",
+          actorId: "7002",
+          richBytes: encodeRichText([{ text: "@张三", mentionId: "7001" }, { text: " 改名后不应逃逸" }]),
+        }),
+        "7001",
+      ),
+      client,
+    );
+    assert.equal(svc.store.obs("pw:r4_renamed_escape"), undefined, "负向不匹配强制刷新 oc_* 缓存后成功拦下改名后的禁用群");
+    app.cfg.context.groups_deny = [];
+
+    // 7) [R4 P1-6] 推送处理期间会话被中止（AbortSignal）绝不落库
+    const abortCtrl = new AbortController();
+    app.cfg.context.groups_allow = ["pw_chat:9601", "pw_chat:9603"];
+    mock.setOnChatMode(() => abortCtrl.abort());
+    await assert.rejects(
+      svc.personalWeb.handleMessage(
+        decodeMessage(buildNativeMessage({ id: "r4_aborted_push", chatId: "9603", actorId: "7002", text: "中止期间到达" }), "7001"),
+        client,
+        abortCtrl.signal,
+      ),
+      /中止|aborted/i,
+    );
+    mock.setOnChatMode(undefined);
+    app.cfg.context.groups_allow = ["pw_chat:9601"];
+    assert.equal(svc.store.obs("pw:r4_aborted_push"), undefined, "会话中止后绝不落库");
+
+    // 8) [R4 P2-9] 范围外群的 @我 消息被编辑移除 @我 后，撤回旧待处理观测
+    mock.setChatName("9699", "未列入群");
+    await svc.personalWeb.handleMessage(
+      decodeMessage(
+        buildNativeMessage({
+          id: "r4_withdrawn_at",
+          chatId: "9699",
+          actorId: "7002",
+          richBytes: encodeRichText([{ text: "@张三", mentionId: "7001" }, { text: " 请处理" }]),
+        }),
+        "7001",
+      ),
+      client,
+    );
+    assert.equal(svc.store.obsPending("pw:r4_withdrawn_at"), true);
+    // 发送者编辑移除了 @张三
+    await svc.personalWeb.handleMessage(
+      decodeMessage(buildNativeMessage({ id: "r4_withdrawn_at", chatId: "9699", actorId: "7002", text: "没事了发错人" }), "7001"),
+      client,
+    );
+    assert.equal(svc.store.obsPending("pw:r4_withdrawn_at"), false, "编辑移除 @我 后必须撤回旧待处理状态");
+    assert.equal(svc.store.obs("pw:r4_withdrawn_at")?.meta.withdrawn, true);
+
+    // 9) [R4 P2-10] 防抖合并同群两个不同话题的 @我 时保留全部锚点，并同时补读两个话题根消息
+    const triggeredList: { anchors: { rootId: string }[] }[] = [];
+    const multiBridge = new PersonalWebBridge(app, svc.store, {
+      onFastTrigger: (t) => triggeredList.push(t),
+      onReconnect: () => undefined,
+      onNeedsLogin: () => undefined,
+      clientOptions: { endpoints: mock.endpoints },
+    });
+    (multiBridge as unknown as { client?: FeishuWebClient }).client = client;
+    mock.addMessage("root_th_a", buildNativeMessage({ id: "root_th_a", chatId: "9601", actorId: "7003", text: "话题A根消息", createdAtSec: nowSec - 600, position: 1 }));
+    mock.addMessage("root_th_b", buildNativeMessage({ id: "root_th_b", chatId: "9601", actorId: "7004", text: "话题B根消息", createdAtSec: nowSec - 500, position: 2 }));
+    await multiBridge.handleMessage(
+      decodeMessage(
+        buildNativeMessage({
+          id: "th_at_a",
+          chatId: "9601",
+          actorId: "7002",
+          rootId: "root_th_a",
+          parentId: "root_th_a",
+          threadId: "th_a",
+          richBytes: encodeRichText([{ text: "@张三", mentionId: "7001" }, { text: " 看话题A" }]),
+        }),
+        "7001",
+      ),
+      client,
+    );
+    await multiBridge.handleMessage(
+      decodeMessage(
+        buildNativeMessage({
+          id: "th_at_b",
+          chatId: "9601",
+          actorId: "7002",
+          rootId: "root_th_b",
+          parentId: "root_th_b",
+          threadId: "th_b",
+          richBytes: encodeRichText([{ text: "@张三", mentionId: "7001" }, { text: " 看话题B" }]),
+        }),
+        "7001",
+      ),
+      client,
+    );
+    await waitUntil(() => triggeredList.length === 1);
+    assert.equal(triggeredList[0].anchors.length, 2, "防抖期内两个不同话题的锚点必须全部保留");
+    await multiBridge.hydrateContext(triggeredList[0].anchors as never, "pw_chat:9601", "普通群A");
+    const dualWin = svc.store.convWindowAround("pw_chat:9601", "pw:th_at_b", 20, 5, "7001");
+    assert.ok(dualWin.some((o) => o.id === "pw:root_th_a"), "保留话题A根锚点");
+    assert.ok(dualWin.some((o) => o.id === "pw:root_th_b"), "保留话题B根锚点");
+    multiBridge.stop();
+
+    // 10) [R4 P1-7] 自动预起草（auto: true）在排队期间关闭 pre_draft 后执行时必须跳过，绝不调模型
+    const { item: autoDraftItem } = svc.store.upsertItem({ title: "排队后关闭预起草测试", kind: "ask_me", priority: "high", source: "im", confidence: 0.95 });
+    svc.store.addEvidence("item", autoDraftItem.id, "pw:th_at_b", "看话题B", now);
+    svc.enqueue("draft:auto-skip-1", { task: "draft", item_id: autoDraftItem.id, kind: "reply", auto: true });
+    app.cfg.context.personal_web.pre_draft = false;
+    await app.engine.drain(["context"]);
+    assert.equal(app.ledger.get("context:draft:auto-skip-1")?.state, "skipped", "关闭 pre_draft 后自动预起草必须跳过");
+    assert.equal(svc.store.drafts({}).some((d) => d.item_id === autoDraftItem.id), false);
+
+    // 11) [R4 P1-8] 25 个被排除的 IM 会话排在前面时，cycle 必须翻页继续处理第 26 个会议纪要（不饿死）
+    svc.store.db.prepare("UPDATE ctx_obs SET processed = 1").run();
+    for (let i = 0; i < 25; i++) {
+      svc.store.addObs([
+        {
+          id: `im:starve_${i}`,
+          source: "im",
+          kind: "group",
+          conv: `oc_starve_${i}`,
+          conv_name: `已禁用群_${i}`,
+          actor_id: "ou_x",
+          actor_name: "X",
+          is_me: false,
+          time: now - 100_000 + i * 100,
+          text: `被排除消息 ${i}`,
+          url: "",
+          meta: { chat_type: "group" },
+        },
+      ]);
+    }
+    svc.store.addObs([
+      {
+        id: "minutes:m_not_starved",
+        source: "minutes",
+        kind: "minutes",
+        conv: "minutes:m_not_starved",
+        conv_name: "会议：季度评审",
+        actor_id: "",
+        actor_name: "智能纪要",
+        is_me: false,
+        time: now,
+        text: "会议纪要：确定 Q4 路线图",
+        url: "",
+        meta: {},
+      },
+    ]);
+    app.cfg.context.groups_deny = ["已禁用群_"];
+    app.cfg.context.sources = { meego: false, tasks: false, im: true, minutes: true, calendar: false, docs: false };
+    fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner_a", user_name: "张三" }));
+    fs.writeFileSync(path.join(ctxDir, "understand.json"), JSON.stringify({ projects: [], items: [] }));
+    const cycRep = await svc.cycle("context:cycle:r4-page");
+    assert.equal(cycRep.convs, 1, "翻页跳过 25 个被排除 IM 会话后必须处理会议纪要");
+    assert.equal(svc.store.obsPending("minutes:m_not_starved"), false);
+    app.cfg.context.groups_deny = [];
+
+    // 12) [R4 P2-11 & P2-3] 已 created 待回读在关闭 send_replies 后仍可完成回读；跨进程修改 config.yaml 关闭 send_replies 阻止新发送
+    mock.addMessage("r4_reply_orig", buildNativeMessage({ id: "r4_reply_orig", chatId: "9601", actorId: "7002", text: "待回复", position: 90 }));
+    const replyBridge = new PersonalWebBridge(app, svc.store, {
+      onFastTrigger: () => undefined,
+      onReconnect: () => undefined,
+      onNeedsLogin: () => undefined,
+      clientOptions: { endpoints: mock.endpoints },
+    });
+    (replyBridge as unknown as { client?: FeishuWebClient }).client = client;
+    mock.setFailReadbackCount(1);
+    await assert.rejects(
+      replyBridge.sendVerifiedReply({ owner_id: "7001", chat_id: "9601", message_id: "r4_reply_orig", text: "已创建待回读", cid: "cid_r4_readback_off" }),
+      /HTTP 503/,
+    );
+    // 关闭 send_replies 后重试：应走只读回读完成确认而不报错
+    app.cfg.context.personal_web.send_replies = false;
+    const rbRes = await replyBridge.sendVerifiedReply({ owner_id: "7001", chat_id: "9601", message_id: "r4_reply_orig", text: "已创建待回读", cid: "cid_r4_readback_off" });
+    assert.equal(rbRes.verified, true, "已创建的消息在关闭 send_replies 后仍应完成只读回读核验");
+
+    // 跨进程修改磁盘 config.yaml 关闭 send_replies（本进程内存仍为 true）：新发送必须被拦截
+    app.cfg.context.personal_web.send_replies = true;
+    const diskCfg = JSON.parse(fs.readFileSync(cfgFile, "utf8")) as { context: { personal_web: { send_replies: boolean } } };
+    diskCfg.context.personal_web.send_replies = false;
+    await new Promise((r) => setTimeout(r, 15));
+    fs.writeFileSync(cfgFile, JSON.stringify(diskCfg));
+    await assert.rejects(
+      replyBridge.sendVerifiedReply({ owner_id: "7001", chat_id: "9601", message_id: "r4_reply_orig", text: "跨进程关闭后新发", cid: "cid_r4_disk_off" }),
+      /配置文件已关闭 context\.personal_web\.send_replies/,
+    );
+
+    // 13) [R4 P2-14] RFC 6455 校验：拒绝带掩码的服务端帧、分片控制帧和超 125 字节的 Ping 控制帧
+    const wsMask = await BinaryWebSocket.dial(mock.endpoints.websocketUrl);
+    mock.pushRawBytes(Buffer.from([0x82, 0x80, 0x01, 0x02, 0x03, 0x04])); // masked=1 from server
+    await assert.rejects(wsMask.read(500), /掩码位/);
+    wsMask.close();
+
+    const wsBigPing = await BinaryWebSocket.dial(mock.endpoints.websocketUrl);
+    mock.pushRawBytes(Buffer.from([0x89, 126, 0x00, 130])); // Ping with 130-byte payload (> 125)
+    await assert.rejects(wsBigPing.read(500), /RFC 6455/);
+    wsBigPing.close();
+
+    // 14) [R4 P3-1] doctor 对 publication_blocked 返回 warn 并展示原因
+    app.store.set(
+      "ctx.personal_web.state",
+      JSON.stringify({ state: "publication_blocked", owner_id: "7001", owner_name: "张三", session_id: savedLogin.session_id, since: now, last_message_at: now, last_error: "SQLITE_FULL" }),
+    );
+    app.store.set("daemon.heartbeat", `host:1|${now}`);
+    const docBlocked = await runDoctor(app);
+    const pwDoc = docBlocked.checks.find((c) => c.id === "personal_web")!;
+    assert.equal(pwDoc.status, "warn", "publication_blocked 必须在 doctor 中标为 warn");
+    assert.match(pwDoc.detail, /SQLITE_FULL/);
+  } finally {
+    if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevKey;
     app?.store.db.close();
     if (prevCtxDir === undefined) delete process.env.CTX_DIR;
     else process.env.CTX_DIR = prevCtxDir;

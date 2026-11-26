@@ -3,7 +3,7 @@ import { parseArgs } from "node:util";
 import { createApp, initApp, runConfiguredJob, runDaemon, runDispatchOnce, sendBrief } from "./app.ts";
 import { loadConfig } from "./config.ts";
 import { beginLogin, FeishuWebClient, pollLogin, renderQrSvg, renderQrTerminal, WebLoginStore } from "./context/feishu-web/index.ts";
-import { BOUND_OWNER_KV_KEY, verifyWorkspaceOwnerBinding } from "./context/personal-web.ts";
+import { saveWorkspaceBinding, verifyWorkspaceOwnerBinding } from "./context/personal-web.ts";
 import { decide, type Profile } from "./guard.ts";
 import { consoleBaseUrl, isLoopbackHost, resolveConsoleHost, serverToken } from "./server/index.ts";
 import { formatReport, runDoctor } from "./doctor.ts";
@@ -208,9 +208,10 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
         allowNameMismatch: !!values["allow-name-mismatch"],
         allowUnverifiedOwner: !!values["allow-unverified-owner"],
       });
+      if (ctrl.signal.aborted) throw new Error("扫码登录已取消");
       const store = new WebLoginStore(app.cfg.dataDir);
       const saved = store.save(login);
-      app.store.set(BOUND_OWNER_KV_KEY, saved.owner_id);
+      saveWorkspaceBinding(app.store, saved.owner_id, app.cfg.owner.open_id);
       // 清除此前 web-logout 或旧会话残留的 needs_login 错误状态，避免守护进程未启动时 web-status / doctor 误报过期
       app.store.set(
         "ctx.personal_web.state",

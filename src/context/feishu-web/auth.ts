@@ -201,8 +201,9 @@ export async function loadWebMetadata(
   }
   const body = res.body.toString("utf8");
   const match = body.match(APP_KEY_RE);
+  // 优先取响应后 Cookie Jar 中的最新 passport_web_did（防止响应轮换该 Cookie 后仍沿用旧值计算签名）
   const resolvedDeviceId =
-    deviceId || jar.cookieValue(messengerUrl, "passport_web_did") || jar.cookieValue(accountsUrl, "passport_web_did");
+    jar.cookieValue(messengerUrl, "passport_web_did") || jar.cookieValue(accountsUrl, "passport_web_did") || deviceId;
   if (!match?.[1] || !resolvedDeviceId) {
     throw new WebHttpError("http_error", "已登录的个人 Web 元数据暂不可用（缺少 appKey 或 passport_web_did）", res.status);
   }
