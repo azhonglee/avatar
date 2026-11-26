@@ -237,8 +237,29 @@ export function isContextDerivedDispatchBlocked(app: Pick<App, "cfg" | "store" |
   }
 }
 
+/** 判断某条个人任务 GUID（含上下文委派派单任务与自主创建的 task.create_own 任务）是否归属旧主人而应对当前主人隐藏 */
+export function isContextOwnedTaskBlocked(app: Pick<App, "cfg" | "store" | "ledger">, guid: string): boolean {
+  if (!guid) return false;
+  if (isContextDerivedDispatchBlocked(app, guid)) return true;
+  const curOwner = app.cfg.owner.open_id.trim();
+  const ownOrigin = (app.store.get(`ctx.own_task_owner.${guid}`) ?? "").trim();
+  if (ownOrigin && ownOrigin !== curOwner) return true;
+  if (!hasWorkspaceOwnerMismatch(app.store, curOwner)) return false;
+  if (ownOrigin) return true;
+  // 兼容升级前通过 task.create_own 创建、仅在 op.task.create_own.* 记录了 guid 的自主任务
+  try {
+    const legacyOwn = app.store.db
+      .prepare("SELECT 1 FROM kv WHERE k LIKE 'op.task.create_own.%' AND v = ? LIMIT 1")
+      .get(guid);
+    if (legacyOwn) return true;
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
 /**
- * 统一判断任意账本工作项 / 卡片 key（含 failure:<workId> 失败告警卡片、delivery、effect、context）
+ * 统一判断任意账本工作项 / 卡片 key（含 failure:<workId> 失败告警卡片、queued brief、delivery、effect、context）
  * 是否应因工作区主人隔离而被阻断或隐藏。
  */
 export function isWorkBlockedByOwner(
@@ -250,7 +271,8 @@ export function isWorkBlockedByOwner(
   if (!rawId || visited.has(rawId)) return false;
   visited.add(rawId);
 
-  const ownerMismatch = hasWorkspaceOwnerMismatch(app.store, app.cfg.owner.open_id);
+  const curOwner = app.cfg.owner.open_id.trim();
+  const ownerMismatch = hasWorkspaceOwnerMismatch(app.store, curOwner);
   if (typeof workOrId === "string") {
     if (workOrId.startsWith("card:failure:")) {
       return isWorkBlockedByOwner(app, workOrId.slice("card:failure:".length), visited);
@@ -266,11 +288,14 @@ export function isWorkBlockedByOwner(
       ownerMismatch &&
       (rawId.startsWith("card:ctx-") ||
         rawId.startsWith("ctx-draft:") ||
+        rawId === "brief" ||
+        rawId.startsWith("card:brief:") ||
+        rawId.startsWith("brief:") ||
         (rawId.startsWith("context:") && rawId !== "context:pw-needs-login"))
     ) {
       return true;
     }
-    return isContextDerivedDispatchBlocked(app, rawId);
+    return isContextOwnedTaskBlocked(app, rawId);
   }
 
   if (ownerMismatch && isContextHealthWork(w)) return true;
@@ -284,6 +309,17 @@ export function isWorkBlockedByOwner(
 
   if (w.kind === "effect") {
     const e = w.payload as unknown as Partial<Effect>;
+    // 显式绑定了目标主人的通知/卡片（如 sendBrief 生成的概览），若当前 owner.open_id 已变更则严禁投递给新主人
+    const boundRecipient =
+      e.args && "owner_open_id" in e.args && typeof e.args.owner_open_id === "string"
+        ? e.args.owner_open_id.trim()
+        : "";
+    if (boundRecipient && boundRecipient !== curOwner) return true;
+    const isBriefEffect =
+      w.ref === "brief" ||
+      w.ref.startsWith("card:brief:") ||
+      (e.op === "card.upsert" && typeof e.args?.key === "string" && e.args.key.startsWith("brief:"));
+    if (isBriefEffect && ownerMismatch) return true;
     if (w.ref.startsWith("card:failure:")) {
       if (isWorkBlockedByOwner(app, w.ref.slice("card:failure:".length), visited)) return true;
     }
@@ -295,11 +331,11 @@ export function isWorkBlockedByOwner(
       e.op === "card.upsert" && typeof e.args?.key === "string" ? e.args.key : "",
       e.args && "guid" in e.args && typeof e.args.guid === "string" ? e.args.guid : "",
     ].filter(Boolean);
-    if (candidates.some((c) => isContextDerivedDispatchBlocked(app, c))) return true;
+    if (candidates.some((c) => isContextOwnedTaskBlocked(app, c))) return true;
     return false;
   }
 
-  return !!w.ref && isContextDerivedDispatchBlocked(app, w.ref);
+  return !!w.ref && isContextOwnedTaskBlocked(app, w.ref);
 }
 
 export function listDispatches(app: App, f: { filter?: DispatchFilter; q?: string; limit?: number }): DispatchSummary[] {
@@ -522,6 +558,7 @@ function healthItem(app: App, w: WorkItem, ownerMismatch = false): HealthItem {
       summary: "上下文任务已按主人隔离",
       updated: w.updated,
       acknowledged: w.outcome === "acknowledged",
+      isolated: true,
     };
   }
   const p = w.payload as Record<string, unknown>;

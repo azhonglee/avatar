@@ -150,20 +150,29 @@ export class Drafter {
    *   - 逐条校验会话排除状态（checkConvAllowed）与目标证据本身的范围资格（filterObs）；
    *   - 若最新证据因群被移出白名单/静音而失效，自动改选事项上的其他有效目标；若全部目标均不在当前范围内，在调用模型前立即停止。
    */
-  async resolveEligibleTarget(it: ItemRow, kind: CtxDraftKind): Promise<{ target: Record<string, string>; label: string; conv?: Obs }> {
+  async resolveEligibleTarget(
+    it: ItemRow,
+    kind: CtxDraftKind,
+    excludeObsIds?: ReadonlySet<string>,
+  ): Promise<{ target: Record<string, string>; label: string; conv?: Obs }> {
     if (kind === "meego_comment") return this.target(it, kind);
     const activeNativeOwner = this.activeBoundNativeOwner();
     const allObs: Obs[] = [];
     const seenIds = new Set<string>();
     for (const e of this.store.evidence("item", it.id, 50)) {
-      if (seenIds.has(e.obs_id)) continue;
+      if (seenIds.has(e.obs_id) || excludeObsIds?.has(e.obs_id)) continue;
       const o = this.store.obs(e.obs_id);
       if (o && this.isEligibleImObs(o, activeNativeOwner)) {
         seenIds.add(o.id);
         allObs.push(o);
       }
     }
-    if (!allObs.length) throw new DraftTargetIneligibleError("找不到这个事项对应的飞书会话，没法起草消息");
+    if (!allObs.length) {
+      if (excludeObsIds?.size) {
+        throw new DraftTargetIneligibleError("该事项对应的目标消息已不在当前采集范围内，已停止起草回复");
+      }
+      throw new DraftTargetIneligibleError("找不到这个事项对应的飞书会话，没法起草消息");
+    }
     const ordered = [...allObs.filter((o) => !o.is_me), ...allObs.filter((o) => o.is_me)];
     const convAllowedCache = new Map<string, "allowed" | "excluded" | "uncertain">();
     let sawExcluded = false;
@@ -239,17 +248,37 @@ export class Drafter {
     if (!it) throw new Error(`没有这个事项：${itemId}`);
     const k = kind ?? defaultDraftKind(it);
     if (!k || k === "weekly_report") throw new Error("这个事项没有合适的草稿类型");
-    const { target, label, conv } = await this.resolveEligibleTarget(it, k);
     const tz = this.cfg.owner.timezone;
     const p = this.store.project(it.project_id);
     const activeNativeOwner = this.activeBoundNativeOwner();
-    const rawConvObs = conv ? this.store.convObs(conv.conv, Date.now() - 7 * DAY, 30, activeNativeOwner) : [];
-    const scopedConvObs = conv && this.filterObs ? await this.filterObs(conv.conv, rawConvObs) : rawConvObs;
-    // 若已确认合法的目标证据被最近 30 条窗口外的较新消息挤出，将其补回提示词上下文
-    const effectiveConvObs =
-      conv && !scopedConvObs.some((o) => o.id === conv.id)
-        ? [...scopedConvObs, conv].sort((a, b) => a.time - b.time)
-        : scopedConvObs;
+    const excludedTargets = new Set<string>();
+    let chosen: { target: Record<string, string>; label: string; conv?: Obs } | undefined;
+    let effectiveConvObs: Obs[] = [];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const cand = await this.resolveEligibleTarget(it, k, excludedTargets);
+      if (!cand.conv) {
+        chosen = cand;
+        effectiveConvObs = [];
+        break;
+      }
+      const rawConvObs = this.store.convObs(cand.conv.conv, Date.now() - 7 * DAY, 30, activeNativeOwner);
+      // 先把当前目标证据并入待过滤集合，再统一走最终范围过滤；若目标未通过最终过滤（如群在异步查询期间移出白名单），绝不强行补回提示词
+      const combinedRaw = rawConvObs.some((o) => o.id === cand.conv!.id)
+        ? rawConvObs
+        : [...rawConvObs, cand.conv].sort((a, b) => a.time - b.time);
+      const scopedConvObs = this.filterObs ? await this.filterObs(cand.conv.conv, combinedRaw) : combinedRaw;
+      if (!scopedConvObs.some((o) => o.id === cand.conv!.id)) {
+        excludedTargets.add(cand.conv.id);
+        continue;
+      }
+      chosen = cand;
+      effectiveConvObs = scopedConvObs;
+      break;
+    }
+    if (!chosen) {
+      throw new DraftTargetIneligibleError("该事项对应的目标消息已不在当前采集范围内，已停止起草回复");
+    }
+    const { target, label } = chosen;
     const convText = effectiveConvObs.length
       ? effectiveConvObs
           .map((o) => `${fmt(o.time, tz)} ${o.is_me ? "【我】" : o.actor_name}: ${truncate(o.text, 300)}`)

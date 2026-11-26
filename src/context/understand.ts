@@ -73,11 +73,18 @@ export const UnderstandOut = z.object({
 });
 export type UnderstandOut = z.infer<typeof UnderstandOut>;
 
+export interface SubmittedBatchObs {
+  conv: string;
+  entries: { id: string; rev: string }[];
+}
+
 /** 模型有输出但不是合法 JSON / 校验不通过：属于会话内容或格式问题，多次失败可跳过；与进程启动失败 / 超时等环境故障区分。 */
 export class UnderstandParseError extends Error {
-  constructor(message: string) {
+  submittedByConv?: SubmittedBatchObs[];
+  constructor(message: string, submittedByConv?: SubmittedBatchObs[]) {
     super(message);
     this.name = "UnderstandParseError";
+    this.submittedByConv = submittedByConv;
   }
 }
 
@@ -271,7 +278,21 @@ export class Understander {
       });
       if (signal?.aborted) throw new Error("aborted");
       if (!r.text) throw new Error(`理解 harness 无输出（exit ${r.exitCode}${r.timedOut ? "，超时" : ""}）`);
-      const out = parseUnderstand(r.text);
+      let out: UnderstandOut;
+      try {
+        out = parseUnderstand(r.text);
+      } catch (err) {
+        if (err instanceof UnderstandParseError) {
+          const freshSet = new Set(batch.fresh);
+          err.submittedByConv = batch.convs.map((convId) => ({
+            conv: convId,
+            entries: batch.obs
+              .filter((o) => o.conv === convId && freshSet.has(o.id))
+              .map((o) => ({ id: o.id, rev: obsRevision(o) })),
+          }));
+        }
+        throw err;
+      }
       const usedMeta = batch.convs.map((id) => ({ conv: id, conv_name: convs.find((c) => c.conv === id)?.conv_name ?? "" }));
       const disallowedConvs = validateBeforeApply ? await validateBeforeApply(usedMeta, batch.obs) : undefined;
       if (signal?.aborted) throw new Error("aborted");

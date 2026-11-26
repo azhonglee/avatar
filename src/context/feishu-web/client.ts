@@ -390,15 +390,19 @@ export class FeishuWebClient {
     }
     const unpacked = unwrapGatewayPayload(res.body);
     if (!opts.deferCookiePersist && (res.cookiesUpdated || this.hasPendingCookieDelta())) {
-      this.notifySessionConfirmed();
+      if (!this.notifySessionConfirmed()) {
+        throw new WebHttpError("aborted", "本地凭据已被登出或更新");
+      }
     }
     return unpacked;
   }
 
-  /** 将此前延迟（如发回复先落库回执）的待持久化轮换 Cookie 立即刷盘，失败则抛错上报 */
+  /** 将此前延迟（如发回复先落库回执）的待持久化轮换 Cookie 立即刷盘；若会话已被吊销/取代则立即中止后续请求 */
   flushPendingCookies(): void {
     if (this.hasPendingCookieDelta()) {
-      this.notifySessionConfirmed();
+      if (!this.notifySessionConfirmed()) {
+        throw new WebHttpError("aborted", "本地凭据已被登出或更新");
+      }
     }
   }
 

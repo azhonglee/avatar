@@ -19,7 +19,7 @@ import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
 import * as Q from "../src/api/queries.ts";
-import { createApp } from "../src/app.ts";
+import { createApp, runDispatchOnce, sendBrief } from "../src/app.ts";
 import { CardService } from "../src/cards/index.ts";
 import { loadConfig } from "../src/config.ts";
 import {
@@ -93,7 +93,7 @@ import {
   verifyWorkspaceOwnerBinding,
 } from "../src/context/personal-web.ts";
 import { obsRevision, type Obs } from "../src/context/store.ts";
-import { branchUsesGitLfs, pushBranch, tryGit } from "../src/delivery/git.ts";
+import { branchUsesGitLfs, isGitLfsPointerBlob, pushBranch, tryGit } from "../src/delivery/git.ts";
 import { runDoctor } from "../src/doctor.ts";
 import { card as cardEffect, effectHandler } from "../src/effects.ts";
 import {
@@ -7779,6 +7779,620 @@ test("Codex 第十轮回归：服务文件凭据隔离、失败卡片/委派落�
         // ignore
       }
     }
+    if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevKey;
+    if (prevCredFile === undefined) delete process.env.PA_FEISHU_WEB_CRED_FILE;
+    else process.env.PA_FEISHU_WEB_CRED_FILE = prevCredFile;
+    if (prevCredDir === undefined) delete process.env.CREDENTIALS_DIRECTORY;
+    else process.env.CREDENTIALS_DIRECTORY = prevCredDir;
+    if (prevCtxDir === undefined) delete process.env.CTX_DIR;
+    else process.env.CTX_DIR = prevCtxDir;
+    app?.store.db.close();
+    await mock.close();
+  }
+});
+
+test("Codex 第十一轮回归：PID+挂载隔离、草稿终检防重插、晨报/自主任务/CLI/忽略主人隔离、move前落库归属、关键词竞态、Bedrock AWS/废弃profile、条件删凭据、吊销止回读、截断不误清@我、学名重排补位、改名刷新待处理、精准跳过失败批次、LFS严格指针与扫错中止、严格TOML数字与主题无关QR", async () => {
+  const dir = makeTmp("pw-round11-");
+  const ctxDir = path.join(dir, "ctx-fx");
+  fs.mkdirSync(ctxDir, { recursive: true });
+  const prevKey = process.env.PA_FEISHU_WEB_KEY;
+  const prevCredFile = process.env.PA_FEISHU_WEB_CRED_FILE;
+  const prevCredDir = process.env.CREDENTIALS_DIRECTORY;
+  const prevCtxDir = process.env.CTX_DIR;
+  process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
+  delete process.env.PA_FEISHU_WEB_CRED_FILE;
+  delete process.env.CREDENTIALS_DIRECTORY;
+  process.env.CTX_DIR = ctxDir;
+
+  const mock = await startMockFeishuWebServer();
+  let app: ReturnType<typeof createApp> | undefined;
+  try {
+    // 1) [R11 P3] 终端 QR 使用显式黑字白底 ANSI 色彩与 4 模块白色静区（深浅色终端通用）
+    const qrAnsi = renderQrTerminal("https://passport.feishu.cn/suite/passport/qr?code=r11");
+    const qrLines = qrAnsi.split("\n");
+    assert.ok(qrLines.every((l) => l.startsWith("\x1b[30;47m") && l.endsWith("\x1b[0m")), "每行 QR 必须显式指定黑字白底 ANSI 色彩并重置");
+    // 前两行（4 模块高）均为纯白静区（全是空格）
+    assert.match(qrLines[0], /^\x1b\[30;47m +\x1b\[0m$/);
+    assert.match(qrLines[1], /^\x1b\[30;47m +\x1b\[0m$/);
+
+    // 2) [R11 P3] TOML 严格数字校验：拒绝前导零、尾随/连续下划线、非法进制与非法小数
+    for (const bad of ["x = 01\n", "x = -01\n", "x = 42_\n", "x = _42\n", "x = 1__2\n", "x = 0x_1\n", "x = 1.e2\n", "x = 1._0\n"]) {
+      assert.throws(() => parseToml(bad), /TOML/, `非法 TOML 数字 ${JSON.stringify(bad)} 必须被拒绝`);
+    }
+    const okNums = parseToml("a = 0\nb = 1_000\nc = -42\nd = 0xdead_beef\ne = 3.14_15e-2\n");
+    assert.equal(okNums.a, 0);
+    assert.equal(okNums.b, 1000);
+    assert.equal(okNums.c, -42);
+    assert.equal(okNums.d, 0xdeadbeef);
+    assert.equal(okNums.e, 0.031415);
+
+    // 3) [R11 P1 & P2] Bedrock aws.profile/region 必须保留、非法 aws 认证字段必须拒绝；废弃顶层 profile = "..." 必须 fail-closed
+    const bedHome = path.join(dir, "codex-bed-r11");
+    fs.mkdirSync(bedHome, { recursive: true });
+    fs.writeFileSync(
+      path.join(bedHome, "config.toml"),
+      [
+        'model = "anthropic.claude-3-7-sonnet"',
+        'model_provider = "amazon-bedrock"',
+        "[model_providers.amazon-bedrock.aws]",
+        'profile = "corp-prod"',
+        'region = "us-west-2"',
+      ].join("\n"),
+    );
+    const bedRes = extractSafeCodexProviderConfig({ CODEX_HOME: bedHome }, [], false);
+    assert.ok(bedRes.args.some((a) => a.includes('profile="corp-prod"') && a.includes('region="us-west-2"')), "amazon-bedrock 的 aws.profile 与 aws.region 必须保留");
+
+    const bedBadHome = path.join(dir, "codex-bed-bad-r11");
+    fs.mkdirSync(bedBadHome, { recursive: true });
+    fs.writeFileSync(
+      path.join(bedBadHome, "config.toml"),
+      [
+        'model_provider = "amazon-bedrock"',
+        "[model_providers.amazon-bedrock.aws]",
+        'profile = "corp-prod"',
+        'credential_process = "/usr/bin/evil"',
+      ].join("\n"),
+    );
+    assert.throws(() => extractSafeCodexProviderConfig({ CODEX_HOME: bedBadHome }, [], false), /credential_process|不受支持/);
+
+    const legacyProfHome = path.join(dir, "codex-legacy-prof-r11");
+    fs.mkdirSync(legacyProfHome, { recursive: true });
+    fs.writeFileSync(
+      path.join(legacyProfHome, "config.toml"),
+      ['profile = "retired"', "[profiles.retired]", 'model_provider = "openai"'].join("\n"),
+    );
+    assert.throws(
+      () => extractSafeCodexProviderConfig({ CODEX_HOME: legacyProfHome }, [], false),
+      /profile.*已废弃|--profile/,
+      "Codex 0.169 已废弃顶层 profile = ... 必须 fail-closed 拒绝，绝不激活 [profiles.*]",
+    );
+
+    // 4) [R11 P1] PID + 挂载命名空间隔离：即使只有 PA_FEISHU_WEB_KEY（EnvironmentFile 场景）也必须包裹独立 PID 命名空间，隐藏父进程 /proc/<pid>/environ
+    const envOnlyWrap = wrapCredentialIsolatedCommand("sh", ["-c", "true"], { PA_FEISHU_WEB_KEY: "env_secret_r11" }, { forceBackend: { kind: "bwrap", bin: "bwrap" } });
+    assert.equal(envOnlyWrap.isolated, true);
+    assert.ok(envOnlyWrap.args.includes("--unshare-pid") && envOnlyWrap.args.includes("--proc"), "仅设置 PA_FEISHU_WEB_KEY 时也必须启用 PID + /proc 隔离");
+    assert.throws(
+      () => wrapCredentialIsolatedCommand("sh", ["-c", "true"], { PA_FEISHU_WEB_KEY: "env_secret_r11" }, { forceBackend: { kind: "none" } }),
+      /PA_FEISHU_WEB_KEY|拒绝执行/,
+    );
+    if (hasCredentialMountIsolation()) {
+      const realPidWrap = wrapCredentialIsolatedCommand(
+        "sh",
+        ["-c", `test -r /proc/${process.pid}/environ && echo LEAK || echo HIDDEN`],
+        { PA_FEISHU_WEB_KEY: "env_secret_r11" },
+      );
+      const pidOut = await runProcess(realPidWrap.cmd, realPidWrap.args, { timeoutMs: 15_000 });
+      assert.equal(pidOut.code, 0, pidOut.stderr);
+      assert.equal(pidOut.stdout.trim(), "HIDDEN", "独立 PID+/proc 命名空间内绝不能读取宿主常驻进程的 /proc/<daemon-pid>/environ");
+    }
+
+    // 5) [R11 P2] Git LFS 严格指针校验（源代码提及 spec URL 不误判）+ 扫描失败中止推送
+    assert.equal(isGitLfsPointerBlob('const x = "version https://git-lfs.github.com/spec/v1";\n'), false);
+    assert.equal(
+      isGitLfsPointerBlob(`version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 42\n`),
+      true,
+    );
+    const nonLfsRemote = path.join(dir, "non-lfs-remote.git");
+    const nonLfsRepo = path.join(dir, "non-lfs-repo");
+    fs.mkdirSync(nonLfsRemote, { recursive: true });
+    fs.mkdirSync(nonLfsRepo, { recursive: true });
+    await tryGit(nonLfsRemote, ["init", "--bare"]);
+    await tryGit(nonLfsRepo, ["init", "-b", "main"]);
+    await tryGit(nonLfsRepo, ["config", "user.name", "Tester"]);
+    await tryGit(nonLfsRepo, ["config", "user.email", "tester@example.com"]);
+    await tryGit(nonLfsRepo, ["remote", "add", "origin", nonLfsRemote]);
+    fs.writeFileSync(path.join(nonLfsRepo, "base.txt"), "base\n");
+    await tryGit(nonLfsRepo, ["add", "base.txt"]);
+    await tryGit(nonLfsRepo, ["commit", "-m", "base"]);
+    await tryGit(nonLfsRepo, ["push", "-u", "origin", "main"]);
+    await tryGit(nonLfsRepo, ["checkout", "-b", "feat/mentions-lfs-url"]);
+    // 小于 1024 字节的普通源码文件里包含 LFS spec URL 字面量，绝不能误判为 LFS 指针
+    fs.writeFileSync(path.join(nonLfsRepo, "doc.ts"), 'export const SPEC = "version https://git-lfs.github.com/spec/v1";\n');
+    await tryGit(nonLfsRepo, ["add", "doc.ts"]);
+    await tryGit(nonLfsRepo, ["commit", "-m", "mention lfs spec in source"]);
+    assert.equal(await branchUsesGitLfs(nonLfsRepo, "feat/mentions-lfs-url"), false, "包含 LFS URL 字面量的普通源码文件不得误判为 Git LFS 指针");
+    await assert.rejects(branchUsesGitLfs(nonLfsRepo, "refs/does-not-exist-r11"), /失败/, "LFS 扫描命令失败时必须抛错而非静默返回 false");
+
+    // ───────── 初始化共享测试 App ─────────
+    const cfgFile = path.join(dir, "config.yaml");
+    fs.writeFileSync(
+      cfgFile,
+      JSON.stringify({
+        data_dir: path.join(dir, "data"),
+        bins: { lark: path.join(STUBS, "ctx-lark"), acpx: path.join(STUBS, "acpx"), bytedcli: path.join(STUBS, "ctx-bytedcli") },
+        harnesses: { claude: { agent: "claude" }, cx: { type: "codex-exec", cmd: path.join(STUBS, "ctx-codex") } },
+        roles: { brain: "claude" },
+        owner: { open_id: "ou_owner_a" },
+        cards: { enabled: false },
+        engine: { retry_base_ms: 20, retry_max_ms: 50, tick_ms: 50, effect_attempts: 1 },
+        context: {
+          enabled: true,
+          harness: "cx",
+          groups: "allowlist",
+          max_groups: 2,
+          lookback_days: 7,
+          groups_allow: ["oc_r11_draft_ok"],
+          groups_deny: [],
+          personal_web: { enabled: true, fast_lane: true, debounce_ms: 0, pre_draft: false, send_replies: true },
+        },
+      }),
+    );
+    app = createApp(loadConfig(cfgFile));
+    const svc = new ContextService(app);
+    const now = Date.now();
+    const nowSec = Math.floor(now / 1000);
+    const baseCookies = [{ name: "session", value: "r11_sess", domain: "internal-api-lark-api.feishu.cn", path: "/" }];
+    const loginA = commitWorkspaceLogin(
+      app,
+      { owner_id: "7001", owner_name: "主人A", session_id: "sess_r11_a", cookies: baseCookies },
+      { allowUnverifiedOwner: true },
+    );
+
+    // 6) [R11 P1] Board.createTask 必须在 move() 之前通过 onCreated 持久化 GUID 归属
+    app.store.set("board.tasklist", "tl_r11");
+    app.store.set("board.section.dispatch", "sec_dispatch_r11");
+    app.store.set("board.section.running", "sec_running_r11");
+    const origLarkRun = app.lark.run.bind(app.lark);
+    app.lark.run = async (argv, opts) => {
+      if (argv[0] === "task" && argv[1] === "+create") return { task: { guid: "guid_r11_move_timeout" } };
+      if (argv[0] === "task" && argv[1] === "+tasklist-task-add") throw new Error("simulated move timeout");
+      return origLarkRun(argv, opts);
+    };
+    const { item: moveFailItem } = svc.store.upsertItem({
+      title: "move 超时测试委派",
+      kind: "todo",
+      project_id: "",
+      status: "open",
+      priority: "high",
+      source: "im",
+    });
+    await assert.rejects(
+      app.commands.exec("context.item_delegate", { id: moveFailItem.id }, { source: "web", actor: "owner" }),
+      /simulated move timeout/,
+    );
+    assert.equal(
+      app.store.get("ctx.dispatch_ref_owner.guid_r11_move_timeout"),
+      "ou_owner_a",
+      "即使 board.move 超时失败，任务 GUID 的原主人归属也必须在 task +create 返回后立即持久化",
+    );
+    app.lark.run = origLarkRun;
+
+    // 7) [R11 P1 & P2] 排队中的晨报绑定渲染主人 + task.create_own 归属隔离 + runDispatchOnce 过滤 + work.acknowledge 隔离
+    const fxHandler = effectHandler(app.cfg, app.ledger, app.board, app.lark, app.store);
+    // 主人 A 创建自主任务 task.create_own
+    app.lark.run = async (argv, opts) => {
+      if (argv[0] === "task" && argv[1] === "+create") return { task: { guid: "guid_r11_own_task_a" } };
+      if (argv[0] === "task" && argv[1] === "+get-my-tasks") {
+        return {
+          items: [
+            { guid: "guid_r11_own_task_a", summary: "主人A私密承诺任务", due: { timestamp: String(now - 60_000) } },
+            { guid: "guid_r11_normal_task", summary: "普通公开任务", due: { timestamp: String(now - 60_000) } },
+          ],
+        };
+      }
+      return origLarkRun(argv, opts);
+    };
+    app.ledger.enqueue({
+      id: "fx:r11-own-task",
+      kind: "effect",
+      ref: "context:auto",
+      payload: { op: "task.create_own", args: { summary: "主人A私密承诺任务", description: "私密", item_id: "it_r11_own" } },
+    });
+    app.store.db.prepare("UPDATE work SET lease_owner = ?, lease_until = ? WHERE id = ?").run(app.ledger.owner, Date.now() + 60_000, "fx:r11-own-task");
+    await fxHandler.run(app.ledger.get("fx:r11-own-task")!, { attempt: 1, signal: new AbortController().signal });
+    assert.equal(app.store.get("ctx.own_task_owner.guid_r11_own_task_a"), "ou_owner_a");
+
+    // 主人 A 渲染并入队晨报（此时尚未投递）
+    const origListSection = app.board.listSection.bind(app.board);
+    app.board.listSection = async () => [];
+    await sendBrief(app, "morning");
+    const queuedBrief = app.ledger.active("effect").find((e) => e.ref === "brief");
+    assert.ok(queuedBrief, "sendBrief 应已入队晨报 effect");
+
+    // 准备一条主人 A 的在途委派派单和一条失败 effect
+    const isoDispId = "dispatch:guid_r11_iso_cli:1";
+    app.store.set(`ctx.dispatch_owner.${isoDispId}`, "ou_owner_a");
+    app.store.set(`ctx.dispatch_ref_owner.guid_r11_iso_cli`, "ou_owner_a");
+    app.ledger.enqueue({
+      id: isoDispId,
+      kind: "dispatch",
+      ref: "guid_r11_iso_cli",
+      state: "queued",
+      payload: { guid: "guid_r11_iso_cli", summary: "主人A绝密CLI派单", description: "", harness: "cx" },
+    });
+    const deadCtxFxId = "fx:r11-dead-ctx-ack";
+    app.ledger.enqueue({
+      id: deadCtxFxId,
+      kind: "effect",
+      ref: "card:ctx-item:r11",
+      payload: { op: "notify", args: { markdown: "旧主人上下文通知" } },
+    });
+    app.store.db.prepare("UPDATE work SET state = 'dead', terminal = 1 WHERE id = ?").run(deadCtxFxId);
+
+    // 切换为主人 B
+    app.cfg.owner.open_id = "ou_owner_b";
+    // 7a) 排队中的主人 A 晨报必须被阻断，绝不能投递给主人 B
+    await assert.rejects(
+      fxHandler.run(queuedBrief as never, { attempt: 1, signal: new AbortController().signal }),
+      /主人隔离|阻断/,
+      "已排队的旧主人晨报在 owner.open_id 变更后绝不能投递给新主人",
+    );
+    // 7b) 新生成的晨报必须隐藏主人 A 的 task.create_own 自主任务，保留普通公开任务
+    const briefB = await buildBrief(app.cfg, app.lark, app.store, app.ledger, app.board, "morning");
+    assert.equal(briefB.includes("主人A私密承诺任务"), false, "buildBrief 必须过滤旧主人经 task.create_own 创建的自主任务");
+    assert.equal(briefB.includes("普通公开任务"), true);
+    // 7c) runDispatchOnce (pa dispatch) 必须过滤被 owner_isolated 终止的旧主人派单，且不抹除账本原始 summary
+    const onceRes = await runDispatchOnce(app);
+    assert.equal(
+      onceRes.items.some((w) => w?.id === isoDispId),
+      false,
+      "runDispatchOnce 必须隐藏归属旧主人的隔离派单，不向 CLI 打印其 summary",
+    );
+    assert.equal(app.ledger.get<{ summary?: string }>(isoDispId)?.payload.summary, "主人A绝密CLI派单", "账本原始 summary 必须完整保留");
+    // 7d) HealthItem 标为 isolated 且 work.acknowledge 必须拒绝忽略旧主人的失败工作
+    const healthB = Q.health(app);
+    const isoHealthRow = healthB.failed.find((x) => x.id === deadCtxFxId);
+    assert.equal(isoHealthRow?.isolated, true, "脱敏后的健康项必须标记 isolated=true 以便前端隐藏重试/忽略按钮");
+    await assert.rejects(
+      app.commands.exec("work.acknowledge", { id: deadCtxFxId }, { source: "web", actor: "owner" }),
+      /主人隔离|阻断/,
+      "work.acknowledge 绝不能允许新主人忽略旧主人的失败工作",
+    );
+    app.board.listSection = origListSection;
+    app.lark.run = origLarkRun;
+    app.cfg.owner.open_id = "ou_owner_a";
+
+    // 8) [R11 P1] 草稿目标在最终 filterObs 期间离开白名单：绝不把旧目标强行补回提示词
+    const callsLog = path.join(ctxDir, "calls.log");
+    fs.writeFileSync(callsLog, "");
+    fs.writeFileSync(path.join(ctxDir, "draft.txt"), "不应生成的草稿");
+    svc.store.addObs([
+      {
+        id: "im:r11_race_target",
+        source: "im",
+        kind: "group",
+        conv: "oc_r11_draft_ok",
+        conv_name: "白名单竞态群",
+        actor_id: "ou_bob",
+        actor_name: "Bob",
+        is_me: false,
+        time: now - 5_000,
+        text: "竞态群私密文本",
+        url: "",
+        meta: { chat_type: "group", message_id: "r11_race_target" },
+      },
+    ]);
+    const { item: raceDraftItem } = svc.store.upsertItem({
+      title: "草稿终检竞态事项",
+      kind: "ask_me",
+      project_id: "",
+      status: "open",
+      priority: "high",
+      counterpart: "Bob",
+      next_step: "回复",
+      source: "im",
+    });
+    svc.store.addEvidence("item", raceDraftItem.id, "im:r11_race_target", "竞态群私密文本", now - 5_000);
+    const origFilterObs = svc.drafter.filterObs;
+    let filterCalls = 0;
+    svc.drafter.filterObs = async (conv, obs) => {
+      filterCalls++;
+      // 第一次（resolveEligibleTarget）在范围内，第二次（组装提示词最终过滤）模拟群刚好移出白名单
+      if (filterCalls === 2) {
+        app!.cfg.context.groups_allow = ["oc_r11_other"];
+      }
+      return origFilterObs!(conv, obs);
+    };
+    await assert.rejects(
+      svc.drafter.forItem(raceDraftItem.id, "reply"),
+      /采集范围|已停止起草/,
+      "目标证据在最终 filterObs 中被剔除后绝不能补回提示词，必须立即停止起草",
+    );
+    svc.drafter.filterObs = origFilterObs;
+    assert.equal(fs.readFileSync(callsLog, "utf8").trim(), "", "草稿终检剔除目标后绝不能调用模型");
+
+    // 9) [R11 P1] 原生推送异步检查期间新增关键词排除：必须用核验后的真实群名重跑检查并拦截入库
+    app.cfg.context.groups = "allowlist";
+    app.cfg.context.groups_allow = ["pw_chat:9911"];
+    app.cfg.context.groups_deny = [];
+    mock.setChatName("9911", "绝密财务群");
+    mock.setChatKind("9911", CHAT_KIND_GROUP);
+    const clientA = await FeishuWebClient.connect(loginA, { endpoints: mock.endpoints });
+    // 第一次 readChat 缓存一个占位/旧名或触发异步检查，期间在 onChatMode 注入新关键词排除 "财务"
+    let injectedKw = false;
+    mock.setOnChatMode(() => {
+      if (!injectedKw) {
+        injectedKw = true;
+        app!.cfg.context.groups_deny = ["财务"];
+      }
+    });
+    const kwMsg = decodeMessage(
+      buildNativeMessage({ id: "r11_kw_race_msg", chatId: "9911", actorId: "7099", text: "财务数据不该入库", createdAtSec: nowSec }),
+      "7001",
+    );
+    await svc.personalWeb.handleMessage(kwMsg, clientA);
+    mock.setOnChatMode(undefined);
+    assert.equal(svc.store.obs("pw:r11_kw_race_msg"), undefined, "异步查询期间新增关键词排除必须触发复核并用核验群名拦截入库");
+    app.cfg.context.groups_deny = [];
+
+    // 10) [R11 P2] 截断的 --is-at-me 搜索（has_more=true）不得把已确认的 at_me: true 覆盖为 false
+    const truncChat = "oc_r11_trunc";
+    app.cfg.context.groups = "allowlist";
+    app.cfg.context.groups_allow = [truncChat];
+    svc.store.addObs([
+      {
+        id: "im:om_r11_trunc_at",
+        source: "im",
+        kind: "at_me",
+        conv: truncChat,
+        conv_name: "截断测试群",
+        actor_id: "ou_bob",
+        actor_name: "Bob",
+        is_me: false,
+        time: now - 10_000,
+        text: "@张三 别清除我的标记",
+        url: "",
+        meta: { chat_type: "group", at_me: true },
+      },
+    ]);
+    svc.store.markProcessed(["im:om_r11_trunc_at"]);
+    fs.writeFileSync(
+      path.join(ctxDir, "lark.json"),
+      JSON.stringify({
+        at_me: [],
+        at_me_has_more: true,
+        chats: {
+          [truncChat]: [
+            {
+              message_id: "om_r11_trunc_at",
+              chat_id: truncChat,
+              chat_type: "group",
+              chat_name: "截断测试群",
+              sender: { id: "ou_bob", name: "Bob", sender_type: "user" },
+              create_time: new Date(now - 10_000).toISOString(),
+              content: JSON.stringify({ text: "@张三 别清除我的标记" }),
+            },
+          ],
+        },
+      }),
+    );
+    await svc.connectors.pullIm();
+    assert.equal(svc.store.obs("im:om_r11_trunc_at")?.meta.at_me, true, "截断的 --is-at-me 结果绝不能清除已确认的 at_me: true");
+
+    // 11) [R11 P2] 拉取期间学到群 A 改名命中排除规则 -> 持久化新名、不推进游标重启一轮并补采接替群 B
+    const grpA = "oc_r11_rank_a";
+    const grpB = "oc_r11_rank_b";
+    app.cfg.context.groups = "allowlist";
+    app.cfg.context.groups_allow = [grpA, grpB];
+    app.cfg.context.groups_deny = ["机密"];
+    app.cfg.context.max_groups = 1;
+    rememberOpenGroupName(app.store, grpA, "普通群A");
+    rememberOpenGroupName(app.store, grpB, "普通群B");
+    app.store.set("ctx.cursor.im.groups", String(now - 60_000));
+    fs.writeFileSync(
+      path.join(ctxDir, "lark.json"),
+      JSON.stringify({
+        chat_meta: {
+          [grpA]: { name: "机密群A", chat_mode: "group" },
+          [grpB]: { name: "普通群B", chat_mode: "group" },
+        },
+        chats: {
+          [grpA]: [
+            {
+              message_id: "om_r11_a_renamed",
+              chat_id: grpA,
+              chat_type: "group",
+              chat_name: "机密群A",
+              sender: { id: "ou_bob", name: "Bob", sender_type: "user" },
+              create_time: new Date(now - 15_000).toISOString(),
+              content: JSON.stringify({ text: "A群已改名为机密" }),
+            },
+          ],
+          [grpB]: [
+            {
+              message_id: "om_r11_b_replacement",
+              chat_id: grpB,
+              chat_type: "group",
+              chat_name: "普通群B",
+              sender: { id: "ou_bob", name: "Bob", sender_type: "user" },
+              create_time: new Date(now - 12_000).toISOString(),
+              content: JSON.stringify({ text: "接替群B的消息必须采到" }),
+            },
+          ],
+        },
+      }),
+    );
+    const rerankRes = await svc.connectors.pullIm();
+    assert.equal(rerankRes.count, 1, "群A改名触发排除后必须重排补采接替群B");
+    assert.equal(svc.store.obs("im:om_r11_a_renamed"), undefined, "已改名为机密的群A消息绝不入库");
+    assert.equal(svc.store.obs("im:om_r11_b_replacement")?.text, "接替群B的消息必须采到");
+
+    // 12) [R11 P2] checkConvAllowedForUnderstand 必须先刷新最新群名再按名称排除（避免旧名被排除的群改回正常名后永远卡死）
+    const recoverChat = "oc_r11_recover_name";
+    app.cfg.context.groups_deny = ["保密"];
+    svc.store.addObs([
+      {
+        id: "im:r11_recover_pending",
+        source: "im",
+        kind: "group",
+        conv: recoverChat,
+        conv_name: "保密旧群名",
+        actor_id: "ou_bob",
+        actor_name: "Bob",
+        is_me: false,
+        time: now - 5_000,
+        text: "改名后应可理解",
+        url: "",
+        meta: { chat_type: "group" },
+      },
+    ]);
+    fs.writeFileSync(
+      path.join(ctxDir, "lark.json"),
+      JSON.stringify({ chat_meta: { [recoverChat]: { name: "开放项目群", chat_mode: "group" } } }),
+    );
+    const recoverElig = await svc.personalWeb.checkConvAllowedForUnderstand(recoverChat, "保密旧群名");
+    assert.equal(recoverElig, "allowed", "旧缓存名命中关键词但最新群名已改为合法名时，必须刷新后放行");
+    app.cfg.context.groups_deny = [];
+
+    // 13) [R11 P2] mention-only 模式下 3 次模型解析失败：仅跳过实际提交给模型的 @我，保留同群未提交的普通消息待处理
+    const skipChat = "oc_r11_selective_skip";
+    app.cfg.context.groups = "allowlist";
+    app.cfg.context.groups_allow = ["oc_r11_unrelated_only"];
+    app.cfg.context.sources = { im: true, meego: false, tasks: false, minutes: false, calendar: false, docs: false };
+    // 先将之前遗留的 pending 观测标为已处理，聚焦测试 skipChat
+    svc.store.db.prepare("UPDATE ctx_obs SET processed = 1").run();
+    svc.store.addObs([
+      {
+        id: "im:r11_skip_mention",
+        source: "im",
+        kind: "at_me",
+        conv: skipChat,
+        conv_name: "精准跳过群",
+        actor_id: "ou_bob",
+        actor_name: "Bob",
+        is_me: false,
+        time: now - 6_000,
+        text: "@张三 坏输出触发解析失败",
+        url: "",
+        meta: { chat_type: "group", at_me: true },
+      },
+      {
+        id: "im:r11_keep_ordinary",
+        source: "im",
+        kind: "group",
+        conv: skipChat,
+        conv_name: "精准跳过群",
+        actor_id: "ou_bob",
+        actor_name: "Bob",
+        is_me: false,
+        time: now - 5_000,
+        text: "同群未被送入模型的普通消息必须保持 pending",
+        url: "",
+        meta: { chat_type: "group", at_me: false },
+      },
+    ]);
+    fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({}));
+    fs.writeFileSync(path.join(ctxDir, "understand.txt"), "NOT VALID JSON {{{");
+    for (let i = 0; i < 3; i++) {
+      await svc.cycle(`ctx:r11-parse-fail-${i}`);
+    }
+    fs.rmSync(path.join(ctxDir, "understand.txt"), { force: true });
+    assert.equal(svc.store.obsPending("im:r11_skip_mention"), false, "连续 3 次解析失败的已提交 @我 观测应被跳过");
+    assert.equal(
+      svc.store.obsPending("im:r11_keep_ordinary"),
+      true,
+      "同群未送入模型的普通消息绝不能被连带 skipConv 标记为已处理，恢复白名单后必须仍可处理",
+    );
+
+    // 14) [R11 P2] 并发 web-login 抢先提交新会话时，logout 的条件文件清理绝不能误删新提交的凭据文件
+    const raceCredFile = path.join(dir, "race-logout-cred.enc");
+    process.env.PA_FEISHU_WEB_CRED_FILE = raceCredFile;
+    commitWorkspaceLogin(
+      app,
+      { owner_id: "7001", owner_name: "主人A", session_id: "sess_r11_old_gen", cookies: baseCookies },
+      { allowUnverifiedOwner: true },
+    );
+    const raceStore = new WebLoginStore(app.cfg.dataDir);
+    // 模拟在 logout 拿到锁前，另一进程已提交了 sess_r11_new_gen 并更新 ACTIVE_SESSION_KV_KEY
+    const origClearIf = WebLoginStore.prototype.clearIf;
+    let simulatedConcurrentLogin = false;
+    WebLoginStore.prototype.clearIf = function (shouldDelete) {
+      if (!simulatedConcurrentLogin) {
+        simulatedConcurrentLogin = true;
+        commitWorkspaceLogin(
+          app!,
+          { owner_id: "7001", owner_name: "主人A", session_id: "sess_r11_new_gen", cookies: baseCookies },
+          { allowUnverifiedOwner: true },
+        );
+      }
+      return origClearIf.call(this, shouldDelete);
+    };
+    let raceLogoutRes: ReturnType<typeof revokeWorkspacePersonalWebSession>;
+    try {
+      raceLogoutRes = revokeWorkspacePersonalWebSession(app);
+    } finally {
+      WebLoginStore.prototype.clearIf = origClearIf;
+    }
+    assert.equal(raceLogoutRes!.fileRemoved, false, "并发 web-login 刚提交的新凭据绝不能被旧 logout 误删");
+    assert.equal(raceStore.load()?.session_id, "sess_r11_new_gen", "新提交的会话凭据必须完整保留在磁盘");
+
+    // 15) [R11 P2] 会话观察器返回 false 时（发包期间登出），flushPendingCookies 必须中止且不再发起已吊销会话的回读请求
+    const abortSendPath = path.join(dir, "abort-send-cred.enc");
+    process.env.PA_FEISHU_WEB_CRED_FILE = abortSendPath;
+    commitWorkspaceLogin(
+      app,
+      { owner_id: "7001", owner_name: "主人A", session_id: "sess_r11_abort_send", cookies: baseCookies },
+      { allowUnverifiedOwner: true },
+    );
+    mock.setChatName("9912", "发包吊销测试群");
+    mock.setChatKind("9912", CHAT_KIND_GROUP);
+    mock.addMessage("r11_send_target", buildNativeMessage({ id: "r11_send_target", chatId: "9912", actorId: "7099", text: "请回复", createdAtSec: nowSec }));
+    const sendBridge = new PersonalWebBridge(app, svc.store, {
+      onFastTrigger: () => undefined,
+      onReconnect: () => undefined,
+      onNeedsLogin: () => undefined,
+      clientOptions: { endpoints: mock.endpoints },
+    });
+    const origReadMsg = FeishuWebClient.prototype.readMessage;
+    let readbacksAfterSend = 0;
+    let sendCompleted = false;
+    FeishuWebClient.prototype.readMessage = async function (id, sig) {
+      if (sendCompleted) readbacksAfterSend++;
+      return origReadMsg.call(this, id, sig);
+    };
+    mock.setGatewayRotateCookie("session=rot_mid_send; Path=/");
+    const origSendReply = FeishuWebClient.prototype.sendReply;
+    FeishuWebClient.prototype.sendReply = async function (...args) {
+      const created = await origSendReply.apply(this, args);
+      sendCompleted = true;
+      // 模拟发包返回时工作区已被 web-logout 吊销
+      revokeWorkspacePersonalWebSession(app!);
+      return created;
+    };
+    try {
+      await assert.rejects(
+        sendBridge.sendVerifiedReply({
+          owner_id: "7001",
+          chat_id: "9912",
+          message_id: "r11_send_target",
+          text: "发包途中吊销测试",
+          cid: "cid_r11_abort_readback",
+        }),
+        /吊销|登出|取代/,
+      );
+    } finally {
+      FeishuWebClient.prototype.sendReply = origSendReply;
+      FeishuWebClient.prototype.readMessage = origReadMsg;
+      mock.setGatewayRotateCookie("");
+    }
+    assert.equal(readbacksAfterSend, 0, "发包期间会话被吊销后绝不能再用旧会话发起认证回读请求");
+    assert.equal(
+      JSON.parse(app.store.get("pw.delivery.cid_r11_abort_readback") ?? "{}").state,
+      "created",
+      "已发出的回复仍必须持久化为 created 回执以便重登录后只读回读恢复",
+    );
+  } finally {
     if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
     else process.env.PA_FEISHU_WEB_KEY = prevKey;
     if (prevCredFile === undefined) delete process.env.PA_FEISHU_WEB_CRED_FILE;

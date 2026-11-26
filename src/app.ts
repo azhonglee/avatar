@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { Cron } from "croner";
+import { isContextDerivedDispatchBlocked } from "./api/queries.ts";
 import { Board, KnowledgeBase } from "./board.ts";
 import { Bus } from "./bus.ts";
 import { Commands } from "./commands.ts";
@@ -133,13 +134,14 @@ export async function initApp(app: App): Promise<void> {
   await app.kb.init();
 }
 
-/** 生成概览并经 outbox 私信（同一天同一种只发一次）。启用卡片时以卡片发送。 */
+/** 生成概览并经 outbox 私信（同一天同一种只发一次）。启用卡片时以卡片发送；绑定渲染时的目标主人 open_id 防换主人后错投。 */
 export async function sendBrief(app: App, mode: "morning" | "evening"): Promise<void> {
+  const ownerOpenId = app.cfg.owner.open_id.trim();
   const text = await buildBrief(app.cfg, app.lark, app.store, app.ledger, app.board, mode);
   const date = new Date().toISOString().slice(0, 10);
   const c = app.cfg.cards.enabled ? app.ext.cards?.brief?.(mode, text) : undefined;
-  if (c) app.ledger.emit(`card:brief:${date}-${mode}`, [card(`brief:${date}-${mode}`, c, "brief")], `brief-${mode}-${date}`);
-  else app.ledger.emit("brief", [notify(text)], `brief-${mode}-${date}`);
+  if (c) app.ledger.emit(`card:brief:${date}-${mode}`, [card(`brief:${date}-${mode}`, c, "brief", ownerOpenId)], `brief-${mode}-${date}`);
+  else app.ledger.emit("brief", [notify(text, "brief", ownerOpenId)], `brief-${mode}-${date}`);
 }
 
 /** 立即执行一个配置的作业并等待结果（命令行用）。 */
@@ -153,12 +155,15 @@ export async function runConfiguredJob(app: App, name: string): Promise<string> 
   return w?.payload.result ?? `作业状态：${w?.state ?? "未知"}${w?.error ? `（${w.error}）` : ""}`;
 }
 
-/** 命令行单次派单：对账后把能做的派单做完，返回本次涉及的派单。 */
+/** 命令行单次派单：对账后把能做的派单做完，返回本次涉及的派单（按主人隔离过滤旧主人上下文派单）。 */
 export async function runDispatchOnce(app: App): Promise<{ enqueued: number; items: (WorkItem<DispatchPayload> | undefined)[] }> {
   const r = await app.dispatcher.reconcile();
   const before = new Set(app.ledger.active("dispatch").map((w) => w.id));
   await app.engine.drain(["dispatch", "effect"]);
-  return { enqueued: r.enqueued, items: [...before].map((id) => app.ledger.get<DispatchPayload>(id)) };
+  const items = [...before]
+    .map((id) => app.ledger.get<DispatchPayload>(id))
+    .filter((w) => !w || !isContextDerivedDispatchBlocked(app, w.id));
+  return { enqueued: r.enqueued, items };
 }
 
 /** 常驻运行：事件长连接 + 定时任务 + 工作引擎。 */

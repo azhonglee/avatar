@@ -122,7 +122,14 @@ export class Board {
     return { completed: false, sectionGuid: mine.section_guid };
   }
 
-  async createTask(t: { summary: string; description: string; due?: string; section: SectionKey; opKey?: string }): Promise<string> {
+  async createTask(t: {
+    summary: string;
+    description: string;
+    due?: string;
+    section: SectionKey;
+    opKey?: string;
+    onCreated?: (guid: string) => void;
+  }): Promise<string> {
     const create = async () => {
       const args = ["task", "+create", "--summary", t.summary, "--description", t.description, "--tasklist-id", this.tasklistGuid];
       if (t.due) args.push("--due", t.due);
@@ -130,9 +137,11 @@ export class Board {
       const created = await this.lark.run(args, { as: "user" });
       const guid = String(deepFind(created, "guid") ?? "");
       if (!guid) throw new Error(`创建任务失败：${JSON.stringify(created)}`);
+      t.onCreated?.(guid);
       return guid;
     };
     const guid = t.opKey ? await this.store.once(`task.create.${t.opKey}`, create) : await create();
+    t.onCreated?.(guid);
     await this.move(guid, t.section);
     return guid;
   }

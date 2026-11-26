@@ -143,62 +143,93 @@ export function revokeWorkspacePersonalWebSession(app: App): { fileRemoved: bool
     existingOnDisk = undefined;
   }
 
-  const revokedIds = loadRevokedSessionIds(app.store);
-  const addId = (sid: string | undefined) => {
-    const clean = (sid ?? "").trim();
-    if (clean) revokedIds.add(clean);
-  };
-  addId(existingOnDisk?.session_id);
-  addId(app.store.get(ACTIVE_SESSION_KV_KEY));
+  let revokedSet = new Set<string>();
+  const db = app.store.db;
+  // 在单个 SQLite BEGIN IMMEDIATE 事务中原子提交工作区级吊销标记与黑名单，避免与并发 web-login 交错写坏状态
+  db.exec("BEGIN IMMEDIATE");
   try {
-    const saved = JSON.parse(app.store.get(STATE_KV_KEY) ?? "null") as { session_id?: string } | null;
-    addId(saved?.session_id);
-  } catch {
-    // ignore
-  }
-
-  let clearPending = false;
-  try {
-    const rawPending = (app.store.get(PENDING_CRED_COMMIT_KV_KEY) ?? "").trim();
-    if (rawPending) {
-      const parsed = JSON.parse(rawPending) as { file?: string; session_id?: string };
-      addId(parsed.session_id);
-      if (!parsed.file || parsed.file === loginStore.file) {
-        clearPending = true;
-      }
+    const revokedIds = loadRevokedSessionIds(app.store);
+    const addId = (sid: string | undefined) => {
+      const clean = (sid ?? "").trim();
+      if (clean) revokedIds.add(clean);
+    };
+    addId(existingOnDisk?.session_id);
+    addId(app.store.get(ACTIVE_SESSION_KV_KEY));
+    try {
+      const saved = JSON.parse(app.store.get(STATE_KV_KEY) ?? "null") as { session_id?: string } | null;
+      addId(saved?.session_id);
+    } catch {
+      // ignore
     }
-  } catch {
-    // ignore
-  }
 
-  // 先提交共享数据库吊销标记，再做本地文件清理（即使文件目录只读或锁超时也已完成工作区吊销）
-  const capped = [...revokedIds].slice(-50);
-  app.store.set(REVOKED_SESSIONS_KV_KEY, JSON.stringify(capped));
-  app.store.set(REVOKED_AT_KV_KEY, String(Date.now()));
-  app.store.set(ACTIVE_SESSION_KV_KEY, "");
-  if (clearPending) {
-    app.store.set(PENDING_CRED_COMMIT_KV_KEY, "");
+    let clearPending = false;
+    try {
+      const rawPending = (app.store.get(PENDING_CRED_COMMIT_KV_KEY) ?? "").trim();
+      if (rawPending) {
+        const parsed = JSON.parse(rawPending) as { file?: string; session_id?: string };
+        addId(parsed.session_id);
+        if (!parsed.file || parsed.file === loginStore.file) {
+          clearPending = true;
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    const capped = [...revokedIds].slice(-50);
+    revokedSet = new Set(capped);
+    app.store.set(REVOKED_SESSIONS_KV_KEY, JSON.stringify(capped));
+    app.store.set(REVOKED_AT_KV_KEY, String(Date.now()));
+    app.store.set(ACTIVE_SESSION_KV_KEY, "");
+    if (clearPending) {
+      app.store.set(PENDING_CRED_COMMIT_KV_KEY, "");
+    }
+    app.store.set(
+      STATE_KV_KEY,
+      JSON.stringify({
+        state: "needs_login",
+        owner_id: "",
+        owner_name: "",
+        session_id: "",
+        cookie_version: 0,
+        since: Date.now(),
+        last_message_at: null,
+        last_error: "已手动登出",
+      }),
+    );
+    db.exec("COMMIT");
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // ignore
+    }
+    throw err;
   }
-  app.store.set(
-    STATE_KV_KEY,
-    JSON.stringify({
-      state: "needs_login",
-      owner_id: "",
-      owner_name: "",
-      session_id: "",
-      cookie_version: 0,
-      since: Date.now(),
-      last_message_at: null,
-      last_error: "已手动登出",
-    }),
-  );
 
   let fileRemoved = false;
   let fileError: string | undefined;
   try {
-    const existed = fs.existsSync(loginStore.file);
-    loginStore.clear();
-    fileRemoved = existed;
+    const res = loginStore.clearIf((curRes, stagedRes) => {
+      const workspaceStillRevoked = () =>
+        !!(app.store.get(REVOKED_AT_KV_KEY) ?? "").trim() && !(app.store.get(ACTIVE_SESSION_KV_KEY) ?? "").trim();
+      const shouldRemoveEntry = (entry: typeof curRes): boolean => {
+        if (entry.status === "missing") return false;
+        if (entry.status === "ok" && entry.login.session_id) {
+          if (revokedSet.has(entry.login.session_id)) return true;
+          const activeNow = (app.store.get(ACTIVE_SESSION_KV_KEY) ?? "").trim();
+          // 并发 web-login 刚刚在吊销后提交了新会话：绝不删除该新会话文件
+          if (activeNow && activeNow === entry.login.session_id) return false;
+          return workspaceStillRevoked();
+        }
+        return workspaceStillRevoked();
+      };
+      return {
+        removeFile: shouldRemoveEntry(curRes),
+        removeStaged: shouldRemoveEntry(stagedRes),
+      };
+    });
+    fileRemoved = res.fileRemoved;
   } catch (err) {
     fileError = errMsg(err);
   }
@@ -891,6 +922,16 @@ export class PersonalWebBridge {
     return [...this.collectOpenChatExclusions().keys()].sort().join(",");
   }
 
+  /** 原生推送入库期间需监测的完整排除策略快照（含 oc_* 排除规则与全部 groups_deny 关键词/ID 规则） */
+  private nativeExclusionPolicyKey(): string {
+    const oc = [...this.collectOpenChatExclusions().entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([id, name]) => `${id}=${name}`)
+      .join("|");
+    const deny = [...this.cfg.context.groups_deny].map((s) => s.trim()).sort().join("|");
+    return `${oc};${deny}`;
+  }
+
   /** 仅收集显式 `pw_chat:<id>` 原生排除/静音规则（纯数字如 "2024" 保持既有群名关键词语义，避免误把老配置当原生 ID） */
   private collectNativeChatExclusions(): Map<string, string> {
     const map = new Map<string, string>();
@@ -962,10 +1003,10 @@ export class PersonalWebBridge {
 
   /**
    * 评估当前个人 Web 会话是否命中排除/静音规则：
-   *   - 返回 true：明确命中排除，应丢弃；
-   *   - 返回 false：确认未命中排除，允许继续；
+   *   - 返回 `{ excluded: true, verifiedChatName }`：明确命中排除，应丢弃；
+   *   - 返回 `{ excluded: false, verifiedChatName }`：确认未命中排除，允许继续（携带最新核验过的群名供提交前终检使用）；
    *   - 抛错：存在无法实时确认的排除规则，按 fail-closed 暂缓入库（不发 ACK）。
-   * 当存在 oc_* 排除且使用缓存名称出现“不匹配（负向放行）”时，强制实时刷新双边群名后再决定是否放行，防止改名群借陈旧缓存逃逸。
+   * 当存在关键词或 oc_* 排除且群名来自缓存时，强制实时刷新群名再判定，既防止改名命中规则后逃逸，也防止改名脱离规则后永久卡死。
    */
   private async evaluateChatExclusion(params: {
     chatId: string;
@@ -976,13 +1017,17 @@ export class PersonalWebBridge {
     activeClient?: FeishuWebClient;
     chatNameFromCache?: boolean;
     signal?: AbortSignal;
-  }): Promise<boolean> {
+  }): Promise<{ excluded: boolean; verifiedChatName: string }> {
     const { chatId, pwConv, kind, convName, activeClient, signal } = params;
     let chatName = params.chatName;
     let chatNameRefreshed = !params.chatNameFromCache;
 
-    if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(chatId)) return true;
-    if (this.matchesDirectNativeIdDeny(pwConv)) return true;
+    if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(chatId)) {
+      return { excluded: true, verifiedChatName: chatName };
+    }
+    if (this.matchesDirectNativeIdDeny(pwConv)) {
+      return { excluded: true, verifiedChatName: chatName };
+    }
 
     const ensureFreshChatName = async (reason: string): Promise<void> => {
       if (chatNameRefreshed) return;
@@ -992,6 +1037,7 @@ export class PersonalWebBridge {
       try {
         chatName = (await activeClient.readChat(chatId, { force: true, signal })).name.trim();
         chatNameRefreshed = true;
+        if (chatName) this.pwGroupNameCache.set(pwConv, chatName);
       } catch {
         throw new Error(`实时刷新群名称失败，无法核验${reason}，按 fail-closed 暂缓入库`);
       }
@@ -1003,63 +1049,89 @@ export class PersonalWebBridge {
     const nameRules = this.nameDenyPatterns();
     if (nameRules.length > 0) {
       if (kind === "group") {
-        if (chatName && nameRules.some((d) => chatName.includes(d))) return true;
-        // 负向放行前必须使用实时刷新后的当前群名（避免群改名命中关键词后借缓存/旧标签逃逸）
-        await ensureFreshChatName("groups_deny 关键词排除规则");
-        if (nameRules.some((d) => chatName.includes(d))) return true;
+        const staleMatched = !!chatName && nameRules.some((d) => chatName.includes(d));
+        if (!chatNameRefreshed && activeClient) {
+          try {
+            await ensureFreshChatName("groups_deny 关键词排除规则");
+          } catch (err) {
+            if (staleMatched) return { excluded: true, verifiedChatName: chatName };
+            throw err;
+          }
+        } else if (staleMatched) {
+          return { excluded: true, verifiedChatName: chatName };
+        } else {
+          await ensureFreshChatName("groups_deny 关键词排除规则");
+        }
+        if (nameRules.some((d) => chatName.includes(d))) {
+          return { excluded: true, verifiedChatName: chatName };
+        }
       } else if (nameRules.some((d) => convName.includes(d))) {
-        return true;
+        return { excluded: true, verifiedChatName: chatName };
       }
     }
 
     const ocRules = this.collectOpenChatExclusions();
-    if (ocRules.size === 0) return false;
+    if (ocRules.size === 0) return { excluded: false, verifiedChatName: chatName };
     for (const [ocId, staleLabel] of ocRules) {
       let resolved = await this.resolveOpenChatMeta(ocId);
       if (!resolved) {
         if (kind === "group" && chatName && staleLabel && norm(chatName) === norm(staleLabel)) {
-          return true;
+          return { excluded: true, verifiedChatName: chatName };
         }
         throw new Error(`无法实时解析排除规则 ${ocId} 的会话元数据，按 fail-closed 暂缓入库`);
       }
       if (kind === "group") {
         if (resolved.meta.chatType === "p2p") continue;
         if (resolved.meta.chatType === "unknown") {
-          if (chatName && resolved.meta.name && norm(chatName) === norm(resolved.meta.name)) return true;
+          if (chatName && resolved.meta.name && norm(chatName) === norm(resolved.meta.name)) {
+            return { excluded: true, verifiedChatName: chatName };
+          }
           throw new Error(`排除规则 ${ocId} 无法识别会话类型，按 fail-closed 暂缓入库`);
         }
         if (!resolved.meta.name) {
           throw new Error(`排除规则 ${ocId} 缺少群名称，无法与当前个人 Web 群聊区分，按 fail-closed 暂缓入库`);
         }
-        if (chatName && norm(chatName) === norm(resolved.meta.name)) return true;
-
-        // 负向不匹配时，若任一侧来自缓存或尚未实时刷新，强制刷新双边群名后再决定是否放行（防群改名后缓存不同步逃逸）
+        const staleOcMatched = !!chatName && norm(chatName) === norm(resolved.meta.name);
         if (resolved.fromCache || !chatNameRefreshed || !chatName) {
           if (resolved.fromCache) {
             const freshOc = await this.resolveOpenChatMeta(ocId, { force: true });
             if (!freshOc) {
+              if (staleOcMatched) return { excluded: true, verifiedChatName: chatName };
               throw new Error(`复核排除规则 ${ocId} 失败，按 fail-closed 暂缓入库`);
             }
             resolved = freshOc;
             if (resolved.meta.chatType === "p2p") continue;
             if (resolved.meta.chatType === "unknown") {
-              if (chatName && resolved.meta.name && norm(chatName) === norm(resolved.meta.name)) return true;
+              if (chatName && resolved.meta.name && norm(chatName) === norm(resolved.meta.name)) {
+                return { excluded: true, verifiedChatName: chatName };
+              }
               throw new Error(`排除规则 ${ocId} 无法识别会话类型，按 fail-closed 暂缓入库`);
             }
             if (!resolved.meta.name) {
               throw new Error(`排除规则 ${ocId} 缺少群名称，无法与当前个人 Web 群聊区分，按 fail-closed 暂缓入库`);
             }
           }
-          await ensureFreshChatName(`排除规则 ${ocId}`);
-          if (nameRules.length > 0 && nameRules.some((d) => chatName.includes(d))) return true;
-          if (norm(chatName) === norm(resolved.meta.name)) return true;
+          try {
+            await ensureFreshChatName(`排除规则 ${ocId}`);
+          } catch (err) {
+            if (staleOcMatched) return { excluded: true, verifiedChatName: chatName };
+            throw err;
+          }
+          if (nameRules.length > 0 && nameRules.some((d) => chatName.includes(d))) {
+            return { excluded: true, verifiedChatName: chatName };
+          }
+          if (norm(chatName) === norm(resolved.meta.name)) {
+            return { excluded: true, verifiedChatName: chatName };
+          }
+        } else if (staleOcMatched) {
+          return { excluded: true, verifiedChatName: chatName };
         }
       } else {
         if (resolved.meta.chatType === "group") continue;
         throw new Error(`存在开放平台私聊或未知类型排除规则 (${ocId})，个人 Web 私聊无法映射其 open chat_id，按 fail-closed 暂缓入库`);
       }
     }
-    return false;
+    return { excluded: false, verifiedChatName: chatName };
   }
 
   /**
@@ -1167,7 +1239,7 @@ export class PersonalWebBridge {
         }
       }
       try {
-        const excluded = await this.evaluateChatExclusion({
+        const exclRes = await this.evaluateChatExclusion({
           chatId,
           pwConv: conv,
           kind,
@@ -1176,38 +1248,32 @@ export class PersonalWebBridge {
           activeClient: client,
           chatNameFromCache,
         });
-        return excluded ? "excluded" : "allowed";
+        return exclRes.excluded ? "excluded" : "allowed";
       } catch {
         return "uncertain";
       }
     }
 
-    // oc_* 开放平台会话
+    // oc_* 开放平台会话：先做确定性 ID 排除；名称排除必须先拉取当前最新群名（避免群从被排除旧名改回合法名后永远卡死）
     if (this.store.isConvMutedById(conv)) return "excluded";
+    if (this.cfg.context.groups_deny.some((raw) => raw.trim() === conv)) return "excluded";
     const latest = this.store.latestConvObs(conv);
-    let effectiveName = (convName || latest?.conv_name || "").trim();
+    let effectiveName = (latest?.conv_name || convName || "").trim();
     let recordedType = classifyRecordedChatType(latest);
     const nameRules = this.nameDenyPatterns();
-    for (const raw of this.cfg.context.groups_deny) {
-      const d = raw.trim();
-      if (!d) continue;
-      if (d === conv) return "excluded";
-      if (!d.startsWith("oc_") && !d.startsWith("pw_chat:") && effectiveName && effectiveName.includes(d)) {
-        return "excluded";
-      }
-    }
     const nativeExcl = nativeExclSnapshot ?? (await this.resolveNativeExclusionsForPolling());
-    if (recordedType === "group" && effectiveName && nativeExcl.confirmedGroupNames.has(norm(effectiveName))) {
-      return "excluded";
-    }
+    const staleNameExcluded =
+      !!effectiveName &&
+      (nameRules.some((d) => effectiveName.includes(d)) ||
+        (recordedType !== "dm" && nativeExcl.confirmedGroupNames.has(norm(effectiveName))));
     const hasNameBasedRules = nativeExcl.confirmedGroupNames.size > 0 || nameRules.length > 0;
-    // 对未知类型会话，以及在存在关键词/原生静音规则时的已知群会话，均强制拉取当前最新群名后再放行模型（防止入库后改名逃逸）
+    // 对未知类型会话，以及在存在关键词/原生静音规则时的已知群会话，先实时刷新最新群名后再判定是否排除或放行
     const mustRefreshOpenChat =
       (recordedType === "unknown" && (nativeExcl.dmsInconclusive || nativeExcl.groupsInconclusive || hasNameBasedRules)) ||
       (recordedType === "group" && hasNameBasedRules);
     if (mustRefreshOpenChat) {
       const fresh = await this.resolveOpenChatMeta(conv, { force: true });
-      if (!fresh) return "uncertain";
+      if (!fresh) return staleNameExcluded ? "excluded" : "uncertain";
       if (fresh.meta.chatType === "p2p") recordedType = "dm";
       else if (fresh.meta.chatType === "group") recordedType = "group";
       effectiveName = fresh.meta.name;
@@ -1508,13 +1574,13 @@ export class PersonalWebBridge {
       }
     }
 
-    const convName =
+    let convName =
       convKind === "dm"
         ? `私聊：${isMe ? effectiveMsg.conversationId : effectiveMsg.actorId || effectiveMsg.conversationId}`
         : chatName || `群聊(${effectiveMsg.conversationId})`;
 
-    const ocExclBefore = this.openChatExclusionsKey();
-    const excluded = await this.evaluateChatExclusion({
+    const exclPolicyBefore = this.nativeExclusionPolicyKey();
+    const exclRes = await this.evaluateChatExclusion({
       chatId: effectiveMsg.conversationId,
       pwConv,
       kind: convKind,
@@ -1524,11 +1590,15 @@ export class PersonalWebBridge {
       chatNameFromCache: true,
       signal,
     });
-    if (excluded) return;
+    if (exclRes.verifiedChatName) {
+      chatName = exclRes.verifiedChatName;
+      if (convKind === "group") convName = chatName;
+    }
+    if (exclRes.excluded) return;
 
-    // 5) 落库前最终核验会话代际、中止信号与当前采集策略：
-    //    如果异步排除查询期间策略变化，先重跑排除校验，并在最后一次 await 结束后再做一次无 await 的同步提交前终检，
-    //    彻底杜绝「登出/静音/关闭 sources.im 发生在最后一次 await 期间仍把消息写入数据库」的竞态。
+    // 5) 落库前最终核验会话代际、中止信号与当前采集策略（包含 oc_* 与关键词排除规则）：
+    //    如果异步排除查询期间策略变化，先重跑排除校验并用核验后的真实群名做同步终检，
+    //    彻底杜绝「登出/静音/新增关键词排除/关闭 sources.im 发生在最后一次 await 期间仍把消息写入数据库」的竞态。
     const checkFinalIngestSync = (): boolean => {
       if (signal?.aborted) {
         throw new WebHttpError("aborted", "会话已中止，放弃提交推送观测");
@@ -1547,9 +1617,9 @@ export class PersonalWebBridge {
     };
 
     if (!checkFinalIngestSync()) return;
-    if (this.openChatExclusionsKey() !== ocExclBefore) {
-      const ocExclRetry = this.openChatExclusionsKey();
-      const excludedNow = await this.evaluateChatExclusion({
+    if (this.nativeExclusionPolicyKey() !== exclPolicyBefore) {
+      const exclPolicyRetry = this.nativeExclusionPolicyKey();
+      const exclResNow = await this.evaluateChatExclusion({
         chatId: effectiveMsg.conversationId,
         pwConv,
         kind: convKind,
@@ -1559,9 +1629,13 @@ export class PersonalWebBridge {
         chatNameFromCache: true,
         signal,
       });
-      if (excludedNow) return;
+      if (exclResNow.verifiedChatName) {
+        chatName = exclResNow.verifiedChatName;
+        if (convKind === "group") convName = chatName;
+      }
+      if (exclResNow.excluded) return;
       if (!checkFinalIngestSync()) return;
-      if (this.openChatExclusionsKey() !== ocExclRetry) {
+      if (this.nativeExclusionPolicyKey() !== exclPolicyRetry) {
         // 排除规则连续两次在异步查询期间变化：抛可重试错误暂缓 ACK，防止 handlePush 误确认导致合法消息丢失
         throw new Error("推送入库期间排除规则连续变化，暂缓 ACK 留待飞书重投");
       }
@@ -1750,9 +1824,9 @@ export class PersonalWebBridge {
     }
     if (!sessionStillValid()) return 0;
 
-    const ocExclBefore = this.openChatExclusionsKey();
+    const exclPolicyBefore = this.nativeExclusionPolicyKey();
     try {
-      const excluded = await this.evaluateChatExclusion({
+      const exclRes = await this.evaluateChatExclusion({
         chatId: primary.conversationId,
         pwConv: conv,
         kind: isDm ? "dm" : "group",
@@ -1762,7 +1836,8 @@ export class PersonalWebBridge {
         chatNameFromCache: true,
         signal,
       });
-      if (excluded) return 0;
+      if (exclRes.verifiedChatName) chatName = exclRes.verifiedChatName;
+      if (exclRes.excluded) return 0;
     } catch (err) {
       log("warn", "快通道跳过补读背景（排除规则未确认）", { conv, err: errMsg(err) });
       return 0;
@@ -1812,10 +1887,10 @@ export class PersonalWebBridge {
         return true;
       };
       if (!checkHydrateFinalSync()) return 0;
-      if (this.openChatExclusionsKey() !== ocExclBefore) {
-        const ocExclRetry = this.openChatExclusionsKey();
+      if (this.nativeExclusionPolicyKey() !== exclPolicyBefore) {
+        const exclPolicyRetry = this.nativeExclusionPolicyKey();
         try {
-          const excludedNow = await this.evaluateChatExclusion({
+          const exclResNow = await this.evaluateChatExclusion({
             chatId: primary.conversationId,
             pwConv: conv,
             kind: isDm ? "dm" : "group",
@@ -1825,12 +1900,13 @@ export class PersonalWebBridge {
             chatNameFromCache: true,
             signal,
           });
-          if (excludedNow) return 0;
+          if (exclResNow.verifiedChatName) chatName = exclResNow.verifiedChatName;
+          if (exclResNow.excluded) return 0;
         } catch {
           return 0;
         }
         if (!checkHydrateFinalSync()) return 0;
-        if (this.openChatExclusionsKey() !== ocExclRetry) return 0;
+        if (this.nativeExclusionPolicyKey() !== exclPolicyRetry) return 0;
       }
       const ownerName = this.app.store.get("ctx.owner_name") || clientOwnerName || "我";
       const bg: Obs[] = [...collected.values()].map((m) => {
@@ -2111,6 +2187,8 @@ export class PersonalWebBridge {
               reply_id: replyId,
               updated_at: Date.now(),
             });
+            // 已安全持久化 created 回执；若发包期间会话已被登出或取代，立刻中止后续回读与 Cookie 写入（留待重登录后只读回读恢复）
+            this.assertSessionOwner(args.owner_id, initialSessionId);
           },
         },
       );
@@ -2121,6 +2199,7 @@ export class PersonalWebBridge {
           return { replyId: cur.reply_id, rootId: cur.root_id, parentId: cur.parent_id, threadId: "", verified: true };
         }
         if (cur.state === "created" && cur.reply_id) {
+          this.assertSessionOwner(args.owner_id, initialSessionId);
           const verified = await client.verifyReplyReadback({
             replyId: cur.reply_id,
             chatId: cur.chat_id,

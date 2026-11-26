@@ -78,9 +78,18 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
     run: async (a, ctx) => {
       const summary = `${a.harness ? `[${a.harness}] ` : ""}${a.summary}`;
       const description = [a.description ?? "", a.repo ? `repo: ${a.repo}` : ""].filter(Boolean).join("\n");
-      const guid = await board.createTask({ summary, description, section: "dispatch" });
-      // 在对账前立即持久化 GUID 归属：即使后续 board 读取/对账失败，远端已建任务也已绑定原主人
+      // 在远端创建返回 GUID 的第一时间（先于独立的 move 与 reconcile）即持久化主人归属，防止 move/reconcile 超时导致无主委派任务
       const contextOwner = ctx.contextOwner?.trim();
+      const guid = await board.createTask({
+        summary,
+        description,
+        section: "dispatch",
+        onCreated: (createdGuid) => {
+          if (contextOwner) {
+            store.set(`ctx.dispatch_ref_owner.${createdGuid}`, contextOwner);
+          }
+        },
+      });
       if (contextOwner) {
         store.set(`ctx.dispatch_ref_owner.${guid}`, contextOwner);
       }
@@ -165,6 +174,10 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
     schema: S.id,
     target: (a) => a.id,
     run: async (a) => {
+      const w = ledger.get(a.id);
+      if (isWorkBlockedByOwner(d, w ?? a.id)) {
+        throw new CommandError("conflict", "该工作项源自旧工作区主人的工作上下文，已按主人隔离阻断操作");
+      }
       if (!ledger.acknowledge(a.id)) throw new CommandError("conflict", "只有失败落定的工作可以忽略");
       return { ok: true, message: "已忽略", target: a.id };
     },

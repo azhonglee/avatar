@@ -286,6 +286,24 @@ export class ContextService {
                   }),
                 ),
               );
+              // 在仍持有会话占坑租约期间处理连续解析失败跳过：仅标记本批实际送入模型的精确观测及修订，绝不波及同群未送入模型的普通消息
+              results.forEach((res, gi) => {
+                if (res.status !== "rejected" || !(res.reason instanceof UnderstandParseError)) return;
+                const reason = truncate(errMsg(res.reason), 300);
+                const submittedMap = new Map(
+                  (res.reason.submittedByConv ?? []).map((s) => [s.conv, s.entries]),
+                );
+                for (const c of groups[gi]) {
+                  const entries = submittedMap.get(c.conv);
+                  if (!entries?.length) continue;
+                  const n = Number(kv.get(`ctx.fail.${c.conv}`) ?? 0) + 1;
+                  kv.set(`ctx.fail.${c.conv}`, String(n));
+                  if (n >= 3) {
+                    const skipped = this.store.skipObsIfClaimed(c.conv, entries, claimToken, procOwner);
+                    log("warn", "会话理解连续失败，已按提交观测精确跳过", { conv: c.conv_name, skipped, err: reason });
+                  }
+                }
+              });
             }
           } finally {
             signal?.removeEventListener("abort", onParentAbort);
@@ -319,17 +337,6 @@ export class ContextService {
             const reason = truncate(errMsg(res.reason), 300);
             rep.errors.push(`理解失败：${reason}`);
             log("warn", "理解批次失败", { err: reason, convs: groups[gi].map((c) => c.conv_name) });
-            // 只在模型输出无法解析时按会话累计失败并在第 3 次跳过；spawn ENOENT / 超时 / 无输出等环境故障保留待处理，修复后继续跑
-            if (res.reason instanceof UnderstandParseError) {
-              for (const c of groups[gi]) {
-                const n = Number(kv.get(`ctx.fail.${c.conv}`) ?? 0) + 1;
-                kv.set(`ctx.fail.${c.conv}`, String(n));
-                if (n >= 3) {
-                  const skipped = this.store.skipConv(c.conv);
-                  log("warn", "会话理解连续失败，已跳过", { conv: c.conv_name, skipped, err: reason });
-                }
-              }
-            }
           });
           if (!progress) break; // 本轮全部失败或没有进展：等下一轮
         }

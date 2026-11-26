@@ -21,7 +21,11 @@ function probeMountMaskBackend(): MountMaskBackend {
   if (cachedMountMaskBackend) return cachedMountMaskBackend;
   try {
     const bwrapBin = resolveBin("bwrap");
-    const r = spawnSync(bwrapBin, ["--dev-bind", "/", "/", "--", "true"], { timeout: 3_000, stdio: "ignore" });
+    const r = spawnSync(
+      bwrapBin,
+      ["--die-with-parent", "--dev-bind", "/", "/", "--unshare-pid", "--proc", "/proc", "--", "true"],
+      { timeout: 3_000, stdio: "ignore" },
+    );
     if (r.status === 0) {
       cachedMountMaskBackend = { kind: "bwrap", bin: bwrapBin };
       return cachedMountMaskBackend;
@@ -34,7 +38,24 @@ function probeMountMaskBackend(): MountMaskBackend {
     const setprivBin = resolveBin("setpriv");
     const r = spawnSync(
       unshareBin,
-      ["-r", "-m", "--", setprivBin, "--bounding-set", "-all", "--inh-caps", "-all", "--ambient-caps", "-all", "--no-new-privs", "true"],
+      [
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "--pid",
+        "--fork",
+        "--mount-proc",
+        "--",
+        setprivBin,
+        "--bounding-set",
+        "-all",
+        "--inh-caps",
+        "-all",
+        "--ambient-caps",
+        "-all",
+        "--no-new-privs",
+        "true",
+      ],
       { timeout: 3_000, stdio: "ignore" },
     );
     if (r.status === 0) {
@@ -48,19 +69,20 @@ function probeMountMaskBackend(): MountMaskBackend {
   return cachedMountMaskBackend;
 }
 
-/** 探测当前宿主机是否具备零特权挂载命名空间遮罩能力（bwrap 或 unshare + setpriv 永久降权） */
+/** 探测当前宿主机是否具备零特权 PID + 挂载命名空间隔离能力（bwrap --unshare-pid --proc /proc 或 unshare --pid --mount-proc + setpriv 永久降权） */
 export function hasCredentialMountIsolation(): boolean {
   return probeMountMaskBackend().kind !== "none";
 }
 
 /**
- * 为仓库校验命令、git 子进程等同一 UID 下的不可信子进程提供内核级文件系统遮罩：
- *   - 若当前服务通过 systemd `LoadCredential` 在 `CREDENTIALS_DIRECTORY` 中暴露了 `feishu-web-key`，
- *     仅从环境变量剥离 `CREDENTIALS_DIRECTORY` 不足以阻止同 UID 子进程按绝对路径直接读取该文件；
- *   - 本函数优先用 `bwrap --bind /dev/null <keyFile>`（保留真实 UID/GID、零特权、NoNewPrivs），
- *     或在 `unshare -r -m` 挂载 `/dev/null` 后通过 `setpriv --bounding-set -all --inh-caps -all --ambient-caps -all --no-new-privs`
- *     永久剥离挂载管理权限再 exec 目标命令（杜绝子进程 umount 绕过遮罩）；
- *   - 若宿主机既无 `bwrap` 也无支持永久降权的 `unshare + setpriv`，则按 fail-closed 拒绝启动子进程。
+ * 为模型执行器、仓库校验命令、git 子进程等同 UID 不可信子进程提供内核级进程与文件系统隔离：
+ *   - 当服务持有 `CREDENTIALS_DIRECTORY/feishu-web-key`（systemd LoadCredentialEncrypted）或 `PA_FEISHU_WEB_KEY`（EnvironmentFile/环境变量）时，
+ *     仅从子进程环境变量剥离仍无法阻止同 UID 子进程读取密钥文件或通过宿主机 `/proc/<daemon-pid>/{environ,root,mem}` 探测常驻进程；
+ *   - 本函数优先用 `bwrap --unshare-pid --proc /proc [--bind /dev/null <keyFile>]`（独立 PID 命名空间 + 干净 `/proc` 隐藏常驻进程，
+ *     并遮罩密钥文件，零特权且 NoNewPrivs）；
+ *   - 回退用 `unshare --user --map-root-user --mount --pid --fork --mount-proc` 完成遮罩后，立即通过 `setpriv --bounding-set -all ... --no-new-privs`
+ *     永久剥离挂载与提权能力再 exec 目标命令；
+ *   - 若宿主机不支持 PID + 挂载命名空间隔离，按 fail-closed 拒绝启动子进程。
  */
 export function wrapCredentialIsolatedCommand(
   cmd: string,
@@ -69,22 +91,29 @@ export function wrapCredentialIsolatedCommand(
   opts?: { forceBackend?: MountMaskBackend },
 ): { cmd: string; args: string[]; isolated: boolean } {
   const credDir = rawEnv.CREDENTIALS_DIRECTORY?.trim();
-  if (!credDir) return { cmd, args, isolated: false };
-  const keyFile = path.join(credDir, FEISHU_WEB_KEY_CRED);
-  if (!fs.existsSync(keyFile)) return { cmd, args, isolated: false };
-  const resolvedKeyFile = (() => {
-    try {
-      return fs.realpathSync(keyFile);
-    } catch {
-      return path.resolve(keyFile);
-    }
-  })();
+  const keyFile = credDir ? path.join(credDir, FEISHU_WEB_KEY_CRED) : "";
+  const hasCredKeyFile = !!keyFile && fs.existsSync(keyFile);
+  const hasEnvKey = !!(rawEnv.PA_FEISHU_WEB_KEY?.trim());
+  if (!hasCredKeyFile && !hasEnvKey) return { cmd, args, isolated: false };
+
+  const resolvedKeyFile = hasCredKeyFile
+    ? (() => {
+        try {
+          return fs.realpathSync(keyFile);
+        } catch {
+          return path.resolve(keyFile);
+        }
+      })()
+    : "";
 
   const backend = opts?.forceBackend ?? probeMountMaskBackend();
   if (backend.kind === "bwrap") {
-    const maskArgs: string[] = ["--die-with-parent", "--dev-bind", "/", "/", "--bind", "/dev/null", path.resolve(keyFile)];
-    if (resolvedKeyFile !== path.resolve(keyFile)) {
-      maskArgs.push("--bind", "/dev/null", resolvedKeyFile);
+    const maskArgs: string[] = ["--die-with-parent", "--dev-bind", "/", "/", "--unshare-pid", "--proc", "/proc"];
+    if (hasCredKeyFile) {
+      maskArgs.push("--bind", "/dev/null", path.resolve(keyFile));
+      if (resolvedKeyFile && resolvedKeyFile !== path.resolve(keyFile)) {
+        maskArgs.push("--bind", "/dev/null", resolvedKeyFile);
+      }
     }
     return { cmd: backend.bin, args: [...maskArgs, "--", cmd, ...args], isolated: true };
   }
@@ -92,17 +121,39 @@ export function wrapCredentialIsolatedCommand(
     if (!backend.setprivBin) {
       throw new Error("unshare 回退缺少 setpriv，无法在启动子命令前永久剥离挂载权限，已按安全策略拒绝执行");
     }
-    const maskTargets = resolvedKeyFile !== path.resolve(keyFile) ? [path.resolve(keyFile), resolvedKeyFile] : [path.resolve(keyFile)];
-    // 严格兼容 POSIX sh：完成 bind-mount 遮罩后立刻用 setpriv 永久清空全部 capabilities 并置 NoNewPrivs，防止不可信子进程 umount
+    const unshareBase = ["--user", "--map-root-user", "--mount", "--pid", "--fork", "--mount-proc", "--"];
+    if (!hasCredKeyFile) {
+      return {
+        cmd: backend.bin,
+        args: [
+          ...unshareBase,
+          backend.setprivBin,
+          "--bounding-set",
+          "-all",
+          "--inh-caps",
+          "-all",
+          "--ambient-caps",
+          "-all",
+          "--no-new-privs",
+          cmd,
+          ...args,
+        ],
+        isolated: true,
+      };
+    }
+    const maskTargets =
+      resolvedKeyFile && resolvedKeyFile !== path.resolve(keyFile) ? [path.resolve(keyFile), resolvedKeyFile] : [path.resolve(keyFile)];
+    // 严格兼容 POSIX sh：在独立 PID+Mount 命名空间完成 bind-mount 遮罩后立刻用 setpriv 永久清空全部 capabilities 并置 NoNewPrivs
     const script =
       maskTargets.length === 2
         ? 'mount --bind /dev/null "$1" && mount --bind /dev/null "$2" && sp="$3" && shift 3 && exec "$sp" --bounding-set -all --inh-caps -all --ambient-caps -all --no-new-privs "$@"'
         : 'mount --bind /dev/null "$1" && sp="$2" && shift 2 && exec "$sp" --bounding-set -all --inh-caps -all --ambient-caps -all --no-new-privs "$@"';
-    return { cmd: backend.bin, args: ["-r", "-m", "--", "sh", "-c", script, "_", ...maskTargets, backend.setprivBin, cmd, ...args], isolated: true };
+    return { cmd: backend.bin, args: [...unshareBase, "sh", "-c", script, "_", ...maskTargets, backend.setprivBin, cmd, ...args], isolated: true };
   }
   throw new Error(
-    "检测到 CREDENTIALS_DIRECTORY 包含 feishu-web-key，但当前宿主机不支持 bwrap 或带 setpriv 降权的 unshare -r -m 挂载命名空间隔离；" +
-      "为防止仓库校验或 git 子进程按路径读取个人 Web 加密密钥，已拒绝执行。请安装 bubblewrap，或以独立系统服务账号配合 root 只读 EnvironmentFile 部署。",
+    "检测到当前环境持有个人 Web 加密密钥（CREDENTIALS_DIRECTORY/feishu-web-key 或 PA_FEISHU_WEB_KEY），" +
+      "但宿主机不支持 bwrap 或带 setpriv 降权的 unshare PID+挂载命名空间隔离；" +
+      "为防止同 UID 子进程读取密钥文件或通过 /proc/<daemon-pid> 检查常驻进程，已拒绝执行。请安装 bubblewrap 或将不可信 worker 运行在独立 OS 用户身份下。",
   );
 }
 
@@ -471,9 +522,38 @@ export function extractSafeCodexProviderConfig(
       }
     }
 
+    const rawAws = obj.aws;
+    if (rawAws !== undefined) {
+      if (!isPlainTable(rawAws)) {
+        throw new Error(`Codex [model_providers.${providerName}.aws] 格式非法`);
+      }
+      const awsMap: TomlTable = Object.create(null) as TomlTable;
+      for (const [ak, av] of Object.entries(rawAws)) {
+        if (ak !== "profile" && ak !== "region") {
+          throw new Error(
+            `Codex [model_providers.${providerName}.aws] 包含不受支持的字段 "${ak}"；为防止改变认证方式或引入非白名单凭据设置，tools=none 模式仅保留 aws.profile 与 aws.region`,
+          );
+        }
+        if (typeof av !== "string" || !av.trim()) {
+          throw new Error(`Codex [model_providers.${providerName}.aws].${ak} 必须为非空字符串`);
+        }
+        awsMap[ak] = av;
+      }
+      if (Object.keys(awsMap).length > 0) {
+        sanitized.aws = awsMap;
+      }
+    }
+
     for (const [k, v] of Object.entries(obj)) {
-      if (k === "http_headers" || k === "env_http_headers" || k === "query_params" || k === "experimental_bearer_token") continue;
-      if (!SAFE_CODEX_PROVIDER_SCALARS.has(k)) continue;
+      if (k === "http_headers" || k === "env_http_headers" || k === "query_params" || k === "experimental_bearer_token" || k === "aws") continue;
+      if (!SAFE_CODEX_PROVIDER_SCALARS.has(k)) {
+        if (k === "gcp" || k === "auth" || k === "credentials" || k.includes("token") || k.includes("secret") || k.includes("key")) {
+          throw new Error(
+            `Codex [model_providers.${providerName}] 包含不受支持的认证/路由字段 "${k}"；为避免静默切换目标账号或认证方式，已中止 tools=none 执行`,
+          );
+        }
+        continue;
+      }
       if (k === "base_url") {
         if (typeof v !== "string" || !v.trim()) throw new Error(`Codex [model_providers.${providerName}].base_url 必须为非空 URL 字符串`);
         sanitized.base_url = validateSafeCodexUrl(v.trim(), `model_providers.${providerName}.base_url`);
@@ -589,6 +669,27 @@ export function extractSafeCodexProviderConfig(
         }
         throw new Error(`extraArgs 中的 model_providers.${pName}.env_http_headers 格式非法`);
       }
+      if (field === "aws") {
+        if (segs.length === 3 && isPlainTable(val)) {
+          const awsMap: TomlTable = Object.create(null) as TomlTable;
+          for (const [ak, av] of Object.entries(val)) {
+            if (ak !== "profile" && ak !== "region") {
+              throw new Error(`extraArgs model_providers.${pName}.aws 不支持字段 "${ak}"，仅允许 profile 与 region`);
+            }
+            if (typeof av !== "string" || !av.trim()) {
+              throw new Error(`extraArgs model_providers.${pName}.aws.${ak} 必须为非空字符串`);
+            }
+            awsMap[ak] = av;
+          }
+          mergeProviderSubtable(dst, "aws", awsMap);
+          return;
+        }
+        if (segs.length === 4 && (segs[3] === "profile" || segs[3] === "region") && typeof val === "string" && val.trim()) {
+          mergeProviderSubtable(dst, "aws", { [segs[3]]: val });
+          return;
+        }
+        throw new Error(`extraArgs 中的 model_providers.${pName}.aws 格式或字段不受支持（仅允许 profile 与 region）`);
+      }
       if (field === "query_params") {
         if (segs.length === 3 && isPlainTable(val)) {
           for (const [qk, qv] of Object.entries(val)) {
@@ -676,24 +777,14 @@ export function extractSafeCodexProviderConfig(
     }
 
     const profileRaw = doc.profile;
-    if (profileRaw !== undefined && (typeof profileRaw !== "string" || !profileRaw.trim())) {
-      throw new Error("Codex config.toml 中的 profile 配置非法；为避免误发往默认供应商，已中止 tools=none 执行");
-    }
-    const activeProfileName = typeof profileRaw === "string" ? profileRaw.trim() : undefined;
-    let activeProfile: TomlTable | undefined;
-    if (activeProfileName) {
-      const profilesTable = doc.profiles;
-      const candidate = isPlainTable(profilesTable) ? profilesTable[activeProfileName] : undefined;
-      if (!isPlainTable(candidate)) {
-        throw new Error(
-          `Codex config.toml 指定了 profile "${activeProfileName}"，但未找到对应的 [profiles.${activeProfileName}]；为避免将私聊发往默认供应商，已中止执行`,
-        );
-      }
-      activeProfile = candidate;
+    if (profileRaw !== undefined) {
+      const legacyName = typeof profileRaw === "string" && profileRaw.trim() ? profileRaw.trim() : "<name>";
+      throw new Error(
+        `Codex 0.169 已废弃 config.toml 中的顶层 profile = "${legacyName}"（请改用 --profile ${legacyName} 与 ${legacyName}.config.toml，或在 config.yaml 中直接配置 model / model_provider）；为避免激活失效配置，已中止 tools=none 执行`,
+      );
     }
 
-    const effectiveVal = (key: string): TomlValue | undefined =>
-      activeProfile && activeProfile[key] !== undefined ? activeProfile[key] : doc[key];
+    const effectiveVal = (key: string): TomlValue | undefined => doc[key];
 
     const selectedProviderVal = effectiveVal("model_provider");
     if (selectedProviderVal !== undefined && (typeof selectedProviderVal !== "string" || !selectedProviderVal.trim())) {

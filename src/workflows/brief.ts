@@ -1,4 +1,4 @@
-import { isContextDerivedDispatchBlocked } from "../api/queries.ts";
+import { isContextDerivedDispatchBlocked, isContextOwnedTaskBlocked } from "../api/queries.ts";
 import type { Board, BoardTask } from "../board.ts";
 import { toBoardTask } from "../board.ts";
 import type { Config } from "../config.ts";
@@ -22,7 +22,7 @@ export async function buildBrief(
   const now = Date.now();
   const tz = cfg.owner.timezone;
   const dayEnd = endOfLocalDay(now, tz);
-  const isTaskVisible = (t: BoardTask) => !isContextDerivedDispatchBlocked({ cfg, store, ledger }, t.guid);
+  const isTaskVisible = (t: BoardTask) => !isContextOwnedTaskBlocked({ cfg, store, ledger }, t.guid);
   const mine = findItems(
     await lark.run(["task", "+get-my-tasks", "--complete=false", "--page-all"], { as: "user" }),
     "guid",

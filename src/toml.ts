@@ -538,12 +538,15 @@ class TomlParser {
     if (raw === "inf" || raw === "+inf") return Infinity;
     if (raw === "-inf") return -Infinity;
     if (raw === "nan" || raw === "+nan" || raw === "-nan") return Number.NaN;
-    if (/^0x[0-9a-fA-F_]+$/.test(raw)) return parseInt(raw.slice(2).replace(/_/g, ""), 16);
-    if (/^0o[0-7_]+$/.test(raw)) return parseInt(raw.slice(2).replace(/_/g, ""), 8);
-    if (/^0b[01_]+$/.test(raw)) return parseInt(raw.slice(2).replace(/_/g, ""), 2);
-    if (/^[+-]?\d[\d_]*(\.\d[\d_]*)?([eE][+-]?\d[\d_]*)?$/.test(raw)) {
-      const cleaned = raw.replace(/_/g, "");
-      const num = Number(cleaned);
+    if (/^0x[0-9a-fA-F](?:_?[0-9a-fA-F])*$/.test(raw)) return parseInt(raw.slice(2).replace(/_/g, ""), 16);
+    if (/^0o[0-7](?:_?[0-7])*$/.test(raw)) return parseInt(raw.slice(2).replace(/_/g, ""), 8);
+    if (/^0b[01](?:_?[01])*$/.test(raw)) return parseInt(raw.slice(2).replace(/_/g, ""), 2);
+    if (/^[+-]?(?:0|[1-9](?:_?[0-9])*)$/.test(raw)) {
+      const num = Number(raw.replace(/_/g, ""));
+      if (Number.isFinite(num)) return num;
+    }
+    if (/^[+-]?(?:0|[1-9](?:_?[0-9])*)(?:\.[0-9](?:_?[0-9])*(?:[eE][+-]?[0-9](?:_?[0-9])*)?|[eE][+-]?[0-9](?:_?[0-9])*)$/.test(raw)) {
+      const num = Number(raw.replace(/_/g, ""));
       if (Number.isFinite(num)) return num;
     }
     if (

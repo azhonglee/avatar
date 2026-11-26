@@ -42,7 +42,9 @@ function FailedItem({ it }: { it: HealthItem }) {
             {refLink(it)}
           </div>
         </div>
-        {!it.acknowledged ? (
+        {it.isolated ? (
+          <Pill tone="muted">已隔离</Pill>
+        ) : !it.acknowledged ? (
           <div className="row-gap">
             <button className="btn btn-sm btn-primary" disabled={cmd.isPending(kr)} onClick={() => void cmd.run("work.retry", { id: it.id }, { key: kr, navigate: false })}>
               {cmd.isPending(kr) && <Spinner />}重试

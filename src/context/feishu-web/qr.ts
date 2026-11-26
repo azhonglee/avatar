@@ -349,8 +349,8 @@ export function encodeQrMatrix(text: string): QrMatrix {
   return { size, modules: bestGrid };
 }
 
-/** Render QR matrix for dark or light UTF-8 terminals using compact half-block characters with quiet zone. */
-export function renderQrTerminal(text: string, quiet = 2): string {
+/** Render QR matrix with explicit black-on-white ANSI colors and a 4-module white quiet zone (theme-independent for dark and light terminals). */
+export function renderQrTerminal(text: string, quiet = 4): string {
   const { size, modules } = encodeQrMatrix(text);
   const full = size + quiet * 2;
   const darkAt = (r: number, c: number) => {
@@ -360,20 +360,20 @@ export function renderQrTerminal(text: string, quiet = 2): string {
     return modules[mr * size + mc] === 1;
   };
   const lines: string[] = [];
-  // Invert visually onto white quiet-zone background: white cell = █ (light), dark cell = space
-  // Using standard white-on-black terminal convention (most terminals are dark bg):
-  // light module -> full block (white), dark module -> space (black) yields crisp white quiet zone!
+  // Explicit black foreground (30) on white background (47) so dark modules render black and light modules + quiet zone render white on every terminal theme.
+  const BLACK_ON_WHITE = "\x1b[30;47m";
+  const RESET = "\x1b[0m";
   for (let r = 0; r < full; r += 2) {
-    let line = "";
+    let line = BLACK_ON_WHITE;
     for (let c = 0; c < full; c++) {
-      const topLight = !darkAt(r, c);
-      const botLight = r + 1 < full ? !darkAt(r + 1, c) : true;
-      if (topLight && botLight) line += "█";
-      else if (topLight) line += "▀";
-      else if (botLight) line += "▄";
+      const topDark = darkAt(r, c);
+      const botDark = r + 1 < full ? darkAt(r + 1, c) : false;
+      if (topDark && botDark) line += "█";
+      else if (topDark) line += "▀";
+      else if (botDark) line += "▄";
       else line += " ";
     }
-    lines.push(line);
+    lines.push(line + RESET);
   }
   return lines.join("\n");
 }

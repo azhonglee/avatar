@@ -124,12 +124,20 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
           break;
         }
         case "task.create_own": {
-          await store.once(`task.create_own.${e.args.item_id ?? item.id}`, async () => {
+          const createdOwner = cfg.owner.open_id.trim();
+          const guid = await store.once(`task.create_own.${e.args.item_id ?? item.id}`, async () => {
             const args = ["task", "+create", "--summary", e.args.summary, "--description", e.args.description, "--assignee", cfg.owner.open_id];
             if (e.args.due) args.push("--due", e.args.due);
             const out = await lark.run(args, { as: "user" });
-            return String(deepFind(out, "guid") ?? "created");
+            const g = String(deepFind(out, "guid") ?? "created");
+            if (g && g !== "created" && createdOwner) {
+              store.set(`ctx.own_task_owner.${g}`, createdOwner);
+            }
+            return g;
           });
+          if (guid && guid !== "created" && createdOwner && !store.get(`ctx.own_task_owner.${guid}`)) {
+            store.set(`ctx.own_task_owner.${guid}`, createdOwner);
+          }
           break;
         }
         default:
@@ -143,8 +151,14 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
 
 export const move = (guid: string, section: SectionKey): Effect => ({ op: "task.move", args: { guid, section } });
 export const comment = (guid: string, content: string): Effect => ({ op: "task.comment", args: { guid, content } });
-export const notify = (markdown: string, kind?: NotifyKind): Effect => ({ op: "notify", args: { markdown, kind } });
-export const card = (key: string, c: Record<string, unknown>, kind?: NotifyKind): Effect => ({ op: "card.upsert", args: { key, card: c, kind } });
+export const notify = (markdown: string, kind?: NotifyKind, owner_open_id?: string): Effect => ({
+  op: "notify",
+  args: { markdown, kind, ...(owner_open_id ? { owner_open_id } : {}) },
+});
+export const card = (key: string, c: Record<string, unknown>, kind?: NotifyKind, owner_open_id?: string): Effect => ({
+  op: "card.upsert",
+  args: { key, card: c, kind, ...(owner_open_id ? { owner_open_id } : {}) },
+});
 
 /**
  * 同一个 key 只有一张卡片：没发过就以机器人身份私信主人（幂等键 = key），记下 message_id；发过就原地更新。

@@ -557,14 +557,28 @@ export class Connectors {
     const sinceMine = Number(this.kv("cursor.im.mine") ?? 0) || baseCursor;
     const sinceGroups = Number(this.kv("cursor.im.groups") ?? 0) || baseCursor;
     const end = isoLocal(now);
-    const searchFrom = async (sinceMs: number, extra: string[]) =>
-      arr(
-        await this.lark(
-          ["im", "+messages-search", "--start", isoLocal(sinceMs - 5 * 60_000), "--end", end, "--page-all", "--page-limit", "40", "--page-size", "50", "--no-reactions", ...extra],
-          300_000,
-        ),
-        "messages",
+    const SEARCH_PAGE_LIMIT = 40;
+    const SEARCH_PAGE_SIZE = 50;
+    const searchRaw = async (sinceMs: number, extra: string[]) =>
+      this.lark(
+        [
+          "im",
+          "+messages-search",
+          "--start",
+          isoLocal(sinceMs - 5 * 60_000),
+          "--end",
+          end,
+          "--page-all",
+          "--page-limit",
+          String(SEARCH_PAGE_LIMIT),
+          "--page-size",
+          String(SEARCH_PAGE_SIZE),
+          "--no-reactions",
+          ...extra,
+        ],
+        300_000,
       );
+    const searchFrom = async (sinceMs: number, extra: string[]) => arr(await searchRaw(sinceMs, extra), "messages");
 
     let policySig = this.pollingPolicySignature();
     const initialGroupsMode = this.cfg.context.groups;
@@ -584,7 +598,13 @@ export class Connectors {
 
     type StreamKind = "at_me" | "p2p" | "mine" | "group";
     const raws: { m: Raw; kind: string; stream: StreamKind; fallbackGroupName?: string }[] = [];
-    for (const m of await searchFrom(sinceAtMe, ["--is-at-me"])) raws.push({ m, kind: "at_me", stream: "at_me" });
+    const atMeRawResp = await searchRaw(sinceAtMe, ["--is-at-me"]);
+    const atMeMsgs = arr(atMeRawResp, "messages");
+    // 仅当 --is-at-me 返回完整未截断的结果集（无 has_more 且未触达 40×50 上限）时，才对窗口内未命中的群消息推断 at_me: false
+    const atMeSearchTruncated =
+      deepFind(atMeRawResp, "has_more") === true || atMeMsgs.length >= SEARCH_PAGE_LIMIT * SEARCH_PAGE_SIZE;
+    const effectiveAtMeWindowStartMs = atMeSearchTruncated ? undefined : atMeWindowStartMs;
+    for (const m of atMeMsgs) raws.push({ m, kind: "at_me", stream: "at_me" });
     const fetchedP2p = !nativeExcl?.dmsInconclusive;
     if (fetchedP2p) {
       // 保留查询条件已知的 chat_type="p2p"，防止接口缺省单行 chat_type 时落入群聊分支
@@ -881,8 +901,30 @@ export class Connectors {
           dropped++;
           continue;
         }
-        const o = this.toObs(m, entry.kind, me, atMeWindowStartMs);
+        const o = this.toObs(m, entry.kind, me, effectiveAtMeWindowStartMs);
         if (o) obs.push(o);
+      }
+
+      // 若拉取消息期间学到的新群名导致生效群选排变化（例如群 A 改名命中排除规则，空出名额给群 B），
+      // 先持久化新学到的群名，再不推进游标重启一轮拉取以补采接替群 B，避免推进 cursor.im.groups 遗漏 B 的消息
+      if (learnedNames.size > 0 && !nativeExcl?.groupsInconclusive) {
+        const learnedRankedKey = selectEffectiveOpenGroups({
+          cfg: this.cfg,
+          store: this.store,
+          spoken,
+          knownNames,
+          nativeExcl,
+          now,
+        })
+          .map(([id]) => id)
+          .join(",");
+        if (learnedRankedKey !== initialRankedKey) {
+          mergeKnownOpenGroupNames(this.app.store, learnedNames);
+          if (restartAttempt < 1) {
+            return this.pullIm(restartAttempt + 1);
+          }
+          return { count: 0, dropped: 0 };
+        }
       }
 
       // 私聊没有会话名：用对方名字

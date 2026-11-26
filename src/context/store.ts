@@ -1106,6 +1106,35 @@ export class ContextStore {
     });
   }
 
+  /**
+   * 在仍持有该会话占坑租约的同一写事务内，只将指定提交给模型的精确观测（且当前修订仍匹配）标为已处理，
+   * 避免 mention-only 失败跳过把该群未送入模型的普通待处理消息一并吞掉。
+   */
+  skipObsIfClaimed(
+    conv: string,
+    entries: { id: string; rev: string }[],
+    holder: string,
+    procOwner: string,
+    now = Date.now(),
+  ): number {
+    if (!entries.length) return 0;
+    const get = this.db.prepare("SELECT conv, text, meta, processed FROM ctx_obs WHERE id = ?");
+    const upd = this.db.prepare("UPDATE ctx_obs SET processed = 1, meta = ? WHERE id = ? AND text = ? AND meta = ?");
+    return this.tx(() => {
+      if (!this.isConvClaimedBy(conv, holder, procOwner, now)) return 0;
+      let n = 0;
+      for (const entry of entries) {
+        const cur = get.get(entry.id) as { conv: string; text: string; meta: string; processed: number } | undefined;
+        if (!cur || cur.processed !== 0 || cur.conv !== conv) continue;
+        const m = j<Record<string, unknown>>(cur.meta, {});
+        if (obsRevision({ text: cur.text, meta: m }) !== entry.rev) continue;
+        if (m.background_only) delete m.background_only;
+        n += Number(upd.run(JSON.stringify(m), entry.id, cur.text, cur.meta).changes);
+      }
+      return n;
+    });
+  }
+
   /** 某会话所有待处理观测标为已处理（理解反复失败时跳过） */
   skipConv(conv: string): number {
     return Number(this.db.prepare("UPDATE ctx_obs SET processed = 1 WHERE conv = ? AND processed = 0").run(conv).changes);

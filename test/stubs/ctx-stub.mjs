@@ -69,7 +69,7 @@ if (role === "lark") {
       fail(`桩未实现：${argv.slice(0, 3).join(" ")}`);
     }
     case "im +messages-search":
-      if (argv.includes("--is-at-me")) ok({ messages: fx.at_me ?? [] });
+      if (argv.includes("--is-at-me")) ok({ messages: fx.at_me ?? [], ...(fx.at_me_has_more ? { has_more: true } : {}) });
       if (flag("--chat-type") === "p2p") ok({ messages: fx.p2p ?? [] });
       if (flag("--sender")) ok({ messages: fx.mine ?? [] });
       ok({ messages: [] });

@@ -476,11 +476,11 @@ export class WebLoginStore {
     }
   }
 
-  inspect(): WebLoginInspectResult {
-    if (!fs.existsSync(this.file)) return { status: "missing" };
+  inspectPath(targetFile: string): WebLoginInspectResult {
+    if (!fs.existsSync(targetFile)) return { status: "missing" };
     let rawJson: unknown;
     try {
-      rawJson = JSON.parse(fs.readFileSync(this.file, "utf8")) as unknown;
+      rawJson = JSON.parse(fs.readFileSync(targetFile, "utf8")) as unknown;
     } catch {
       return { status: "invalid" };
     }
@@ -511,6 +511,10 @@ export class WebLoginStore {
     } catch {
       return { status: "invalid" };
     }
+  }
+
+  inspect(): WebLoginInspectResult {
+    return this.inspectPath(this.file);
   }
 
   load(): WebLogin | undefined {
@@ -782,6 +786,31 @@ export class WebLoginStore {
         },
         curVer + 1,
       );
+    });
+  }
+
+  /** 在跨进程文件锁保护下按当前磁盘会话代际条件删除现网与暂存凭据，避免并发 web-login 新提交的会话被登出误删 */
+  clearIf(
+    shouldDelete: (current: WebLoginInspectResult, staged: WebLoginInspectResult) => { removeFile: boolean; removeStaged: boolean },
+  ): { fileRemoved: boolean; stagedRemoved: boolean } {
+    return this.withLock(() => {
+      const curRes = this.inspectPath(this.file);
+      const stagedRes = this.inspectPath(this.stagedFile);
+      const decision = shouldDelete(curRes, stagedRes);
+      let stagedRemoved = false;
+      let fileRemoved = false;
+      if (decision.removeStaged && fs.existsSync(this.stagedFile)) {
+        fs.rmSync(this.stagedFile, { force: true });
+        stagedRemoved = true;
+      }
+      if (decision.removeFile && fs.existsSync(this.file)) {
+        fs.rmSync(this.file, { force: true });
+        fileRemoved = true;
+      }
+      if (stagedRemoved || fileRemoved) {
+        fsyncDir(path.dirname(this.file));
+      }
+      return { fileRemoved, stagedRemoved };
     });
   }
 

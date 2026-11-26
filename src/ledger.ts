@@ -46,12 +46,12 @@ export type Effect =
   | { op: "task.move"; args: { guid: string; section: string } }
   | { op: "task.comment"; args: { guid: string; content: string } }
   | { op: "task.complete"; args: { guid: string } }
-  | { op: "notify"; args: { markdown: string; kind?: NotifyKind } }
+  | { op: "notify"; args: { markdown: string; kind?: NotifyKind; owner_open_id?: string } }
   /**
    * 飞书交互卡片：同一个 key 只有一张卡片——第一次发送，之后原地更新（messages patch）。
    * card 是完整的卡片 JSON（schema 2.0）。
    */
-  | { op: "card.upsert"; args: { key: string; card: Record<string, unknown>; kind?: NotifyKind } }
+  | { op: "card.upsert"; args: { key: string; card: Record<string, unknown>; kind?: NotifyKind; owner_open_id?: string } }
   /** 以你本人身份回复一条消息（只在你确认草稿后产生） */
   | { op: "im.reply"; args: { message_id: string; text: string; draft_id?: string } }
   /** 以你本人身份在会话里发一条消息（只在你确认草稿后产生） */

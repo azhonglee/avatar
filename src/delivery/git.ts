@@ -1,5 +1,6 @@
+import { spawn } from "node:child_process";
 import { prepareHarnessEnv, wrapCredentialIsolatedCommand } from "../harness.ts";
-import { runProcess, type ProcResult } from "../util.ts";
+import { errMsg, runProcess, type ProcResult } from "../util.ts";
 
 /**
  * 交付用到的 git 操作：
@@ -121,62 +122,228 @@ export function parseRemote(url: string): RemoteRef | undefined {
 }
 
 const ZERO_OID = "0000000000000000000000000000000000000000";
+const LFS_SPEC_HEADER = "version https://git-lfs.github.com/spec/v1";
+const LFS_SPEC_HEADER_BUF = Buffer.from(LFS_SPEC_HEADER, "utf8");
+const LFS_POINTER_MIN_BYTES = 80;
+const LFS_POINTER_MAX_BYTES = 1024;
+
+async function tryGitBuffer(
+  cwd: string,
+  args: string[],
+  opts?: { input?: string; timeoutMs?: number },
+): Promise<{ code: number; stdout: Buffer; stderr: string }> {
+  const baseEnv = prepareHarnessEnv();
+  try {
+    const childEnv: NodeJS.ProcessEnv = { ...baseEnv.env, GIT_TERMINAL_PROMPT: "0" };
+    delete childEnv.GIT_EXTERNAL_DIFF;
+    const wrapped = wrapCredentialIsolatedCommand("git", ["-C", cwd, ...GIT_SAFE_ARGS, ...args]);
+    return await new Promise((resolve) => {
+      const child = spawn(wrapped.cmd, wrapped.args, {
+        env: childEnv,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      const outChunks: Buffer[] = [];
+      let errStr = "";
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, opts?.timeoutMs ?? 300_000);
+      timer.unref?.();
+      child.stdout.on("data", (d: Buffer) => outChunks.push(d));
+      child.stderr.on("data", (d: Buffer) => {
+        errStr += d.toString("utf8");
+      });
+      child.on("error", (err) => {
+        clearTimeout(timer);
+        resolve({ code: 127, stdout: Buffer.alloc(0), stderr: err.message });
+      });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({
+          code: timedOut ? 124 : (code ?? 1),
+          stdout: Buffer.concat(outChunks),
+          stderr: timedOut ? `${errStr}\n(timeout)`.trim() : errStr,
+        });
+      });
+      if (opts?.input !== undefined) child.stdin.end(opts.input);
+      else child.stdin.end();
+    });
+  } finally {
+    baseEnv.cleanup();
+  }
+}
+
+/** 严格校验一段文本是否是合规的 Git LFS 指针文件（防止源代码里出现 spec URL 字面量造成误判）。 */
+export function isGitLfsPointerBlob(content: string): boolean {
+  if (!content || Buffer.byteLength(content, "utf8") > LFS_POINTER_MAX_BYTES) return false;
+  const lines = content.replace(/\r\n/g, "\n").split("\n").filter((l) => l.length > 0);
+  if (lines.length < 3) return false;
+  if (lines[0] !== LFS_SPEC_HEADER) return false;
+  let hasOid = false;
+  let hasSize = false;
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^oid sha256:[0-9a-f]{64}$/.test(line)) hasOid = true;
+    else if (/^size \d+$/.test(line)) hasSize = true;
+    else if (!/^[a-z0-9._-]+ \S/.test(line)) return false;
+  }
+  return hasOid && hasSize;
+}
 
 /**
- * 检测分支（含当前树及待推送提交历史，包括先添加后删除的 LFS 文件）是否涉及 Git LFS 对象：
+ * 检测分支（含当前树及远端尚未拥有的待推送历史对象，包括先添加后删除的 LFS 文件）是否涉及 Git LFS 对象：
  *   - 仅使用只读内置 git 命令（禁用仓库 hooks），不依赖本机是否安装 git-lfs；
- *   - 既检查分支顶端 `.gitattributes` 的 `filter=lfs`，也用 `git log -S` 扫描待推送提交历史中的 LFS 指针（涵盖历史提交添加后又被后续提交删除的 LFS 对象）。
+ *   - 既检查分支顶端 `.gitattributes` 的 `filter=lfs`，也仅扫描远端缺少的对象（`rev-list --objects`）并严格校验小 blob 是否为合法 Git LFS 指针；
+ *   - 任一检查命令失败/超时时显式抛错（fail-closed），绝不把扫描失败当成“无 LFS 对象”。
  */
-export async function branchUsesGitLfs(cwd: string, branch: string, remoteSha?: string): Promise<boolean> {
-  const tree = await tryGit(cwd, ["ls-tree", "-r", "--name-only", "-z", `refs/heads/${branch}`]);
-  const listOut = tree.code === 0 ? tree.stdout : (await tryGit(cwd, ["ls-files", "-z"])).stdout;
-  if (listOut) {
-    const attrs = await tryGit(cwd, ["check-attr", "--stdin", "-z", "filter"], { input: listOut });
-    if (attrs.code === 0 && attrs.stdout) {
+export async function branchUsesGitLfs(
+  cwd: string,
+  branch: string,
+  remoteSha?: string,
+  knownRemoteShas?: string[],
+): Promise<boolean> {
+  const localRef = `refs/heads/${branch}`;
+  const tree = await tryGit(cwd, ["ls-tree", "-r", "--name-only", "-z", localRef]);
+  if (tree.code !== 0) {
+    throw new Error(`git ls-tree 检查分支 ${branch} 失败：${(tree.stderr || tree.stdout).trim()}`);
+  }
+  if (tree.stdout) {
+    const attrs = await tryGit(cwd, ["check-attr", "--stdin", "-z", "filter"], { input: tree.stdout });
+    if (attrs.code !== 0) {
+      throw new Error(`git check-attr 检查分支 ${branch} 失败：${(attrs.stderr || attrs.stdout).trim()}`);
+    }
+    if (attrs.stdout) {
       const fields = attrs.stdout.split("\0");
       for (let i = 0; i + 2 < fields.length; i += 3) {
         if (fields[i + 1] === "filter" && fields[i + 2] === "lfs") return true;
       }
     }
   }
-  // 扫描待推送提交范围（若远端基线提交在本地存在则只扫增量，否则扫整条分支历史）中是否出现过 Git LFS 指针
-  let revSpec = `refs/heads/${branch}`;
-  if (remoteSha && remoteSha !== ZERO_OID) {
-    const hasRemoteCommit = (await tryGit(cwd, ["cat-file", "-e", `${remoteSha}^{commit}`])).code === 0;
-    if (hasRemoteCommit) revSpec = `${remoteSha}..refs/heads/${branch}`;
+
+  // 仅排除远端已拥有且本地可解析为 commit 的基线提交，避免扫描整仓无关历史
+  const rawExcludes = [...new Set([remoteSha, ...(knownRemoteShas ?? [])].filter((s): s is string => !!s && s !== ZERO_OID && /^[0-9a-f]{40,64}$/i.test(s)))];
+  const validRemoteCommits: string[] = [];
+  if (rawExcludes.length > 0) {
+    const chk = await tryGit(cwd, ["cat-file", "--batch-check=%(objecttype) %(objectname)"], {
+      input: rawExcludes.join("\n") + "\n",
+    });
+    if (chk.code !== 0) {
+      throw new Error(`git cat-file 校验远端基线提交失败：${(chk.stderr || chk.stdout).trim()}`);
+    }
+    for (const line of chk.stdout.split("\n")) {
+      const [type, sha] = line.trim().split(" ");
+      if (type === "commit" && sha) validRemoteCommits.push(sha);
+    }
   }
-  const histPtr = await tryGit(cwd, ["log", "-n", "1", "--format=%H", "-S", "version https://git-lfs.github.com/spec/v1", revSpec]);
-  return histPtr.code === 0 && histPtr.stdout.trim().length > 0;
+
+  const revArgs = ["rev-list", "--objects", localRef, ...(validRemoteCommits.length ? ["--not", ...validRemoteCommits] : [])];
+  const revList = await tryGit(cwd, revArgs);
+  if (revList.code !== 0) {
+    throw new Error(`git rev-list 扫描分支 ${branch} 待推送对象失败：${(revList.stderr || revList.stdout).trim()}`);
+  }
+  const objShas: string[] = [];
+  const seen = new Set<string>();
+  for (const line of revList.stdout.split("\n")) {
+    const sha = line.trim().split(/\s+/)[0];
+    if (sha && !seen.has(sha)) {
+      seen.add(sha);
+      objShas.push(sha);
+    }
+  }
+  if (objShas.length === 0) return false;
+
+  const metaCheck = await tryGit(cwd, ["cat-file", "--batch-check=%(objecttype) %(objectsize) %(objectname)"], {
+    input: objShas.join("\n") + "\n",
+  });
+  if (metaCheck.code !== 0) {
+    throw new Error(`git cat-file --batch-check 检查待推送对象元信息失败：${(metaCheck.stderr || metaCheck.stdout).trim()}`);
+  }
+  const smallBlobs: string[] = [];
+  for (const line of metaCheck.stdout.split("\n")) {
+    const parts = line.trim().split(" ");
+    if (parts.length < 3) continue;
+    const [type, sizeStr, sha] = parts;
+    const size = Number(sizeStr);
+    if (type === "blob" && Number.isFinite(size) && size >= LFS_POINTER_MIN_BYTES && size <= LFS_POINTER_MAX_BYTES) {
+      smallBlobs.push(sha);
+    }
+  }
+  if (smallBlobs.length === 0) return false;
+
+  // 以原始 Buffer 偏移解析 git cat-file --batch，避免二进制小文件触发 UTF-8 截断/错位
+  const batchRes = await tryGitBuffer(cwd, ["cat-file", "--batch"], { input: smallBlobs.join("\n") + "\n" });
+  if (batchRes.code !== 0) {
+    throw new Error(`git cat-file --batch 读取候选 blob 失败：${batchRes.stderr.trim()}`);
+  }
+  const buf = batchRes.stdout;
+  let offset = 0;
+  while (offset < buf.length) {
+    const nl = buf.indexOf(0x0a, offset);
+    if (nl === -1) break;
+    const header = buf.subarray(offset, nl).toString("utf8").trim();
+    offset = nl + 1;
+    const parts = header.split(" ");
+    if (parts.length < 3 || parts[1] === "missing") continue;
+    const size = Number(parts[2]);
+    if (!Number.isFinite(size) || size < 0 || offset + size > buf.length) {
+      throw new Error("git cat-file --batch 输出帧长度异常，无法安全确认 LFS 指针");
+    }
+    const blobBuf = buf.subarray(offset, offset + size);
+    offset += size + 1; // 跳过对象后的 '\n'
+    if (blobBuf.includes(LFS_SPEC_HEADER_BUF) && isGitLfsPointerBlob(blobBuf.toString("utf8"))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
  * 推送 pa/ 分支。只对我们自己的 pa/ 分支使用 --force-with-lease（返工后历史可能被改写），其他分支普通推送。
  * 保持禁用仓库自定义 hooks（core.hooksPath=/dev/null）；若分支或待推送历史涉及 Git LFS 对象，
  * 推送前通过 Git LFS 官方的 `git lfs pre-push` 按实际推送引用范围上传所有历史与当前引用的 LFS 对象，
- * 失败则立即中止推送并返回明确错误，防止远端只收到悬空 LFS 指针。
+ * 扫描或上传失败均立即中止推送并返回明确错误，防止远端只收到悬空 LFS 指针。
  * 被拒绝（远端有本地没有的提交）是永久错误；网络等其他失败可重试。
  */
 export async function pushBranch(cwd: string, remote: string, branch: string): Promise<{ ok: true } | { ok: false; rejected: boolean; message: string }> {
   const localRef = `refs/heads/${branch}`;
   const localShaRes = await tryGit(cwd, ["rev-parse", localRef]);
-  const localSha = localShaRes.code === 0 ? localShaRes.stdout.trim() : "";
-  const lsRemote = await tryGit(cwd, ["ls-remote", remote, localRef]);
-  const remoteSha =
-    lsRemote.code === 0
-      ? (lsRemote.stdout
-          .trim()
-          .split(/\s+/)[0]
-          ?.trim() || ZERO_OID)
-      : ZERO_OID;
+  if (localShaRes.code !== 0 || !localShaRes.stdout.trim()) {
+    return { ok: false, rejected: false, message: `无法解析本地分支 ${branch}：${(localShaRes.stderr || localShaRes.stdout).trim()}` };
+  }
+  const localSha = localShaRes.stdout.trim();
+  const lsRemote = await tryGit(cwd, ["ls-remote", remote]);
+  if (lsRemote.code !== 0) {
+    return { ok: false, rejected: false, message: `无法读取远端 ${remote} 引用列表：${(lsRemote.stderr || lsRemote.stdout).trim()}` };
+  }
+  let remoteSha = ZERO_OID;
+  const knownRemoteShas: string[] = [];
+  for (const line of lsRemote.stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const [sha, ref] = trimmed.split(/\s+/);
+    if (!sha || !ref) continue;
+    if (ref === localRef) remoteSha = sha;
+    if (!ref.endsWith("^{}")) knownRemoteShas.push(sha);
+  }
 
-  if (await branchUsesGitLfs(cwd, branch, remoteSha)) {
+  let usesLfs = false;
+  try {
+    usesLfs = await branchUsesGitLfs(cwd, branch, remoteSha, knownRemoteShas);
+  } catch (err) {
+    return {
+      ok: false,
+      rejected: false,
+      message: `检测分支 ${branch} 是否包含 Git LFS 对象失败，已中止推送以避免遗漏历史 LFS 对象：${errMsg(err)}`,
+    };
+  }
+
+  if (usesLfs) {
     const urlRes = await tryGit(cwd, ["config", "--get", `remote.${remote}.url`]);
     const rUrl = urlRes.code === 0 ? urlRes.stdout.trim() : "";
     const lfsArgs = ["lfs", "pre-push", remote, ...(rUrl ? [rUrl] : [])];
-    const stdinLine = localSha ? `${localRef} ${localSha} ${localRef} ${remoteSha}\n` : "";
-    const lfs = stdinLine
-      ? await tryGit(cwd, lfsArgs, { input: stdinLine })
-      : await tryGit(cwd, ["lfs", "push", remote, localRef]);
+    const stdinLine = `${localRef} ${localSha} ${localRef} ${remoteSha}\n`;
+    const lfs = await tryGit(cwd, lfsArgs, { input: stdinLine });
     if (lfs.code !== 0) {
       const lfsOut = `${lfs.stdout}\n${lfs.stderr}`.trim();
       const missingLfs = /not a git command|git-lfs.*not found|No such file/i.test(lfsOut);

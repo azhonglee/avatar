@@ -180,6 +180,8 @@ export interface HealthItem {
   summary: string;
   updated: number;
   acknowledged: boolean;
+  /** true 表示该条工作因归属旧工作区主人而被脱敏隔离，前端隐藏重试/忽略按钮 */
+  isolated?: boolean;
 }
 
 export interface Health {
