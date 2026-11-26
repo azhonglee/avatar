@@ -629,26 +629,64 @@ export class WebLoginStore {
   }
 
   /**
-   * 崩溃恢复协调：若 SQLite 已提交 `pendingKey` 且 `.staged` 仍存在，说明上次崩溃发生在 SQLite COMMIT 与 rename 之间，
-   * 原子补全 rename 并清除标记；若 SQLite 未提交 `pendingKey` 但残留 `.staged`，说明上次崩溃在 COMMIT 之前，安全清理孤儿暂存文件。
+   * 崩溃恢复协调（严格绑定目标凭据文件路径与 session_id）：
+   *   - 若 pending 标记指向另一个凭据路径（例如常驻进程用了 PA_FEISHU_WEB_CRED_FILE 而交互 CLI 用默认路径），直接忽略不清除标记也不删他人暂存文件；
+   *   - 若 pending 标记绑定本路径：先尝试 rename `.staged -> file`，仅在确实完成 rename 或验证现网文件已安装匹配的 owner_id + session_id 后才清除标记；
+   *   - 若 SQLite 无 pending 标记且本路径残留孤儿 `.staged`，安全清理。
    */
   reconcilePendingCommit(
     store: { get(k: string): string | undefined; set(k: string, v: string): void },
     pendingKey: string,
   ): void {
-    const hasPending = !!(store.get(pendingKey) ?? "").trim();
+    const parsePending = (raw: string | undefined): { file?: string; staged_file?: string; owner_id?: string; session_id?: string } | undefined => {
+      const t = (raw ?? "").trim();
+      if (!t) return undefined;
+      try {
+        const obj = JSON.parse(t) as Record<string, unknown>;
+        return {
+          file: typeof obj.file === "string" ? obj.file : undefined,
+          staged_file: typeof obj.staged_file === "string" ? obj.staged_file : undefined,
+          owner_id: typeof obj.owner_id === "string" ? obj.owner_id : undefined,
+          session_id: typeof obj.session_id === "string" ? obj.session_id : undefined,
+        };
+      } catch {
+        return {};
+      }
+    };
+
+    const initialPending = parsePending(store.get(pendingKey));
+    if (initialPending?.file && path.resolve(initialPending.file) !== path.resolve(this.file)) {
+      return;
+    }
     const hasStaged = fs.existsSync(this.stagedFile);
-    if (!hasPending && !hasStaged) return;
+    if (!initialPending && !hasStaged) return;
     try {
       this.withLock(() => {
-        const pendingNow = !!(store.get(pendingKey) ?? "").trim();
-        const stagedNow = fs.existsSync(this.stagedFile);
+        const pendingNow = parsePending(store.get(pendingKey));
+        if (pendingNow?.file && path.resolve(pendingNow.file) !== path.resolve(this.file)) {
+          return;
+        }
+        const stagedPath = pendingNow?.staged_file ? path.resolve(pendingNow.staged_file) : this.stagedFile;
+        const stagedNow = fs.existsSync(stagedPath);
         if (pendingNow) {
-          if (stagedNow) {
-            fs.renameSync(this.stagedFile, this.file);
+          let installed = false;
+          if (stagedNow && path.resolve(stagedPath) === path.resolve(this.stagedFile)) {
+            fs.renameSync(stagedPath, this.file);
+            installed = true;
+          } else {
+            const cur = this.load();
+            if (
+              cur &&
+              (!pendingNow.owner_id || cur.owner_id === pendingNow.owner_id) &&
+              (!pendingNow.session_id || cur.session_id === pendingNow.session_id)
+            ) {
+              installed = true;
+            }
           }
-          store.set(pendingKey, "");
-        } else if (stagedNow) {
+          if (installed) {
+            store.set(pendingKey, "");
+          }
+        } else if (fs.existsSync(this.stagedFile)) {
           fs.rmSync(this.stagedFile, { force: true });
         }
       });

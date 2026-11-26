@@ -96,6 +96,122 @@ export interface NativePollingExclusions {
   dmsInconclusive: boolean;
 }
 
+export interface SpokenGroupEntry {
+  name: string;
+  at: number;
+}
+
+export const OPEN_GROUP_NAMES_KV_KEY = "ctx.open_group_names";
+
+export function loadSpokenGroups(store: App["store"]): Record<string, SpokenGroupEntry> {
+  try {
+    return JSON.parse(store.get("ctx.spoken_groups") ?? "{}") as Record<string, SpokenGroupEntry>;
+  } catch {
+    return {};
+  }
+}
+
+export function loadKnownOpenGroupNames(store: App["store"]): Record<string, string> {
+  try {
+    const raw = JSON.parse(store.get(OPEN_GROUP_NAMES_KV_KEY) ?? "{}") as Record<string, unknown>;
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(raw)) {
+      if (typeof v === "string" && v.trim()) out[k] = v.trim();
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function rememberOpenGroupName(store: App["store"], chatId: string, name: string): void {
+  const id = chatId.trim();
+  const clean = name.trim();
+  if (!id || !clean || clean === "群聊" || clean.startsWith("私聊")) return;
+  const cur = loadKnownOpenGroupNames(store);
+  if (cur[id] === clean) return;
+  cur[id] = clean;
+  const keys = Object.keys(cur);
+  if (keys.length > 500) {
+    for (const old of keys.slice(0, keys.length - 500)) delete cur[old];
+  }
+  store.set(OPEN_GROUP_NAMES_KV_KEY, JSON.stringify(cur));
+}
+
+export function isOpenGroupDirectlyDenied(
+  cfg: App["cfg"],
+  store: ContextStore,
+  chatId: string,
+  chatName: string,
+  nativeExcl?: NativePollingExclusions,
+): boolean {
+  if (chatId && store.isConvMutedById(chatId)) return true;
+  if (
+    cfg.context.groups_deny.some((raw) => {
+      const d = raw.trim();
+      if (!d) return false;
+      if (chatId === d) return true;
+      // 仅 oc_* 与 pw_chat:* 视作会话 ID；纯数字（如 "2024"）保持原有群名关键词排除语义
+      if (!d.startsWith("oc_") && !d.startsWith("pw_chat:") && chatName && chatName.includes(d)) return true;
+      return false;
+    })
+  ) {
+    return true;
+  }
+  if (chatName && nativeExcl?.confirmedGroupNames.has(norm(chatName))) return true;
+  return false;
+}
+
+/**
+ * 统一的开放平台群（oc_*）生效范围选择：
+ *   - `allowlist` 模式：去重保留开放平台群 ID，使用 spoken_groups / 已知群名缓存 / 观测记录补齐名称，
+ *     先过滤被静音或按群名/ID 排除的群，再按 max_groups 截断（避免被群名排除的 A 占掉 B 的名额）；
+ *   - `spoken` 模式：从回看窗口内的 spoken_groups 中过滤被静音/排除的群，按最近发言时间倒序取前 max_groups 个。
+ * 由采集器 `pullIm` 与理解/起草范围过滤共享，保证两处口径完全一致。
+ */
+export function selectEffectiveOpenGroups(params: {
+  cfg: App["cfg"];
+  store: ContextStore;
+  spoken: Record<string, SpokenGroupEntry>;
+  knownNames?: Record<string, string>;
+  nativeExcl?: NativePollingExclusions;
+  now?: number;
+}): [string, SpokenGroupEntry][] {
+  const { cfg, store, spoken, knownNames, nativeExcl } = params;
+  const now = params.now ?? Date.now();
+  const lookback = cfg.context.lookback_days * DAY;
+  const maxGroups = Math.max(0, cfg.context.max_groups);
+
+  const resolveName = (id: string, fallback = ""): string => {
+    const first = (fallback || spoken[id]?.name || knownNames?.[id] || "").trim();
+    if (first && first !== "群聊" && !first.startsWith("私聊")) return first;
+    const obsName = (store.latestConvObs(id)?.conv_name ?? "").trim();
+    return obsName && obsName !== "群聊" && !obsName.startsWith("私聊") ? obsName : "";
+  };
+
+  if (cfg.context.groups === "allowlist") {
+    if (maxGroups === 0) return [];
+    const out: [string, SpokenGroupEntry][] = [];
+    const seen = new Set<string>();
+    for (const raw of cfg.context.groups_allow) {
+      const id = raw.trim();
+      if (!id || seen.has(id) || id.startsWith("pw_chat:") || /^\d+$/.test(id)) continue;
+      seen.add(id);
+      const name = resolveName(id);
+      if (isOpenGroupDirectlyDenied(cfg, store, id, name, nativeExcl)) continue;
+      out.push([id, { name, at: now }]);
+      if (out.length >= maxGroups) break;
+    }
+    return out;
+  }
+
+  return Object.entries(spoken)
+    .map(([id, v]): [string, SpokenGroupEntry] => [id, { name: resolveName(id, v.name), at: v.at }])
+    .filter(([id, v]) => v.at >= now - lookback && !isOpenGroupDirectlyDenied(cfg, store, id, v.name, nativeExcl))
+    .sort((a, b) => b[1].at - a[1].at)
+    .slice(0, maxGroups);
+}
+
 export class Connectors {
   app: App;
   store: ContextStore;
@@ -312,8 +428,9 @@ export class Connectors {
       .sort()
       .join("|");
     const deny = [...this.cfg.context.groups_deny].map((s) => s.trim()).sort().join("|");
-    const allow = [...this.cfg.context.groups_allow].map((s) => s.trim()).sort().join("|");
-    return `${this.cfg.context.sources.im ? 1 : 0};${this.cfg.context.groups};${allow};${deny};${mutes}`;
+    // 保留 groups_allow 顺序：在 max_groups 截断下，白名单顺序变化同样改变选中群集合
+    const allow = this.cfg.context.groups_allow.map((s) => s.trim()).join("|");
+    return `${this.cfg.context.sources.im ? 1 : 0};${this.cfg.context.groups};${this.cfg.context.max_groups};${allow};${deny};${mutes}`;
   }
 
   private async resolveCurrentChatMeta(chatId: string): Promise<{ name: string; chatType: "p2p" | "group" | "" } | undefined> {
@@ -396,7 +513,7 @@ export class Connectors {
     };
   }
 
-  async pullIm(): Promise<{ count: number; dropped: number }> {
+  async pullIm(restartAttempt = 0): Promise<{ count: number; dropped: number }> {
     const me = this.cfg.owner.open_id;
     const now = Date.now();
     const lookback = this.cfg.context.lookback_days * DAY;
@@ -420,7 +537,18 @@ export class Connectors {
       );
 
     let policySig = this.pollingPolicySignature();
+    const initialGroupsMode = this.cfg.context.groups;
+    const initialMaxGroups = this.cfg.context.max_groups;
+    const initialAllowOrder = this.cfg.context.groups_allow.map((s) => s.trim()).join("|");
     let nativeExcl = this.nativeExclusions ? await this.nativeExclusions() : undefined;
+
+    const metaCache = new Map<string, { name: string; chatType: "p2p" | "group" | "" } | null>();
+    const getChatMeta = async (chatId: string) => {
+      if (metaCache.has(chatId)) return metaCache.get(chatId) ?? undefined;
+      const resolved = await this.resolveCurrentChatMeta(chatId);
+      metaCache.set(chatId, resolved ?? null);
+      return resolved;
+    };
 
     type StreamKind = "at_me" | "p2p" | "mine" | "group";
     const raws: { m: Raw; kind: string; stream: StreamKind; fallbackGroupName?: string }[] = [];
@@ -436,32 +564,60 @@ export class Connectors {
     for (const m of mine) raws.push({ m, kind: "mine", stream: "mine" });
 
     // 我发言过的群：记录最后发言时间，回看窗口内的群都继续读
-    const spoken: Record<string, { name: string; at: number }> = JSON.parse(this.kv("spoken_groups") ?? "{}");
+    const spoken: Record<string, SpokenGroupEntry> = loadSpokenGroups(this.app.store);
+    const knownNames: Record<string, string> = loadKnownOpenGroupNames(this.app.store);
     for (const m of mine) {
       if (m.chat_type === "group" || m.chat_type === "topic_group") {
         const at = parseTime(m.create_time, this.cfg.owner.timezone);
         const cur = spoken[m.chat_id];
-        if (!cur || at > cur.at) spoken[m.chat_id] = { name: String(m.chat_name ?? cur?.name ?? ""), at };
+        const cname = String(m.chat_name ?? cur?.name ?? "").trim();
+        if (!cur || at > cur.at) spoken[m.chat_id] = { name: cname, at };
+        if (cname && m.chat_id) knownNames[m.chat_id] = cname;
       }
     }
     for (const [id, v] of Object.entries(spoken)) if (v.at < now - lookback) delete spoken[id];
-    const groups =
-      this.cfg.context.groups === "allowlist"
-        ? Object.fromEntries(
-            this.cfg.context.groups_allow
-              .map((s) => s.trim())
-              // 仅保留开放平台群 ID，防止 pw_chat:* / 纯数字原生 ID 占用轮询 max_groups 配额
-              .filter((id) => id && !id.startsWith("pw_chat:") && !/^\d+$/.test(id))
-              .map((id) => [id, { name: spoken[id]?.name ?? "", at: now }]),
-          )
-        : spoken;
+
     const scannedGroups = !nativeExcl?.groupsInconclusive;
+    const needsNameForRanking = this.hasNameDenyPatterns() || !!(nativeExcl && nativeExcl.confirmedGroupNames.size > 0);
+    if (scannedGroups && this.cfg.context.groups === "allowlist" && needsNameForRanking) {
+      const seenAllow = new Set<string>();
+      let allowedCount = 0;
+      for (const raw of this.cfg.context.groups_allow) {
+        const id = raw.trim();
+        if (!id || seenAllow.has(id) || id.startsWith("pw_chat:") || /^\d+$/.test(id)) continue;
+        seenAllow.add(id);
+        let name = (spoken[id]?.name || knownNames[id] || this.store.latestConvObs(id)?.conv_name || "").trim();
+        if (name === "群聊" || name.startsWith("私聊")) name = "";
+        if (!name) {
+          const fresh = await getChatMeta(id);
+          if (fresh?.name) {
+            name = fresh.name;
+            knownNames[id] = name;
+          }
+        }
+        if (!isOpenGroupDirectlyDenied(this.cfg, this.store, id, name, nativeExcl)) {
+          allowedCount++;
+          if (allowedCount >= this.cfg.context.max_groups) break;
+        }
+      }
+    }
+
+    const initialSpokenSnapshot: Record<string, SpokenGroupEntry> = Object.fromEntries(
+      Object.entries(spoken).map(([k, v]) => [k, { ...v }]),
+    );
+    const initialKnownNamesSnapshot: Record<string, string> = { ...knownNames };
     const ranked = !scannedGroups
       ? []
-      : Object.entries(groups)
-          .filter(([id, v]) => this.classifyExclusion(id, v.name, "group", nativeExcl, false) === "allowed")
-          .sort((a, b) => b[1].at - a[1].at)
-          .slice(0, this.cfg.context.max_groups);
+      : selectEffectiveOpenGroups({
+          cfg: this.cfg,
+          store: this.store,
+          spoken: initialSpokenSnapshot,
+          knownNames: initialKnownNamesSnapshot,
+          nativeExcl,
+          now,
+        });
+    const initialRankedKey = ranked.map(([id]) => id).join(",");
+    const rankedSet = new Set(ranked.map(([id]) => id));
 
     const chatPollState = new Map<string, { startCur: number; hadPriorCursor: boolean; fetchFailed: boolean; hadInconclusiveRow: boolean }>();
     for (const [chatId, v] of ranked) {
@@ -535,20 +691,46 @@ export class Connectors {
       }
     }
 
-    const metaCache = new Map<string, { name: string; chatType: "p2p" | "group" | "" } | null>();
-    const getChatMeta = async (chatId: string) => {
-      if (metaCache.has(chatId)) return metaCache.get(chatId) ?? undefined;
-      const resolved = await this.resolveCurrentChatMeta(chatId);
-      metaCache.set(chatId, resolved ?? null);
-      return resolved;
+    const scopeSelectionChanged = (latestExcl?: NativePollingExclusions): boolean => {
+      if (
+        this.cfg.context.groups !== initialGroupsMode ||
+        this.cfg.context.max_groups !== initialMaxGroups ||
+        this.cfg.context.groups_allow.map((s) => s.trim()).join("|") !== initialAllowOrder ||
+        (!latestExcl?.groupsInconclusive) !== scannedGroups
+      ) {
+        return true;
+      }
+      const rechecked = !latestExcl?.groupsInconclusive
+        ? selectEffectiveOpenGroups({
+            cfg: this.cfg,
+            store: this.store,
+            spoken: initialSpokenSnapshot,
+            knownNames: initialKnownNamesSnapshot,
+            nativeExcl: latestExcl,
+            now,
+          })
+            .map(([id]) => id)
+            .join(",")
+        : "";
+      return rechecked !== initialRankedKey;
     };
 
-    // 提交前检测静音/排除策略是否在分页拉取期间变更；若变更则刷新原生排除快照并在原子事务内复核提交
+    // 提交前检测静音/排除策略与选群集合是否在分页拉取期间变更：
+    // 若选中群集合变化（例如 allowlist 从 A 改为 B 或静音触发 max_groups 补位），绝不落库旧群消息或推进游标，而是重启一轮拉取（最多 1 次，仍变更则直接丢弃）
     for (let attempt = 0; attempt < 2; attempt++) {
       const latestSig = this.pollingPolicySignature();
       if (latestSig !== policySig) {
         policySig = latestSig;
         nativeExcl = this.nativeExclusions ? await this.nativeExclusions() : undefined;
+      }
+      if (!this.cfg.context.sources.im) {
+        return { count: 0, dropped: 0 };
+      }
+      if (scopeSelectionChanged(nativeExcl)) {
+        if (restartAttempt < 1) {
+          return this.pullIm(restartAttempt + 1);
+        }
+        return { count: 0, dropped: 0 };
       }
 
       let atMeBlocked = !!nativeExcl?.groupsInconclusive;
@@ -589,8 +771,11 @@ export class Connectors {
         if (!chatName && !needsCurrentName && entry.fallbackGroupName) {
           chatName = entry.fallbackGroupName;
         }
-        if (chatName && chatId && spoken[chatId]) {
-          spoken[chatId].name = chatName;
+        if (chatName && chatId) {
+          if (spoken[chatId]) spoken[chatId].name = chatName;
+          if (chatId.startsWith("oc_") && chatType.toLowerCase() !== "p2p" && chatName !== "群聊" && !chatName.startsWith("私聊")) {
+            knownNames[chatId] = chatName;
+          }
         }
         m.chat_name = chatName;
         m.chat_type = chatType;
@@ -618,6 +803,17 @@ export class Connectors {
           }
           continue;
         }
+        // allowlist 模式下，不在当前选中群集合里的非 @我 普通群消息（如本人发在白名单外群的消息）不入库
+        if (
+          this.cfg.context.groups === "allowlist" &&
+          entry.kind !== "at_me" &&
+          chatType.toLowerCase() !== "p2p" &&
+          chatId.startsWith("oc_") &&
+          !rankedSet.has(chatId)
+        ) {
+          dropped++;
+          continue;
+        }
         const o = this.toObs(m, entry.kind, me);
         if (o) obs.push(o);
       }
@@ -627,9 +823,9 @@ export class Connectors {
       for (const o of obs) if (o.meta.chat_type === "p2p" && !o.is_me && o.actor_name) p2pName.set(o.conv, o.actor_name);
       for (const o of obs) if (o.meta.chat_type === "p2p") o.conv_name = `私聊：${p2pName.get(o.conv) ?? o.conv_name}`;
 
-      // 原子事务提交前最后一次核对策略签名：若在元信息查询期间策略再度变化则重试，绝不提交过期的观测或游标
+      // 原子事务提交前最后一次核对策略签名与群选择集合：若期间策略变更则重试/重启，绝不提交过期的观测或游标
       const commitRes = this.store.tx(() => {
-        if (this.pollingPolicySignature() !== policySig) {
+        if (this.pollingPolicySignature() !== policySig || scopeSelectionChanged(nativeExcl)) {
           return { committed: false as const, count: 0 };
         }
         if (!this.cfg.context.sources.im) {
@@ -637,6 +833,9 @@ export class Connectors {
         }
         const n = this.store.addObs(obs);
         this.setKv("spoken_groups", JSON.stringify(spoken));
+        for (const [cid, cname] of Object.entries(knownNames)) {
+          rememberOpenGroupName(this.app.store, cid, cname);
+        }
         for (const [chatId, st] of chatPollState) {
           if (st.fetchFailed || st.hadInconclusiveRow || nativeExcl?.groupsInconclusive) {
             // 首次拉取该群即受阻时，持久化原始起点 startCur，防止随后推进 cursor.im.groups 跳过未拉到的历史消息

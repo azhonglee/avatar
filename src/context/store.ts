@@ -443,15 +443,28 @@ export class ContextStore {
 
   /**
    * 理解窗口：这个会话最早的一批待处理观测（按时间正序，最多 maxFresh 条）+ 它们之前的若干条已处理观测作为背景。
-   * 从最早的待处理开始，保证大群 / 停机后积压的消息分几批都能处理到，不会因为只取最近 N 条而永远卡住。
+   * 当 `opts.onlyMentions` 为 true（例如群已被移出 allowlist，仅允许真实 @我 例外）时，
+   * 在 SQL LIMIT 之前直接筛选 `kind = 'at_me'`，防止前面积压超过 60 条普通消息饿死后到的真实 @我。
    */
-  convWindow(conv: string, maxFresh = 60, context = 12, activeNativeOwner?: string | null): Obs[] {
+  convWindow(
+    conv: string,
+    maxFresh = 60,
+    context = 12,
+    activeNativeOwner?: string | null,
+    opts?: { onlyMentions?: boolean },
+  ): Obs[] {
     const owner = this.ownerClause(activeNativeOwner);
     const nw = ContextStore.NOT_WITHDRAWN;
+    const mentionSql = opts?.onlyMentions
+      ? " AND kind = 'at_me' AND COALESCE(json_extract(meta, '$.at_me'), 1) != 0 AND COALESCE(json_extract(meta, '$.is_mention_me'), 1) != 0"
+      : "";
     const fresh = this.db
-      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0${nw}${owner.sql} ORDER BY time ASC, id ASC LIMIT ?`)
+      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0${nw}${mentionSql}${owner.sql} ORDER BY time ASC, id ASC LIMIT ?`)
       .all(conv, ...owner.args, maxFresh) as Row[];
     if (!fresh.length) return [];
+    if (opts?.onlyMentions) {
+      return fresh.map((r) => this.toObs(r));
+    }
     const t0 = Number(fresh[0].time);
     const before = this.db
       .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 1 AND time <= ?${nw}${owner.sql} ORDER BY time DESC, id DESC LIMIT ?`)
@@ -462,18 +475,29 @@ export class ContextStore {
   /**
    * 快通道理解窗口：
    *   - 若触发消息（targetObsId）已被常规周期或前序作业处理完（或已撤回/不属于当前账号），直接返回空数组；
+   *   - 当 `opts.onlyMentions` 为 true（群已移出白名单/有效发言群，仅允许真实 @我）时，仅选择真实 `@me` 观测，不混入普通群消息或普通背景；
    *   - 否则包含触发消息及其前后待处理消息（最多 maxFresh 条）、紧贴触发前的最近背景，并为批次中**所有**待处理话题消息补齐 root/parent 锚点。
    */
-  convWindowAround(conv: string, targetObsId: string, maxFresh = 60, context = 12, activeNativeOwner?: string | null): Obs[] {
+  convWindowAround(
+    conv: string,
+    targetObsId: string,
+    maxFresh = 60,
+    context = 12,
+    activeNativeOwner?: string | null,
+    opts?: { onlyMentions?: boolean },
+  ): Obs[] {
     const owner = this.ownerClause(activeNativeOwner);
     const nw = ContextStore.NOT_WITHDRAWN;
+    const mentionSql = opts?.onlyMentions
+      ? " AND kind = 'at_me' AND COALESCE(json_extract(meta, '$.at_me'), 1) != 0 AND COALESCE(json_extract(meta, '$.is_mention_me'), 1) != 0"
+      : "";
     const target = this.db
-      .prepare(`SELECT * FROM ctx_obs WHERE id = ? AND conv = ? AND processed = 0${nw}${owner.sql}`)
+      .prepare(`SELECT * FROM ctx_obs WHERE id = ? AND conv = ? AND processed = 0${nw}${mentionSql}${owner.sql}`)
       .get(targetObsId, conv, ...owner.args) as Row | undefined;
     if (!target) return [];
     const targetTime = Number(target.time);
     const after = this.db
-      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 AND time >= ?${nw}${owner.sql} ORDER BY time ASC, id ASC LIMIT ?`)
+      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 AND time >= ?${nw}${mentionSql}${owner.sql} ORDER BY time ASC, id ASC LIMIT ?`)
       .all(conv, targetTime, ...owner.args, maxFresh) as Row[];
     const hasTarget = after.some((r) => String(r.id) === String(target.id));
     let fresh = hasTarget ? after : [target, ...after.slice(0, Math.max(0, maxFresh - 1))];
@@ -481,12 +505,15 @@ export class ContextStore {
     if (rem > 0) {
       const seen = new Set(fresh.map((r) => String(r.id)));
       const earlierPending = this.db
-        .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 AND time <= ?${nw}${owner.sql} ORDER BY time DESC, id DESC LIMIT ?`)
+        .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 AND time <= ?${nw}${mentionSql}${owner.sql} ORDER BY time DESC, id DESC LIMIT ?`)
         .all(conv, targetTime, ...owner.args, rem + seen.size) as Row[];
       const extra = earlierPending.filter((r) => !seen.has(String(r.id))).slice(0, rem).reverse();
       fresh = [...extra, ...fresh];
     }
     fresh.sort((a, b) => Number(a.time) - Number(b.time) || String(a.id).localeCompare(String(b.id)));
+    if (opts?.onlyMentions) {
+      return fresh.map((r) => this.toObs(r));
+    }
     const includedIds = new Set(fresh.map((r) => String(r.id)));
     // 独立拉取紧贴触发消息之前的最近背景（以 targetTime 为锚点而非最早积压 t0，防止刚补读的近邻背景被旧积压挤出）
     const beforeTrigger = (
@@ -531,6 +558,12 @@ export class ContextStore {
   latestConvObs(conv: string): Obs | undefined {
     const row = this.db.prepare("SELECT * FROM ctx_obs WHERE conv = ? ORDER BY time DESC LIMIT 1").get(conv) as Row | undefined;
     return row ? this.toObs(row) : undefined;
+  }
+
+  isDmConv(conv: string): boolean {
+    return !!this.db
+      .prepare("SELECT 1 FROM ctx_obs WHERE conv = ? AND (kind = 'p2p' OR lower(coalesce(json_extract(meta, '$.chat_type'), '')) = 'p2p') LIMIT 1")
+      .get(conv);
   }
 
   /**

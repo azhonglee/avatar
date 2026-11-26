@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +10,83 @@ import { runProcess } from "./util.ts";
 const FEISHU_WEB_KEY_CRED = "feishu-web-key";
 /** Linux kernel tmpfs magic number (`linux/magic.h`: `TMPFS_MAGIC`). */
 const LINUX_TMPFS_MAGIC = 0x01021994;
+
+type MountMaskBackend = { kind: "bwrap"; bin: string } | { kind: "unshare"; bin: string } | { kind: "none" };
+let cachedMountMaskBackend: MountMaskBackend | undefined;
+
+function probeMountMaskBackend(): MountMaskBackend {
+  if (cachedMountMaskBackend) return cachedMountMaskBackend;
+  try {
+    const bwrapBin = resolveBin("bwrap");
+    const r = spawnSync(bwrapBin, ["--dev-bind", "/", "/", "--", "true"], { timeout: 3_000, stdio: "ignore" });
+    if (r.status === 0) {
+      cachedMountMaskBackend = { kind: "bwrap", bin: bwrapBin };
+      return cachedMountMaskBackend;
+    }
+  } catch {
+    // 尝试 unshare
+  }
+  try {
+    const unshareBin = resolveBin("unshare");
+    const r = spawnSync(unshareBin, ["-r", "-m", "--", "true"], { timeout: 3_000, stdio: "ignore" });
+    if (r.status === 0) {
+      cachedMountMaskBackend = { kind: "unshare", bin: unshareBin };
+      return cachedMountMaskBackend;
+    }
+  } catch {
+    // 均不可用
+  }
+  cachedMountMaskBackend = { kind: "none" };
+  return cachedMountMaskBackend;
+}
+
+/**
+ * 为仓库校验命令、git 子进程等同一 UID 下的不可信子进程提供内核级文件系统遮罩：
+ *   - 若当前服务通过 systemd `LoadCredential` 在 `CREDENTIALS_DIRECTORY` 中暴露了 `feishu-web-key`，
+ *     仅从环境变量剥离 `CREDENTIALS_DIRECTORY` 不足以阻止同 UID 子进程按绝对路径直接读取该文件；
+ *   - 本函数优先用 `bwrap --bind /dev/null <keyFile>`（保留真实 UID/GID、零特权）或 `unshare -r -m` 在子进程独立挂载命名空间中
+ *     将 `feishu-web-key` 覆盖挂载为 `/dev/null`，同时保持目录内其他无关凭据可读；
+ *   - 若宿主机既无 `bwrap` 也无可用 `unshare -r -m`，则按 fail-closed 拒绝启动子进程，提示改用 root 只读 `EnvironmentFile` 或独立服务账号隔离。
+ */
+export function wrapCredentialIsolatedCommand(
+  cmd: string,
+  args: string[],
+  rawEnv: NodeJS.ProcessEnv = process.env,
+  opts?: { forceBackend?: MountMaskBackend },
+): { cmd: string; args: string[]; isolated: boolean } {
+  const credDir = rawEnv.CREDENTIALS_DIRECTORY?.trim();
+  if (!credDir) return { cmd, args, isolated: false };
+  const keyFile = path.join(credDir, FEISHU_WEB_KEY_CRED);
+  if (!fs.existsSync(keyFile)) return { cmd, args, isolated: false };
+  const resolvedKeyFile = (() => {
+    try {
+      return fs.realpathSync(keyFile);
+    } catch {
+      return path.resolve(keyFile);
+    }
+  })();
+
+  const backend = opts?.forceBackend ?? probeMountMaskBackend();
+  if (backend.kind === "bwrap") {
+    const maskArgs: string[] = ["--die-with-parent", "--dev-bind", "/", "/", "--bind", "/dev/null", path.resolve(keyFile)];
+    if (resolvedKeyFile !== path.resolve(keyFile)) {
+      maskArgs.push("--bind", "/dev/null", resolvedKeyFile);
+    }
+    return { cmd: backend.bin, args: [...maskArgs, "--", cmd, ...args], isolated: true };
+  }
+  if (backend.kind === "unshare") {
+    const maskTargets = resolvedKeyFile !== path.resolve(keyFile) ? [path.resolve(keyFile), resolvedKeyFile] : [path.resolve(keyFile)];
+    const script =
+      maskTargets.length === 2
+        ? 'mount --bind /dev/null "$1" && mount --bind /dev/null "$2" && shift 2 && exec "$@"'
+        : 'mount --bind /dev/null "$1" && shift && exec "$@"';
+    return { cmd: backend.bin, args: ["-r", "-m", "--", "sh", "-c", script, "_", ...maskTargets, cmd, ...args], isolated: true };
+  }
+  throw new Error(
+    "检测到 CREDENTIALS_DIRECTORY 包含 feishu-web-key，但当前宿主机不支持 bwrap 或 unshare -r -m 挂载命名空间隔离；" +
+      "为防止仓库校验或 git 子进程按路径读取个人 Web 加密密钥，已拒绝执行。请安装 bubblewrap，或改用仅 root 可读的 EnvironmentFile / 独立服务账号部署。",
+  );
+}
 
 /** 检测目录是否位于易失性内存文件系统（tmpfs），绝不把无关 systemd 凭据复制到磁盘介质的 /tmp */
 function findVolatileTmpfsBase(env: NodeJS.ProcessEnv, overrideCandidates?: string[]): string | undefined {
@@ -149,13 +227,25 @@ function serializeTomlScalar(v: TomlValue): string {
   if (typeof v === "string") return JSON.stringify(v);
   if (typeof v === "boolean") return v ? "true" : "false";
   if (typeof v === "number") {
-    if (!Number.isFinite(v)) throw new Error(`不支持的 Codex 非有限数值配置：${v}`);
+    if (!Number.isFinite(v)) throw new Error("不支持的非有限数值 TOML 配置");
     return String(v);
   }
   throw new Error("不支持的非标量 TOML 配置值");
 }
 
+function serializeTomlInlineValue(v: TomlValue): string {
+  if (isPlainTable(v)) {
+    const entries = Object.entries(v).map(([k, val]) => `${formatTomlKeySegment(k)}=${serializeTomlInlineValue(val)}`);
+    return `{${entries.join(",")}}`;
+  }
+  if (Array.isArray(v)) {
+    return `[${v.map((el) => serializeTomlInlineValue(el)).join(",")}]`;
+  }
+  return serializeTomlScalar(v);
+}
+
 const BUILTIN_CODEX_PROVIDERS = new Set(["openai", "oss"]);
+const ALLOWED_CODEX_CREDENTIAL_STORES = new Set(["file", "keyring", "auto"]);
 const SAFE_CODEX_TOP_SCALARS = new Set([
   "model",
   "model_provider",
@@ -164,6 +254,7 @@ const SAFE_CODEX_TOP_SCALARS = new Set([
   "openai_base_url",
   "chatgpt_base_url",
   "oss_provider",
+  "cli_auth_credentials_store",
 ]);
 const SAFE_CODEX_EXTRA_SCALARS = [
   "model_reasoning_effort",
@@ -171,6 +262,7 @@ const SAFE_CODEX_EXTRA_SCALARS = [
   "openai_base_url",
   "chatgpt_base_url",
   "oss_provider",
+  "cli_auth_credentials_store",
 ] as const;
 const SAFE_CODEX_PROVIDER_SCALARS = new Set([
   "name",
@@ -185,32 +277,78 @@ const SAFE_CODEX_PROVIDER_SCALARS = new Set([
 ]);
 const SECRET_QUERY_PARAM_RE = /(?:key|token|secret|auth|sig|pass|cred)/i;
 
+function validateSafeCodexUrl(rawUrl: string, label: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error(`Codex ${label} 不是合法 URL；已中止 tools=none 执行`);
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(`Codex ${label} 仅支持 http/https 协议；已中止 tools=none 执行`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error(
+      `Codex ${label} 包含内嵌账号/口令（userinfo）；为避免凭据暴露在命令行参数与运行日志中，tools=none 模式拒绝透传，请改用 env_key 或 env_http_headers`,
+    );
+  }
+  for (const [k] of parsed.searchParams) {
+    if (SECRET_QUERY_PARAM_RE.test(k)) {
+      throw new Error(
+        `Codex ${label} 的查询参数 "${k}" 疑似包含凭据；为避免密钥暴露在命令行参数与运行日志中，tools=none 模式拒绝透传，请改用 env_key 或 env_http_headers`,
+      );
+    }
+  }
+  if (parsed.hash && SECRET_QUERY_PARAM_RE.test(parsed.hash)) {
+    throw new Error(`Codex ${label} 的 URL 片段疑似包含凭据；已中止 tools=none 执行`);
+  }
+  return rawUrl;
+}
+
+function validateSafeScalarValue(key: string, val: TomlValue): TomlValue {
+  if (key === "openai_base_url" || key === "chatgpt_base_url") {
+    if (typeof val !== "string" || !val.trim()) throw new Error(`Codex ${key} 必须为非空 URL 字符串`);
+    return validateSafeCodexUrl(val.trim(), key);
+  }
+  if (key === "cli_auth_credentials_store") {
+    if (typeof val !== "string" || !ALLOWED_CODEX_CREDENTIAL_STORES.has(val)) {
+      throw new Error(`Codex cli_auth_credentials_store 仅支持 file / keyring / auto`);
+    }
+    return val;
+  }
+  return val;
+}
+
 function parseCliConfigAssignment(expr: string): { key: string; value: string } | undefined {
   const eq = expr.indexOf("=");
   if (eq <= 0) return undefined;
   return { key: expr.slice(0, eq).trim(), value: expr.slice(eq + 1).trim() };
 }
 
-function parseCliTomlOrLiteral(raw: string): TomlValue {
+function parseCliTomlOrLiteral(keyLabel: string, raw: string): TomlValue {
   try {
     return parseTomlValue(raw);
   } catch {
-    // codex -c 对裸字符串回退为字符串字面量；仅允许无括号/引号/换行的简单字面量，复杂非法表达式仍按 fail-closed 报错
     if (/^[A-Za-z0-9._:/+-]+$/.test(raw)) return raw;
-    throw new Error(`无法解析 Codex -c 配置值：${raw.slice(0, 60)}`);
+    // 绝不回显原始配置值，防止未加引号的密钥泄漏到日志或错误信息
+    throw new Error(`无法解析 Codex -c 键 "${keyLabel}" 的配置值（请检查 TOML 语法或引号）`);
   }
 }
 
 function redactCodexLogArgs(args: string[]): string[] {
-  return args.map((a) =>
-    /^(?:--config=)?model_providers\.[^=]+\.(?:http_headers|experimental_bearer_token|query_params)(?:\.[^=]+)?=/.test(a)
-      ? a.replace(/=.*$/, "=<redacted>")
-      : a,
-  );
+  return args.map((a) => {
+    if (/^(?:--config=)?model_providers\.[^=]+\.(?:http_headers|experimental_bearer_token|query_params)(?:\.[^=]+)?=/.test(a)) {
+      return a.replace(/=.*$/, "=<redacted>");
+    }
+    if (/^(?:--config=)?(?:openai_base_url|chatgpt_base_url|model_providers\.[^=]+\.base_url)=/.test(a) && /[@?]/.test(a)) {
+      return a.replace(/=.*$/, "=<redacted-url>");
+    }
+    return a;
+  });
 }
 
 export interface SafeCodexProviderConfig {
-  /** 从用户 config.toml 提取的安全 `-c` 参数（不含任何静态凭据明文） */
+  /** 从用户 config.toml 提取的安全 `-c` 参数（不含任何静态凭据明文；含点号供应商名以 TOML 内联表编码避免 `-c` 按点切分） */
   args: string[];
   /** 仅通过子进程环境变量传递的静态请求头（由 `env_http_headers` 引用，永不出现在 argv 或运行日志中） */
   extraEnv: Record<string, string>;
@@ -220,11 +358,11 @@ export interface SafeCodexProviderConfig {
 
 /**
  * 为 `codex-exec` 的 `tools: "none"` 模式构造工具隔离参数：
- *   1. 按子进程实际 `CODEX_HOME` / `HOME` 定位 `config.toml`，并用完整 TOML 1.0 解析器解析（绝不被多行字符串中的 `[...]` 误导）；
- *   2. 严格校验 `extraArgs`，仅放行模型/供应商/禁用特性开关，拒绝 `--profile`、`--enable`、`-c mcp_servers.*` / `plugins.*` / `hooks.*` / `sandbox_permissions` 等；
- *   3. 静态 `http_headers`（无论点分表还是内联表 `{ ... }`）与 `experimental_bearer_token` 一律转为子进程环境变量 + `env_http_headers`，
- *      彻底避免供应商密钥出现在进程参数（argv / ps）或持久化运行日志中；
- *   4. 若配置了自定义供应商、profile 或无法安全解析的 TOML，按 fail-closed 抛错，绝不把私聊误发往默认供应商。
+ *   1. 按子进程实际 `CODEX_HOME` / `HOME` 定位 `config.toml`，并用严格 TOML 1.0 解析器解析（拒绝重复键与多行字符串误判）；
+ *   2. 保留 `cli_auth_credentials_store`、`model`、`model_provider`、`model_reasoning_effort`、`service_tier`、安全 base_url 等配置；
+ *   3. 严格校验 `extraArgs`，拒绝 `--profile`、`--enable`、`-c mcp_servers.*` / `plugins.*` / `hooks.*` / `sandbox_permissions` 及含凭据 URL；
+ *   4. 静态 `http_headers`（无论点分表还是内联表 `{ ... }`）与 `experimental_bearer_token` 一律转为子进程环境变量 + `env_http_headers`；
+ *   5. 通过 `-c model_providers={<provider>={...}}` 内联表形式下发供应商配置，兼容带点号的供应商名（如 `corp.test`）。
  */
 export function extractSafeCodexProviderConfig(
   env: NodeJS.ProcessEnv,
@@ -237,15 +375,17 @@ export function extractSafeCodexProviderConfig(
 
   const extraEnv: Record<string, string> = {};
   let secretHdrIdx = 0;
-  const bindEnvHeader = (pKey: string, headerName: string, headerValue: string, targetArgs: string[]) => {
+  const allocEnvHeaderVar = (headerValue: string): string => {
     const varName = `__PA_CODEX_HDR_${secretHdrIdx++}`;
     extraEnv[varName] = headerValue;
-    targetArgs.push("-c", `model_providers.${pKey}.env_http_headers.${formatTomlKeySegment(headerName)}=${JSON.stringify(varName)}`);
+    return varName;
   };
 
-  const emitProviderEntries = (providerName: string, obj: TomlTable, targetArgs: string[]) => {
-    const pKey = formatTomlKeySegment(providerName);
-    const explicitEnvHeaders = new Set<string>();
+  const sanitizeProviderTable = (providerName: string, obj: TomlTable): TomlTable => {
+    const sanitized: TomlTable = Object.create(null) as TomlTable;
+    const envHeaders: TomlTable = Object.create(null) as TomlTable;
+    const explicitEnvLower = new Set<string>();
+
     const rawEnvHeaders = obj.env_http_headers;
     if (rawEnvHeaders !== undefined) {
       if (!isPlainTable(rawEnvHeaders)) {
@@ -255,8 +395,8 @@ export function extractSafeCodexProviderConfig(
         if (typeof hv !== "string") {
           throw new Error(`Codex env_http_headers.${hk} 必须为环境变量名字符串`);
         }
-        explicitEnvHeaders.add(hk.toLowerCase());
-        targetArgs.push("-c", `model_providers.${pKey}.env_http_headers.${formatTomlKeySegment(hk)}=${JSON.stringify(hv)}`);
+        explicitEnvLower.add(hk.toLowerCase());
+        envHeaders[hk] = hv;
       }
     }
 
@@ -269,9 +409,8 @@ export function extractSafeCodexProviderConfig(
         if (typeof hv !== "string") {
           throw new Error(`Codex http_headers.${hk} 必须为字符串`);
         }
-        // 静态请求头（含内联表与子表）一律走环境变量引用，绝不进入 argv 或日志
-        if (!explicitEnvHeaders.has(hk.toLowerCase())) {
-          bindEnvHeader(pKey, hk, hv, targetArgs);
+        if (!explicitEnvLower.has(hk.toLowerCase())) {
+          envHeaders[hk] = allocEnvHeaderVar(hv);
         }
       }
     }
@@ -282,11 +421,15 @@ export function extractSafeCodexProviderConfig(
         throw new Error(`Codex [model_providers.${providerName}].experimental_bearer_token 格式非法`);
       }
       const hasAuthHdr =
-        explicitEnvHeaders.has("authorization") ||
+        explicitEnvLower.has("authorization") ||
         (isPlainTable(rawHttpHeaders) && Object.keys(rawHttpHeaders).some((k) => k.toLowerCase() === "authorization"));
       if (!hasAuthHdr) {
-        bindEnvHeader(pKey, "Authorization", `Bearer ${rawBearer}`, targetArgs);
+        envHeaders.Authorization = allocEnvHeaderVar(`Bearer ${rawBearer}`);
       }
+    }
+
+    if (Object.keys(envHeaders).length > 0) {
+      sanitized.env_http_headers = envHeaders;
     }
 
     const rawQuery = obj.query_params;
@@ -294,6 +437,7 @@ export function extractSafeCodexProviderConfig(
       if (!isPlainTable(rawQuery)) {
         throw new Error(`Codex [model_providers.${providerName}.query_params] 格式非法`);
       }
+      const qMap: TomlTable = Object.create(null) as TomlTable;
       for (const [qk, qv] of Object.entries(rawQuery)) {
         if (typeof qv !== "string") throw new Error(`Codex query_params.${qk} 必须为字符串`);
         if (SECRET_QUERY_PARAM_RE.test(qk)) {
@@ -301,66 +445,113 @@ export function extractSafeCodexProviderConfig(
             `Codex [model_providers.${providerName}.query_params] 包含疑似密钥参数 "${qk}"；为避免密钥暴露在命令行参数中，tools=none 模式拒绝透传，请改用 env_key 或 env_http_headers`,
           );
         }
-        targetArgs.push("-c", `model_providers.${pKey}.query_params.${formatTomlKeySegment(qk)}=${JSON.stringify(qv)}`);
+        qMap[qk] = qv;
+      }
+      if (Object.keys(qMap).length > 0) {
+        sanitized.query_params = qMap;
       }
     }
 
     for (const [k, v] of Object.entries(obj)) {
       if (k === "http_headers" || k === "env_http_headers" || k === "query_params" || k === "experimental_bearer_token") continue;
       if (!SAFE_CODEX_PROVIDER_SCALARS.has(k)) continue;
-      targetArgs.push("-c", `model_providers.${pKey}.${formatTomlKeySegment(k)}=${serializeTomlScalar(v)}`);
+      if (k === "base_url") {
+        if (typeof v !== "string" || !v.trim()) throw new Error(`Codex [model_providers.${providerName}].base_url 必须为非空 URL 字符串`);
+        sanitized.base_url = validateSafeCodexUrl(v.trim(), `model_providers.${providerName}.base_url`);
+      } else {
+        sanitized[k] = v;
+      }
     }
+    return sanitized;
   };
 
-  // 1) 严格校验并净化 extraArgs：tools="none" 仅允许模型/供应商/特性禁用参数，禁止通过 extraArgs 注入 MCP、工具或放宽沙箱
+  // 1) 严格校验并净化 extraArgs：tools="none" 仅允许模型/供应商/特性禁用参数
   let extraHasModelProvider = false;
   let extraProvider: string | undefined;
-  const extraProviderDefs = new Set<string>();
+  const extraProviderTables = new Map<string, TomlTable>();
   let extraHasModel = hasExplicitModel;
   const sanitizedExtraArgs: string[] = [];
+
+  const ensureExtraProvider = (pName: string): TomlTable => {
+    let t = extraProviderTables.get(pName);
+    if (!t) {
+      t = Object.create(null) as TomlTable;
+      extraProviderTables.set(pName, t);
+    }
+    return t;
+  };
+
+  const mergeProviderSubtable = (target: TomlTable, subKey: string, entries: TomlTable) => {
+    const existing = target[subKey];
+    const sub: TomlTable = isPlainTable(existing) ? existing : (Object.create(null) as TomlTable);
+    for (const [k, v] of Object.entries(entries)) sub[k] = v;
+    target[subKey] = sub;
+  };
 
   const handleExtraConfigExpr = (expr: string) => {
     const parsed = parseCliConfigAssignment(expr);
     if (!parsed) {
-      throw new Error(`codex-exec tools="none" 模式拒绝无法解析的 -c 参数：${expr.slice(0, 60)}`);
+      throw new Error('codex-exec tools="none" 模式拒绝无法解析的 -c 参数（缺少 key=value）');
     }
     const segs = parseTomlKeyPath(parsed.key);
-    const val = parseCliTomlOrLiteral(parsed.value);
+    const val = parseCliTomlOrLiteral(parsed.key, parsed.value);
     if (segs.length === 1 && SAFE_CODEX_TOP_SCALARS.has(segs[0])) {
+      const checkedVal = validateSafeScalarValue(segs[0], val);
       if (segs[0] === "model") {
         extraHasModel = true;
       } else if (segs[0] === "model_provider") {
-        if (typeof val !== "string" || !val) throw new Error("codex-exec extraArgs 中的 model_provider 必须为非空字符串");
+        if (typeof checkedVal !== "string" || !checkedVal) {
+          throw new Error("codex-exec extraArgs 中的 model_provider 必须为非空字符串");
+        }
         extraHasModelProvider = true;
-        extraProvider = val;
+        extraProvider = checkedVal;
       }
-      sanitizedExtraArgs.push("-c", `${formatTomlKeySegment(segs[0])}=${serializeTomlScalar(val)}`);
+      sanitizedExtraArgs.push("-c", `${formatTomlKeySegment(segs[0])}=${serializeTomlScalar(checkedVal)}`);
+      return;
+    }
+    if (segs.length === 1 && segs[0] === "model_providers") {
+      if (!isPlainTable(val)) throw new Error("extraArgs 中的 model_providers 必须为 TOML 内联表");
+      for (const [pName, pDef] of Object.entries(val)) {
+        if (!isPlainTable(pDef)) throw new Error(`extraArgs model_providers.${pName} 必须为表`);
+        const sanitizedP = sanitizeProviderTable(pName, pDef);
+        const dst = ensureExtraProvider(pName);
+        for (const [fk, fv] of Object.entries(sanitizedP)) {
+          if (isPlainTable(fv)) mergeProviderSubtable(dst, fk, fv);
+          else dst[fk] = fv;
+        }
+      }
       return;
     }
     if (segs[0] === "model_providers" && segs.length >= 3) {
       const pName = segs[1];
       const field = segs[2];
-      const pKey = formatTomlKeySegment(pName);
-      extraProviderDefs.add(pName);
+      const dst = ensureExtraProvider(pName);
       if (segs.length === 3 && SAFE_CODEX_PROVIDER_SCALARS.has(field)) {
-        sanitizedExtraArgs.push("-c", `model_providers.${pKey}.${formatTomlKeySegment(field)}=${serializeTomlScalar(val)}`);
+        if (field === "base_url") {
+          if (typeof val !== "string" || !val.trim()) throw new Error(`extraArgs model_providers.${pName}.base_url 必须为非空 URL`);
+          dst.base_url = validateSafeCodexUrl(val.trim(), `extraArgs model_providers.${pName}.base_url`);
+        } else {
+          dst[field] = val;
+        }
         return;
       }
       if (segs.length === 3 && field === "experimental_bearer_token") {
         if (typeof val !== "string" || !val) throw new Error("experimental_bearer_token 必须为非空字符串");
-        bindEnvHeader(pKey, "Authorization", `Bearer ${val}`, sanitizedExtraArgs);
+        mergeProviderSubtable(dst, "env_http_headers", { Authorization: allocEnvHeaderVar(`Bearer ${val}`) });
         return;
       }
       if (field === "http_headers") {
         if (segs.length === 3 && isPlainTable(val)) {
+          const mapped: TomlTable = Object.create(null) as TomlTable;
           for (const [hk, hv] of Object.entries(val)) {
             if (typeof hv !== "string") throw new Error(`extraArgs http_headers.${hk} 必须为字符串`);
-            bindEnvHeader(pKey, hk, hv, sanitizedExtraArgs);
+            mapped[hk] = allocEnvHeaderVar(hv);
           }
+          mergeProviderSubtable(dst, "env_http_headers", mapped);
           return;
         }
         if (segs.length === 4 && typeof val === "string") {
-          bindEnvHeader(pKey, segs[3], val, sanitizedExtraArgs);
+          mergeProviderSubtable(dst, "env_http_headers", { [segs[3]]: allocEnvHeaderVar(val) });
           return;
         }
         throw new Error(`extraArgs 中的 model_providers.${pName}.http_headers 格式非法`);
@@ -369,12 +560,12 @@ export function extractSafeCodexProviderConfig(
         if (segs.length === 3 && isPlainTable(val)) {
           for (const [hk, hv] of Object.entries(val)) {
             if (typeof hv !== "string") throw new Error(`extraArgs env_http_headers.${hk} 必须为字符串`);
-            sanitizedExtraArgs.push("-c", `model_providers.${pKey}.env_http_headers.${formatTomlKeySegment(hk)}=${JSON.stringify(hv)}`);
           }
+          mergeProviderSubtable(dst, "env_http_headers", val);
           return;
         }
         if (segs.length === 4 && typeof val === "string") {
-          sanitizedExtraArgs.push("-c", `model_providers.${pKey}.env_http_headers.${formatTomlKeySegment(segs[3])}=${JSON.stringify(val)}`);
+          mergeProviderSubtable(dst, "env_http_headers", { [segs[3]]: val });
           return;
         }
         throw new Error(`extraArgs 中的 model_providers.${pName}.env_http_headers 格式非法`);
@@ -386,15 +577,15 @@ export function extractSafeCodexProviderConfig(
             if (SECRET_QUERY_PARAM_RE.test(qk)) {
               throw new Error(`extraArgs query_params 包含疑似密钥参数 "${qk}"，tools=none 模式拒绝透传`);
             }
-            sanitizedExtraArgs.push("-c", `model_providers.${pKey}.query_params.${formatTomlKeySegment(qk)}=${JSON.stringify(qv)}`);
           }
+          mergeProviderSubtable(dst, "query_params", val);
           return;
         }
         if (segs.length === 4 && typeof val === "string") {
           if (SECRET_QUERY_PARAM_RE.test(segs[3])) {
             throw new Error(`extraArgs query_params 包含疑似密钥参数 "${segs[3]}"，tools=none 模式拒绝透传`);
           }
-          sanitizedExtraArgs.push("-c", `model_providers.${pKey}.query_params.${formatTomlKeySegment(segs[3])}=${JSON.stringify(val)}`);
+          mergeProviderSubtable(dst, "query_params", { [segs[3]]: val });
           return;
         }
         throw new Error(`extraArgs 中的 model_providers.${pName}.query_params 格式非法`);
@@ -451,76 +642,101 @@ export function extractSafeCodexProviderConfig(
   }
 
   // 2) 解析子进程主目录对应的 $CODEX_HOME/config.toml
-  if (!fs.existsSync(configPath)) {
-    return { args: [], extraEnv, sanitizedExtraArgs };
-  }
-  const rawContent = fs.readFileSync(configPath, "utf8");
-  let doc: TomlTable;
-  try {
-    doc = parseToml(rawContent);
-  } catch (err) {
-    throw new Error(
-      `无法安全解析 Codex 配置文件 (${configPath})：${err instanceof Error ? err.message : String(err)}；为避免将私聊发往默认供应商，已中止 tools=none 执行`,
-    );
-  }
+  const out: string[] = [];
+  const mergedProviders: TomlTable = Object.create(null) as TomlTable;
 
-  const profileRaw = doc.profile;
-  if (profileRaw !== undefined && (typeof profileRaw !== "string" || !profileRaw.trim())) {
-    throw new Error("Codex config.toml 中的 profile 配置非法；为避免误发往默认供应商，已中止 tools=none 执行");
-  }
-  const activeProfileName = typeof profileRaw === "string" ? profileRaw.trim() : undefined;
-  let activeProfile: TomlTable | undefined;
-  if (activeProfileName) {
-    const profilesTable = doc.profiles;
-    const candidate = isPlainTable(profilesTable) ? profilesTable[activeProfileName] : undefined;
-    if (!isPlainTable(candidate)) {
+  if (fs.existsSync(configPath)) {
+    const rawContent = fs.readFileSync(configPath, "utf8");
+    let doc: TomlTable;
+    try {
+      doc = parseToml(rawContent);
+    } catch (err) {
       throw new Error(
-        `Codex config.toml 指定了 profile "${activeProfileName}"，但未找到对应的 [profiles.${activeProfileName}]；为避免将私聊发往默认供应商，已中止执行`,
+        `无法安全解析 Codex 配置文件 (${configPath})：${err instanceof Error ? err.message : "TOML 语法错误"}；为避免将私聊发往默认供应商，已中止 tools=none 执行`,
       );
     }
-    activeProfile = candidate;
+
+    const profileRaw = doc.profile;
+    if (profileRaw !== undefined && (typeof profileRaw !== "string" || !profileRaw.trim())) {
+      throw new Error("Codex config.toml 中的 profile 配置非法；为避免误发往默认供应商，已中止 tools=none 执行");
+    }
+    const activeProfileName = typeof profileRaw === "string" ? profileRaw.trim() : undefined;
+    let activeProfile: TomlTable | undefined;
+    if (activeProfileName) {
+      const profilesTable = doc.profiles;
+      const candidate = isPlainTable(profilesTable) ? profilesTable[activeProfileName] : undefined;
+      if (!isPlainTable(candidate)) {
+        throw new Error(
+          `Codex config.toml 指定了 profile "${activeProfileName}"，但未找到对应的 [profiles.${activeProfileName}]；为避免将私聊发往默认供应商，已中止执行`,
+        );
+      }
+      activeProfile = candidate;
+    }
+
+    const effectiveVal = (key: string): TomlValue | undefined =>
+      activeProfile && activeProfile[key] !== undefined ? activeProfile[key] : doc[key];
+
+    const selectedProviderVal = effectiveVal("model_provider");
+    if (selectedProviderVal !== undefined && (typeof selectedProviderVal !== "string" || !selectedProviderVal.trim())) {
+      throw new Error("Codex config.toml 中的 model_provider 配置非法；为避免将私聊发往默认供应商，已中止执行");
+    }
+    const selectedProvider = typeof selectedProviderVal === "string" ? selectedProviderVal.trim() : undefined;
+    const effectiveProvider = extraProvider ?? selectedProvider ?? "openai";
+
+    const modelVal = effectiveVal("model");
+    if (!extraHasModel && modelVal !== undefined) {
+      if (typeof modelVal !== "string") throw new Error("Codex config.toml 中的 model 必须为字符串");
+      out.push("-c", `model=${JSON.stringify(modelVal)}`);
+    }
+    for (const scalarKey of SAFE_CODEX_EXTRA_SCALARS) {
+      const v = effectiveVal(scalarKey);
+      if (v !== undefined) {
+        const checked = validateSafeScalarValue(scalarKey, v);
+        out.push("-c", `${scalarKey}=${serializeTomlScalar(checked)}`);
+      }
+    }
+
+    if (selectedProvider && !extraHasModelProvider) {
+      out.push("-c", `model_provider=${JSON.stringify(selectedProvider)}`);
+    }
+
+    const providersRoot = doc.model_providers;
+    if (providersRoot !== undefined && !isPlainTable(providersRoot)) {
+      throw new Error("Codex config.toml 中的 model_providers 必须为表；已中止 tools=none 执行");
+    }
+    const providerObj = isPlainTable(providersRoot) ? providersRoot[effectiveProvider] : undefined;
+    if (providerObj !== undefined && !isPlainTable(providerObj)) {
+      throw new Error(`Codex config.toml 中的 [model_providers.${effectiveProvider}] 格式非法；已中止执行`);
+    }
+    if (!providerObj && !BUILTIN_CODEX_PROVIDERS.has(effectiveProvider) && !extraProviderTables.has(effectiveProvider)) {
+      throw new Error(
+        `Codex config.toml 指定了自定义供应商 "${effectiveProvider}"，但未能解析对应的 [model_providers.${effectiveProvider}] 配置；为避免私聊误发往默认供应商，已中止执行`,
+      );
+    }
+    if (providerObj) {
+      mergedProviders[effectiveProvider] = sanitizeProviderTable(effectiveProvider, providerObj);
+    }
   }
 
-  const effectiveVal = (key: string): TomlValue | undefined =>
-    activeProfile && activeProfile[key] !== undefined ? activeProfile[key] : doc[key];
-
-  const selectedProviderVal = effectiveVal("model_provider");
-  if (selectedProviderVal !== undefined && (typeof selectedProviderVal !== "string" || !selectedProviderVal.trim())) {
-    throw new Error("Codex config.toml 中的 model_provider 配置非法；为避免将私聊发往默认供应商，已中止执行");
-  }
-  const selectedProvider = typeof selectedProviderVal === "string" ? selectedProviderVal.trim() : undefined;
-  const effectiveProvider = extraProvider ?? selectedProvider ?? "openai";
-
-  const out: string[] = [];
-  const modelVal = effectiveVal("model");
-  if (!extraHasModel && modelVal !== undefined) {
-    if (typeof modelVal !== "string") throw new Error("Codex config.toml 中的 model 必须为字符串");
-    out.push("-c", `model=${JSON.stringify(modelVal)}`);
-  }
-  for (const scalarKey of SAFE_CODEX_EXTRA_SCALARS) {
-    const v = effectiveVal(scalarKey);
-    if (v !== undefined) out.push("-c", `${scalarKey}=${serializeTomlScalar(v)}`);
+  // 将 extraArgs 中覆盖的 model_providers 合并进同一个 TOML 内联表（extraArgs 优先），
+  // 通过 `-c model_providers={...}` 传给 Codex，彻底兼容带点号的供应商名（如 corp.test）
+  for (const [pName, pOverride] of extraProviderTables) {
+    const existing = mergedProviders[pName];
+    if (isPlainTable(existing)) {
+      const combined: TomlTable = Object.create(null) as TomlTable;
+      for (const [k, v] of Object.entries(existing)) combined[k] = v;
+      for (const [k, v] of Object.entries(pOverride)) {
+        if (isPlainTable(v)) mergeProviderSubtable(combined, k, v);
+        else combined[k] = v;
+      }
+      mergedProviders[pName] = combined;
+    } else {
+      mergedProviders[pName] = pOverride;
+    }
   }
 
-  if (selectedProvider && !extraHasModelProvider) {
-    out.push("-c", `model_provider=${JSON.stringify(selectedProvider)}`);
-  }
-
-  const providersRoot = doc.model_providers;
-  if (providersRoot !== undefined && !isPlainTable(providersRoot)) {
-    throw new Error("Codex config.toml 中的 model_providers 必须为表；已中止 tools=none 执行");
-  }
-  const providerObj = isPlainTable(providersRoot) ? providersRoot[effectiveProvider] : undefined;
-  if (providerObj !== undefined && !isPlainTable(providerObj)) {
-    throw new Error(`Codex config.toml 中的 [model_providers.${effectiveProvider}] 格式非法；已中止执行`);
-  }
-  if (!providerObj && !BUILTIN_CODEX_PROVIDERS.has(effectiveProvider) && !extraProviderDefs.has(effectiveProvider)) {
-    throw new Error(
-      `Codex config.toml 指定了自定义供应商 "${effectiveProvider}"，但未能解析对应的 [model_providers.${effectiveProvider}] 配置；为避免私聊误发往默认供应商，已中止执行`,
-    );
-  }
-  if (providerObj) {
-    emitProviderEntries(effectiveProvider, providerObj, out);
+  if (Object.keys(mergedProviders).length > 0) {
+    out.push("-c", `model_providers=${serializeTomlInlineValue(mergedProviders)}`);
   }
 
   return { args: out, extraEnv, sanitizedExtraArgs };
@@ -606,7 +822,8 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       PA_LARK_REAL: realLark,
       PA_GUARD_LOG: path.join(cfg.dataDir, "logs", "guard.log"),
     };
-    r = await runProcess(cfg.bins.acpx, args, {
+    const wrapped = wrapCredentialIsolatedCommand(cfg.bins.acpx, args);
+    r = await runProcess(wrapped.cmd, wrapped.args, {
       cwd: run.cwd,
       env,
       input: run.prompt,
@@ -717,7 +934,8 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
     }
     if (h.model) args.push("-m", h.model);
     args.push(...extraToPass, "-");
-    r = await runProcess(cmd, args, {
+    const wrapped = wrapCredentialIsolatedCommand(cmd, args);
+    r = await runProcess(wrapped.cmd, wrapped.args, {
       cwd: execCwd,
       env: finalEnv,
       input: run.prompt,
@@ -789,7 +1007,8 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       PA_LARK_REAL: realLark,
       PA_GUARD_LOG: path.join(cfg.dataDir, "logs", "guard.log"),
     };
-    r = await runProcess(cmd, args, {
+    const wrapped = wrapCredentialIsolatedCommand(cmd, args);
+    r = await runProcess(wrapped.cmd, wrapped.args, {
       cwd: run.cwd,
       env,
       stdinFd: fd,

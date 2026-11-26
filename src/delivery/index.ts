@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { z } from "zod";
 import type { App } from "../app.ts";
-import { deliveryOf, taskUrl } from "../api/queries.ts";
+import { deliveryOf, isContextDerivedDispatchBlocked, taskUrl } from "../api/queries.ts";
 import type { DeliveryStatus } from "../api/types.ts";
 import { CommandError } from "../commands.ts";
 import { repoSpec, type Config, type RepoSpec } from "../config.ts";
@@ -88,6 +88,9 @@ export function registerDelivery(app: App): void {
 
   /** 派单存在、已结束、是这张卡片最新的一次、有分支，且当前交付状态允许这个动作。 */
   function checkTarget(id: string, action: DeliveryAction): { w: Dispatch; status: DeliveryStatus } {
+    if (isContextDerivedDispatchBlocked(app, id)) {
+      throw new CommandError("conflict", "该派单源自旧工作区主人的工作上下文，已按主人隔离阻断操作");
+    }
     const w = ledger.get<DispatchPayload>(id);
     if (!w || w.kind !== "dispatch") throw new CommandError("not_found", `没有这项派单：${id}`);
     if (!w.terminal) throw new CommandError("conflict", "派单还在进行中，结束后才能交付");

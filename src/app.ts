@@ -63,7 +63,7 @@ export function createApp(cfg: Config) {
   engine.register(dispatcher.handler());
   engine.register(jobHandler(cfg, store, ledger));
   engine.register(eventHandler(app));
-  registerCoreCommands(commands, { cfg, ledger, board, dispatcher });
+  registerCoreCommands(commands, { cfg, store, ledger, board, dispatcher });
   registerModules(app);
   return app;
 }

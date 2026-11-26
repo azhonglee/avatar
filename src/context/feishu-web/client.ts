@@ -246,7 +246,9 @@ export class FeishuWebClient {
     const meta = await loadWebMetadata(jar, ep, { signal });
     client.deviceId = meta.deviceId;
     client.appKey = meta.appKey;
-    client.notifySessionConfirmed();
+    if (!client.notifySessionConfirmed()) {
+      throw new WebHttpError("aborted", "本地凭据已被登出或更新");
+    }
     return client;
   }
 

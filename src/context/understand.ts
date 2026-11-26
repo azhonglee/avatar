@@ -111,6 +111,8 @@ export interface ApplyResult {
   people: number;
   conflicts: number;
   rejected: number;
+  /** 本次事务实际标记为已处理的新观测数量（整批被拒绝或丢租约时为 0） */
+  processed: number;
 }
 
 const fmt = (ms: number, tz: string) =>
@@ -134,6 +136,7 @@ export class Understander {
     maxChars = 24_000,
     activeNativeOwner?: string | null,
     filterObs?: (conv: string, obs: Obs[]) => Obs[],
+    isMentionsOnly?: (conv: string) => boolean,
   ): { prompt: string; obs: Obs[]; fresh: string[]; convs: string[] } {
     const tz = this.cfg.owner.timezone;
     const sections: string[] = [];
@@ -142,9 +145,10 @@ export class Understander {
     const used: string[] = [];
     let size = 0;
     for (const c of convs) {
+      const onlyMentions = isMentionsOnly ? isMentionsOnly(c.conv) : false;
       const rawList = c.target_obs_id
-        ? this.store.convWindowAround(c.conv, c.target_obs_id, 60, 12, activeNativeOwner)
-        : this.store.convWindow(c.conv, 60, 12, activeNativeOwner);
+        ? this.store.convWindowAround(c.conv, c.target_obs_id, 60, 12, activeNativeOwner, { onlyMentions })
+        : this.store.convWindow(c.conv, 60, 12, activeNativeOwner, { onlyMentions });
       const list = filterObs ? filterObs(c.conv, rawList) : rawList;
       if (!list.length) continue;
       if (!list.some((o) => !this.isProcessed(o.id))) continue;
@@ -232,14 +236,16 @@ export class Understander {
     convs: { conv: string; conv_name: string; target_obs_id?: string }[],
     signal?: AbortSignal,
     activeNativeOwner?: string | null,
-    validateBeforeApply?: (batchConvs: { conv: string; conv_name: string }[]) => Promise<Set<string>>,
+    validateBeforeApply?: (batchConvs: { conv: string; conv_name: string }[], batchObs: Obs[]) => Promise<Set<string>>,
     opts?: {
       filterObs?: (conv: string, obs: Obs[]) => Obs[];
+      isMentionsOnly?: (conv: string) => boolean;
       claimCheck?: { convs: string[]; holder: string; procOwner: string };
     },
   ): Promise<ApplyResult & { convs: string[]; fresh: number }> {
+    if (signal?.aborted) throw new Error("aborted");
     this.processedCache.clear();
-    const batch = this.buildBatch(convs, 24_000, activeNativeOwner, opts?.filterObs);
+    const batch = this.buildBatch(convs, 24_000, activeNativeOwner, opts?.filterObs, opts?.isMentionsOnly);
     if (!batch.fresh.length) {
       // 若因当前白名单/范围过滤导致该会话无合格待处理行，不调用 skipConv，留待后续范围恢复或 @我 触发
       if (!opts?.filterObs) {
@@ -263,16 +269,18 @@ export class Understander {
         onSpawn: (pid) => this.app.ledger.setStepPid(step, pid),
         stepId: step,
       });
+      if (signal?.aborted) throw new Error("aborted");
       if (!r.text) throw new Error(`理解 harness 无输出（exit ${r.exitCode}${r.timedOut ? "，超时" : ""}）`);
       const out = parseUnderstand(r.text);
       const usedMeta = batch.convs.map((id) => ({ conv: id, conv_name: convs.find((c) => c.conv === id)?.conv_name ?? "" }));
-      const disallowedConvs = validateBeforeApply ? await validateBeforeApply(usedMeta) : undefined;
+      const disallowedConvs = validateBeforeApply ? await validateBeforeApply(usedMeta, batch.obs) : undefined;
+      if (signal?.aborted) throw new Error("aborted");
       const claimCheck = opts?.claimCheck
         ? { ...opts.claimCheck, convs: batch.convs.filter((id) => opts.claimCheck!.convs.includes(id)) }
         : undefined;
       const res = this.apply(out, batch.obs, batch.fresh, disallowedConvs, claimCheck);
       this.app.ledger.endStep(step, "ok", `新事项 ${res.created.length}，关闭 ${res.closed.length}，知识 ${res.knowledge}`);
-      return { ...res, convs: batch.convs, fresh: batch.fresh.length };
+      return { ...res, convs: batch.convs, fresh: res.processed };
     } catch (e) {
       this.app.ledger.endStep(step, "failed", errMsg(e));
       throw e;
@@ -492,14 +500,14 @@ export class Understander {
         res.conflicts++;
       }
 
-      this.store.markProcessed(
-        validFreshIds
-          .filter((id) => !keepPendingIds.has(id))
-          .flatMap((id) => {
-            const o = byId.get(id);
-            return o ? [{ id, rev: obsRevision(o) }] : [];
-          }),
-      );
+      const toMark = validFreshIds
+        .filter((id) => !keepPendingIds.has(id))
+        .flatMap((id) => {
+          const o = byId.get(id);
+          return o ? [{ id, rev: obsRevision(o) }] : [];
+        });
+      this.store.markProcessed(toMark);
+      res.processed = toMark.length;
     });
     // 把 Meego 待办挂到具体项目
     return res;
@@ -591,7 +599,7 @@ export async function splitProject(u: Understander, workId: string, projectId: s
 }
 
 function emptyResult(): ApplyResult {
-  return { projects: 0, created: [], closed: [], updated: 0, knowledge: 0, updates: 0, people: 0, conflicts: 0, rejected: 0 };
+  return { projects: 0, created: [], closed: [], updated: 0, knowledge: 0, updates: 0, people: 0, conflicts: 0, rejected: 0, processed: 0 };
 }
 
 /** 已知项目按两层树列出：顶层在前，子项目缩进在下 */

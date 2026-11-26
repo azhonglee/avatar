@@ -1,12 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+import { isContextDerivedDispatchBlocked } from "./api/queries.ts";
 import type { CommandName, DeliveryStatus } from "./api/types.ts";
 import { CommandError, S, type Commands } from "./commands.ts";
 import type { Config } from "./config.ts";
 import type { Board } from "./board.ts";
 import { loadPrompt } from "./harness.ts";
 import type { Ledger, WorkItem } from "./ledger.ts";
+import type { Store } from "./store.ts";
 import { expandHome } from "./util.ts";
 import { enqueueJob } from "./workflows/agent.ts";
 import type { Dispatcher, DispatchPayload } from "./workflows/dispatch.ts";
@@ -33,16 +35,24 @@ export function availableActions(
 
 export interface CoreDeps {
   cfg: Config;
+  store: Store;
   ledger: Ledger;
   board: Board;
   dispatcher: Dispatcher;
 }
 
-function terminalDispatch(ledger: Ledger, id: string): WorkItem<DispatchPayload> {
-  const w = ledger.get<DispatchPayload>(id);
+function assertDispatchOwnerAllowed(d: Pick<CoreDeps, "cfg" | "store" | "ledger">, id: string): void {
+  if (isContextDerivedDispatchBlocked(d, id)) {
+    throw new CommandError("conflict", "该派单源自旧工作区主人的工作上下文，已按主人隔离阻断操作");
+  }
+}
+
+function terminalDispatch(d: Pick<CoreDeps, "cfg" | "store" | "ledger">, id: string): WorkItem<DispatchPayload> {
+  assertDispatchOwnerAllowed(d, id);
+  const w = d.ledger.get<DispatchPayload>(id);
   if (!w || w.kind !== "dispatch") throw new CommandError("not_found", `没有这项派单：${id}`);
   if (!w.terminal) throw new CommandError("conflict", "派单还在进行中，请先取消");
-  const latest = ledger.latest("dispatch", w.ref);
+  const latest = d.ledger.latest("dispatch", w.ref);
   if (latest && latest.id !== w.id) throw new CommandError("conflict", "这张卡片已经有更新的派单，请操作最新的一次");
   return w;
 }
@@ -81,6 +91,7 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
     schema: S.id,
     target: (a) => a.id,
     run: async (a) => {
+      assertDispatchOwnerAllowed(d, a.id);
       const w = ledger.get(a.id);
       if (!w || w.kind !== "dispatch") throw new CommandError("not_found", `没有这项派单：${a.id}`);
       if (w.terminal) throw new CommandError("conflict", "派单已经结束");
@@ -95,7 +106,7 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
     schema: S.id,
     target: (a) => a.id,
     run: async (a) => {
-      const w = terminalDispatch(ledger, a.id);
+      const w = terminalDispatch(d, a.id);
       const id = dispatcher.redispatch(w.ref, { reason: "手动重试", harness: w.payload.harness || undefined, from: w.id });
       return { ok: true, message: "已重新派单", target: id };
     },
@@ -107,7 +118,7 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
     schema: z.object({ id: z.string().min(1), feedback: z.string().trim().min(1, "请写下返工意见").max(5000) }),
     target: (a) => a.id,
     run: async (a) => {
-      const w = terminalDispatch(ledger, a.id);
+      const w = terminalDispatch(d, a.id);
       const id = dispatcher.redispatch(w.ref, { reason: "带意见返工", feedback: a.feedback, harness: w.payload.harness || undefined, from: w.id });
       return { ok: true, message: "已带着你的意见重新派单", target: id };
     },
@@ -119,7 +130,7 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
     schema: z.object({ id: z.string().min(1), harness: harnessName }),
     target: (a) => a.id,
     run: async (a) => {
-      const w = terminalDispatch(ledger, a.id);
+      const w = terminalDispatch(d, a.id);
       const id = dispatcher.redispatch(w.ref, { reason: `换执行者为 ${a.harness}`, harness: a.harness, from: w.id });
       return { ok: true, message: `已改由 ${a.harness} 重新执行`, target: id };
     },

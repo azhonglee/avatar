@@ -6,7 +6,7 @@ import { repoSpec, type Config } from "../config.ts";
 import { tryGit } from "../delivery/git.ts";
 import { comment, move } from "../effects.ts";
 import { checkpoint, type Ctx, type Handler } from "../engine.ts";
-import { loadPrompt, prepareHarnessEnv, runHarness } from "../harness.ts";
+import { loadPrompt, prepareHarnessEnv, runHarness, wrapCredentialIsolatedCommand } from "../harness.ts";
 import type { Effect, Ledger, WorkItem } from "../ledger.ts";
 import type { Store } from "../store.ts";
 import { errMsg, log, render, runProcess, truncate } from "../util.ts";
@@ -477,7 +477,8 @@ export class Dispatcher {
     const step = this.ledger.startStep({ work_id: it.id, name: `verify#${p.round}`, log: logFile });
     const baseEnv = prepareHarnessEnv();
     try {
-      const r = await runProcess("bash", ["-lc", p.verify], {
+      const wrapped = wrapCredentialIsolatedCommand("bash", ["-lc", p.verify]);
+      const r = await runProcess(wrapped.cmd, wrapped.args, {
         cwd: p.cwd,
         env: baseEnv.env,
         timeoutMs: this.cfg.acceptance.verify_timeout_sec * 1000,

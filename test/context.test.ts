@@ -481,6 +481,8 @@ test("积压的大群：从最早的待处理消息开始分批理解，超过�
     time: old + i * 60_000, text: `第 ${i} 条讨论`, url: "", meta: {},
   }));
   s3.store.addObs(obs);
+  const prevSpoken = JSON.parse(app.store.get("ctx.spoken_groups") ?? "{}") as Record<string, { name: string; at: number }>;
+  app.store.set("ctx.spoken_groups", JSON.stringify({ ...prevSpoken, oc_big: { name: "大群", at: Date.now() } }));
   writeFx("understand.json", {});
   const calls0 = codexCalls().length;
   for (let i = 0; i < 4 && s3.store.pendingConvs(50).some((c) => c.conv === "oc_big"); i++) await s3.cycle(`context:test-big-${i}`);

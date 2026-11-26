@@ -1,15 +1,30 @@
-import { prepareHarnessEnv } from "../harness.ts";
+import { prepareHarnessEnv, wrapCredentialIsolatedCommand } from "../harness.ts";
 import { runProcess, type ProcResult } from "../util.ts";
 
-/** 交付用到的 git 操作。所有命令都显式指定 -C 目录，不依赖进程当前目录；不弹交互式认证提示，并剥离个人 Web 凭据环境。 */
+/**
+ * 交付用到的 git 操作：
+ *   - 显式指定 -C 目录，不依赖进程当前目录；
+ *   - 关闭交互认证、禁用仓库级 hooks / fsmonitor / external diff（防不可信仓库配置执行任意代码）；
+ *   - 剥离个人 Web 凭据环境，并在存在 systemd feishu-web-key 时通过内核挂载命名空间遮罩该密钥文件。
+ */
 
-const GIT_ID = ["-c", "user.name=personal-agent", "-c", "user.email=personal-agent@localhost"];
+const GIT_SAFE_ARGS = [
+  "-c", "user.name=personal-agent",
+  "-c", "user.email=personal-agent@localhost",
+  "-c", "core.hooksPath=/dev/null",
+  "-c", "core.fsmonitor=false",
+  "-c", "core.pager=cat",
+];
 
 export async function tryGit(cwd: string, args: string[]): Promise<ProcResult> {
   const baseEnv = prepareHarnessEnv();
   try {
-    return await runProcess("git", ["-C", cwd, ...GIT_ID, ...args], {
-      env: { ...baseEnv.env, GIT_TERMINAL_PROMPT: "0" },
+    const safeSubArgs = args[0] === "diff" ? ["diff", "--no-ext-diff", ...args.slice(1)] : args;
+    const childEnv: NodeJS.ProcessEnv = { ...baseEnv.env, GIT_TERMINAL_PROMPT: "0" };
+    delete childEnv.GIT_EXTERNAL_DIFF;
+    const wrapped = wrapCredentialIsolatedCommand("git", ["-C", cwd, ...GIT_SAFE_ARGS, ...safeSubArgs]);
+    return await runProcess(wrapped.cmd, wrapped.args, {
+      env: childEnv,
       timeoutMs: 300_000,
     });
   } finally {

@@ -132,7 +132,9 @@ function startOfLocalDay(tz: string, now = Date.now()): number {
 
 export function overview(app: App): Overview {
   const { ledger, cfg } = app;
-  const recent = ledger.list<DispatchPayload>({ kinds: ["dispatch"], limit: 500 }).filter((w) => !w.terminal || w.updated > Date.now() - 14 * DAY);
+  const recent = ledger
+    .list<DispatchPayload>({ kinds: ["dispatch"], limit: 500 })
+    .filter((w) => (!w.terminal || w.updated > Date.now() - 14 * DAY) && !isContextDerivedDispatchBlocked(app, w.id));
   const latest = latestPerCard(app, recent);
   const needs = latest.filter((w) => ATTENTION.includes(w.state as DispatchState)).map((w) => summarize(app, w));
   const review = latest
@@ -172,10 +174,45 @@ export function overview(app: App): Overview {
 
 export type DispatchFilter = "active" | "attention" | "review" | "done" | "all";
 
+/** 判断某条派单（或其关联任务 ref / 重试链路）是否源自工作上下文委派且归属的旧主人与当前配置 owner.open_id 不一致 */
+export function isContextDerivedDispatchBlocked(app: Pick<App, "cfg" | "store" | "ledger">, dispatchId: string): boolean {
+  if (!dispatchId) return false;
+  const curOwner = app.cfg.owner.open_id.trim();
+  const w = app.ledger.get(dispatchId);
+  const directOrigin = (app.store.get(`ctx.dispatch_owner.${dispatchId}`) ?? "").trim();
+  const refOrigin = (w?.ref ? app.store.get(`ctx.dispatch_ref_owner.${w.ref}`) : undefined)?.trim() ?? "";
+  const idAsRefOrigin = (app.store.get(`ctx.dispatch_ref_owner.${dispatchId}`) ?? "").trim();
+  const originOwner = directOrigin || refOrigin || idAsRefOrigin;
+  if (originOwner && originOwner !== curOwner) return true;
+  if (!hasWorkspaceOwnerMismatch(app.store, curOwner)) return false;
+  if (originOwner) return true;
+  // 兜底兼容升级前已通过 item_delegate 创建但尚未写 ctx.dispatch_owner.<id> 的派单（含同 ref 的重试派单）
+  try {
+    const hasTable = app.store.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ctx_item'").get();
+    if (!hasTable) return false;
+    const directRow = app.store.db
+      .prepare("SELECT 1 FROM ctx_item WHERE json_extract(meta, '$.delegated') = ? LIMIT 1")
+      .get(dispatchId);
+    if (directRow) return true;
+    if (w?.ref) {
+      for (const peer of app.ledger.list({ kinds: ["dispatch"], ref: w.ref, limit: 20 })) {
+        const peerRow = app.store.db
+          .prepare("SELECT 1 FROM ctx_item WHERE json_extract(meta, '$.delegated') = ? LIMIT 1")
+          .get(peer.id);
+        if (peerRow) return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export function listDispatches(app: App, f: { filter?: DispatchFilter; q?: string; limit?: number }): DispatchSummary[] {
   const items = app.ledger.list<DispatchPayload>({ kinds: ["dispatch"], limit: Math.min(f.limit ?? 200, 500) });
   const q = f.q?.trim().toLowerCase();
   return items
+    .filter((w) => !isContextDerivedDispatchBlocked(app, w.id))
     .filter((w) => {
       switch (f.filter ?? "all") {
         case "active":
@@ -239,10 +276,21 @@ function effectSummary(e: Effect): string {
 }
 
 export function auditViews(app: App, target?: string, limit = 50): AuditView[] {
-  return app.ledger.auditLog(limit, target).map((a) => ({ id: a.id, at: a.at, source: a.source, command: a.command, target: a.target, ok: !!a.ok, message: a.message }));
+  const ownerMismatch = hasWorkspaceOwnerMismatch(app.store, app.cfg.owner.open_id);
+  return app.ledger
+    .auditLog(limit, target)
+    .filter((a) => {
+      if (ownerMismatch && a.command.startsWith("context.")) return false;
+      if (a.target && isContextDerivedDispatchBlocked(app, a.target)) return false;
+      return true;
+    })
+    .map((a) => ({ id: a.id, at: a.at, source: a.source, command: a.command, target: a.target, ok: !!a.ok, message: a.message }));
 }
 
 export async function dispatchDetail(app: App, id: string): Promise<DispatchDetail | undefined> {
+  if (isContextDerivedDispatchBlocked(app, id)) {
+    throw new CommandError("conflict", "该派单源自旧工作区主人的工作上下文，已按主人隔离阻断访问");
+  }
   const w = app.ledger.get<DispatchPayload>(id);
   if (!w || w.kind !== "dispatch") return undefined;
   const p = w.payload;
@@ -265,7 +313,7 @@ export async function dispatchDetail(app: App, id: string): Promise<DispatchDeta
     effects: app.ledger.effectsOf(id).map((e) => ({ id: e.id, op: e.payload.op, state: e.state, summary: effectSummary(e.payload), error: e.error, updated: e.updated })),
     previous: app.ledger
       .list<DispatchPayload>({ kinds: ["dispatch"], ref: w.ref, limit: 20 })
-      .filter((x) => x.id !== id)
+      .filter((x) => x.id !== id && !isContextDerivedDispatchBlocked(app, x.id))
       .map((x) => summarize(app, x)),
     diff_stat: diffStat,
     actions: availableActions(w, {
@@ -281,6 +329,9 @@ export async function dispatchDetail(app: App, id: string): Promise<DispatchDeta
 const DIFF_MAX = 400_000;
 
 export async function dispatchDiff(app: App, id: string): Promise<DiffView | undefined> {
+  if (isContextDerivedDispatchBlocked(app, id)) {
+    throw new CommandError("conflict", "该派单源自旧工作区主人的工作上下文，已按主人隔离阻断访问");
+  }
   const w = app.ledger.get<DispatchPayload>(id);
   if (!w || w.kind !== "dispatch") return undefined;
   const p = w.payload;
@@ -306,6 +357,9 @@ export function stepLog(app: App, stepId: number, offset: number): LogChunk | un
   const s = app.ledger.step(stepId);
   if (!s) return undefined;
   const file = path.resolve(s.log || "");
+  if (isContextDerivedDispatchBlocked(app, s.work_id)) {
+    throw new CommandError("conflict", "该步骤日志属于旧工作区主人委派的上下文派单，已按主人隔离阻断读取");
+  }
   if (hasWorkspaceOwnerMismatch(app.store, app.cfg.owner.open_id)) {
     const work = app.ledger.get(s.work_id);
     const isContextStep =
@@ -347,8 +401,10 @@ function isContextHealthWork(w: WorkItem): boolean {
   return false;
 }
 
-function healthItem(w: WorkItem, ownerMismatch = false): HealthItem {
-  if (ownerMismatch && isContextHealthWork(w)) {
+function healthItem(app: App, w: WorkItem, ownerMismatch = false): HealthItem {
+  const blockedContextDispatch =
+    isContextDerivedDispatchBlocked(app, w.id) || (!!w.ref && isContextDerivedDispatchBlocked(app, w.ref));
+  if ((ownerMismatch && isContextHealthWork(w)) || blockedContextDispatch) {
     return {
       id: w.id,
       kind: w.kind as HealthItem["kind"],
@@ -385,11 +441,11 @@ export function health(app: App): Health {
   const { ledger, store, cfg } = app;
   const ownerMismatch = hasWorkspaceOwnerMismatch(store, cfg.owner.open_id);
   const kinds = ["event", "effect", "job", "delivery"] as const;
-  const retrying = kinds.flatMap((k) => ledger.active(k)).filter((w) => w.attempts > 1 || !!w.error).map((w) => healthItem(w, ownerMismatch));
+  const retrying = kinds.flatMap((k) => ledger.active(k)).filter((w) => w.attempts > 1 || !!w.error).map((w) => healthItem(app, w, ownerMismatch));
   const failed = ledger
     .list({ kinds: [...kinds], states: ["dead", "errored"], limit: 200 })
     .filter((w) => w.updated > Date.now() - 14 * DAY)
-    .map((w) => healthItem(w, ownerMismatch));
+    .map((w) => healthItem(app, w, ownerMismatch));
   const hb = store.get("daemon.heartbeat");
   const [owner, at] = hb ? hb.split("|") : [null, null];
   let guard: Health["guard"] = [];

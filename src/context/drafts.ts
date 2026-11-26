@@ -28,9 +28,11 @@ export function defaultDraftKind(it: ItemRow): CtxDraftKind | undefined {
 export class Drafter {
   app: App;
   store: ContextStore;
-  constructor(app: App, store: ContextStore) {
+  filterObs?: (conv: string, obs: Obs[]) => Obs[] | Promise<Obs[]>;
+  constructor(app: App, store: ContextStore, filterObs?: (conv: string, obs: Obs[]) => Obs[] | Promise<Obs[]>) {
     this.app = app;
     this.store = store;
+    this.filterObs = filterObs;
   }
   private get cfg() {
     return this.app.cfg;
@@ -152,9 +154,18 @@ export class Drafter {
     const tz = this.cfg.owner.timezone;
     const p = this.store.project(it.project_id);
     const activeNativeOwner = this.activeBoundNativeOwner();
-    const convText = conv
-      ? this.store
-          .convObs(conv.conv, Date.now() - 7 * DAY, 30, activeNativeOwner)
+    const rawConvObs = conv ? this.store.convObs(conv.conv, Date.now() - 7 * DAY, 30, activeNativeOwner) : [];
+    const scopedConvObs = conv && this.filterObs ? await this.filterObs(conv.conv, rawConvObs) : rawConvObs;
+    // 若触发证据本身在最近 30 条窗口外被较新的范围外普通群消息挤出，仅在该证据通过当前范围过滤时将其补回
+    let effectiveConvObs = scopedConvObs;
+    if (conv && !scopedConvObs.some((o) => o.id === conv.id)) {
+      const checkedSelf = this.filterObs ? await this.filterObs(conv.conv, [conv]) : [conv];
+      if (checkedSelf.length) {
+        effectiveConvObs = [...scopedConvObs, ...checkedSelf].sort((a, b) => a.time - b.time);
+      }
+    }
+    const convText = effectiveConvObs.length
+      ? effectiveConvObs
           .map((o) => `${fmt(o.time, tz)} ${o.is_me ? "【我】" : o.actor_name}: ${truncate(o.text, 300)}`)
           .join("\n")
       : "（无）";

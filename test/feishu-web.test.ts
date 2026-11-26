@@ -71,6 +71,7 @@ import {
   type WebEndpoints,
   type WebMessage,
 } from "../src/context/feishu-web/index.ts";
+import { selectEffectiveOpenGroups } from "../src/context/connectors.ts";
 import { ContextService } from "../src/context/index.ts";
 import {
   BOUND_OWNER_KV_KEY,
@@ -87,7 +88,7 @@ import {
 import { obsRevision, type Obs } from "../src/context/store.ts";
 import { tryGit } from "../src/delivery/git.ts";
 import { runDoctor } from "../src/doctor.ts";
-import { extractSafeCodexProviderArgs, extractSafeCodexProviderConfig, mergeHarnessEnv, prepareHarnessEnv } from "../src/harness.ts";
+import { extractSafeCodexProviderArgs, extractSafeCodexProviderConfig, mergeHarnessEnv, prepareHarnessEnv, wrapCredentialIsolatedCommand } from "../src/harness.ts";
 import { SettingsService } from "../src/settings.ts";
 import { parseToml } from "../src/toml.ts";
 import { runProcess } from "../src/util.ts";
@@ -3176,10 +3177,10 @@ test("Codex 第五轮回归：加密防降级、显式绑定、主人变更全�
       }
       assert.equal(fs.existsSync(filteredDir), false, "子进程结束后临时凭据目录必须清理");
     }
-    // 明确验证无可用 tmpfs 时的 fail-closed 回退：彻底移除 CREDENTIALS_DIRECTORY，绝不落盘复制
+    // 明确验证无可用 tmpfs 时的 fail-closed 回退：传空候选集避免受宿主机 os.tmpdir() 本身是否为 tmpfs 影响，彻底移除 CREDENTIALS_DIRECTORY
     const envNoTmpfs = prepareHarnessEnv(
       { PATH: "/usr/bin", CREDENTIALS_DIRECTORY: credDirMixed },
-      { tmpfsCandidates: [makeTmp("pa-disk-not-tmpfs-")] },
+      { tmpfsCandidates: [] },
     );
     try {
       assert.equal(envNoTmpfs.env.CREDENTIALS_DIRECTORY, undefined, "无可用内核 tmpfs 时必须移除 CREDENTIALS_DIRECTORY 而绝不复制到磁盘");
@@ -3846,16 +3847,22 @@ test("Codex 第六轮回归：派生上下文主人隔离、Codex 供应商保�
     );
     const extractedCfg = extractSafeCodexProviderConfig({ CODEX_HOME: codexHome }, [], false);
     const extracted = extractedCfg.args;
+    const parseProviderMap = (args: string[]) => {
+      const mpArg = args.find((a) => a.startsWith("model_providers="));
+      assert.ok(mpArg, `应以 TOML 内联表形式透传 model_providers：${JSON.stringify(args)}`);
+      const doc = parseToml(mpArg!);
+      return doc.model_providers as Record<string, Record<string, unknown>>;
+    };
     assert.ok(extracted.includes('model="gpt-5-internal"'), "必须保留 config.toml 的 model");
     assert.ok(extracted.includes('model_provider="corp"'), "必须保留自定义 model_provider");
-    assert.ok(extracted.includes('model_providers.corp.base_url="https://gateway.corp.internal/v1"'), "必须保留自定义供应商 base_url");
-    assert.ok(extracted.includes('model_providers.corp.env_key="CORP_API_KEY"'), "必须保留 env_key");
+    const corpProv = parseProviderMap(extracted).corp as Record<string, unknown>;
+    assert.equal(corpProv.base_url, "https://gateway.corp.internal/v1", "必须保留自定义供应商 base_url");
+    assert.equal(corpProv.env_key, "CORP_API_KEY", "必须保留 env_key");
     assert.ok(!extracted.some((a) => a.includes("top-secret-header")), "静态 http_headers 明文绝不能进入 argv");
-    const secretHdrArg = extracted.find((a) => a.startsWith("model_providers.corp.env_http_headers.X-Secret-Token="));
-    assert.ok(secretHdrArg, "静态 http_headers 必须自动转为 env_http_headers 环境变量引用");
-    const secretHdrVar = JSON.parse(secretHdrArg!.slice(secretHdrArg!.indexOf("=") + 1)) as string;
-    assert.equal(extractedCfg.extraEnv[secretHdrVar], "top-secret-header", "静态 http_headers 值必须仅通过子进程环境变量传递");
-    assert.ok(extracted.includes('model_providers.corp.env_http_headers.X-Tenant="CORP_TENANT"'), "必须保留 env_http_headers");
+    const corpEnvHdrs = corpProv.env_http_headers as Record<string, string>;
+    assert.ok(corpEnvHdrs?.["X-Secret-Token"], "静态 http_headers 必须自动转为 env_http_headers 环境变量引用");
+    assert.equal(extractedCfg.extraEnv[corpEnvHdrs["X-Secret-Token"]], "top-secret-header", "静态 http_headers 值必须仅通过子进程环境变量传递");
+    assert.equal(corpEnvHdrs["X-Tenant"], "CORP_TENANT", "必须保留 env_http_headers");
     assert.ok(!extracted.some((a) => a.includes("mcp_servers") || a.includes("plugins") || a.includes("evil")), "绝不能带入 mcp_servers 或 plugins");
 
     // 显式传 hasExplicitModel=true 时不得再覆盖 model
@@ -3870,11 +3877,11 @@ test("Codex 第六轮回归：派生上下文主人隔离、Codex 供应商保�
     );
     const extractedOai = extractSafeCodexProviderArgs({ CODEX_HOME: openaiProxyHome }, [], false);
     assert.ok(extractedOai.includes('openai_base_url="https://oai-proxy.corp/v1"'));
-    assert.ok(extractedOai.includes('model_providers.openai.base_url="https://oai-proxy.corp/v1"'));
+    assert.equal(parseProviderMap(extractedOai).openai.base_url, "https://oai-proxy.corp/v1");
 
     // extraArgs 仅指定 -c model_provider="corp" 时仍需提取 config.toml 中的 [model_providers.corp]
     const extractedFromExtra = extractSafeCodexProviderArgs({ CODEX_HOME: codexHome }, ["-c", 'model_provider="corp"'], false);
-    assert.ok(extractedFromExtra.includes('model_providers.corp.base_url="https://gateway.corp.internal/v1"'));
+    assert.equal(parseProviderMap(extractedFromExtra).corp.base_url, "https://gateway.corp.internal/v1");
     assert.ok(!extractedFromExtra.includes('model_provider="corp"'), "extraArgs 已指定 model_provider 时不重复输出");
 
     // fail-closed：--profile、缺失的自定义供应商、非法 TOML 均直接抛错；合法内联表应完整解析
@@ -3884,7 +3891,7 @@ test("Codex 第六轮回归：派生上下文主人隔离、Codex 供应商保�
     assert.throws(() => extractSafeCodexProviderArgs({ CODEX_HOME: missingProvHome }, [], false), /ghost/);
     const inlineProvHome = makeTmp("pa-r6-codex-inline-");
     fs.writeFileSync(path.join(inlineProvHome, "config.toml"), 'model_provider = "corp"\nmodel_providers = { corp = { base_url = "https://x" } }\n');
-    assert.ok(extractSafeCodexProviderArgs({ CODEX_HOME: inlineProvHome }, [], false).includes('model_providers.corp.base_url="https://x"'));
+    assert.equal(parseProviderMap(extractSafeCodexProviderArgs({ CODEX_HOME: inlineProvHome }, [], false)).corp.base_url, "https://x");
     const brokenTomlHome = makeTmp("pa-r6-codex-broken-");
     fs.writeFileSync(path.join(brokenTomlHome, "config.toml"), 'model_provider = "corp"\n[model_providers.corp\nbase_url = "https://x"\n');
     assert.throws(() => extractSafeCodexProviderArgs({ CODEX_HOME: brokenTomlHome }, [], false), /无法安全解析|TOML/);
@@ -4862,15 +4869,17 @@ test("Codex 第七轮回归：TOML 解析与内联头隔离、extraArgs 白名�
     // 不设 CODEX_HOME，仅设 env.HOME -> 必须解析 env.HOME/.codex/config.toml 而非 os.homedir()
     const homeCfg = extractSafeCodexProviderConfig({ HOME: fakeHome }, [], false);
     assert.ok(homeCfg.args.includes('model_provider="private_gw"'), "必须按子进程 env.HOME 解析 config.toml");
-    assert.ok(homeCfg.args.includes('model_providers.private_gw.base_url="https://gw.private.internal/v1"'));
-    assert.ok(homeCfg.args.includes('model_providers.private_gw.query_params.api-version="2025-04-01"'));
+    const homeMpArg = homeCfg.args.find((a) => a.startsWith("model_providers="));
+    assert.ok(homeMpArg, "应以 TOML 内联表形式输出 model_providers");
+    const homePrivGw = (parseToml(homeMpArg!).model_providers as Record<string, Record<string, unknown>>).private_gw;
+    assert.equal(homePrivGw.base_url, "https://gw.private.internal/v1");
+    assert.equal((homePrivGw.query_params as Record<string, string>)["api-version"], "2025-04-01");
     assert.ok(
       !homeCfg.args.some((a) => a.includes("inline-super-secret")),
       "内联 http_headers 中的明文密钥绝不能进入 Codex argv",
     );
-    const authEnvArg = homeCfg.args.find((a) => a.startsWith("model_providers.private_gw.env_http_headers.Authorization="));
-    assert.ok(authEnvArg, "内联 http_headers 必须自动转为 env_http_headers 环境变量引用");
-    const authVarName = JSON.parse(authEnvArg!.slice(authEnvArg!.indexOf("=") + 1)) as string;
+    const authVarName = (homePrivGw.env_http_headers as Record<string, string>)?.Authorization;
+    assert.ok(authVarName, "内联 http_headers 必须自动转为 env_http_headers 环境变量引用");
     assert.equal(homeCfg.extraEnv[authVarName], "Bearer inline-super-secret");
 
     // extraArgs 白名单：拒绝 MCP、--enable、--sandbox、--full-auto、含密钥 query_params；净化 extraArgs 里的内联 http_headers
@@ -5138,6 +5147,13 @@ data_dir: ${dir}
     // 8) [R7 P1-7] cycle 候选筛选绑定策略快照：在筛选第二个候选期间新增静音第一个候选对应的原生群，必须重启筛选且不送模型
     app.store.db.prepare("UPDATE ctx_obs SET processed = 1 WHERE processed = 0").run();
     app.cfg.context.groups = "spoken";
+    app.store.set(
+      "ctx.spoken_groups",
+      JSON.stringify({
+        oc_r7_sel1: { name: "候选群一", at: now },
+        oc_r7_sel2: { name: "候选群二", at: now },
+      }),
+    );
     svc.store.addObs([
       {
         id: "im:om_r7_sel1",
@@ -5313,7 +5329,8 @@ data_dir: ${dir}
     svc.store.releaseConv("pw_chat:9507", "tok_new", "procNew");
     svc.store.markProcessed(["pw:r7_batch_keep", "pw:r7_batch_stale"]);
 
-    // 11) [R7 P2-13] pullIm：若排除规则在群排行前阻断了群拉取、随后在提交前清除，cursor.im.groups 绝不能推进到 now（未扫描必须钉住原始起点）
+    // 11) [R7 P2-13 + R8 P1-5] pullIm：若排除规则在群排行前阻断了群拉取、随后在提交前清除，绝不能在未扫描的情况下推进 cursor.im.groups——
+    //     必须重启完整拉取该群并落库消息（或在不稳定时放弃且不推进游标）
     app.cfg.context.groups = "spoken";
     app.store.set("ctx.spoken_groups", JSON.stringify({ oc_r7_unscanned: { name: "未扫描群", at: now } }));
     app.store.db.prepare("DELETE FROM kv WHERE k LIKE 'ctx.cursor.%'").run();
@@ -5333,7 +5350,18 @@ data_dir: ${dir}
       sigCalls++;
       return sigCalls === 1 ? "sig_before" : "sig_after";
     };
-    fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner_a", user_name: "张三" }));
+    fs.writeFileSync(
+      path.join(ctxDir, "lark.json"),
+      JSON.stringify({
+        user_open_id: "ou_owner_a",
+        user_name: "张三",
+        chats: {
+          oc_r7_unscanned: [
+            { message_id: "om_r7_unscanned_1", chat_id: "oc_r7_unscanned", chat_name: "未扫描群", chat_type: "group", create_time: String(nowSec), sender: { id: "ou_x", name: "X", sender_type: "user" }, content: "重启后必须扫到的群消息" },
+          ],
+        },
+      }),
+    );
     try {
       await svc.connectors.pullIm();
     } finally {
@@ -5341,8 +5369,8 @@ data_dir: ${dir}
       (svc.connectors as unknown as { pollingPolicySignature: () => string }).pollingPolicySignature = origSig;
       app.cfg.context.groups = "allowlist";
     }
-    const unscannedGroupsCur = Number(app.store.get("ctx.cursor.im.groups") ?? "0");
-    assert.ok(unscannedGroupsCur > 0 && unscannedGroupsCur < now - 1000, "未实际拉取的 groups 流绝不能因提交前清除阻断而推进到 now，必须钉住原始起点");
+    assert.ok(svc.store.obs("im:om_r7_unscanned_1"), "提交前排除阻断解除后必须重启并实际扫描该群，绝不能漏采就推进 cursor.im.groups");
+    assert.ok(app.store.get("ctx.cursor.chat.oc_r7_unscanned"), "重启实际扫描完成后才推进该群游标");
 
     // 12) [R7 P2-14] sendVerifiedReply：发包响应同时返回新消息 ID 与 Cookie 轮换，但 Cookie 落盘失败时必须先记 created，重跑只做回读不重发
     const r7TargetBuf = buildNativeMessage({
@@ -5511,6 +5539,762 @@ data_dir: ${dir}
     assert.ok(ctxHealthRow, "健康页可保留脱敏后的故障占位");
     assert.ok(!ctxHealthRow!.error.includes("机密群") && !ctxHealthRow!.summary.includes("秘密回复"), "主人变更后 health() 必须脱敏上下文 effect 的摘要与错误");
     app.cfg.owner.open_id = "ou_owner_a";
+  } finally {
+    if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevKey;
+    if (prevCredFile === undefined) delete process.env.PA_FEISHU_WEB_CRED_FILE;
+    else process.env.PA_FEISHU_WEB_CRED_FILE = prevCredFile;
+    if (prevCredDir === undefined) delete process.env.CREDENTIALS_DIRECTORY;
+    else process.env.CREDENTIALS_DIRECTORY = prevCredDir;
+    if (prevCtxDir === undefined) delete process.env.CTX_DIR;
+    else process.env.CTX_DIR = prevCtxDir;
+    app?.store.db.close();
+    await mock.close();
+  }
+});
+
+test("Codex 第八轮回归：挂载命名空间密钥隔离、草稿范围过滤、精确输入复核、发包前撤回复检、选群变更重启轮询、URL/重复键/凭据存储/点号供应商/错误脱敏、审计与派单主人隔离、@我预筛、共享选群榜单、路径绑定恢复、同会话轮换唤醒、快通道取消与元数据失效", async () => {
+  const prevKey = process.env.PA_FEISHU_WEB_KEY;
+  const prevCredFile = process.env.PA_FEISHU_WEB_CRED_FILE;
+  const prevCredDir = process.env.CREDENTIALS_DIRECTORY;
+  const prevCtxDir = process.env.CTX_DIR;
+  process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
+  delete process.env.PA_FEISHU_WEB_CRED_FILE;
+  delete process.env.CREDENTIALS_DIRECTORY;
+
+  const mock = await startMockFeishuWebServer();
+  let app: ReturnType<typeof createApp> | undefined;
+  try {
+    // 1) [R8 P1-1] 挂载命名空间隔离 feishu-web-key：即使子进程按原 CREDENTIALS_DIRECTORY 绝对路径读取也读不到密钥，同时无关凭据仍可读；无隔离后端时 fail-closed
+    const isoCredDir = makeTmp("pa-r8-iso-creds-");
+    const isoKeyFile = path.join(isoCredDir, "feishu-web-key");
+    const isoOtherFile = path.join(isoCredDir, "other-service-token");
+    fs.writeFileSync(isoKeyFile, "SUPER_SECRET_FEISHU_KEY_R8", { mode: 0o400 });
+    fs.writeFileSync(isoOtherFile, "KEEP_OTHER_TOKEN_R8", { mode: 0o400 });
+    assert.throws(
+      () => wrapCredentialIsolatedCommand("sh", ["-c", "true"], { CREDENTIALS_DIRECTORY: isoCredDir }, { forceBackend: { kind: "none" } }),
+      /bwrap|unshare|拒绝执行/,
+      "无挂载命名空间后端时必须 fail-closed 拒绝启动子进程",
+    );
+    const wrappedRead = wrapCredentialIsolatedCommand(
+      "sh",
+      ["-c", `cat "$1" 2>/dev/null || true; printf "|"; cat "$2" 2>/dev/null || true`, "_", isoKeyFile, isoOtherFile],
+      { CREDENTIALS_DIRECTORY: isoCredDir },
+    );
+    assert.equal(wrappedRead.isolated, true, "存在 feishu-web-key 时必须启用挂载命名空间遮罩");
+    const isoRes = await runProcess(wrappedRead.cmd, wrappedRead.args, { timeoutMs: 15_000 });
+    assert.equal(isoRes.code, 0, isoRes.stderr);
+    const [maskedKeyOut, otherOut] = isoRes.stdout.split("|");
+    assert.equal(maskedKeyOut, "", "子进程即使按绝对路径直接 cat CREDENTIALS_DIRECTORY/feishu-web-key 也绝不能读出密钥");
+    assert.equal(otherOut, "KEEP_OTHER_TOKEN_R8", "同目录内无关凭据应保持可读");
+
+    // tryGit 在 CREDENTIALS_DIRECTORY 存在 feishu-web-key 时同样自动隔离，且禁用仓库 hooks / external diff 同时保留正常内部 diff
+    const testRepo = makeTmp("pa-r8-git-");
+    process.env.CREDENTIALS_DIRECTORY = isoCredDir;
+    try {
+      assert.equal((await tryGit(testRepo, ["init", "-q"])).code, 0);
+      fs.writeFileSync(path.join(testRepo, "a.txt"), "line1\n");
+      assert.equal((await tryGit(testRepo, ["add", "a.txt"])).code, 0);
+      assert.equal((await tryGit(testRepo, ["commit", "-qm", "init"])).code, 0);
+      fs.writeFileSync(path.join(testRepo, "a.txt"), "line1\nline2\n");
+      const diffRes = await tryGit(testRepo, ["diff", "--no-color"]);
+      assert.equal(diffRes.code, 0, diffRes.stderr);
+      assert.match(diffRes.stdout, /\+line2/, "禁用 diff.external 后内部 diff 必须正常输出");
+    } finally {
+      delete process.env.CREDENTIALS_DIRECTORY;
+    }
+
+    // 2) [R8 P1-6, P1-7, P2-12, P2-13, P2-14] TOML 重复键拒绝、错误不含原始值、URL 含凭据拒绝、保留 cli_auth_credentials_store、点号供应商内联表编码
+    assert.throws(
+      () => parseToml('model_provider = "corp"\nmodel_provider = "openai"\n'),
+      /重复定义/,
+      "重复顶层键必须按 TOML 1.0 规范显式拒绝",
+    );
+    assert.throws(
+      () => parseToml('[model_providers.corp]\nbase_url = "https://a"\n[model_providers.corp]\nbase_url = "https://b"\n'),
+      /重复定义/,
+      "重复表头必须显式拒绝",
+    );
+    assert.throws(
+      () => parseToml('x = { a = "1", a = "2" }\n'),
+      /重复定义/,
+      "内联表重复键必须显式拒绝",
+    );
+    try {
+      parseToml("api_token = sk_live_unquoted_secret_r8\n");
+      assert.fail("未加引号的非法标量必须报错");
+    } catch (err) {
+      const msg = (err as Error).message;
+      assert.match(msg, /第 1 行/, "解析错误应指出行列位置");
+      assert.ok(!msg.includes("sk_live_unquoted_secret_r8"), `TOML 解析错误绝不能回显原始敏感值：${msg}`);
+    }
+
+    const r8CodexHome = makeTmp("pa-r8-codex-");
+    fs.writeFileSync(
+      path.join(r8CodexHome, "config.toml"),
+      [
+        'cli_auth_credentials_store = "keyring"',
+        'model = "gpt-5-dotted"',
+        'model_provider = "corp.test"',
+        "",
+        '[model_providers."corp.test"]',
+        'name = "Corp Dotted"',
+        'base_url = "https://gw.corp.internal/v1"',
+        'wire_api = "responses"',
+        'http_headers = { Authorization = "Bearer dotted-secret-r8" }',
+      ].join("\n"),
+    );
+    const dottedCfg = extractSafeCodexProviderConfig({ CODEX_HOME: r8CodexHome }, [], false);
+    assert.ok(dottedCfg.args.includes('cli_auth_credentials_store="keyring"'), "必须保留合法的 cli_auth_credentials_store");
+    assert.ok(dottedCfg.args.includes('model_provider="corp.test"'));
+    const mpInlineArg = dottedCfg.args.find((a) => a.startsWith("model_providers="));
+    assert.ok(mpInlineArg && mpInlineArg.includes('"corp.test"'), `点号供应商名必须编码在 TOML 内联表中：${mpInlineArg}`);
+    const parsedMp = (parseToml(mpInlineArg!).model_providers as Record<string, Record<string, unknown>>)["corp.test"];
+    assert.equal(parsedMp.base_url, "https://gw.corp.internal/v1");
+    const dottedAuthVar = (parsedMp.env_http_headers as Record<string, string>).Authorization;
+    assert.equal(dottedCfg.extraEnv[dottedAuthVar], "Bearer dotted-secret-r8");
+    assert.ok(!dottedCfg.args.some((a) => a.includes("dotted-secret-r8")), "密钥值绝不能进入 argv");
+
+    // URL 含 userinfo / 密钥 query_param 拒绝；非法 -c 值错误不回显原始值；非法 cli_auth_credentials_store 拒绝
+    const badUrlHome = makeTmp("pa-r8-badurl-");
+    fs.writeFileSync(
+      path.join(badUrlHome, "config.toml"),
+      'model_provider = "gw"\n[model_providers.gw]\nbase_url = "https://user:topsecret@gw.corp/v1"\n',
+    );
+    assert.throws(() => extractSafeCodexProviderConfig({ CODEX_HOME: badUrlHome }, [], false), /凭据|用户信息/);
+    fs.writeFileSync(
+      path.join(badUrlHome, "config.toml"),
+      'model_provider = "gw"\n[model_providers.gw]\nbase_url = "https://gw.corp/v1?api_key=sk-url-leak"\n',
+    );
+    assert.throws(() => extractSafeCodexProviderConfig({ CODEX_HOME: badUrlHome }, [], false), /查询参数|凭据/);
+    fs.writeFileSync(path.join(badUrlHome, "config.toml"), 'openai_base_url = "https://tok@oai.corp/v1"\n');
+    assert.throws(() => extractSafeCodexProviderConfig({ CODEX_HOME: badUrlHome }, [], false), /凭据|用户信息/);
+    fs.writeFileSync(path.join(badUrlHome, "config.toml"), 'cli_auth_credentials_store = "bogus"\n');
+    assert.throws(() => extractSafeCodexProviderConfig({ CODEX_HOME: badUrlHome }, [], false), /cli_auth_credentials_store/);
+    try {
+      extractSafeCodexProviderConfig({ CODEX_HOME: r8CodexHome }, ["-c", "model_providers.corp.http_headers={ broken = sk_cli_secret_r8"], false);
+      assert.fail("非法 -c 表达式必须报错");
+    } catch (err) {
+      const msg = (err as Error).message;
+      assert.ok(!msg.includes("sk_cli_secret_r8"), `无效 -c 错误绝不能回显原始敏感值：${msg}`);
+    }
+
+    // 3) [R8 P2-18] 元数据加载期间被登出/替换会话：FeishuWebClient.connect 必须拒绝返回过期客户端
+    let confirmSeq = 0;
+    await assert.rejects(
+      () =>
+        FeishuWebClient.connect(
+          {
+            owner_id: "7001",
+            owner_name: "张三",
+            session_id: "sess_r8_meta_race",
+            cookie_version: 1,
+            cookies: [{ name: "session", value: "valid_cookie", domain: "internal-api-lark-api.feishu.cn", path: "/" }],
+            updated_at: new Date().toISOString(),
+          },
+          {
+            endpoints: mock.endpoints,
+            onSessionConfirmed: (updated) => {
+              confirmSeq++;
+              // 第一次（verifyOwner）通过，第二次（loadWebMetadata 之后）模拟已被登出/换会话返回 null
+              return confirmSeq === 1 ? updated : null;
+            },
+          },
+        ),
+      /登出|更新/,
+      "loadWebMetadata 期间会话被登出或替换时 connect 必须抛错而不是返回过期客户端",
+    );
+
+    // 4) [R8 P2-15] 凭据崩溃恢复严格绑定文件路径与 session_id：默认路径 CLI 绝不清除自定义路径常驻进程的 pending 标记
+    const recDir = makeTmp("pa-r8-recover-");
+    const customCredPath = path.join(recDir, "daemon-custom-cred.json");
+    const recAppCfgFile = path.join(recDir, "config.yaml");
+    const ctxDir = makeTmp("pa-r8-lark-");
+    process.env.CTX_DIR = ctxDir;
+    const callsLog = path.join(recDir, "calls.log");
+    const harnessScript = path.join(recDir, "fake-r8-harness.mjs");
+    const gateFlagFile = path.join(recDir, "r8-gate.flag");
+    const enteredFlagFile = path.join(recDir, "r8-entered.flag");
+    const responseJsonFile = path.join(recDir, "r8-response.json");
+    fs.writeFileSync(responseJsonFile, JSON.stringify({ projects: [], items: [], knowledge: [], updates: [], people: [], conflicts: [] }));
+    fs.writeFileSync(
+      harnessScript,
+      `#!/usr/bin/env node
+import fs from "node:fs";
+const prompt = fs.readFileSync(0, "utf8");
+fs.appendFileSync(${JSON.stringify(callsLog)}, JSON.stringify({ prompt }) + "\\n");
+if (fs.existsSync(${JSON.stringify(gateFlagFile)})) {
+  fs.writeFileSync(${JSON.stringify(enteredFlagFile)}, "1");
+  const deadline = Date.now() + 8000;
+  while (fs.existsSync(${JSON.stringify(gateFlagFile)}) && Date.now() < deadline) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+}
+if (prompt.includes("草稿") || prompt.includes("答复或进展")) {
+  process.stdout.write("收到，我这边马上处理。\\n");
+} else {
+  process.stdout.write(fs.readFileSync(${JSON.stringify(responseJsonFile)}, "utf8") + "\\n");
+}
+`,
+      { mode: 0o755 },
+    );
+    fs.writeFileSync(
+      recAppCfgFile,
+      `
+data_dir: ${recDir}
+bins:
+  lark: ${path.join(STUBS, "ctx-lark")}
+  bytedcli: ${path.join(STUBS, "ctx-bytedcli")}
+owner:
+  open_id: ou_owner_a
+harnesses:
+  mock_ctx:
+    type: codex-exec
+    cmd: ${harnessScript}
+roles:
+  brain: mock_ctx
+context:
+  enabled: true
+  harness: mock_ctx
+  groups: allowlist
+  max_groups: 5
+  groups_allow: ["pw_chat:9801", "oc_r8_mix"]
+  groups_deny: []
+  sources:
+    meego: false
+    tasks: false
+    im: true
+    minutes: false
+    calendar: false
+    docs: false
+  personal_web:
+    enabled: true
+    fast_lane: true
+    pre_draft: false
+    send_replies: true
+    debounce_ms: 0
+`,
+    );
+    app = createApp(loadConfig(recAppCfgFile));
+    const svc = new ContextService(app);
+    const daemonCredStore = new WebLoginStore(recDir, customCredPath);
+    const defaultCredStore = new WebLoginStore(recDir);
+    daemonCredStore.stageWithLock((stage) => {
+      const staged = stage({
+        owner_id: "7001",
+        owner_name: "张三",
+        session_id: "sess_r8_custom",
+        cookie_version: 1,
+        cookies: [{ name: "session", value: "custom_cookie", domain: "internal-api-lark-api.feishu.cn", path: "/" }],
+        updated_at: new Date().toISOString(),
+      });
+      // 模拟 SQLite 已提交但 rename 之前崩溃
+      app!.store.set(
+        PENDING_CRED_COMMIT_KV_KEY,
+        JSON.stringify({
+          file: daemonCredStore.file,
+          staged_file: daemonCredStore.stagedFile,
+          owner_id: staged.payload.owner_id,
+          session_id: staged.payload.session_id,
+          at: Date.now(),
+        }),
+      );
+    });
+    assert.equal(fs.existsSync(daemonCredStore.stagedFile), true);
+    // 默认路径 CLI 进程运行恢复：绝不能清除属于自定义路径的 pending 标记，也不能删除他人 staged 文件
+    defaultCredStore.reconcilePendingCommit(app.store, PENDING_CRED_COMMIT_KV_KEY);
+    assert.ok(app.store.get(PENDING_CRED_COMMIT_KV_KEY), "不同路径的 CLI 绝不能误清自定义路径的 pending 标记");
+    assert.equal(fs.existsSync(daemonCredStore.stagedFile), true, "不同路径的 CLI 绝不能删除他人 staged 文件");
+    // 常驻进程按自定义路径启动恢复：必须补全 rename 并清除标记
+    daemonCredStore.reconcilePendingCommit(app.store, PENDING_CRED_COMMIT_KV_KEY);
+    assert.equal(app.store.get(PENDING_CRED_COMMIT_KV_KEY), "", "目标路径恢复完成后清除 pending 标记");
+    assert.equal(daemonCredStore.load()?.session_id, "sess_r8_custom", "已批准登录必须成功恢复到自定义凭据路径");
+
+    // 绑定测试主工作区凭据到默认路径
+    const savedLogin = commitWorkspaceLogin(
+      app,
+      {
+        owner_id: "7001",
+        owner_name: "张三",
+        session_id: "sess_r8_main",
+        cookie_version: 1,
+        cookies: [{ name: "session", value: "valid_cookie", domain: "internal-api-lark-api.feishu.cn", path: "/" }],
+        updated_at: new Date().toISOString(),
+      },
+      { allowUnverifiedOwner: true },
+    );
+    const client = await FeishuWebClient.connect(savedLogin, {
+      endpoints: mock.endpoints,
+      onSessionConfirmed: (u, d) => svc.personalWeb.loginStore.saveIfSessionMatches(u, d),
+    });
+    (svc.personalWeb as unknown as { client?: FeishuWebClient }).client = client;
+    const now = Date.now();
+    const nowSec = Math.floor(now / 1000);
+    fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner_a", user_name: "张三" }));
+
+    // 5) [R8 P1-2] 回复草稿提示词遵守当前群范围：移除白名单后，即使群里还有普通消息（含 35 条更新普通消息），草稿提示词只包含真实 @我 而绝不包含范围外普通群消息
+    app.cfg.context.groups_allow = [];
+    const draftObsList: Obs[] = [
+      {
+        id: "pw:r8_draft_atme",
+        source: "im",
+        kind: "at_me",
+        conv: "pw_chat:9801",
+        conv_name: "已移除白名单群",
+        actor_id: "7002",
+        actor_name: "王五",
+        is_me: false,
+        time: now - 40_000,
+        text: "@张三 麻烦确认下排期",
+        url: "",
+        meta: { transport: "personal_web", native_owner_id: "7001", native_message_id: "r8_draft_atme", native_chat_id: "9801", native_root_id: "r8_draft_atme", chat_type: "group", at_me: true },
+      },
+      ...Array.from({ length: 35 }, (_, i) => ({
+        id: `pw:r8_draft_ord_${i}`,
+        source: "im" as const,
+        kind: "group",
+        conv: "pw_chat:9801",
+        conv_name: "已移除白名单群",
+        actor_id: "7003",
+        actor_name: "赵六",
+        is_me: false,
+        time: now - 35_000 + i * 500,
+        text: `范围外普通敏感消息_${i}`,
+        url: "",
+        meta: { transport: "personal_web", native_owner_id: "7001", native_message_id: `r8_draft_ord_${i}`, native_chat_id: "9801", chat_type: "group" },
+      })),
+    ];
+    svc.store.addObs(draftObsList);
+    svc.store.markProcessed(draftObsList.map((o) => o.id));
+    const { item: draftScopeItem } = svc.store.upsertItem({ title: "确认排期", kind: "ask_me", priority: "high", source: "im" });
+    svc.store.addEvidence("item", draftScopeItem.id, "pw:r8_draft_atme", "麻烦确认下排期", now - 40_000);
+    fs.writeFileSync(callsLog, "");
+    await svc.drafter.forItem(draftScopeItem.id, "reply");
+    const draftCalls = fs.readFileSync(callsLog, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as { prompt: string });
+    assert.equal(draftCalls.length, 1);
+    assert.ok(draftCalls[0].prompt.includes("麻烦确认下排期"), "草稿提示词必须保留合法的触发 @我");
+    assert.ok(!draftCalls[0].prompt.includes("范围外普通敏感消息"), "草稿提示词绝不能混入已被移出白名单的普通群消息");
+
+    // 6) [R8 P1-3] 推理期间含普通消息+@我的混合群被移出白名单：validateBeforeApply 逐条复核精确 prompt 输入，整体丢弃本批并保留 @我 待下轮单独重跑
+    app.cfg.context.groups_allow = ["oc_r8_mix"];
+    svc.store.addObs([
+      {
+        id: "im:r8_mix_ord",
+        source: "im",
+        kind: "group",
+        conv: "oc_r8_mix",
+        conv_name: "混合批次群",
+        actor_id: "ou_x",
+        actor_name: "某人",
+        is_me: false,
+        time: now - 10_000,
+        text: "普通群消息机密项目X",
+        url: "",
+        meta: { chat_type: "group" },
+      },
+      {
+        id: "im:r8_mix_atme",
+        source: "im",
+        kind: "at_me",
+        conv: "oc_r8_mix",
+        conv_name: "混合批次群",
+        actor_id: "ou_y",
+        actor_name: "李四",
+        is_me: false,
+        time: now - 5_000,
+        text: "@张三 请看下混合批次提及",
+        url: "",
+        meta: { chat_type: "group", at_me: true },
+      },
+    ]);
+    fs.writeFileSync(
+      responseJsonFile,
+      JSON.stringify({
+        projects: [{ name: "机密项目X" }],
+        items: [{ title: "混合批次事项", kind: "ask_me", project: "机密项目X", priority: "high", evidence: [{ obs_id: "im:r8_mix_atme", quote: "混合批次提及" }] }],
+        knowledge: [],
+        updates: [],
+        people: [],
+        conflicts: [],
+      }),
+    );
+    fs.writeFileSync(gateFlagFile, "hold");
+    fs.rmSync(enteredFlagFile, { force: true });
+    const mixPromise = svc.cycle("work:r8-mix-mid-remove");
+    await waitUntil(() => fs.existsSync(enteredFlagFile), 5_000);
+    // 在模型推理中途将 oc_r8_mix 移出白名单（此时 @我 仍然合法，但同批送入模型的普通消息不再允许！）
+    app.cfg.context.groups_allow = [];
+    fs.rmSync(gateFlagFile, { force: true });
+    const mixRep = await mixPromise;
+    assert.equal(mixRep.created, 0, "含现已越界普通消息的混合批次必须整体丢弃，即使批内仍有合法 @我");
+    assert.equal(svc.store.findProject("机密项目X"), undefined, "越界混合批次绝不能写入任何派生项目");
+    assert.equal(svc.store.obsPending("im:r8_mix_atme"), true, "幸存的合法 @我 必须保留 pending 待下轮干净批次重跑");
+    // 下轮重跑：只送 @我，绝不再送普通消息
+    fs.writeFileSync(callsLog, "");
+    fs.writeFileSync(
+      responseJsonFile,
+      JSON.stringify({
+        projects: [],
+        items: [{ title: "干净批次提及事项", kind: "ask_me", priority: "high", evidence: [{ obs_id: "im:r8_mix_atme", quote: "混合批次提及" }] }],
+        knowledge: [],
+        updates: [],
+        people: [],
+        conflicts: [],
+      }),
+    );
+    const cleanRep = await svc.cycle("work:r8-mix-clean-rerun");
+    assert.equal(cleanRep.created, 1);
+    const cleanPrompts = fs.readFileSync(callsLog, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as { prompt: string });
+    assert.ok(cleanPrompts.every((c) => !c.prompt.includes("普通群消息机密项目X")), "重跑批次绝不能再带入范围外普通消息");
+    assert.ok(cleanPrompts.some((c) => c.prompt.includes("混合批次提及")), "重跑批次应干净处理合法 @我");
+
+    // 7) [R8 P2-10] 先按资格筛选再截断 pending 窗口：范围外群前面积压 65 条普通待处理消息，第 66 条 @我 仍能立刻进入常规周期且不带普通消息
+    const starveObs: Obs[] = [
+      ...Array.from({ length: 65 }, (_, i) => ({
+        id: `im:r8_starve_ord_${i}`,
+        source: "im" as const,
+        kind: "group",
+        conv: "oc_r8_starve",
+        conv_name: "积压范围外群",
+        actor_id: "ou_x",
+        actor_name: "某人",
+        is_me: false,
+        time: now - 100_000 + i * 1000,
+        text: `积压普通消息_${i}`,
+        url: "",
+        meta: { chat_type: "group" },
+      })),
+      {
+        id: "im:r8_starve_atme_66",
+        source: "im",
+        kind: "at_me",
+        conv: "oc_r8_starve",
+        conv_name: "积压范围外群",
+        actor_id: "ou_y",
+        actor_name: "李四",
+        is_me: false,
+        time: now - 1_000,
+        text: "@张三 第66条提及不能被饿死",
+        url: "",
+        meta: { chat_type: "group", at_me: true },
+      },
+    ];
+    svc.store.addObs(starveObs);
+    fs.writeFileSync(callsLog, "");
+    fs.writeFileSync(
+      responseJsonFile,
+      JSON.stringify({
+        projects: [],
+        items: [{ title: "第66条提及事项", kind: "ask_me", priority: "high", evidence: [{ obs_id: "im:r8_starve_atme_66", quote: "第66条提及" }] }],
+        knowledge: [],
+        updates: [],
+        people: [],
+        conflicts: [],
+      }),
+    );
+    const starveRep = await svc.cycle("work:r8-starve-66");
+    assert.equal(starveRep.created, 1, "65 条旧普通消息绝不能饿死第 66 条真实 @我");
+    assert.equal(svc.store.obsPending("im:r8_starve_atme_66"), false);
+    const starvePrompts = fs.readFileSync(callsLog, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as { prompt: string });
+    assert.ok(starvePrompts.some((c) => c.prompt.includes("第66条提及不能被饿死")));
+    assert.ok(starvePrompts.every((c) => !c.prompt.includes("积压普通消息_")), "仅真实 @我 进入提示词，普通消息保持不送模型");
+
+    // 8) [R8 P2-11] 共享生效选群榜单：allowlist 含名称被禁的 A 与正常 B 且 max_groups=1 时，B 不被 A 占坑；spoken 模式下超榜群仅放行 @我
+    app.cfg.context.groups = "allowlist";
+    app.cfg.context.max_groups = 1;
+    app.cfg.context.groups_allow = ["oc_r8_denied_a", "oc_r8_ok_b"];
+    app.cfg.context.groups_deny = ["摸鱼"];
+    app.store.set("ctx.spoken_groups", JSON.stringify({ oc_r8_denied_a: { name: "全员摸鱼群", at: now }, oc_r8_ok_b: { name: "核心研发群", at: now - 1000 } }));
+    const effAllow = selectEffectiveOpenGroups({
+      cfg: app.cfg,
+      store: svc.store,
+      spoken: JSON.parse(app.store.get("ctx.spoken_groups")!),
+      now,
+    });
+    assert.deepEqual(effAllow.map(([id]) => id), ["oc_r8_ok_b"], "名称被排除的 A 不得占掉 B 的 max_groups=1 配额");
+    const sampleB: Obs = { id: "im:r8_b_1", source: "im", kind: "group", conv: "oc_r8_ok_b", conv_name: "核心研发群", actor_id: "ou_x", actor_name: "X", is_me: false, time: now, text: "B 群普通消息", url: "", meta: { chat_type: "group" } };
+    assert.equal(svc.personalWeb.filterWindowByCurrentScope("oc_r8_ok_b", [sampleB]).length, 1, "B 群在共享选群结果中，普通消息必须通过过滤");
+
+    app.cfg.context.groups = "spoken";
+    app.cfg.context.groups_deny = [];
+    app.store.set("ctx.spoken_groups", JSON.stringify({ oc_r8_top1: { name: "最热群", at: now }, oc_r8_drop2: { name: "次热群", at: now - 10_000 } }));
+    const dropOrd: Obs = { id: "im:r8_drop_ord", source: "im", kind: "group", conv: "oc_r8_drop2", conv_name: "次热群", actor_id: "ou_x", actor_name: "X", is_me: false, time: now, text: "次热群普通消息", url: "", meta: { chat_type: "group" } };
+    const dropAt: Obs = { id: "im:r8_drop_at", source: "im", kind: "at_me", conv: "oc_r8_drop2", conv_name: "次热群", actor_id: "ou_x", actor_name: "X", is_me: false, time: now, text: "@张三 次热群提及", url: "", meta: { chat_type: "group", at_me: true } };
+    const filteredSpoken = svc.personalWeb.filterWindowByCurrentScope("oc_r8_drop2", [dropOrd, dropAt]);
+    assert.deepEqual(filteredSpoken.map((o) => o.id), ["im:r8_drop_at"], "spoken 模式下跌出 top max_groups 的 oc_* 群必须剔除普通消息仅保留 @我");
+
+    // 9) [R8 P1-5] 轮询期间选中群集合变更：allowlist 从 A 变为 B 时重启并只落库 B；连续变更则安全丢弃且不推进 cursor.im.groups
+    app.cfg.context.groups = "allowlist";
+    app.cfg.context.max_groups = 5;
+    app.cfg.context.groups_allow = ["oc_r8_poll_a"];
+    app.store.db.prepare("DELETE FROM kv WHERE k LIKE 'ctx.cursor.%'").run();
+    const origLarkRun = app.lark.run.bind(app.lark);
+    let pollFlipMode: "once" | "always" = "once";
+    let pollFlipCount = 0;
+    app.lark.run = async (args: string[], opts?: Parameters<typeof origLarkRun>[1]) => {
+      if (args[0] === "im" && args[1] === "+messages-search") return { messages: [] };
+      if (args[0] === "im" && args[1] === "+chat-messages-list") {
+        const cid = args[args.indexOf("--chat-id") + 1];
+        if (pollFlipMode === "once" && cid === "oc_r8_poll_a") {
+          app!.cfg.context.groups_allow = ["oc_r8_poll_b"];
+          return {
+            messages: [{ message_id: "om_r8_poll_a", chat_id: "oc_r8_poll_a", chat_name: "旧群A", chat_type: "group", create_time: String(nowSec), sender: { id: "ou_x", name: "X", sender_type: "user" }, content: "旧群A消息" }],
+          };
+        }
+        if (pollFlipMode === "once" && cid === "oc_r8_poll_b") {
+          return {
+            messages: [{ message_id: "om_r8_poll_b", chat_id: "oc_r8_poll_b", chat_name: "新群B", chat_type: "group", create_time: String(nowSec), sender: { id: "ou_x", name: "X", sender_type: "user" }, content: "新群B消息" }],
+          };
+        }
+        if (pollFlipMode === "always") {
+          pollFlipCount++;
+          app!.cfg.context.groups_allow = [`oc_r8_churn_${pollFlipCount}`];
+          return {
+            messages: [{ message_id: `om_r8_churn_${pollFlipCount}`, chat_id: cid, chat_name: "抖动群", chat_type: "group", create_time: String(nowSec), sender: { id: "ou_x", name: "X", sender_type: "user" }, content: "抖动消息" }],
+          };
+        }
+      }
+      return origLarkRun(args, opts);
+    };
+    try {
+      const rRestart = await svc.connectors.pullIm();
+      assert.equal(rRestart.count, 1);
+      assert.equal(svc.store.obs("im:om_r8_poll_a"), undefined, "allowlist 变更后旧群 A 的消息绝不能落库");
+      assert.ok(svc.store.obs("im:om_r8_poll_b"), "重启轮询后新群 B 的消息必须完整拉取落库");
+      assert.equal(app.store.get("ctx.cursor.chat.oc_r8_poll_a"), undefined, "旧群 A 游标不得推进");
+      assert.ok(app.store.get("ctx.cursor.chat.oc_r8_poll_b"), "新群 B 游标应正常推进");
+
+      // 连续两轮都在拉取中变更 allowlist：必须放弃本轮且绝不推进 cursor.im.groups
+      app.store.db.prepare("DELETE FROM kv WHERE k LIKE 'ctx.cursor.%'").run();
+      pollFlipMode = "always";
+      app.cfg.context.groups_allow = ["oc_r8_churn_0"];
+      const rChurn = await svc.connectors.pullIm();
+      assert.equal(rChurn.count, 0);
+      assert.equal(app.store.get("ctx.cursor.im.groups"), undefined, "连续变更放弃本轮时绝不能推进 cursor.im.groups");
+      assert.equal(app.store.get("ctx.cursor.im"), undefined);
+    } finally {
+      app.lark.run = origLarkRun;
+    }
+
+    // 10) [R8 P1-4] outbox 发包前二次核验目标未撤回（含 onBeforeSend 竞态）；已 created 的记录仍允许只读回读恢复
+    svc.store.addObs([
+      {
+        id: "pw:r8_outbox_msg",
+        source: "im",
+        kind: "at_me",
+        conv: "pw_chat:9802",
+        conv_name: "范围外群",
+        actor_id: "7002",
+        actor_name: "王五",
+        is_me: false,
+        time: now,
+        text: "@张三 待撤回目标",
+        url: "",
+        meta: { transport: "personal_web", native_owner_id: "7001", native_message_id: "r8_outbox_msg", native_chat_id: "9802", native_root_id: "r8_outbox_msg", chat_type: "group", at_me: true },
+      },
+    ]);
+    mock.addMessage(
+      "r8_outbox_msg",
+      buildNativeMessage({
+        id: "r8_outbox_msg",
+        chatId: "9802",
+        actorId: "7002",
+        createdAtSec: nowSec - 10,
+        richBytes: encodeRichText([{ text: "@张三", mentionId: "7001" }, { text: " 待撤回目标" }]),
+      }),
+    );
+    mock.setChatKind("9802", CHAT_KIND_GROUP);
+    const sendsBeforeWithdrawn = mock.sentReplies.length;
+    // 在 sendVerifiedReply 拉取 chatMode 之后、发包前（onBeforeSend）模拟目标消息被编辑撤回
+    mock.setOnChatMode(() => {
+      svc.store.retirePendingObs("pw:r8_outbox_msg");
+    });
+    try {
+      await assert.rejects(
+        () => svc.personalWeb.sendVerifiedReply({ owner_id: "7001", chat_id: "9802", message_id: "r8_outbox_msg", text: "不应发出的回复", cid: "cid_r8_withdrawn_send" }),
+        /撤回|移出/,
+        "outbox 发包前目标观测已被撤回时必须中止发送",
+      );
+    } finally {
+      mock.setOnChatMode(undefined);
+    }
+    assert.equal(mock.sentReplies.length, sendsBeforeWithdrawn, "目标撤回后绝不能向飞书发送回复");
+    // 已 created 的投递在原消息撤回后仍允许只读回读确认
+    mock.addMessage("sent_r8_created_ok", buildNativeMessage({ id: "sent_r8_created_ok", chatId: "9802", actorId: "7001", createdAtSec: nowSec, text: "已发出的回读内容", cid: "cid_r8_created_ok", rootId: "r8_outbox_msg", parentId: "r8_outbox_msg" }));
+    const createdTextHash = crypto.createHash("sha256").update("已发出的回读内容").digest("hex");
+    app.store.set(
+      "pw.delivery.cid_r8_created_ok",
+      JSON.stringify({ cid: "cid_r8_created_ok", state: "created", owner_id: "7001", chat_id: "9802", message_id: "r8_outbox_msg", root_id: "r8_outbox_msg", parent_id: "r8_outbox_msg", reply_id: "sent_r8_created_ok", text_hash: createdTextHash, threaded: false, updated_at: now }),
+    );
+    const readbackOk = await svc.personalWeb.sendVerifiedReply({ owner_id: "7001", chat_id: "9802", message_id: "r8_outbox_msg", text: "已发出的回读内容", cid: "cid_r8_created_ok" });
+    assert.equal(readbackOk.replyId, "sent_r8_created_ok");
+    assert.equal(mock.sentReplies.length, sendsBeforeWithdrawn, "已 created 记录只做回读确认不重发");
+
+    // 11) [R8 P2-17] fastCycle 在首个异步资格查询期间收到取消信号时，必须立刻中止：不补读、不调模型、不发提醒
+    svc.store.addObs([
+      {
+        id: "pw:r8_fast_cancel",
+        source: "im",
+        kind: "at_me",
+        conv: "pw_chat:9803",
+        conv_name: "取消测试群",
+        actor_id: "7002",
+        actor_name: "王五",
+        is_me: false,
+        time: now,
+        text: "@张三 取消信号测试",
+        url: "",
+        meta: { transport: "personal_web", native_owner_id: "7001", native_message_id: "r8_fast_cancel", native_chat_id: "9803", chat_type: "group", at_me: true },
+      },
+    ]);
+    const fastCtrl = new AbortController();
+    const origFastCheck = svc.personalWeb.checkConvAllowedForUnderstand.bind(svc.personalWeb);
+    const origHydrate = svc.personalWeb.hydrateContext.bind(svc.personalWeb);
+    let hydrateCalled = false;
+    svc.personalWeb.checkConvAllowedForUnderstand = async (...args) => {
+      const res = await origFastCheck(...args);
+      fastCtrl.abort();
+      return res;
+    };
+    svc.personalWeb.hydrateContext = async (...args) => {
+      hydrateCalled = true;
+      return origHydrate(...args);
+    };
+    fs.writeFileSync(callsLog, "");
+    try {
+      await assert.rejects(
+        () =>
+          svc.fastCycle(
+            "work:r8-fast-cancel",
+            {
+              conv: "pw_chat:9803",
+              conv_name: "取消测试群",
+              trigger_obs_id: "pw:r8_fast_cancel",
+              anchor: { id: "r8_fast_cancel", conversationId: "9803", rootId: "", parentId: "", threadId: "", position: 1, createdAtMs: now },
+            },
+            fastCtrl.signal,
+          ),
+        /aborted/,
+        "首个资格查询期间已中止的 signal 必须立刻中止 fastCycle",
+      );
+    } finally {
+      svc.personalWeb.checkConvAllowedForUnderstand = origFastCheck;
+      svc.personalWeb.hydrateContext = origHydrate;
+    }
+    assert.equal(hydrateCalled, false, "已取消的 fastCycle 不得继续补读历史");
+    assert.equal(fs.readFileSync(callsLog, "utf8").trim(), "", "已取消的 fastCycle 不得调用模型");
+
+    // 12) [R8 P1-8 & P1-9] 主人变更后隐藏历史 context 审计消息与上下文委派派单（含描述、diff、步骤日志、列表、概览、命令与审计）
+    const cfl = svc.store.addConflict({
+      project_id: "",
+      topic: "机密发布节奏",
+      claims: [
+        { claim: "主人A私密结论：周五灰度内部客户X", obs_id: "pw:r8_draft_atme", quote: "周五灰度", time: now },
+        { claim: "延后到下周一", obs_id: "pw:r8_draft_atme", quote: "下周一", time: now },
+      ],
+    });
+    await app.commands.exec("context.conflict_resolve", { id: cfl.id, choice: 0 }, { source: "web", actor: "owner" });
+    // 通过 context.item_delegate 创建上下文派生派单（mock board.createTask + dispatcher.reconcile）
+    const origCreateTask = app.board.createTask.bind(app.board);
+    const origReconcile = app.dispatcher.reconcile.bind(app.dispatcher);
+    let delegatedId = "";
+    app.board.createTask = async (t) => {
+      const guid = "task_r8_delegated";
+      app!.ledger.enqueue({
+        id: `dispatch:${guid}:1`,
+        kind: "dispatch",
+        ref: guid,
+        state: "running",
+        payload: { guid, summary: t.summary, description: t.description ?? "", harness: "mock_ctx", reviewer: "", verify: "", cwd: "", branch: "", base: "", round: 1, maxRounds: 1, checkpoints: {}, report: "", feedback: "", history: [] },
+      });
+      return guid;
+    };
+    app.dispatcher.reconcile = async () => ({ enqueued: 0, cancelled: 0, deferred: 0 });
+    try {
+      const delRes = await app.commands.exec("context.item_delegate", { id: draftScopeItem.id }, { source: "web", actor: "owner" });
+      delegatedId = delRes.target ?? "";
+    } finally {
+      app.board.createTask = origCreateTask;
+      app.dispatcher.reconcile = origReconcile;
+    }
+    assert.ok(delegatedId.startsWith("dispatch:task_r8_delegated:"));
+    const delLogFile = path.join(recDir, "runs", "dispatch-r8-secret.log");
+    fs.mkdirSync(path.dirname(delLogFile), { recursive: true });
+    fs.writeFileSync(delLogFile, "worker log containing 麻烦确认下排期\n");
+    const delStepId = app.ledger.startStep({ work_id: delegatedId, name: "worker#1", harness: "mock_ctx", log: delLogFile });
+    app.ledger.endStep(delStepId, "ok", "done");
+
+    // 切换工作区主人为 ou_owner_b：必须全面阻断历史 context 审计与上下文派生派单
+    app.cfg.owner.open_id = "ou_owner_b";
+    try {
+      const auditB = Q.auditViews(app, undefined, 100);
+      assert.ok(!auditB.some((a) => a.command.startsWith("context.")), "主人变更后 /api/audit 不得返回历史 context.* 审计消息");
+      assert.ok(!auditB.some((a) => a.message.includes("内部客户X")), "主人变更后 /api/audit 绝不能泄漏旧主人冲突结论");
+      assert.ok(!auditB.some((a) => a.target === delegatedId), "主人变更后 /api/audit 不得返回上下文派生派单的审计记录");
+      assert.ok(!Q.listDispatches(app, {}).some((d) => d.id === delegatedId), "主人变更后派单列表必须隐藏旧主人上下文委派派单");
+      assert.ok(!Q.overview(app).running.some((d) => d.id === delegatedId), "主人变更后概览必须隐藏旧主人上下文委派派单");
+      await assert.rejects(() => Q.dispatchDetail(app!, delegatedId), /主人隔离|阻断/, "主人变更后 dispatchDetail 必须拒绝读取上下文派单描述");
+      await assert.rejects(() => Q.dispatchDiff(app!, delegatedId), /主人隔离|阻断/, "主人变更后 dispatchDiff 必须拒绝访问");
+      assert.throws(() => Q.stepLog(app!, delStepId, 0), /主人隔离|阻断/, "主人变更后 stepLog 必须拒绝读取上下文派单的 worker 日志");
+      await assert.rejects(() => app!.commands.exec("dispatch.cancel", { id: delegatedId }, { source: "web", actor: "owner" }), /主人隔离|阻断/);
+    } finally {
+      app.cfg.owner.open_id = "ou_owner_a";
+    }
+
+    // 13) [R8 P2-16] 监听进入 needs_login 后，另一进程以相同 owner_id + session_id 写入更高 cookie_version 轮换凭据必须立刻唤醒恢复监听
+    const rotMock = await startMockFeishuWebServer();
+    try {
+      const rotBridge = new PersonalWebBridge(app, svc.store, {
+        onFastTrigger: () => undefined,
+        onReconnect: () => undefined,
+        onNeedsLogin: () => undefined,
+        credentialWatchIntervalMs: 30,
+        clientOptions: { endpoints: rotMock.endpoints },
+      });
+      // 先模拟一次 SessionNeedsLoginError 使 supervisor 休眠在 waitForCredentialChange，再以同 owner_id + session_id 写入 cookie_version=2
+      const rotLogin = rotBridge.loginStore.save({
+        owner_id: "7001",
+        owner_name: "张三",
+        session_id: "sess_r8_rotate_wake",
+        cookie_version: 1,
+        cookies: [{ name: "session", value: "expired_v1", domain: "internal-api-lark-api.feishu.cn", path: "/" }],
+        updated_at: new Date(Date.now() - 1000).toISOString(),
+      });
+      const origConnect = FeishuWebClient.connect;
+      let connectCalls = 0;
+      FeishuWebClient.connect = async (loginArg, opts, sig) => {
+        connectCalls++;
+        if ((loginArg.cookie_version ?? 1) < 2) {
+          throw new SessionNeedsLoginError("cookie expired v1");
+        }
+        return origConnect.call(FeishuWebClient, loginArg, opts, sig);
+      };
+      const handle = rotBridge.start();
+      try {
+        await waitUntil(() => rotBridge.status().state === "needs_login" && connectCalls >= 1, 4_000);
+        // 另一进程同会话轮换 Cookie（相同 owner_id & session_id，更高 cookie_version）
+        const merged = rotBridge.loginStore.saveIfSessionMatches(
+          {
+            ...rotLogin,
+            cookies: [{ name: "session", value: "fresh_v2", domain: "internal-api-lark-api.feishu.cn", path: "/" }],
+            updated_at: new Date().toISOString(),
+          },
+          {
+            upserts: [{ name: "session", value: "fresh_v2", domain: "internal-api-lark-api.feishu.cn", path: "/" }],
+            deletes: [],
+            baseValues: { "session\0internal-api-lark-api.feishu.cn\0/": "expired_v1" },
+          },
+        );
+        assert.ok(merged && (merged.cookie_version ?? 0) >= 2, "同会话轮换 Cookie 必须递增 cookie_version");
+        await waitUntil(() => rotBridge.status().state === "listening", 4_000);
+        assert.ok(connectCalls >= 2, "同会话 cookie_version 递增后必须立即唤醒休眠监听并重新连上");
+      } finally {
+        handle.stop();
+        FeishuWebClient.connect = origConnect;
+      }
+    } finally {
+      await rotMock.close();
+    }
   } finally {
     if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
     else process.env.PA_FEISHU_WEB_KEY = prevKey;
