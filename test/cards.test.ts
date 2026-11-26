@@ -272,6 +272,21 @@ test("/do 表单卡片：描述、执行者、仓库字段；提交后显示结�
   assert.match(text(done), /dispatches\/dispatch%3Ag%3A1/);
 });
 
+test("卡片控制台链接携带签名票据：自动经 /login?ticket=...&next=... 跳转", () => {
+  const tctx: RenderCtx = { ...ctx, consoleTicket: "1893456000000.sig_abc" };
+  const openUrls = (c: unknown) =>
+    findAll(c, (n) => n.tag === "button" && (n.behaviors as { type: string }[])[0]?.type === "open_url").map((b) => (b.behaviors as J[])[0].default_url as string);
+
+  const d = openUrls(dispatchCard(dview(), tctx));
+  assert.ok(d.includes("http://127.0.0.1:7878/login?ticket=1893456000000.sig_abc&next=%2Fdispatches%2Fdispatch%253Ag1%253A1"), JSON.stringify(d));
+  const f = openUrls(failureCard(fview(), tctx));
+  assert.ok(f.includes("http://127.0.0.1:7878/login?ticket=1893456000000.sig_abc&next=%2Fhealth"), JSON.stringify(f));
+  const b = openUrls(briefCard("morning", "**早报**\n**今日**\n- 1", tctx, "2026-11-23"));
+  assert.ok(b.includes("http://127.0.0.1:7878/login?ticket=1893456000000.sig_abc"), JSON.stringify(b));
+  const df = openUrls(doFormCard({ key: "do:om_9", harnesses: [], defaultHarness: "", repos: [], submitted: { summary: "修 bug", message: "已创建派单", dispatchId: "dispatch:g:1" } }, tctx));
+  assert.ok(df.includes("http://127.0.0.1:7878/login?ticket=1893456000000.sig_abc&next=%2Fdispatches%2Fdispatch%253Ag%253A1"), JSON.stringify(df));
+});
+
 // ───────── 回调解析 ─────────
 
 test("parseAction：只认主人；回调值与表单合并（操作对象不能被表单覆盖）；独立下拉；兜底识别表单提交；坏输入", () => {

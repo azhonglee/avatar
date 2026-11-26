@@ -1,4 +1,4 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -15,8 +15,9 @@ import { errMsg, log } from "../util.ts";
  *
  * 安全：
  *   - 监听 cfg.server.host（默认 0.0.0.0，同局域网可直接访问；如需仅限本机访问可设为 127.0.0.1）
- *   - 令牌鉴权：令牌存在 kv（server.token），`pa console` 打印一次性登录链接；
- *     /login?token= 校验后写入 HttpOnly + SameSite=Strict 的 Cookie。也接受 Authorization: Bearer
+ *   - 令牌鉴权：令牌存在 kv（server.token），`pa console` 打印登录链接；
+ *     飞书卡片链接携带短期 HMAC 签名票据（/login?ticket=<exp>.<sig>&next=...），不暴露主令牌，轮换令牌即全部失效；
+ *     /login 校验后写入 HttpOnly + SameSite=Lax 的 Cookie 并跳转到站内 next 路径。也接受 Authorization: Bearer
  *   - 写请求要求 JSON 且同源（Origin 与 Host 一致），防 CSRF
  */
 
@@ -84,6 +85,7 @@ export function consoleBaseUrl(host: string, port: number, ifaces?: NodeJS.Dict<
 }
 
 const COOKIE = "pa_session";
+const LOGIN_TICKET_TTL_MS = 7 * 86_400_000;
 const MAX_BODY = 1024 * 1024;
 const WEB_DIST = path.join(ROOT, "web", "dist");
 
@@ -94,6 +96,48 @@ export function serverToken(app: App, rotate = false): string {
     app.store.set("server.token", t);
   }
   return t;
+}
+
+/** 用主令牌签发短期无状态登录票据（`<expMs>.<hmac-sha256-base64url>`），供发给本人的飞书卡片链接免登；轮换主令牌即刻失效。 */
+export function signLoginTicket(token: string, ttlMs = LOGIN_TICKET_TTL_MS, now = Date.now()): string {
+  const exp = String(Math.floor(now + ttlMs));
+  const sig = createHmac("sha256", token).update(`login:${exp}`).digest("base64url");
+  return `${exp}.${sig}`;
+}
+
+export function verifyLoginTicket(token: string, ticket: string, now = Date.now()): boolean {
+  if (!token || !ticket) return false;
+  const parts = ticket.split(".");
+  if (parts.length !== 2) return false;
+  const [expStr, sig] = parts;
+  if (!/^\d+$/.test(expStr) || !sig) return false;
+  const exp = Number(expStr);
+  if (!Number.isSafeInteger(exp) || exp < now) return false;
+  const expected = createHmac("sha256", token).update(`login:${expStr}`).digest("base64url");
+  return safeEqual(sig, expected);
+}
+
+/** 校验并规范化登录后跳转的站内相对路径，拦截开放重定向（`//evil`、`/\evil`、外链、控制字符等）。 */
+export function safeNextPath(raw: string | null | undefined): string {
+  if (!raw || !raw.startsWith("/") || raw.startsWith("//") || raw.startsWith("/\\") || /[\x00-\x1f\x7f]/.test(raw)) return "/";
+  try {
+    const u = new URL(raw, "http://local.invalid");
+    if (u.origin !== "http://local.invalid") return "/";
+    return `${u.pathname}${u.search}${u.hash}`;
+  } catch {
+    return "/";
+  }
+}
+
+/** 构造控制台链接；提供 ticket 时经 `/login?ticket=...&next=...` 写入 Cookie 后再跳目标页。 */
+export function consoleLinkUrl(base: string, targetPath = "/", ticket?: string): string {
+  if (!base) return "";
+  const clean = base.replace(/\/+$/, "");
+  const next = safeNextPath(targetPath);
+  if (!ticket) return `${clean}${next}`;
+  const qs = new URLSearchParams({ ticket });
+  if (next !== "/") qs.set("next", next);
+  return `${clean}/login?${qs.toString()}`;
 }
 
 class HttpError extends Error {
@@ -123,13 +167,19 @@ function safeEqual(a: string, b: string): boolean {
 }
 
 function cookies(req: http.IncomingMessage): Record<string, string> {
-  return Object.fromEntries(
-    (req.headers.cookie ?? "")
-      .split(";")
-      .map((c) => c.trim().split("="))
-      .filter((kv) => kv.length === 2)
-      .map(([k, v]) => [k, decodeURIComponent(v)]),
-  );
+  const out: Record<string, string> = {};
+  for (const part of (req.headers.cookie ?? "").split(";")) {
+    const i = part.indexOf("=");
+    if (i <= 0) continue;
+    const k = part.slice(0, i).trim();
+    const v = part.slice(i + 1).trim();
+    try {
+      out[k] = decodeURIComponent(v);
+    } catch {
+      out[k] = v;
+    }
+  }
+  return out;
 }
 
 const SECURITY_HEADERS = {
@@ -209,7 +259,8 @@ export interface ConsoleServer {
 }
 
 export async function startServer(app: App, o: { version: string; port?: number; host?: string }): Promise<ConsoleServer> {
-  const token = serverToken(app);
+  serverToken(app); // 启动时确保令牌已生成
+  const currentToken = () => serverToken(app);
   const host = o.host ?? app.cfg.server.host;
   const clients = new Set<http.ServerResponse>();
 
@@ -242,9 +293,10 @@ export async function startServer(app: App, o: { version: string; port?: number;
   const ping = setInterval(() => broadcast({ type: "ping", at: Date.now() }), 15_000);
 
   const authed = (req: http.IncomingMessage): boolean => {
+    const tok = currentToken();
     const bearer = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
     const c = cookies(req)[COOKIE];
-    return (!!bearer && safeEqual(bearer, token)) || (!!c && safeEqual(c, token));
+    return (!!bearer && safeEqual(bearer, tok)) || (!!c && safeEqual(c, tok));
   };
 
   const sameOrigin = (req: http.IncomingMessage): boolean => {
@@ -262,20 +314,30 @@ export async function startServer(app: App, o: { version: string; port?: number;
     const m = req.method ?? "GET";
 
     if (pathname === "/login" && m === "GET") {
+      const tok = currentToken();
       const t = url.searchParams.get("token") ?? "";
-      if (!safeEqual(t, token)) {
-        res.writeHead(401, { "Content-Type": "text/html; charset=utf-8", ...SECURITY_HEADERS });
+      const ticket = url.searchParams.get("ticket") ?? "";
+      const next = safeNextPath(url.searchParams.get("next"));
+      const valid = (!!t && safeEqual(t, tok)) || (!!ticket && verifyLoginTicket(tok, ticket));
+      if (!valid) {
+        // 卡片里的短期票据过期后，若当前浏览器/飞书 WebView 仍持有效会话 Cookie，直接放行到目标页
+        if (!t && ticket && authed(req)) {
+          res.writeHead(302, { Location: next, "Cache-Control": "no-store", ...SECURITY_HEADERS });
+          return void res.end();
+        }
+        res.writeHead(401, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", ...SECURITY_HEADERS });
         return void res.end("<meta charset=utf-8><p>登录链接无效或已过期。请在开发机上运行 <code>pa console</code> 获取新链接。</p>");
       }
       res.writeHead(302, {
-        "Set-Cookie": `${COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${30 * 86400}`,
-        Location: "/",
+        "Set-Cookie": `${COOKIE}=${encodeURIComponent(tok)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${30 * 86400}`,
+        Location: next,
+        "Cache-Control": "no-store",
         ...SECURITY_HEADERS,
       });
       return void res.end();
     }
     if (pathname === "/logout" && m === "POST") {
-      return send(res, 200, { ok: true }, { "Set-Cookie": `${COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0` });
+      return send(res, 200, { ok: true }, { "Set-Cookie": `${COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0` });
     }
     if (pathname === "/api/health/live") return send(res, 200, { ok: true });
 

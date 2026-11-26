@@ -2,7 +2,7 @@ import { Cron } from "croner";
 import { z } from "zod";
 import type { App } from "../app.ts";
 import type { CtxCycleReport, CtxDraftKind, CtxItemStatus, CtxItemView, CommandResult } from "../api/types.ts";
-import { consoleBaseUrl } from "../server/index.ts";
+import { consoleBaseUrl, serverToken, signLoginTicket } from "../server/index.ts";
 import { CommandError } from "../commands.ts";
 import { card as cardEffect, notify } from "../effects.ts";
 import type { Handler } from "../engine.ts";
@@ -55,7 +55,12 @@ export class ContextService {
 
   renderCtx(notice?: string): CtxRenderCtx {
     const { cfg } = this;
-    return { consoleBase: cfg.server.enabled ? consoleBaseUrl(cfg.server.host, cfg.server.port) : "", timezone: cfg.owner.timezone, notice };
+    return {
+      consoleBase: cfg.server.enabled ? consoleBaseUrl(cfg.server.host, cfg.server.port) : "",
+      consoleTicket: cfg.server.enabled ? signLoginTicket(serverToken(this.app)) : undefined,
+      timezone: cfg.owner.timezone,
+      notice,
+    };
   }
 
   cardsOn(): boolean {

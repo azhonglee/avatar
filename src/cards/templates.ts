@@ -1,4 +1,5 @@
 import type { CommandName, DeliveryStatus } from "../api/types.ts";
+import { consoleLinkUrl } from "../server/index.ts";
 import { truncate } from "../util.ts";
 import type { CheckResult } from "../workflows/dispatch.ts";
 
@@ -24,6 +25,8 @@ export interface RenderCtx {
   harnesses: string[];
   /** 控制台地址（如 http://<局域网IP>:7878），没启用控制台时为空 */
   consoleBase: string;
+  /** 短期签名登录票据（见 server/index.ts）；提供时控制台链接经 /login?ticket=...&next=... 免登 */
+  consoleTicket?: string;
   timezone: string;
   /** 刚执行的操作结果，显示在卡片底部 */
   notice?: string;
@@ -264,9 +267,8 @@ export function stageLine(v: Pick<DispatchCardView, "state" | "terminal" | "harn
 const CHECK_ICON = { pass: "✅", fail: "❌", error: "⚠️" } as const;
 const CHECK_TEXT = { pass: "通过", fail: "需修改", error: "故障" } as const;
 
-export function consoleUrl(base: string, dispatchId?: string): string {
-  if (!base) return "";
-  return dispatchId ? `${base}/dispatches/${encodeURIComponent(dispatchId)}` : `${base}/`;
+export function consoleUrl(base: string, dispatchId?: string, ticket?: string): string {
+  return consoleLinkUrl(base, dispatchId ? `/dispatches/${encodeURIComponent(dispatchId)}` : "/", ticket);
 }
 
 export function dispatchCard(v: DispatchCardView, ctx: RenderCtx): Card {
@@ -337,7 +339,7 @@ export function dispatchCard(v: DispatchCardView, ctx: RenderCtx): Card {
     );
   if (has("dispatch.cancel"))
     buttons.push(button("取消", val("dispatch.cancel"), { type: "danger", confirm: { title: "取消这次派单？", text: "正在运行的执行者会被结束，已有改动保留在工作目录。" } }));
-  const url = consoleUrl(ctx.consoleBase, v.id);
+  const url = consoleUrl(ctx.consoleBase, v.id, ctx.consoleTicket);
   if (url) buttons.push(linkButton("在控制台查看", url));
   if (v.taskUrl) buttons.push(linkButton("打开任务", v.taskUrl));
   if (buttons.length) elements.push(buttonRow(buttons));
@@ -477,7 +479,8 @@ export function failureCard(v: FailureCardView, ctx: RenderCtx): Card {
     if (v.canRetry) buttons.push(button("重试", val("work.retry")));
     if (v.canAcknowledge) buttons.push(button("忽略", val("work.acknowledge")));
   }
-  if (ctx.consoleBase) buttons.push(linkButton("查看详情", `${ctx.consoleBase}/health`));
+  const url = consoleLinkUrl(ctx.consoleBase, "/health", ctx.consoleTicket);
+  if (url) buttons.push(linkButton("查看详情", url));
   if (buttons.length) elements.push(buttonRow(buttons));
   elements.push(...noticeEl(ctx.notice));
   return card(header(v.title, status.color, "失败告警", { text: status.text, color: status.color }), elements, `⚠️ ${v.title}`);
@@ -489,7 +492,7 @@ export function failureCard(v: FailureCardView, ctx: RenderCtx): Card {
  * 把 buildBrief 的 Markdown 转成卡片：第一行是标题，以 **粗体** 开头的行开启一个分区。
  * 内容与私信版完全一致（同一份数据），只是分区成块、带“打开控制台”入口。
  */
-export function briefCard(mode: "morning" | "evening", text: string, ctx: Pick<RenderCtx, "consoleBase">, date = new Date().toISOString().slice(0, 10)): Card {
+export function briefCard(mode: "morning" | "evening", text: string, ctx: Pick<RenderCtx, "consoleBase" | "consoleTicket">, date = new Date().toISOString().slice(0, 10)): Card {
   const [first = "", ...rest] = text.split("\n");
   const title = first.replace(/\*\*/g, "").trim() || (mode === "morning" ? "今日概览" : "今日收尾");
   const blocks: string[][] = [];
@@ -498,7 +501,8 @@ export function briefCard(mode: "morning" | "evening", text: string, ctx: Pick<R
     else blocks.at(-1)!.push(line);
   }
   const elements: El[] = blocks.map((b) => md(b.join("\n").trim())).filter((e) => e.content);
-  if (ctx.consoleBase) elements.push(linkButton("打开控制台", consoleUrl(ctx.consoleBase), "primary_filled", true));
+  const url = consoleUrl(ctx.consoleBase, undefined, ctx.consoleTicket);
+  if (url) elements.push(linkButton("打开控制台", url, "primary_filled", true));
   return card(header(title, mode === "morning" ? "wathet" : "indigo", date), elements, title);
 }
 
@@ -515,9 +519,9 @@ export interface DoFormView {
   values?: { summary?: string; description?: string; harness?: string; repo?: string };
 }
 
-export function doFormCard(v: DoFormView, ctx: Pick<RenderCtx, "consoleBase" | "notice">): Card {
+export function doFormCard(v: DoFormView, ctx: Pick<RenderCtx, "consoleBase" | "consoleTicket" | "notice">): Card {
   if (v.submitted) {
-    const url = v.submitted.dispatchId.startsWith("dispatch:") ? consoleUrl(ctx.consoleBase, v.submitted.dispatchId) : "";
+    const url = v.submitted.dispatchId.startsWith("dispatch:") ? consoleUrl(ctx.consoleBase, v.submitted.dispatchId, ctx.consoleTicket) : "";
     const elements: El[] = [md(`**任务**　${esc(v.submitted.summary)}\n${esc(v.submitted.message)}`)];
     if (url) elements.push(buttonRow([linkButton("在控制台查看", url)]));
     return card(header("已创建派单", "green", "进度会以单独的卡片实时更新"), elements, `已创建派单：${v.submitted.summary}`);

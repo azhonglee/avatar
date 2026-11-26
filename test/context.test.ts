@@ -407,6 +407,25 @@ test("控制台 API：今天 / 项目 / 事项 / 知识 / 动态 / 人 / 草稿 
     assert.equal(st.sources.length, 6);
     const res = await fetch(srv.url + "/api/context/items/nope", { headers: { Authorization: `Bearer ${token}` } });
     assert.equal(res.status, 404);
+
+    // 从飞书晨间卡点「打开今天」：携带短期签名票据（不暴露主令牌），经 /login 写入 Cookie 并跳 /today，直接可访问 API
+    const date = ymd(Date.now());
+    const morning = lastCard(`ctx-morning:${date}`)!.card as { body?: { elements?: Record<string, unknown>[] } };
+    const openBtn = (morning.body?.elements ?? []).find(
+      (e) => e.tag === "button" && Array.isArray(e.behaviors) && (e.behaviors[0] as { type?: string })?.type === "open_url",
+    );
+    assert.ok(openBtn, "晨间卡应有打开今天按钮");
+    const openUrl = ((openBtn.behaviors as { default_url: string }[])[0]).default_url;
+    const u = new URL(openUrl);
+    assert.equal(u.pathname, "/login");
+    assert.equal(u.searchParams.get("next"), "/today");
+    assert.ok(u.searchParams.get("ticket") && !openUrl.includes(token), "只含签名票据，不含主令牌");
+    const loginRes = await fetch(srv.url + u.pathname + u.search, { redirect: "manual" });
+    assert.equal(loginRes.status, 302);
+    assert.equal(loginRes.headers.get("location"), "/today");
+    const cookiePair = (loginRes.headers.get("set-cookie") ?? "").split(";")[0];
+    const authedToday = await fetch(srv.url + "/api/context/today", { headers: { Cookie: cookiePair } });
+    assert.equal(authedToday.status, 200);
   } finally {
     await srv.close();
   }

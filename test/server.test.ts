@@ -12,7 +12,19 @@ import { fileURLToPath } from "node:url";
 import { createApp, type App } from "../src/app.ts";
 import type { CommandResult, DispatchDetail, DispatchSummary, Meta, Overview } from "../src/api/types.ts";
 import { loadConfig } from "../src/config.ts";
-import { consoleBaseUrl, detectLanIp, isLoopbackHost, isWildcardHost, serverToken, startServer, type ConsoleServer } from "../src/server/index.ts";
+import {
+  consoleBaseUrl,
+  consoleLinkUrl,
+  detectLanIp,
+  isLoopbackHost,
+  isWildcardHost,
+  safeNextPath,
+  serverToken,
+  signLoginTicket,
+  startServer,
+  verifyLoginTicket,
+  type ConsoleServer,
+} from "../src/server/index.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pa-server-"));
@@ -65,8 +77,9 @@ test("鉴权：没有令牌 401；登录链接写 HttpOnly Cookie；错误令牌
   assert.equal(bad.status, 401);
   const login = await api(`/login?token=${token}`, { auth: false });
   assert.equal(login.status, 302);
+  assert.equal(login.headers.get("location"), "/");
   const cookie = login.headers.get("set-cookie") ?? "";
-  assert.match(cookie, /pa_session=.+HttpOnly; SameSite=Strict/);
+  assert.match(cookie, /pa_session=.+HttpOnly; SameSite=Lax/);
   const viaCookie = await api("/api/meta", { auth: false, headers: { Cookie: cookie.split(";")[0] } });
   assert.equal(viaCookie.status, 200);
   const meta = (await viaCookie.json()) as Meta;
@@ -74,6 +87,63 @@ test("鉴权：没有令牌 401；登录链接写 HttpOnly Cookie；错误令牌
   const page = await api("/", { auth: false });
   assert.equal(page.status, 200);
   assert.match(page.headers.get("content-security-policy") ?? "", /default-src 'self'/);
+});
+
+test("卡片登录票据与 next 跳转：有效票据自动种 Cookie 并跳目标页；防开放重定向；过期票据对已登录浏览器放行；令牌轮换即时失效", async () => {
+  const ticket = signLoginTicket(token);
+  assert.ok(!ticket.includes(token), "票据不暴露主令牌");
+  assert.equal(verifyLoginTicket(token, ticket), true);
+  assert.equal(verifyLoginTicket(token, `${ticket}x`), false);
+
+  const link = consoleLinkUrl(srv.url, "/today", ticket);
+  const parsed = new URL(link);
+  assert.equal(parsed.pathname, "/login");
+  assert.equal(parsed.searchParams.get("ticket"), ticket);
+  assert.equal(parsed.searchParams.get("next"), "/today");
+
+  // 有效票据：种 HttpOnly + SameSite=Lax Cookie 并跳 /today
+  const okRes = await api(`${parsed.pathname}${parsed.search}`, { auth: false });
+  assert.equal(okRes.status, 302);
+  assert.equal(okRes.headers.get("location"), "/today");
+  const cookie = okRes.headers.get("set-cookie") ?? "";
+  assert.match(cookie, /pa_session=.+HttpOnly; SameSite=Lax/);
+  const cookiePair = cookie.split(";")[0];
+  assert.equal((await api("/api/meta", { auth: false, headers: { Cookie: cookiePair } })).status, 200);
+
+  // 篡改票据 / 过期票据：未登录时 401
+  const expired = signLoginTicket(token, -1000);
+  assert.equal(verifyLoginTicket(token, expired), false);
+  assert.equal((await api(`/login?ticket=${encodeURIComponent(expired)}&next=%2Ftoday`, { auth: false })).status, 401);
+  assert.equal((await api(`/login?ticket=${encodeURIComponent(`${ticket}x`)}&next=%2Ftoday`, { auth: false })).status, 401);
+
+  // 过期票据：已持有有效 Cookie 的浏览器 / 飞书 WebView 直接跳去目标页
+  const passThrough = await api(`/login?ticket=${encodeURIComponent(expired)}&next=%2Ftoday`, { auth: false, headers: { Cookie: cookiePair } });
+  assert.equal(passThrough.status, 302);
+  assert.equal(passThrough.headers.get("location"), "/today");
+  assert.equal(passThrough.headers.get("set-cookie"), null);
+
+  // 开放重定向防护：非站内相对路径一律回退 /
+  for (const evil of ["//evil.example/x", "https://evil.example/x", "/\\evil.example", "/today\r\nX-Test: 1"]) {
+    assert.equal(safeNextPath(evil), "/", evil);
+    const r = await api(`/login?ticket=${encodeURIComponent(ticket)}&next=${encodeURIComponent(evil)}`, { auth: false });
+    assert.equal(r.status, 302);
+    assert.equal(r.headers.get("location"), "/", evil);
+  }
+  assert.equal(safeNextPath("/dispatches/dispatch%3Ag1%3A1?tab=diff"), "/dispatches/dispatch%3Ag1%3A1?tab=diff");
+
+  // 主令牌轮换：旧 Cookie 与旧票据在运行中的服务里立即失效，新票据生效
+  const rotated = serverToken(app, true);
+  try {
+    assert.notEqual(rotated, token);
+    assert.equal((await api("/api/meta", { auth: false, headers: { Cookie: cookiePair } })).status, 401);
+    assert.equal((await api(`/login?ticket=${encodeURIComponent(ticket)}&next=%2Ftoday`, { auth: false })).status, 401);
+    const freshTicket = signLoginTicket(rotated);
+    const freshRes = await api(`/login?ticket=${encodeURIComponent(freshTicket)}&next=%2Ftoday`, { auth: false });
+    assert.equal(freshRes.status, 302);
+    assert.equal(freshRes.headers.get("location"), "/today");
+  } finally {
+    app.store.set("server.token", token);
+  }
 });
 
 test("CSRF：跨站来源的写请求被拒绝；写请求必须是 JSON", async () => {

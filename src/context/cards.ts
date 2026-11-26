@@ -1,5 +1,6 @@
 import type { CommandName, CtxConflictView, CtxDraftView, CtxItemDetail, CtxItemView, CtxMeeting, CtxToday, CtxUpdateView } from "../api/types.ts";
 import { button, buttonRow, card, esc, form, grey, header, input, linkButton, md, noticeEl, type ActionValue, type Card } from "../cards/templates.ts";
+import { consoleLinkUrl } from "../server/index.ts";
 import { truncate } from "../util.ts";
 
 /**
@@ -14,6 +15,7 @@ type El = Record<string, unknown>;
 
 export interface CtxRenderCtx {
   consoleBase: string;
+  consoleTicket?: string;
   timezone: string;
   notice?: string;
 }
@@ -45,8 +47,8 @@ function dueText(due: number | null, tz: string, now = Date.now()): string {
   return `截止 ${fmtWhen(due, tz)}`;
 }
 
-function consoleLink(base: string, path: string): string {
-  return base ? `${base.replace(/\/$/, "")}${path}` : "";
+function consoleLink(ctx: CtxRenderCtx, path: string): string {
+  return consoleLinkUrl(ctx.consoleBase, path, ctx.consoleTicket);
 }
 
 /** 一件事的一行描述 + 操作按钮 */
@@ -118,7 +120,7 @@ export function morningCard(t: CtxToday, ctx: CtxRenderCtx, draftable: (it: CtxI
   if (t.meetings.length) elements.push({ tag: "hr" }, md(`**📅 今天的会**\n${meetingsMd(t.meetings, ctx.timezone)}`));
   if (t.changes.length) elements.push({ tag: "hr" }, md(`**🔄 过去 24 小时**\n${changesMd(t.changes, ctx.timezone)}`));
   if (t.needs_review.length) elements.push(md(grey(`另有 ${t.needs_review.length} 件识别把握不大，在控制台「事项 · 待确认」里`)));
-  const url = consoleLink(ctx.consoleBase, "/today");
+  const url = consoleLink(ctx, "/today");
   if (url) elements.push(linkButton("打开今天", url, "primary_filled", true));
   elements.push(...noticeEl(ctx.notice));
   return card(header(`今天 · ${t.date.slice(5)}`, "wathet", summary || "工作上下文"), elements, `今天：${summary || "没有紧急的事"}`);
@@ -138,7 +140,7 @@ export function eveningCard(
   }
   if (v.tomorrow.length) elements.push({ tag: "hr" }, md(`**➡️ 明天先做**\n${v.tomorrow.slice(0, 3).map((i, n) => `${n + 1}. ${esc(truncate(i.title, 60))}`).join("\n")}`));
   if (v.changes.length) elements.push({ tag: "hr" }, md(`**🔄 今天的动态**\n${changesMd(v.changes, ctx.timezone)}`));
-  const url = consoleLink(ctx.consoleBase, "/today");
+  const url = consoleLink(ctx, "/today");
   if (url) elements.push(linkButton("打开控制台", url, "default", true));
   elements.push(...noticeEl(ctx.notice));
   return card(header(`收尾 · ${v.date.slice(5)}`, "indigo", `关掉 ${v.closed.length} · 欠 ${v.asks.length}`), elements, `今日收尾：关掉 ${v.closed.length} 件`);
