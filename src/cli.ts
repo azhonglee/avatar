@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { parseArgs } from "node:util";
 import { createApp, initApp, runConfiguredJob, runDaemon, runDispatchOnce, sendBrief } from "./app.ts";
 import { loadConfig } from "./config.ts";
+import { beginLogin, FeishuWebClient, pollLogin, renderQrSvg, renderQrTerminal, WebLoginStore } from "./context/feishu-web/index.ts";
 import { decide, type Profile } from "./guard.ts";
 import { consoleBaseUrl, isLoopbackHost, resolveConsoleHost, serverToken } from "./server/index.ts";
 import { formatReport, runDoctor } from "./doctor.ts";
@@ -21,6 +22,9 @@ const USAGE = `用法：pa <命令>
   context today               打印「今天」：最该处理的事、冲突、草稿、今天的会
   context digest [morning|evening]   发送晨间卡 / 收尾卡（--print 只打印不发送）
   context split <项目>        把一个大项目拆成子项目（模型归类，可重复执行）
+  context web-login [--out qr.svg]   飞书个人 Web 协议扫码登录（用于秒级实时接收任意群 @我 与私聊）
+  context web-status [--verify]      查看个人 Web 协议登录与长连接状态（--verify 实时向飞书核验凭据）
+  context web-logout          清除本地保存的个人 Web 协议登录凭据
   status                      最近 24 小时的派单、作业，以及重试中/失败的事件和飞书写入
   console [--rotate]          打印控制台登录链接（--rotate 作废旧链接）；常驻进程运行时可用
   command <名称> [JSON 参数]   执行一条命令（与控制台/卡片按钮相同），如 pa command dispatch.cancel '{"id":"…"}'
@@ -170,7 +174,70 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
     await app.engine.drain(["effect"]);
     return;
   }
-  throw new Error("用法：pa context run | today | split <项目> | digest [morning|evening] [--print]");
+  if (sub === "web-login") {
+    const { values } = parseArgs({ args: more, options: { out: { type: "string" } }, allowPositionals: true });
+    console.log("正在向飞书申请个人 Web 登录二维码…");
+    const challenge = await beginLogin();
+    console.log("\n" + renderQrTerminal(challenge.qrCode) + "\n");
+    if (values.out) {
+      fs.writeFileSync(values.out, renderQrSvg(challenge.qrCode), "utf8");
+      console.log(`已将二维码写入：${values.out}`);
+    }
+    const deadline = new Date(challenge.expiresAtMs).toLocaleTimeString("zh-CN", { timeZone: app.cfg.owner.timezone, hour12: false });
+    console.log(`请用本人飞书 App 扫码确认（有效期至 ${deadline}，按 Ctrl+C 取消）…`);
+    const ctrl = new AbortController();
+    const onSig = () => ctrl.abort();
+    process.once("SIGINT", onSig);
+    process.once("SIGTERM", onSig);
+    try {
+      const login = await pollLogin(challenge, {
+        signal: ctrl.signal,
+        onProgress: (st) => {
+          if (st === "scanned") console.log("📱 已扫码，请在手机飞书上点击「确认登录」…");
+          if (st === "approved") console.log("✅ 已确认，正在验证账号并保存凭据…");
+        },
+      });
+      const store = new WebLoginStore(app.cfg.dataDir);
+      store.save(login);
+      if (login.owner_name && !app.store.get("ctx.owner_name")) app.store.set("ctx.owner_name", login.owner_name);
+      console.log(`✅ 个人 Web 登录成功：${login.owner_name || "(无昵称)"}（ID: ${login.owner_id}）`);
+      console.log(`凭据已以 0600 权限保存到：${store.file}`);
+      if (!app.cfg.context.personal_web.enabled) {
+        console.log("提示：在 config.yaml 里把 context.personal_web.enabled 设为 true 并重启 `pa run` 即可开启秒级实时接收。");
+      }
+    } finally {
+      process.off("SIGINT", onSig);
+      process.off("SIGTERM", onSig);
+    }
+    return;
+  }
+  if (sub === "web-status") {
+    const verify = more.includes("--verify");
+    const store = new WebLoginStore(app.cfg.dataDir);
+    const login = store.load();
+    const st = ctx.status().personal_web;
+    const pwCfg = app.cfg.context.personal_web;
+    console.log(`启用状态：${pwCfg.enabled ? "已启用" : "未启用"}（fast_lane=${pwCfg.fast_lane}，debounce_ms=${pwCfg.debounce_ms}，pre_draft=${pwCfg.pre_draft}，send_replies=${pwCfg.send_replies}）`);
+    console.log(`凭据文件：${store.file}（${login ? `已登录 ${login.owner_name || login.owner_id}，更新于 ${login.updated_at ?? "未知"}` : "未登录"}）`);
+    if (st) {
+      console.log(`常驻状态：${st.state}${st.last_message_at ? `，最近消息 ${new Date(st.last_message_at).toLocaleString("zh-CN", { timeZone: app.cfg.owner.timezone, hour12: false })}` : ""}`);
+      if (st.last_error) console.log(`最近错误：${st.last_error}`);
+    }
+    if (verify) {
+      if (!login) throw new Error("尚未登录，请先运行 `pa context web-login`");
+      const client = await FeishuWebClient.connect(login, { onSessionConfirmed: (u) => store.save(u) });
+      console.log(`✅ 在线核验通过：${client.owner().name}（ID: ${client.owner().id}）`);
+    }
+    return;
+  }
+  if (sub === "web-logout") {
+    const store = new WebLoginStore(app.cfg.dataDir);
+    store.clear();
+    app.store.db.prepare("DELETE FROM kv WHERE k = ?").run("ctx.personal_web.state");
+    console.log(`已清除个人 Web 登录凭据（${store.file}）。`);
+    return;
+  }
+  throw new Error("用法：pa context run | today | split <项目> | digest [morning|evening] [--print] | web-login [--out qr.svg] | web-status [--verify] | web-logout");
 }
 
 async function doctor(app: ReturnType<typeof createApp>): Promise<void> {

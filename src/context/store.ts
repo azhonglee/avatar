@@ -203,6 +203,7 @@ export class ContextStore {
         ingested INTEGER NOT NULL, processed INTEGER NOT NULL DEFAULT 0);
       CREATE INDEX IF NOT EXISTS ctx_obs_pending ON ctx_obs (processed, conv, time);
       CREATE INDEX IF NOT EXISTS ctx_obs_conv ON ctx_obs (conv, time);
+      CREATE INDEX IF NOT EXISTS ctx_obs_im_time ON ctx_obs (source, is_me, time);
       CREATE TABLE IF NOT EXISTS ctx_project (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, aliases TEXT NOT NULL DEFAULT '[]', refs TEXT NOT NULL DEFAULT '[]',
         description TEXT NOT NULL DEFAULT '', my_role TEXT NOT NULL DEFAULT '', stage TEXT NOT NULL DEFAULT '',
@@ -266,10 +267,20 @@ export class ContextStore {
 
   // ───────── 观测 ─────────
 
-  /** 幂等写入观测；同 ID 已存在且内容变化（消息被编辑）时更新并重新标为待处理。返回新增或变化的数量。 */
+  /**
+   * 幂等写入观测；同 ID 已存在且内容变化（消息被编辑）时更新并重新标为待处理。
+   * 跨通道去重：个人 Web 实时通道（pw:*）与 lark-cli 轮询（im:*）在 ±15 秒内收到同一条消息（同发送方归属 + 归一正文一致）时，
+   * 不重复入库，而是把开放平台元数据（open_message_id / open_chat_id / applink / 真实名字）回填到已有观测上。
+   * 返回新增或变化的数量。
+   */
   addObs(list: Obs[]): number {
     const now = Date.now();
     const get = this.db.prepare("SELECT text FROM ctx_obs WHERE id = ?");
+    const nearIm = this.db.prepare(
+      `SELECT id, conv, conv_name, actor_id, actor_name, text, url, meta FROM ctx_obs
+       WHERE source = 'im' AND is_me = ? AND time BETWEEN ? AND ? AND id LIKE ? LIMIT 30`,
+    );
+    const enrich = this.db.prepare("UPDATE ctx_obs SET conv_name = ?, actor_name = ?, url = ?, meta = ? WHERE id = ?");
     const ins = this.db.prepare(
       `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
@@ -281,12 +292,77 @@ export class ContextStore {
         if (!o.id || !o.time) continue;
         const cur = get.get(o.id) as { text: string } | undefined;
         if (!cur) {
+          // 跨通道指纹去重（pw:* ↔ im:*）
+          if (o.source === "im" && (o.id.startsWith("im:") || o.id.startsWith("pw:"))) {
+            const nt = norm(o.text);
+            if (nt.length >= 2) {
+              const otherPrefix = o.id.startsWith("im:") ? "pw:%" : "im:%";
+              const cands = nearIm.all(o.is_me ? 1 : 0, o.time - 15_000, o.time + 15_000, otherPrefix) as Row[];
+              const hit = cands.find((c) => norm(String(c.text ?? "")) === nt);
+              if (hit) {
+                const hitMeta = j<Record<string, unknown>>(hit.meta, {});
+                const isIncomingLark = o.id.startsWith("im:");
+                const mergedMeta = isIncomingLark
+                  ? {
+                      ...hitMeta,
+                      open_message_id: String(o.meta.message_id ?? o.id.slice(3)),
+                      open_chat_id: o.conv,
+                      open_actor_id: o.actor_id,
+                    }
+                  : {
+                      ...hitMeta,
+                      native_message_id: String(o.meta.native_message_id ?? o.id.slice(3)),
+                      native_chat_id: String(o.meta.native_chat_id ?? ""),
+                      native_root_id: String(o.meta.native_root_id ?? ""),
+                    };
+                const curConvName = String(hit.conv_name ?? "");
+                const betterConv =
+                  isIncomingLark && o.conv_name && (!curConvName || curConvName.startsWith("群聊(") || curConvName === "群聊" || /^私聊：\d+$/.test(curConvName))
+                    ? o.conv_name
+                    : curConvName;
+                const curActorName = String(hit.actor_name ?? "");
+                const betterActor =
+                  isIncomingLark && o.actor_name && (!curActorName || /^\d+$/.test(curActorName)) ? o.actor_name : curActorName;
+                const betterUrl = String(hit.url ?? "") || o.url;
+                enrich.run(betterConv, betterActor, betterUrl, JSON.stringify(mergedMeta), String(hit.id));
+                continue;
+              }
+            }
+          }
           ins.run(o.id, o.source, o.kind, o.conv, o.conv_name, o.actor_id, o.actor_name, o.is_me ? 1 : 0, o.time, o.text, o.url, JSON.stringify(o.meta ?? {}), now);
           n++;
         } else if (cur.text !== o.text) {
           upd.run(o.text, JSON.stringify(o.meta ?? {}), o.id);
           n++;
         }
+      }
+    });
+    return n;
+  }
+
+  /** 写入背景历史观测（只插未出现过且未跨通道命中的记录，直接标为已处理，供 convWindow 作为上下文背景） */
+  addBackgroundObs(list: Obs[]): number {
+    const now = Date.now();
+    const get = this.db.prepare("SELECT 1 FROM ctx_obs WHERE id = ?");
+    const nearIm = this.db.prepare(
+      `SELECT text FROM ctx_obs WHERE source = 'im' AND is_me = ? AND time BETWEEN ? AND ? LIMIT 30`,
+    );
+    const ins = this.db.prepare(
+      `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+    );
+    let n = 0;
+    this.tx(() => {
+      for (const o of list) {
+        if (!o.id || !o.time) continue;
+        if (get.get(o.id)) continue;
+        const nt = norm(o.text);
+        if (o.source === "im" && nt.length >= 2) {
+          const cands = nearIm.all(o.is_me ? 1 : 0, o.time - 15_000, o.time + 15_000) as { text: string }[];
+          if (cands.some((c) => norm(c.text) === nt)) continue;
+        }
+        ins.run(o.id, o.source, o.kind, o.conv, o.conv_name, o.actor_id, o.actor_name, o.is_me ? 1 : 0, o.time, o.text, o.url, JSON.stringify(o.meta ?? {}), now);
+        n++;
       }
     });
     return n;

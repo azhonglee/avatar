@@ -5,6 +5,7 @@ import YAML from "yaml";
 import type { App } from "./app.ts";
 import type { DoctorCheck, DoctorReport } from "./api/types.ts";
 import { repoSpec } from "./config.ts";
+import { WebLoginStore } from "./context/feishu-web/index.ts";
 import { resolveBin } from "./harness.ts";
 import { consoleBaseUrl, isLoopbackHost } from "./server/index.ts";
 import { validateConfig } from "./settings.ts";
@@ -348,6 +349,38 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
       return warn(`${detail}；卡片已启用但 events.card_actions 为 false：卡片上的按钮不会生效`, `把 ${code("events.card_actions")} 改为 true 并重启常驻进程。\n\n${fix}`);
     if (cfg.cards.enabled && cfg.events.card_actions && !app.ext.cards) return ok(`${detail}（卡片模块未启用，暂不订阅 card.action.trigger）`, fix);
     return ok(detail, fix);
+  });
+
+  add("personal_web", "个人 Web 实时通道", async () => {
+    if (!cfg.context.enabled || !cfg.context.personal_web.enabled) {
+      return skip(
+        "未启用（当前仅走 lark-cli 定时采集）",
+        `如需秒级响应任意群 @我 与私聊，先运行 ${code("bin/pa context web-login")} 扫码，再把 ${code("context.personal_web.enabled")} 设为 true`,
+      );
+    }
+    const login = new WebLoginStore(cfg.dataDir).load();
+    if (!login) {
+      return warn(
+        "已启用但尚未扫码登录（期间仍由每 10 分钟的飞书轮询兜底）",
+        `运行 ${code("bin/pa context web-login")} 使用本人飞书 App 扫码登录`,
+      );
+    }
+    let state = "idle";
+    let lastError = "";
+    try {
+      const saved = JSON.parse(store.get("ctx.personal_web.state") ?? "null") as { state?: string; last_error?: string } | null;
+      if (saved?.state) state = saved.state;
+      if (saved?.last_error) lastError = saved.last_error;
+    } catch {
+      // ignore malformed kv
+    }
+    if (state === "needs_login") {
+      return warn(
+        `会话已失效（${lastError || "需要重新扫码"}）`,
+        `运行 ${code("bin/pa context web-login")} 重新扫码登录`,
+      );
+    }
+    return ok(`${login.owner_name || login.owner_id}（已登录，当前状态：${state}）`);
   });
 
   add("data_dir", "数据目录", async () => {

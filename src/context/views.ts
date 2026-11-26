@@ -8,6 +8,7 @@ import type {
   CtxKnowledgeView,
   CtxMeeting,
   CtxPersonView,
+  CtxPersonalWebStatus,
   CtxProjectDetail,
   CtxProjectSummary,
   CtxStatus,
@@ -267,7 +268,7 @@ export class ContextViews {
     return { ...this.itemView(it), evidence: this.evidence("item", id, 20), drafts: this.store.drafts({ item_id: id }).map((d) => this.draftView(d)), actions };
   }
 
-  status(running: boolean): CtxStatus {
+  status(running: boolean, personalWeb?: CtxPersonalWebStatus): CtxStatus {
     const kv = this.app.store;
     const sources = ["meego", "tasks", "im", "minutes", "calendar", "docs"].map((s) => {
       const r = JSON.parse(kv.get(`ctx.source.${s}`) ?? "null") as { at?: number; count?: number; error?: string } | null;
@@ -281,6 +282,7 @@ export class ContextViews {
       pending_obs: this.store.pendingCount(),
       totals: this.store.totals(),
       understand_enabled: this.app.cfg.context.understand,
+      ...(personalWeb ? { personal_web: personalWeb } : {}),
     };
   }
 
@@ -290,7 +292,7 @@ export class ContextViews {
     return all.filter((m) => m.end >= Date.now() - HOUR && m.start < sod + DAY);
   }
 
-  today(running = false): CtxToday {
+  today(running = false, personalWeb?: CtxPersonalWebStatus): CtxToday {
     const now = Date.now();
     this.store.wakeSnoozed(now);
     const open = this.openItems(now);
@@ -311,7 +313,7 @@ export class ContextViews {
       meetings: this.meetings(),
       changes: this.store.updates({ since: now - DAY, limit: 30 }).map((u) => this.updateView(u)),
       projects: this.projects(false).slice(0, 12),
-      status: this.status(running),
+      status: this.status(running, personalWeb),
     };
   }
 }

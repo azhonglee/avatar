@@ -1,0 +1,736 @@
+import crypto from "node:crypto";
+import {
+  authenticatedHeaders,
+  loadWebMetadata,
+  readNativeProfile,
+  resolveEndpoints,
+  type WebEndpoints,
+} from "./auth.ts";
+import { RecordingCookieJar, type WebLogin } from "./cookies.ts";
+import { fetchWithJar, WEB_USER_AGENT, WebHttpError } from "./http.ts";
+import { MAX_WIRE_BYTES, parseProto, ProtoWriter } from "./proto.ts";
+import {
+  ACCESS_KEY_SALT,
+  CHAT_KIND_P2P,
+  CMD_CHAT_MODE,
+  CMD_HEARTBEAT,
+  CMD_HISTORY,
+  CMD_PUSH_PACKET,
+  CMD_READ_MESSAGE,
+  CMD_SEND_MESSAGE,
+  decodeChatRecord,
+  decodeFrame,
+  decodeMessage,
+  encodeAckFrame,
+  encodeFrame,
+  encodeHistoryWindowPayload,
+  encodePacket,
+  encodeReplyPacket,
+  isGroupChat,
+  replyInThread,
+  unwrapGatewayPayload,
+  USER_SENDER_TYPE,
+  WEB_APP_ID,
+  WEB_LARK_VERSION,
+  WEB_SDK_VERSION,
+  type ChatMeta,
+  type RichSegment,
+  type WebMessage,
+} from "./wire.ts";
+import { BinaryWebSocket } from "./ws.ts";
+
+/**
+ * Feishu personal Web session client:
+ *   - Gateway protobuf RPCs: readMessage, readChat, readContext, sendReply, sendVerifiedReply
+ *   - Frontier WSS push supervisor: heartbeat (25s), idle timeout (75s), profile keepalive (30m),
+ *     cookie rotation observer, exponential backoff (1s..30s), 3-denial threshold before needs_login,
+ *     and backpressure ACK (ACK sent ONLY after durable onMessage succeeds).
+ */
+
+export type ListenerState =
+  | "idle"
+  | "connecting"
+  | "listening"
+  | "publication_blocked"
+  | "reverifying"
+  | "reconnecting"
+  | "needs_login"
+  | "stopped";
+
+export interface FeishuWebClientOptions {
+  endpoints?: Partial<WebEndpoints>;
+  onSessionConfirmed?: (login: WebLogin) => void;
+  heartbeatIntervalMs?: number;
+  socketIdleTimeoutMs?: number;
+  keepaliveIntervalMs?: number;
+  reconnectBaseMs?: number;
+  reconnectCeilingMs?: number;
+  sessionDenialThreshold?: number;
+  sessionDenialRetryMs?: number;
+  sessionHealthyAfterMs?: number;
+  chatCacheTtlMs?: number;
+}
+
+export interface VerifiedReplyInput {
+  chatId: string;
+  messageId: string;
+  rootId?: string;
+  text: string;
+  /** Deterministic idempotency key (32 hex chars). Reusing the same CID prevents duplicate sends. */
+  cid: string;
+  signal?: AbortSignal;
+}
+
+export interface VerifiedReplyResult {
+  replyId: string;
+  rootId: string;
+  threadId: string;
+  verified: boolean;
+}
+
+const DEFAULT_HEARTBEAT_MS = 25_000;
+const DEFAULT_KEEPALIVE_MS = 30 * 60_000;
+const DEFAULT_RECONNECT_BASE_MS = 1_000;
+const DEFAULT_RECONNECT_CEILING_MS = 30_000;
+const DEFAULT_DENIAL_THRESHOLD = 3;
+const DEFAULT_DENIAL_RETRY_MS = 30_000;
+const DEFAULT_CHAT_CACHE_TTL_MS = 10 * 60_000;
+const MAX_HISTORY_WINDOWS = 10;
+
+function randomRequestId(): string {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new WebHttpError("aborted", "已中止"));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(new WebHttpError("aborted", "已中止"));
+    };
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function isCredentialDenied(err: unknown): boolean {
+  return err instanceof WebHttpError && err.code === "credential_denied";
+}
+
+function isAborted(err: unknown): boolean {
+  return err instanceof WebHttpError && err.code === "aborted";
+}
+
+class SessionRetryPolicy {
+  private delayMs: number;
+  private denials = 0;
+  private readonly baseMs: number;
+  private readonly ceilingMs: number;
+  private readonly denialThreshold: number;
+  private readonly denialRetryMs: number;
+
+  constructor(baseMs: number, ceilingMs: number, denialThreshold: number, denialRetryMs: number) {
+    this.baseMs = baseMs;
+    this.delayMs = baseMs;
+    this.ceilingMs = ceilingMs;
+    this.denialThreshold = denialThreshold;
+    this.denialRetryMs = denialRetryMs;
+  }
+
+  markHealthy(): void {
+    this.denials = 0;
+    this.delayMs = this.baseMs;
+  }
+
+  next(err: unknown): { state: ListenerState; waitMs: number; giveUp: boolean } {
+    if (isCredentialDenied(err)) {
+      this.denials++;
+      if (this.denials >= this.denialThreshold) {
+        return { state: "needs_login", waitMs: 0, giveUp: true };
+      }
+      return { state: "reverifying", waitMs: this.denialRetryMs, giveUp: false };
+    }
+    const waitMs = this.delayMs;
+    this.delayMs = Math.min(this.delayMs * 2, this.ceilingMs);
+    return { state: "reconnecting", waitMs, giveUp: false };
+  }
+}
+
+export class FeishuWebClient {
+  private readonly endpoints: WebEndpoints;
+  private readonly jar: RecordingCookieJar;
+  private readonly opts: Required<
+    Pick<
+      FeishuWebClientOptions,
+      | "heartbeatIntervalMs"
+      | "socketIdleTimeoutMs"
+      | "keepaliveIntervalMs"
+      | "reconnectBaseMs"
+      | "reconnectCeilingMs"
+      | "sessionDenialThreshold"
+      | "sessionDenialRetryMs"
+      | "sessionHealthyAfterMs"
+      | "chatCacheTtlMs"
+    >
+  >;
+  private onSessionConfirmed?: (login: WebLogin) => void;
+  private ownerId: string;
+  private ownerName: string;
+  private deviceId = "";
+  private appKey = "";
+  private readonly chatCache = new Map<string, { meta: ChatMeta; expiresAt: number }>();
+
+  private constructor(jar: RecordingCookieJar, login: WebLogin, options: FeishuWebClientOptions = {}) {
+    this.endpoints = resolveEndpoints(options.endpoints);
+    this.jar = jar;
+    this.ownerId = login.owner_id;
+    this.ownerName = login.owner_name;
+    this.onSessionConfirmed = options.onSessionConfirmed;
+    const heartbeat = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_MS;
+    this.opts = {
+      heartbeatIntervalMs: heartbeat,
+      socketIdleTimeoutMs: options.socketIdleTimeoutMs ?? heartbeat * 3,
+      keepaliveIntervalMs: options.keepaliveIntervalMs ?? DEFAULT_KEEPALIVE_MS,
+      reconnectBaseMs: options.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS,
+      reconnectCeilingMs: options.reconnectCeilingMs ?? DEFAULT_RECONNECT_CEILING_MS,
+      sessionDenialThreshold: options.sessionDenialThreshold ?? DEFAULT_DENIAL_THRESHOLD,
+      sessionDenialRetryMs: options.sessionDenialRetryMs ?? DEFAULT_DENIAL_RETRY_MS,
+      sessionHealthyAfterMs: options.sessionHealthyAfterMs ?? heartbeat,
+      chatCacheTtlMs: options.chatCacheTtlMs ?? DEFAULT_CHAT_CACHE_TTL_MS,
+    };
+  }
+
+  /** Connect an approved login, verify owner identity, and load Web SDK metadata. */
+  static async connect(
+    login: WebLogin,
+    options: FeishuWebClientOptions = {},
+    signal?: AbortSignal,
+  ): Promise<FeishuWebClient> {
+    const ep = resolveEndpoints(options.endpoints);
+    const jar = RecordingCookieJar.fromRecords(login.cookies, ep.extraAllowedHosts);
+    const client = new FeishuWebClient(jar, login, options);
+    await client.verifyOwner(signal);
+    const meta = await loadWebMetadata(jar, ep, { signal });
+    client.deviceId = meta.deviceId;
+    client.appKey = meta.appKey;
+    client.notifySessionConfirmed();
+    return client;
+  }
+
+  owner(): { id: string; name: string } {
+    return { id: this.ownerId, name: this.ownerName };
+  }
+
+  /** Live snapshot including any cookies rotated by Feishu since login. */
+  session(): WebLogin {
+    return {
+      owner_id: this.ownerId,
+      owner_name: this.ownerName,
+      cookies: this.jar.records(),
+      updated_at: new Date().toISOString(),
+    };
+  }
+
+  setSessionObserver(cb: ((login: WebLogin) => void) | undefined): void {
+    this.onSessionConfirmed = cb;
+  }
+
+  private notifySessionConfirmed(): void {
+    try {
+      this.onSessionConfirmed?.(this.session());
+    } catch {
+      // observer errors must not break protocol loop
+    }
+  }
+
+  async verifyOwner(signal?: AbortSignal): Promise<void> {
+    const profile = await readNativeProfile(this.jar, this.endpoints, { signal });
+    if (profile.id !== this.ownerId) {
+      throw new WebHttpError("credential_denied", "当前个人 Web 账号与已授权账号不一致");
+    }
+    if (profile.name) this.ownerName = profile.name;
+  }
+
+  // ───────── Gateway RPCs ─────────
+
+  async gateway(
+    command: number,
+    payload: Uint8Array | undefined,
+    opts: { cid?: string; packet?: Buffer; signal?: AbortSignal } = {},
+  ): Promise<Buffer> {
+    const cid = opts.cid || randomRequestId();
+    const packet = opts.packet ?? encodePacket(command, payload, cid);
+    const headers = authenticatedHeaders(this.jar, this.endpoints, {
+      "Content-Type": "application/x-protobuf",
+      "X-Appid": WEB_APP_ID,
+      "X-Command": String(command),
+      "X-Command-Version": WEB_SDK_VERSION,
+      "X-Source": "web",
+      "X-Web-Version": WEB_SDK_VERSION,
+      "X-Request-Id": cid,
+      "X-Lgw-Os-Type": "1",
+      "X-Lgw-Terminal-Type": "2",
+      Origin: this.endpoints.messengerOrigin,
+      Referer: `${this.endpoints.messengerOrigin}/`,
+    });
+    const res = await fetchWithJar(this.jar, {
+      method: "POST",
+      url: this.endpoints.gatewayUrl,
+      headers,
+      body: packet,
+      signal: opts.signal,
+      allowInsecureHttp: this.endpoints.allowInsecureHttp,
+      extraAllowedHosts: this.endpoints.extraAllowedHosts,
+    });
+    if (res.status === 401 || res.status === 403) {
+      throw new WebHttpError("credential_denied", `个人 Web 网关鉴权失败 (HTTP ${res.status})`, res.status);
+    }
+    if (res.status !== 200) {
+      throw new WebHttpError("http_error", `个人 Web 网关请求被拒绝 (HTTP ${res.status})`, res.status);
+    }
+    return unwrapGatewayPayload(res.body);
+  }
+
+  /** Fetch one native message by its numeric message ID (command 8). */
+  async readMessage(id: string, signal?: AbortSignal): Promise<WebMessage> {
+    const req = new ProtoWriter().str(1, id).finish();
+    const data = await this.gateway(CMD_READ_MESSAGE, req, { signal });
+    const fields = parseProto(data, MAX_WIRE_BYTES);
+    for (const entry of fields.allBytes(1)) {
+      const pair = parseProto(entry, MAX_WIRE_BYTES);
+      if (pair.str(1) === id) {
+        return decodeMessage(pair.bytes(2), this.ownerId);
+      }
+    }
+    throw new Error(`无法回读个人消息：${id}`);
+  }
+
+  /** Read conversation name, kind, and topic mode (command 64), with TTL caching. */
+  async readChat(chatId: string, opts: { signal?: AbortSignal; force?: boolean } = {}): Promise<ChatMeta> {
+    const now = Date.now();
+    if (!opts.force) {
+      const cached = this.chatCache.get(chatId);
+      if (cached && cached.expiresAt > now) return cached.meta;
+    }
+    const req = new ProtoWriter().str(1, chatId).finish();
+    const data = await this.gateway(CMD_CHAT_MODE, req, { signal: opts.signal });
+    const fields = parseProto(data, MAX_WIRE_BYTES);
+    for (const entry of fields.allBytes(1)) {
+      const pair = parseProto(entry, MAX_WIRE_BYTES);
+      if (pair.str(1) === chatId) {
+        const meta = decodeChatRecord(pair.bytes(2), chatId);
+        this.chatCache.set(chatId, { meta, expiresAt: now + this.opts.chatCacheTtlMs });
+        return meta;
+      }
+    }
+    throw new Error(`无法读取个人会话信息：${chatId}`);
+  }
+
+  /**
+   * Read bounded conversation history strictly before an anchor message (command 43 / 8).
+   * For topic/reply messages, resolves root & quoted parent; for top-level messages, fetches recent positions.
+   */
+  async readContext(
+    anchor: Pick<WebMessage, "id" | "conversationId" | "rootId" | "parentId" | "threadId" | "position" | "createdAtMs">,
+    opts: { limit?: number; signal?: AbortSignal } = {},
+  ): Promise<WebMessage[]> {
+    const limit = Math.max(1, Math.min(50, opts.limit ?? 20));
+    const matches = (m: WebMessage): boolean => {
+      if (!m.id || m.id === anchor.id || m.conversationId !== anchor.conversationId) return false;
+      if (!m.createdAtMs || (anchor.createdAtMs && m.createdAtMs > anchor.createdAtMs)) return false;
+      if (!m.text.trim() && m.resources.length === 0) return false;
+      if (anchor.rootId) {
+        return m.id === anchor.rootId || (m.id === anchor.parentId && m.rootId === anchor.rootId);
+      }
+      return m.position < anchor.position;
+    };
+
+    const readWindow = async (startPos: number, maxCount: number): Promise<WebMessage[]> => {
+      const collected: WebMessage[] = [];
+      let pos = startPos;
+      for (let page = 0; page < MAX_HISTORY_WINDOWS && pos > 0 && collected.length < maxCount; page++) {
+        const next = Math.max(0, pos - maxCount);
+        const payload = encodeHistoryWindowPayload(anchor.conversationId, pos, next);
+        const raw = await this.gateway(CMD_HISTORY, payload, { signal: opts.signal });
+        const resp = parseProto(raw, MAX_WIRE_BYTES);
+        for (const entry of resp.allBytes(1)) {
+          try {
+            const pair = parseProto(entry, MAX_WIRE_BYTES);
+            const m = decodeMessage(pair.bytes(2), this.ownerId);
+            if (matches(m)) collected.push(m);
+          } catch {
+            // One undecodable historical entry must not abort remaining context
+          }
+        }
+        pos = next;
+      }
+      return collected;
+    };
+
+    let msgs: WebMessage[] = [];
+    if (anchor.threadId || anchor.rootId) {
+      const wanted = new Set<string>();
+      for (const id of [anchor.rootId, anchor.parentId]) {
+        if (id && id !== anchor.id) wanted.add(id);
+      }
+      for (const id of [...wanted]) {
+        try {
+          const m = await this.readMessage(id, opts.signal);
+          if (matches(m)) {
+            msgs.push(m);
+            wanted.delete(id);
+          }
+        } catch {
+          // fall back to window scan if direct read fails
+        }
+      }
+      if (wanted.size > 0 && anchor.position > 0) {
+        try {
+          const win = await readWindow(anchor.position, limit);
+          for (const m of win) {
+            if (wanted.has(m.id)) {
+              msgs.push(m);
+              wanted.delete(m.id);
+            }
+          }
+        } catch {
+          // best effort
+        }
+      }
+    } else if (anchor.position > 0) {
+      msgs = await readWindow(anchor.position, limit);
+    }
+
+    const dedup = new Map<string, WebMessage>();
+    for (const m of msgs) dedup.set(m.id, m);
+    return [...dedup.values()].sort((a, b) => a.createdAtMs - b.createdAtMs).slice(-limit);
+  }
+
+  /** Send a text reply once with a deterministic CID (command 5). */
+  async sendReply(
+    chatId: string,
+    rootId: string,
+    cid: string,
+    segments: RichSegment[],
+    inThread: boolean,
+    signal?: AbortSignal,
+  ): Promise<WebMessage> {
+    const packet = encodeReplyPacket(chatId, rootId, cid, segments, inThread);
+    const data = await this.gateway(CMD_SEND_MESSAGE, undefined, { cid, packet, signal });
+    const resp = parseProto(data, MAX_WIRE_BYTES);
+    const created = decodeMessage(resp.bytes(1), this.ownerId);
+    if (!created.id) {
+      throw new Error("个人 Web 回复未返回消息 ID");
+    }
+    return created;
+  }
+
+  /**
+   * Verified personal reply (used only after explicit human confirmation of a draft):
+   *   1. Pre-send check: reads the original message to confirm it still exists in the expected chat.
+   *   2. Reads chat kind & mode to determine explicit thread reply flag.
+   *   3. Sends ONCE with fixed CID.
+   *   4. Independent readback check verifying owner, chat, root, CID, and text.
+   */
+  async sendVerifiedReply(input: VerifiedReplyInput): Promise<VerifiedReplyResult> {
+    const normalizeText = (s: string) => s.replace(/\r\n/g, "\n").trim();
+    const text = normalizeText(input.text);
+    if (!text) throw new Error("回复内容不能为空");
+    const original = await this.readMessage(input.messageId, input.signal);
+    if (original.conversationId !== input.chatId) {
+      throw new Error("原消息所属会话与草稿目标不一致，拒绝发送");
+    }
+    const actualRoot = original.rootId || original.id;
+    if (input.rootId && input.rootId !== actualRoot) {
+      throw new Error("原消息根话题与草稿记录不一致，拒绝发送");
+    }
+    const chat = await this.readChat(input.chatId, { signal: input.signal });
+    const group = isGroupChat(chat.kind);
+    if (!group && chat.kind !== CHAT_KIND_P2P) {
+      throw new Error(`不支持的个人会话类型：${chat.kind}`);
+    }
+    const inThread = replyInThread(chat.kind, chat.mode);
+    const created = await this.sendReply(input.chatId, actualRoot, input.cid, [{ text }], inThread, input.signal);
+
+    // Independent readback verification
+    const readback = await this.readMessage(created.id, input.signal);
+    const threaded = group || inThread;
+    const verified =
+      readback.id === created.id &&
+      readback.senderType === USER_SENDER_TYPE &&
+      readback.actorId === this.ownerId &&
+      readback.conversationId === input.chatId &&
+      readback.rootId === actualRoot &&
+      readback.parentId === actualRoot &&
+      readback.cid === input.cid &&
+      (!threaded || (!!readback.threadId && !readback.sendToChat)) &&
+      normalizeText(readback.text) === text;
+
+    if (!verified) {
+      throw new Error("个人 Web 回复回读校验未通过（消息身份或正文不一致）");
+    }
+    return {
+      replyId: readback.id,
+      rootId: actualRoot,
+      threadId: readback.threadId,
+      verified: true,
+    };
+  }
+
+  // ───────── Frontier WSS Push Listener ─────────
+
+  async buildSocketUrl(signal?: AbortSignal): Promise<string> {
+    const url = `${this.endpoints.ticketUrl}?local_device_id=${encodeURIComponent(this.deviceId)}`;
+    const res = await fetchWithJar(this.jar, {
+      method: "GET",
+      url,
+      headers: authenticatedHeaders(this.jar, this.endpoints),
+      signal,
+      allowInsecureHttp: this.endpoints.allowInsecureHttp,
+      extraAllowedHosts: this.endpoints.extraAllowedHosts,
+    });
+    if (res.status === 401 || res.status === 403) {
+      throw new WebHttpError("credential_denied", `获取长连接票据鉴权失败 (HTTP ${res.status})`, res.status);
+    }
+    if (res.status !== 200) {
+      throw new WebHttpError("http_error", `获取长连接票据失败 (HTTP ${res.status})`, res.status);
+    }
+    let parsed: { code?: number; ticket?: string };
+    try {
+      parsed = JSON.parse(res.body.toString("utf8")) as typeof parsed;
+    } catch {
+      throw new WebHttpError("http_error", "长连接票据响应不可解析");
+    }
+    if (typeof parsed.code === "number" && parsed.code !== 0) {
+      throw new WebHttpError("http_error", `长连接票据服务返回异常 (code=${parsed.code})`);
+    }
+    if (!parsed.ticket) {
+      throw new WebHttpError("http_error", "长连接票据暂不可用");
+    }
+    const accessKey = crypto
+      .createHash("md5")
+      .update(`2${this.appKey}${this.deviceId}${ACCESS_KEY_SALT}`)
+      .digest("hex");
+
+    const wsUrl = new URL(this.endpoints.websocketUrl);
+    const params: [string, string][] = [
+      ["aid", "1"],
+      ["fpid", "2"],
+      ["ticket", parsed.ticket],
+      ["device_id", this.deviceId],
+      ["access_key", accessKey],
+      ["request_id", randomRequestId()],
+      ["accept_encoding", "gzip"],
+      ["sdk_version", WEB_SDK_VERSION],
+      ["version_code", WEB_SDK_VERSION],
+      ["type", "sdk_main"],
+      ["terminal_type", "2"],
+      ["lark_version", WEB_LARK_VERSION],
+      ["net_status", "5"],
+      ["lark_env", "online"],
+    ];
+    for (const [k, v] of params) wsUrl.searchParams.set(k, v);
+    return wsUrl.toString();
+  }
+
+  /**
+   * Run the persistent Frontier WSS listener loop until `signal` aborts or 3 consecutive
+   * credential denials confirm sign-out (`needs_login`).
+   */
+  async listen(params: {
+    signal: AbortSignal;
+    onMessage: (msg: WebMessage) => Promise<void> | void;
+    onState?: (state: ListenerState, detail?: string) => void;
+    onWarn?: (message: string) => void;
+  }): Promise<void> {
+    const retry = new SessionRetryPolicy(
+      this.opts.reconnectBaseMs,
+      this.opts.reconnectCeilingMs,
+      this.opts.sessionDenialThreshold,
+      this.opts.sessionDenialRetryMs,
+    );
+    const report = (state: ListenerState, detail?: string) => {
+      try {
+        params.onState?.(state, detail);
+      } catch {
+        // ignore observer failure
+      }
+    };
+
+    while (!params.signal.aborted) {
+      report("connecting");
+      let listeningSince = 0;
+      const observeState = (s: ListenerState, detail?: string) => {
+        if (s === "listening" && !listeningSince) listeningSince = Date.now();
+        report(s, detail);
+      };
+
+      try {
+        await this.listenOnce(params.signal, params.onMessage, observeState, params.onWarn);
+        if (params.signal.aborted) break;
+      } catch (err) {
+        if (params.signal.aborted || isAborted(err)) break;
+        if (listeningSince && Date.now() - listeningSince >= this.opts.sessionHealthyAfterMs) {
+          retry.markHealthy();
+        }
+        const decision = retry.next(err);
+        const msg = err instanceof Error ? err.message : String(err);
+        report(decision.state, msg);
+        if (decision.giveUp) {
+          throw err;
+        }
+        try {
+          await sleep(decision.waitMs, params.signal);
+        } catch {
+          break;
+        }
+      }
+    }
+    report("stopped");
+  }
+
+  private async listenOnce(
+    outerSignal: AbortSignal,
+    onMessage: (msg: WebMessage) => Promise<void> | void,
+    onState: (state: ListenerState, detail?: string) => void,
+    onWarn?: (message: string) => void,
+  ): Promise<void> {
+    await this.verifyOwner(outerSignal);
+    this.notifySessionConfirmed();
+    const wsAddress = await this.buildSocketUrl(outerSignal);
+
+    const ws = await BinaryWebSocket.dial(wsAddress, {
+      headers: {
+        "User-Agent": WEB_USER_AGENT,
+        Origin: this.endpoints.messengerOrigin,
+      },
+      signal: outerSignal,
+    });
+
+    const loopCtrl = new AbortController();
+    const onOuterAbort = () => {
+      loopCtrl.abort();
+      ws.close();
+    };
+    outerSignal.addEventListener("abort", onOuterAbort, { once: true });
+
+    // Heartbeat loop (25s)
+    const hbTimer = setInterval(() => {
+      const hbFrame = encodeFrame(encodePacket(CMD_HEARTBEAT, undefined, ""));
+      void ws.writeBinary(hbFrame, 15_000, loopCtrl.signal).catch(() => {
+        ws.close();
+      });
+    }, this.opts.heartbeatIntervalMs);
+    hbTimer.unref?.();
+
+    // Session keepalive loop (30m): touches profile so rotated cookies are persisted
+    const kaTimer = setInterval(() => {
+      void readNativeProfile(this.jar, this.endpoints, { signal: loopCtrl.signal })
+        .then((p) => {
+          if (p.id === this.ownerId) {
+            if (p.name) this.ownerName = p.name;
+            this.notifySessionConfirmed();
+          }
+        })
+        .catch(() => {
+          // transient keepalive error handled on next connect
+        });
+    }, this.opts.keepaliveIntervalMs);
+    kaTimer.unref?.();
+
+    let publicationBlocked = false;
+    let malformedReported = false;
+
+    try {
+      onState("listening");
+      while (!loopCtrl.signal.aborted) {
+        const frame = await ws.read(this.opts.socketIdleTimeoutMs, loopCtrl.signal);
+        if (frame.kind !== "binary") continue;
+
+        let packet: ReturnType<typeof decodeFrame>;
+        try {
+          packet = decodeFrame(frame.data);
+        } catch (err) {
+          if (!malformedReported) {
+            malformedReported = true;
+            onWarn?.(`忽略畸形个人 Web 推送帧：${err instanceof Error ? err.message : String(err)}`);
+          }
+          // Malformed frames remain unacknowledged without tearing down the healthy socket
+          continue;
+        }
+        malformedReported = false;
+
+        if (packet.uint(3) === CMD_PUSH_PACKET) {
+          const delivered = await this.handlePush(packet.bytes(5), loopCtrl.signal, onMessage, onWarn);
+          if (!delivered) {
+            if (!publicationBlocked) {
+              publicationBlocked = true;
+              onState("publication_blocked", "消息写入本地存储失败，暂缓 ACK 等待重试");
+            }
+            // Backpressure: do NOT acknowledge when persistence failed!
+            continue;
+          }
+          if (publicationBlocked) {
+            publicationBlocked = false;
+            onState("listening");
+          }
+        }
+
+        const sid = packet.str(1);
+        if (sid) {
+          await ws.writeBinary(encodeAckFrame(sid), 15_000, loopCtrl.signal);
+        }
+      }
+    } finally {
+      clearInterval(hbTimer);
+      clearInterval(kaTimer);
+      outerSignal.removeEventListener("abort", onOuterAbort);
+      loopCtrl.abort();
+      ws.close();
+    }
+  }
+
+  private async handlePush(
+    payload: Buffer,
+    signal: AbortSignal,
+    onMessage: (msg: WebMessage) => Promise<void> | void,
+    onWarn?: (message: string) => void,
+  ): Promise<boolean> {
+    let push: ReturnType<typeof parseProto>;
+    try {
+      push = parseProto(payload, MAX_WIRE_BYTES);
+    } catch (err) {
+      onWarn?.(`推送载荷解析失败：${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+
+    let rejected = false;
+    for (const entry of push.allBytes(1)) {
+      if (signal.aborted) return false;
+      let msg: WebMessage;
+      try {
+        const pair = parseProto(entry, MAX_WIRE_BYTES);
+        msg = decodeMessage(pair.bytes(2), this.ownerId);
+      } catch (err) {
+        // One undecodable message entry must neither starve siblings nor stall ACK forever
+        onWarn?.(`跳过无法解码的个人消息：${err instanceof Error ? err.message : String(err)}`);
+        continue;
+      }
+      if (msg.unsupported || (!msg.text.trim() && msg.resources.length === 0)) continue;
+      try {
+        await onMessage(msg);
+      } catch (err) {
+        if (signal.aborted) return false;
+        onWarn?.(`个人消息落库失败（将不 ACK）：${err instanceof Error ? err.message : String(err)}`);
+        rejected = true;
+      }
+    }
+    return !rejected;
+  }
+}

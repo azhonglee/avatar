@@ -147,6 +147,12 @@ context:
     auto_close: true          # 有证据（你已回复、Meego 节点已流转）时自动关闭事项
     mute_legacy: true
     create_own_todo: false    # 把你的承诺建成飞书任务（只建给你自己）
+  personal_web:               # 个人 Web 协议实时通道（无需拉机器人进群即可秒级接收 @我 与私聊；对外回复永远需先确认草稿）
+    enabled: false            # 先运行 `bin/pa context web-login` 本人扫码登录，再设为 true 并重启 `pa run`
+    fast_lane: true           # 收到真实 @我 或对方私聊时，不等 10 分钟定时周期，立刻走单会话快通道理解与提醒
+    debounce_ms: 2500         # 同一会话短时间连发多条消息时合并等待毫秒数
+    pre_draft: false          # 快通道识别出高优先级「别人在等你」时是否自动预起草回复（仍需你确认才发送）
+    send_replies: false       # 草稿目标尚无开放平台 om_ ID 时，确认后允许经个人 Web 协议回复（带回读校验）
 
 capture:
   min_confidence: 0.6        # ≥ 该值进“待确认”

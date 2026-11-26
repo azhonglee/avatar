@@ -24,8 +24,16 @@ import { errMsg, log } from "./util.ts";
 export const MASK = "******";
 
 const HOT = new Set(["notify", "budget", "acceptance", "capture", "dispatch", "delivery", "cards", "lark_web", "applink_host", "context"]);
-/** 热加载分组里仍需重启的字段（引擎并发上限、定时任务、模块开关在启动时确定） */
-const COLD_PATHS = new Set(["dispatch.max_parallel", "context.enabled", "context.schedule", "context.morning", "context.evening", "context.weekly"]);
+/** 热加载分组里仍需重启的字段（引擎并发上限、定时任务、模块开关、常驻长连接开关在启动时确定） */
+const COLD_PATHS = new Set([
+  "dispatch.max_parallel",
+  "context.enabled",
+  "context.schedule",
+  "context.morning",
+  "context.evening",
+  "context.weekly",
+  "context.personal_web.enabled",
+]);
 const FORBIDDEN = ["data_dir", "bins"];
 
 type Obj = Record<string, unknown>;
