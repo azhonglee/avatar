@@ -358,11 +358,24 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
         `如需秒级响应任意群 @我 与私聊，先运行 ${code("bin/pa context web-login")} 扫码，再把 ${code("context.personal_web.enabled")} 设为 true`,
       );
     }
-    const login = new WebLoginStore(cfg.dataDir).load();
+    const inspected = new WebLoginStore(cfg.dataDir).inspect();
+    if (inspected.status === "missing_key") {
+      return warn(
+        "检测到已加密的个人 Web 凭据，但当前环境缺少解密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）",
+        "请在常驻服务环境中提供 PA_FEISHU_WEB_KEY 或通过 systemd LoadCredential 配置 feishu-web-key",
+      );
+    }
+    if (inspected.status === "plaintext_rejected") {
+      return warn(
+        "检测到未加密的明文个人 Web 凭据，已按安全策略拒绝加载",
+        `配置加密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）后运行 ${code("bin/pa context web-login")} 重新扫码加密保存`,
+      );
+    }
+    const login = inspected.status === "ok" ? inspected.login : undefined;
     if (!login) {
       return warn(
         "已启用但尚未扫码登录（期间仍由每 10 分钟的飞书轮询兜底）",
-        `运行 ${code("bin/pa context web-login")} 使用本人飞书 App 扫码登录`,
+        `配置加密密钥后运行 ${code("bin/pa context web-login")} 使用本人飞书 App 扫码登录`,
       );
     }
     const pw = app.ext.context?.status().personal_web;

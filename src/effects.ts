@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
 import type { Board, SectionKey } from "./board.ts";
+import { computePwReplyCid } from "./context/personal-web.ts";
 import { deepFind, runProcess } from "./util.ts";
 import type { Store } from "./store.ts";
 import type { Config } from "./config.ts";
@@ -74,11 +74,14 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
           break;
         case "pw.reply": {
           if (!hooks.pwReply) throw new Error("个人 Web 回复未注册");
-          const normText = e.args.text.replace(/\r\n/g, "\n").trim();
-          const revKey = e.args.draft_id
-            ? `draft:${e.args.draft_id}:${e.args.owner_id}:${e.args.chat_id}:${e.args.message_id}:${normText}`
-            : `effect:${item.id}`;
-          const cid = createHash("sha256").update(`avatar-pw\0${revKey}`).digest("hex").slice(0, 32);
+          const { cid } = computePwReplyCid({
+            draft_id: e.args.draft_id,
+            effect_id: item.id,
+            owner_id: e.args.owner_id,
+            chat_id: e.args.chat_id,
+            message_id: e.args.message_id,
+            text: e.args.text,
+          });
           await hooks.pwReply({
             owner_id: e.args.owner_id,
             chat_id: e.args.chat_id,

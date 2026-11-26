@@ -15,6 +15,9 @@ Restart=always
 RestartSec=10
 # 让 lark-cli / acpx / 各 harness 的命令行在 PATH 里（按你的安装位置调整）
 Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# 若启用个人 Web 实时通道（context.personal_web.enabled: true），需提供静态加密密钥（禁止明文落盘）：
+# LoadCredential=feishu-web-key:/path/to/0400/feishu-web.key
+# 或 EnvironmentFile=%h/.config/personal-agent/secrets.env（包含 PA_FEISHU_WEB_KEY=...）
 
 [Install]
 WantedBy=default.target

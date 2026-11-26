@@ -154,18 +154,31 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
   if (sub === "web-status") {
     const verify = more.includes("--verify");
     const store = new WebLoginStore(app.cfg.dataDir);
-    const login = store.load();
+    const inspected = store.inspect();
+    const login = inspected.status === "ok" ? inspected.login : undefined;
     const ctx = app.ext.context;
     const st = ctx?.status().personal_web;
     const pwCfg = app.cfg.context.personal_web;
     console.log(`启用状态：${app.cfg.context.enabled && pwCfg.enabled ? "已启用" : "未启用"}（context.enabled=${app.cfg.context.enabled}，fast_lane=${pwCfg.fast_lane}，debounce_ms=${pwCfg.debounce_ms}，pre_draft=${pwCfg.pre_draft}，send_replies=${pwCfg.send_replies}）`);
-    console.log(`凭据文件：${store.file}（${login ? `已登录 ${login.owner_name || login.owner_id}，更新于 ${login.updated_at ?? "未知"}` : "未登录"}）`);
+    const fileNote = login
+      ? `已登录 ${login.owner_name || login.owner_id}，更新于 ${login.updated_at ?? "未知"}`
+      : inspected.status === "missing_key"
+        ? "凭据已加密但当前环境缺少密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）"
+        : inspected.status === "plaintext_rejected"
+          ? "检测到未加密明文凭据（已拒绝加载，请配置密钥后重新 web-login）"
+          : "未登录";
+    console.log(`凭据文件：${store.file}（${fileNote}）`);
     if (st) {
       console.log(`常驻状态：${st.state}${st.last_message_at ? `，最近消息 ${new Date(st.last_message_at).toLocaleString("zh-CN", { timeZone: app.cfg.owner.timezone, hour12: false })}` : ""}`);
       if (st.last_error) console.log(`最近错误：${st.last_error}`);
     }
     if (verify) {
-      if (!login) throw new Error("尚未登录，请先运行 `pa context web-login`");
+      if (!login) {
+        if (inspected.status === "missing_key") {
+          throw new Error("凭据已加密但当前环境缺少解密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）");
+        }
+        throw new Error("尚未登录，请先运行 `pa context web-login`");
+      }
       const client = await FeishuWebClient.connect(login, { onSessionConfirmed: (u, d) => store.saveIfSessionMatches(u, d) });
       console.log(`✅ 在线核验通过：${client.owner().name}（ID: ${client.owner().id}）`);
     }
@@ -182,6 +195,11 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
       },
       allowPositionals: true,
     });
+    if (!WebLoginStore.hasEncryptionKey()) {
+      throw new Error(
+        "执行 pa context web-login 前必须配置静态加密密钥（设置环境变量 PA_FEISHU_WEB_KEY 或通过 systemd LoadCredential 提供 CREDENTIALS_DIRECTORY/feishu-web-key），拒绝明文写入会话 Cookie",
+      );
+    }
     console.log("正在向飞书申请个人 Web 登录二维码…");
     const challenge = await beginLogin();
     console.log("\n" + renderQrTerminal(challenge.qrCode) + "\n");

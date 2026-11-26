@@ -154,43 +154,46 @@ export class ContextService {
           const targetCount = Math.min(budget, 8 * par);
           const eligible: { conv: string; conv_name: string; n: number }[] = [];
           const scanned = new Set<string>(skippedInCycle);
-          // 持续翻页跳过被排除/占用的会话，直到凑满目标批次或待处理队列真正耗尽，避免后续会议/文档饿死
-          while (eligible.length < targetCount && !signal?.aborted) {
-            const page = this.store.pendingConvs(Math.max(targetCount * 2, 16), activeSources, {
-              excludeConvs: scanned,
-              activeNativeOwner,
-            });
-            if (!page.length) break;
-            for (const c of page) {
-              if (eligible.length >= targetCount) break;
-              scanned.add(c.conv);
-              const decision = await this.personalWeb.checkConvAllowedForUnderstand(c.conv, c.conv_name, nativeExclSnapshot);
-              if (decision !== "allowed") {
-                skippedInCycle.add(c.conv);
-                continue;
-              }
-              if (!this.store.claimConv(c.conv, workId, this.app.ledger.owner)) {
-                skippedInCycle.add(c.conv);
-                continue;
-              }
-              eligible.push(c);
-            }
-          }
-          if (!eligible.length) break;
-          const pending = eligible;
-          const groups: (typeof pending)[] = Array.from({ length: Math.min(par, pending.length) }, () => []);
-          pending.forEach((c, i) => groups[i % groups.length].push(c));
-          // 定期续租，确保长耗时模型调用（最长 900s）期间会话占坑不会提前过期被其他进程抢占
+          // 从首批选坑开始即启动续租心跳，防止大量候选的异步排除校验耗时超过 120s 租约，同时确保中途异常/中止时释放全部已占坑会话
           const claimHeartbeat = setInterval(() => {
-            for (const c of pending) this.store.renewConv(c.conv, workId);
+            for (const c of eligible) this.store.renewConv(c.conv, workId);
           }, 30_000);
           claimHeartbeat.unref?.();
-          let results: PromiseSettledResult<Awaited<ReturnType<Understander["runBatch"]>>>[];
+          let groups: (typeof eligible)[] = [];
+          let results: PromiseSettledResult<Awaited<ReturnType<Understander["runBatch"]>>>[] = [];
           try {
+            // 持续翻页跳过被排除/占用的会话，直到凑满目标批次或待处理队列真正耗尽，避免后续会议/文档饿死
+            while (eligible.length < targetCount && !signal?.aborted) {
+              const page = this.store.pendingConvs(Math.max(targetCount * 2, 16), activeSources, {
+                excludeConvs: scanned,
+                activeNativeOwner,
+              });
+              if (!page.length) break;
+              for (const c of page) {
+                if (eligible.length >= targetCount) break;
+                scanned.add(c.conv);
+                const decision = await this.personalWeb.checkConvAllowedForUnderstand(c.conv, c.conv_name, nativeExclSnapshot);
+                if (decision !== "allowed") {
+                  skippedInCycle.add(c.conv);
+                  continue;
+                }
+                if (!this.store.claimConv(c.conv, workId, this.app.ledger.owner)) {
+                  skippedInCycle.add(c.conv);
+                  continue;
+                }
+                eligible.push(c);
+              }
+            }
+            if (signal?.aborted) throw new Error("aborted");
+            // 推理前逐个续租并核实占坑所有权仍属于本批次，丢弃已失联的占坑
+            const pending = eligible.filter((c) => this.store.renewConv(c.conv, workId));
+            if (!pending.length) break;
+            groups = Array.from({ length: Math.min(par, pending.length) }, () => []);
+            pending.forEach((c, i) => groups[i % groups.length].push(c));
             results = await Promise.allSettled(groups.map((g) => this.understander.runBatch(workId, g, signal, activeNativeOwner)));
           } finally {
             clearInterval(claimHeartbeat);
-            for (const c of pending) this.store.releaseConv(c.conv, workId);
+            for (const c of eligible) this.store.releaseConv(c.conv, workId);
           }
           if (signal?.aborted) throw new Error("aborted");
           let progress = 0;
@@ -298,22 +301,30 @@ export class ContextService {
       const nudged = this.nudge(r.created);
       this.autonomy(r.created);
 
-      // 可选：为高优先级「别人在等你」自动预起草回复草稿（标记 auto: true，执行前二次复核开关与会话排除；永远不自动发送）
+      // 可选：为高优先级「别人在等你」自动预起草回复草稿（标记 auto: true，入队与执行复用同一资格判据；永远不自动发送）
       let preDrafted = 0;
-      if (this.cfg.context.personal_web.pre_draft) {
-        for (const c of r.created) {
-          const it = this.store.item(c.id);
-          if (!it || it.status !== "open" || it.kind !== "ask_me" || it.priority !== "high") continue;
-          if (this.store.hidden(this.store.project(it.project_id))) continue;
-          if (it.meta.needs_review || it.feedback === "unimportant" || !this.draftable(it)) continue;
-          if (this.enqueue(`draft:${it.id}:reply:fast`, { task: "draft", item_id: it.id, kind: "reply", auto: true })) preDrafted++;
-        }
+      for (const c of r.created) {
+        const it = this.store.item(c.id);
+        if (!this.canAutoPreDraft(it)) continue;
+        if (this.enqueue(`draft:${it.id}:reply:fast`, { task: "draft", item_id: it.id, kind: "reply", auto: true })) preDrafted++;
       }
       return { fresh: r.fresh, created: r.created.length, nudged, pre_drafted: preDrafted };
     } finally {
       clearInterval(claimHeartbeat);
       this.store.releaseConv(p.conv, workId);
     }
+  }
+
+  /** 判断事项是否满足快通道自动预起草资格（入队与执行前复用同一判据，防止开关关闭或后续降级后仍送模型） */
+  private canAutoPreDraft(it: ItemRow | undefined): it is ItemRow {
+    const pw = this.cfg.context.personal_web;
+    if (!this.cfg.context.understand || !this.cfg.context.sources.im || !pw.enabled || !pw.fast_lane || !pw.pre_draft) {
+      return false;
+    }
+    if (!it || it.status !== "open" || it.kind !== "ask_me" || it.priority !== "high") return false;
+    if (this.store.hidden(this.store.project(it.project_id))) return false;
+    if (it.meta.needs_review || it.feedback === "unimportant" || !this.draftable(it)) return false;
+    return true;
   }
 
   private async ensureOwnerName(): Promise<void> {
@@ -506,18 +517,9 @@ export class ContextService {
         }
         if (p.task === "draft") {
           if (p.auto) {
-            // 自动预起草执行前复核当前开关、项目静音及目标会话排除规则，防止入队后用户关闭或静音仍把消息送给模型
-            if (
-              !this.cfg.context.understand ||
-              !this.cfg.context.sources.im ||
-              !this.cfg.context.personal_web.enabled ||
-              !this.cfg.context.personal_web.pre_draft
-            ) {
-              this.app.ledger.transition(item, { state: "skipped", terminal: true });
-              return;
-            }
+            // 自动预起草执行前复用完整入队资格判据与目标会话排除校验，防止开关关闭、事项降级/变更或会话静音后仍送模型
             const it = this.store.item(p.item_id);
-            if (!it || it.status !== "open" || it.feedback === "unimportant" || this.store.hidden(this.store.project(it.project_id))) {
+            if (!this.canAutoPreDraft(it)) {
               this.app.ledger.transition(item, { state: "skipped", terminal: true });
               return;
             }

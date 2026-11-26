@@ -5,14 +5,63 @@ import { ROOT, type Config } from "./config.ts";
 import type { Profile } from "./guard.ts";
 import { runProcess } from "./util.ts";
 
-/** 从传给子模型进程的环境里剥离个人 Web 凭据路径与加密密钥，避免任意 harness 读到主人的飞书会话 */
-function sanitizeBaseEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+const FEISHU_WEB_KEY_CRED = "feishu-web-key";
+
+/**
+ * 构造传给子模型进程的基础环境：
+ *   - 始终剥离所有 `PA_FEISHU_WEB_*` 环境变量（凭据路径与静态加密密钥）；
+ *   - 若 `CREDENTIALS_DIRECTORY` 不包含 `feishu-web-key`，原样保留（不破坏无关的 systemd 凭据）；
+ *   - 若 `CREDENTIALS_DIRECTORY` 包含 `feishu-web-key`，则只将无关凭据复制到 0700 临时目录（0400 文件权限）供子进程读取，
+ *     并在子进程结束后立即清理（若目录内仅有 `feishu-web-key`，则移除 `CREDENTIALS_DIRECTORY`）。
+ */
+export function prepareHarnessEnv(env: NodeJS.ProcessEnv = process.env): { env: NodeJS.ProcessEnv; cleanup: () => void } {
   const clean: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(env)) {
-    if (k === "CREDENTIALS_DIRECTORY" || k.startsWith("PA_FEISHU_WEB_")) continue;
+    if (k.startsWith("PA_FEISHU_WEB_")) continue;
     clean[k] = v;
   }
-  return clean;
+  const credDir = env.CREDENTIALS_DIRECTORY?.trim();
+  if (!credDir) return { env: clean, cleanup: () => undefined };
+
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(credDir, { withFileTypes: true });
+  } catch {
+    if (fs.existsSync(path.join(credDir, FEISHU_WEB_KEY_CRED))) {
+      delete clean.CREDENTIALS_DIRECTORY;
+    }
+    return { env: clean, cleanup: () => undefined };
+  }
+
+  if (!entries.some((e) => e.name === FEISHU_WEB_KEY_CRED)) {
+    return { env: clean, cleanup: () => undefined };
+  }
+
+  const others = entries.filter((e) => e.name !== FEISHU_WEB_KEY_CRED);
+  if (others.length === 0) {
+    delete clean.CREDENTIALS_DIRECTORY;
+    return { env: clean, cleanup: () => undefined };
+  }
+
+  const filteredDir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-creds-"));
+  fs.chmodSync(filteredDir, 0o700);
+  for (const entry of others) {
+    const src = path.join(credDir, entry.name);
+    const dst = path.join(filteredDir, entry.name);
+    try {
+      const st = fs.statSync(src);
+      if (st.isFile()) {
+        fs.writeFileSync(dst, fs.readFileSync(src), { mode: 0o400 });
+      }
+    } catch {
+      // 跳过不可读或特殊节点
+    }
+  }
+  clean.CREDENTIALS_DIRECTORY = filteredDir;
+  return {
+    env: clean,
+    cleanup: () => fs.rmSync(filteredDir, { recursive: true, force: true }),
+  };
 }
 
 export interface HarnessRun {
@@ -76,8 +125,9 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
   const harnessEnv = Object.fromEntries(
     Object.entries(h.env).map(([k, v]) => [k, v.replace(/\$\{(\w+)\}/g, (_, n: string) => process.env[n] ?? "")]),
   );
+  const baseEnv = prepareHarnessEnv();
   const env: NodeJS.ProcessEnv = {
-    ...sanitizeBaseEnv(),
+    ...baseEnv.env,
     ...harnessEnv,
     PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${process.env.PATH ?? ""}`,
     PA_GUARD_PROFILE: run.lark,
@@ -86,16 +136,21 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
     PA_GUARD_LOG: path.join(cfg.dataDir, "logs", "guard.log"),
   };
   const started = new Date().toISOString();
-  const r = await runProcess(cfg.bins.acpx, args, {
-    cwd: run.cwd,
-    env,
-    input: run.prompt,
-    // acpx 自己有 --timeout；这里多留 2 分钟兜底，防止进程卡死
-    timeoutMs: (run.timeoutSec + 120) * 1000,
-    group: true,
-    signal: run.signal,
-    onSpawn: run.onSpawn,
-  });
+  let r: Awaited<ReturnType<typeof runProcess>>;
+  try {
+    r = await runProcess(cfg.bins.acpx, args, {
+      cwd: run.cwd,
+      env,
+      input: run.prompt,
+      // acpx 自己有 --timeout；这里多留 2 分钟兜底，防止进程卡死
+      timeoutMs: (run.timeoutSec + 120) * 1000,
+      group: true,
+      signal: run.signal,
+      onSpawn: run.onSpawn,
+    });
+  } finally {
+    baseEnv.cleanup();
+  }
   fs.writeFileSync(
     run.logFile,
     [
@@ -157,13 +212,26 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   // -o 用相对 cwd 的文件名：codex 0.169 在部分路径（如经符号链接的家目录）下打开绝对路径会报 "Not a directory"
   const args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--ephemeral", "--color", "never", "-o", path.basename(outFile)];
   if (run.tools === "none") {
+    // 彻底隔离用户配置（包括 ~/.codex/config.toml 中配置的任意 MCP Server / 插件 / 钩子）与执行规则，仅保留认证，并关闭全部内置工具
     args.push(
+      "--ignore-user-config",
+      "--ignore-rules",
       "--disable", "shell_tool",
       "--disable", "unified_exec",
       "--disable", "apps",
       "--disable", "browser_use",
       "--disable", "computer_use",
+      "--disable", "view_image",
+      "--disable", "image_generation",
+      "--disable", "plugins",
+      "--disable", "remote_plugin",
+      "--disable", "sleep_tool",
+      "--disable", "hooks",
+      "--disable", "multi_agent",
+      "--disable", "code_mode",
+      "--disable", "code_mode_host",
       "-c", "sandbox_permissions=[]",
+      "-c", 'web_search="disabled"',
     );
   }
   if (h.model) args.push("-m", h.model);
@@ -171,13 +239,14 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   const harnessEnv = Object.fromEntries(
     Object.entries(h.env).map(([k, v]) => [k, v.replace(/\$\{(\w+)\}/g, (_, n: string) => process.env[n] ?? "")]),
   );
+  const baseEnv = prepareHarnessEnv();
   const started = new Date().toISOString();
   let r: Awaited<ReturnType<typeof runProcess>>;
   let text = "";
   try {
     r = await runProcess(cmd, args, {
       cwd: execCwd,
-      env: { ...sanitizeBaseEnv(), ...harnessEnv },
+      env: { ...baseEnv.env, ...harnessEnv },
       input: run.prompt,
       timeoutMs: (run.timeoutSec + 60) * 1000,
       group: true,
@@ -191,6 +260,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       text = r.stdout.trim();
     }
   } finally {
+    baseEnv.cleanup();
     if (isolatedTmp) fs.rmSync(isolatedTmp, { recursive: true, force: true });
   }
   fs.writeFileSync(
@@ -229,8 +299,9 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   } catch {
     // run.lark === "none" 时不会执行真实 lark-cli
   }
+  const baseEnv = prepareHarnessEnv();
   const env: NodeJS.ProcessEnv = {
-    ...sanitizeBaseEnv(),
+    ...baseEnv.env,
     ...harnessEnv,
     DOUBAO_CLI_NO_UPDATE_CHECK: "1",
     PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${process.env.PATH ?? ""}`,
@@ -259,6 +330,7 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       onSpawn: run.onSpawn,
     });
   } finally {
+    baseEnv.cleanup();
     try {
       fs.closeSync(fd);
     } catch {

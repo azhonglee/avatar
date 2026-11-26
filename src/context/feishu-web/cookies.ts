@@ -1,8 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { isAlive } from "../../util.ts";
+import { DatabaseSync } from "node:sqlite";
 
 /**
  * RFC 6265 recording cookie jar with strict Feishu host allowlist and atomic 0600 credential store.
@@ -37,6 +36,16 @@ export interface CookieDelta {
   /** 每个发生变更的 Cookie 键在本客户端修改前的基准值（null 表示此前不存在），用于 3-way 冲突检测 */
   baseValues?: Record<string, string | null>;
 }
+
+/** 发起 HTTP 请求前捕获的 Cookie 罐代际快照，用于识别在途期间被磁盘同步轮换过的同键 Cookie */
+export interface CookieSnapshot {
+  generation: number;
+  values: Map<string, string>;
+}
+
+export type WebLoginInspectResult =
+  | { status: "ok"; login: WebLogin }
+  | { status: "missing" | "missing_key" | "plaintext_rejected" | "invalid"; login?: undefined };
 
 export function isAllowedFeishuHost(host: string, extraAllowed?: Iterable<string>): boolean {
   const h = host.trim().toLowerCase();
@@ -131,11 +140,19 @@ export class RecordingCookieJar {
   private readonly dirtyDeletes = new Set<string>();
   private readonly dirtyBaseValues = new Map<string, string | null>();
   private readonly extraAllowed?: Set<string>;
+  private syncGeneration = 0;
 
   constructor(extraAllowedHosts?: Iterable<string>) {
     if (extraAllowedHosts) {
       this.extraAllowed = new Set([...extraAllowedHosts].map((h) => h.trim().toLowerCase()).filter(Boolean));
     }
+  }
+
+  /** 捕获请求发出时刻的 Cookie 代际与各键快照，防止请求在途期间 syncFromDisk() 轮换的 Cookie 被陈旧响应覆写 */
+  snapshot(): CookieSnapshot {
+    const snap = new Map<string, string>();
+    for (const [k, v] of this.values) snap.set(k, v.value);
+    return { generation: this.syncGeneration, values: snap };
   }
 
   static fromRecords(cookies: CookieRecord[], extraAllowedHosts?: Iterable<string>, nowMs = Date.now()): RecordingCookieJar {
@@ -163,12 +180,18 @@ export class RecordingCookieJar {
     return `${c.domain}\0${c.path}\0${c.name}`;
   }
 
-  /** Record Set-Cookie headers from one response, enforcing host allowlist and RFC 6265 scope. */
-  setFromHeaders(requestUrl: URL, setCookieHeaders: string[] | string | undefined, nowMs = Date.now()): void {
-    if (!setCookieHeaders) return;
+  /** Record Set-Cookie headers from one response, enforcing host allowlist, RFC 6265 scope, and request-time snapshot conflict checks. */
+  setFromHeaders(
+    requestUrl: URL,
+    setCookieHeaders: string[] | string | undefined,
+    nowMs = Date.now(),
+    requestSnapshot?: CookieSnapshot,
+  ): boolean {
+    if (!setCookieHeaders) return false;
     const host = requestUrl.hostname.toLowerCase();
-    if (!isAllowedFeishuHost(host, this.extraAllowed)) return;
+    if (!isAllowedFeishuHost(host, this.extraAllowed)) return false;
     const list = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
+    let applied = false;
     for (const raw of list) {
       const parsed = parseSetCookieHeader(raw);
       if (!parsed) continue;
@@ -195,8 +218,15 @@ export class RecordingCookieJar {
         ...(expiresMs && expiresMs > nowMs ? { expires_at: new Date(expiresMs).toISOString() } : {}),
       };
       const key = this.keyOf(record);
-      if (!this.dirtyBaseValues.has(key)) {
-        this.dirtyBaseValues.set(key, this.values.get(key)?.value ?? null);
+      if (requestSnapshot && requestSnapshot.generation !== this.syncGeneration) {
+        const sentBase = requestSnapshot.values.get(key) ?? null;
+        const curVal = this.values.get(key)?.value ?? null;
+        // 请求在途期间磁盘同步已轮换了该 Cookie：拒绝用陈旧响应覆盖较新的轮换值
+        if (curVal !== sentBase) continue;
+        if (!this.dirtyBaseValues.has(key)) this.dirtyBaseValues.set(key, sentBase);
+      } else if (!this.dirtyBaseValues.has(key)) {
+        const base = requestSnapshot ? (requestSnapshot.values.get(key) ?? null) : (this.values.get(key)?.value ?? null);
+        this.dirtyBaseValues.set(key, base);
       }
       if (remove) {
         this.values.delete(key);
@@ -207,7 +237,9 @@ export class RecordingCookieJar {
         this.dirtyDeletes.delete(key);
         this.dirtyUpserts.set(key, { ...record });
       }
+      applied = true;
     }
+    return applied;
   }
 
   /** 读取自上次持久化以来本客户端实际收到的 Set-Cookie 增量及基准值，用于同会话多进程 3-way 冲突检测与合并 */
@@ -246,6 +278,7 @@ export class RecordingCookieJar {
     }
     this.values.clear();
     for (const [k, v] of next) this.values.set(k, v);
+    this.syncGeneration++;
     this.clearDelta();
   }
 
@@ -348,49 +381,83 @@ function decryptPayload(env: EncryptedEnvelope, key: Buffer): string {
 }
 
 /**
- * Atomic 0600 credential store for the owner's personal Feishu Web session.
- * 支持通过 `PA_FEISHU_WEB_CRED_FILE` 将凭据存放在工作区外，并通过 `PA_FEISHU_WEB_KEY` 或 systemd `CREDENTIALS_DIRECTORY/feishu-web-key`
- * 启用 AES-256-GCM 静态加密（所有子模型 harness 均自动剥离这些环境变量）。
+ * Atomic 0600 encrypted credential store for the owner's personal Feishu Web session.
+ *   - 强制使用 AES-256-GCM 静态加密（密钥来自 `PA_FEISHU_WEB_KEY` 或 systemd `CREDENTIALS_DIRECTORY/feishu-web-key`），
+ *     绝不以明文将可复用会话 Cookie 写入磁盘（所有子模型 harness 均自动剥离该密钥）；
+ *   - 缺少密钥时拒绝写入或降级覆盖既有加密凭据；
+ *   - 支持通过 `PA_FEISHU_WEB_CRED_FILE` 将凭据存放在工作区外；
+ *   - 跨进程互斥复用 Node 22 内置 SQLite (`BEGIN IMMEDIATE`) 的内核级 POSIX 文件锁，崩溃由操作系统自动原子释放，无陈旧锁竞态。
  */
 export class WebLoginStore {
   readonly file: string;
+  readonly lockFile: string;
+  private readonly lockTimeoutMs: number;
 
-  constructor(dataDir: string, filename = "feishu-web.json") {
+  constructor(dataDir: string, filename = "feishu-web.json", lockTimeoutMs = 5_000) {
     const external = process.env.PA_FEISHU_WEB_CRED_FILE?.trim();
     this.file = external ? path.resolve(external) : path.join(dataDir, filename);
+    this.lockFile = `${this.file}.lock.db`;
+    this.lockTimeoutMs = Math.max(100, Math.trunc(lockTimeoutMs));
+  }
+
+  static hasEncryptionKey(): boolean {
+    return resolveEncryptionKey() !== undefined;
   }
 
   exists(): boolean {
     return fs.existsSync(this.file);
   }
 
-  load(): WebLogin | undefined {
-    if (!fs.existsSync(this.file)) return undefined;
+  private hasExistingEncryptedFile(): boolean {
+    if (!fs.existsSync(this.file)) return false;
     try {
       const rawJson = JSON.parse(fs.readFileSync(this.file, "utf8")) as unknown;
-      let parsed: Partial<WebLogin>;
-      if (isEncryptedEnvelope(rawJson)) {
-        const key = resolveEncryptionKey();
-        if (!key) return undefined;
-        parsed = JSON.parse(decryptPayload(rawJson, key)) as Partial<WebLogin>;
-      } else {
-        parsed = rawJson as Partial<WebLogin>;
-      }
+      return isEncryptedEnvelope(rawJson);
+    } catch {
+      return false;
+    }
+  }
+
+  inspect(): WebLoginInspectResult {
+    if (!fs.existsSync(this.file)) return { status: "missing" };
+    let rawJson: unknown;
+    try {
+      rawJson = JSON.parse(fs.readFileSync(this.file, "utf8")) as unknown;
+    } catch {
+      return { status: "invalid" };
+    }
+    if (!isEncryptedEnvelope(rawJson)) {
+      return { status: "plaintext_rejected" };
+    }
+    const key = resolveEncryptionKey();
+    if (!key) {
+      return { status: "missing_key" };
+    }
+    try {
+      const parsed = JSON.parse(decryptPayload(rawJson, key)) as Partial<WebLogin>;
       if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.cookies) || typeof parsed.owner_id !== "string" || !parsed.owner_id) {
-        return undefined;
+        return { status: "invalid" };
       }
       return {
-        cookies: parsed.cookies,
-        owner_id: parsed.owner_id,
-        owner_name: typeof parsed.owner_name === "string" ? parsed.owner_name : "",
-        owner_open_id: typeof parsed.owner_open_id === "string" && parsed.owner_open_id ? parsed.owner_open_id : undefined,
-        session_id: typeof parsed.session_id === "string" && parsed.session_id ? parsed.session_id : undefined,
-        cookie_version: typeof parsed.cookie_version === "number" && Number.isFinite(parsed.cookie_version) ? parsed.cookie_version : 1,
-        updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : undefined,
+        status: "ok",
+        login: {
+          cookies: parsed.cookies,
+          owner_id: parsed.owner_id,
+          owner_name: typeof parsed.owner_name === "string" ? parsed.owner_name : "",
+          owner_open_id: typeof parsed.owner_open_id === "string" && parsed.owner_open_id ? parsed.owner_open_id : undefined,
+          session_id: typeof parsed.session_id === "string" && parsed.session_id ? parsed.session_id : undefined,
+          cookie_version: typeof parsed.cookie_version === "number" && Number.isFinite(parsed.cookie_version) ? parsed.cookie_version : 1,
+          updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : undefined,
+        },
       };
     } catch {
-      return undefined;
+      return { status: "invalid" };
     }
+  }
+
+  load(): WebLogin | undefined {
+    const res = this.inspect();
+    return res.status === "ok" ? res.login : undefined;
   }
 
   currentSessionId(): string | undefined {
@@ -398,75 +465,51 @@ export class WebLoginStore {
   }
 
   /**
-   * 进程归属文件锁（linkSync 原子发布 host:pid:token）：
-   *   - 绝不按文件年龄从存活进程手中抢锁（避免慢 fsync 被误抢导致 web-logout 后旧快照写回）；
-   *   - 仅当同机持锁 PID 已确定死亡（!isAlive(pid)）时清理遗留死锁；
-   *   - 释放时核对 token 一致才删除锁文件，绝不误删其他进程的锁。
+   * 跨进程原子文件锁（复用 Node 22 内置 SQLite `BEGIN IMMEDIATE` 的内核级 POSIX 文件锁）：
+   *   - 持锁进程异常退出（含 SIGKILL）时由操作系统内核原子释放，不存在陈旧锁清理竞态；
+   *   - 锁文件权限固定 0600 且永不 unlink 避免 inode 错配；
+   *   - 若锁文件不可读/权限错误立即抛错，不会空转阻塞事件循环；
+   *   - 竞争等待严格受 `lockTimeoutMs`（默认 5000ms）约束。
    */
   private withLock<T>(fn: () => T): T {
     const dir = path.dirname(this.file);
     fs.mkdirSync(dir, { recursive: true });
-    const lockFile = `${this.file}.lock`;
-    const token = crypto.randomUUID();
-    const myStamp = `${os.hostname()}:${process.pid}:${token}`;
-    const candidate = path.join(dir, `.${path.basename(this.file)}.lock.${process.pid}.${token}`);
-    const deadline = Date.now() + 5_000;
-    let acquired = false;
-    try {
-      const fd = fs.openSync(candidate, "w", 0o600);
-      try {
-        fs.writeFileSync(fd, myStamp + "\n", "utf8");
-      } finally {
-        fs.closeSync(fd);
-      }
-      while (!acquired) {
-        try {
-          fs.linkSync(candidate, lockFile);
-          acquired = true;
-        } catch (e) {
-          const code = (e as NodeJS.ErrnoException).code;
-          if (code !== "EEXIST") throw e;
-          let ownerLine = "";
-          try {
-            ownerLine = fs.readFileSync(lockFile, "utf8").trim();
-          } catch {
-            continue;
-          }
-          const [host, pidStr] = ownerLine.split(":");
-          const pid = Number(pidStr);
-          if (host === os.hostname() && Number.isInteger(pid) && pid > 0 && pid !== process.pid && !isAlive(pid)) {
-            // 仅在同机持锁进程确定死亡时才清理遗留锁，且再次核对内容避免竞态误删新锁
-            try {
-              if (fs.readFileSync(lockFile, "utf8").trim() === ownerLine) {
-                fs.rmSync(lockFile, { force: true });
-                continue;
-              }
-            } catch {
-              continue;
-            }
-          }
-          if (Date.now() >= deadline) throw new Error(`等待个人 Web 凭据文件锁超时：${lockFile}`);
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
-        }
-      }
-    } finally {
-      fs.rmSync(candidate, { force: true });
+    if (!fs.existsSync(this.lockFile)) {
+      const fd = fs.openSync(this.lockFile, "a", 0o600);
+      fs.closeSync(fd);
     }
+    const db = new DatabaseSync(this.lockFile);
+    let locked = false;
     try {
+      db.exec(`PRAGMA busy_timeout = ${this.lockTimeoutMs}`);
+      db.exec("BEGIN IMMEDIATE");
+      locked = true;
       return fn();
     } finally {
-      try {
-        if (fs.readFileSync(lockFile, "utf8").trim() === myStamp) {
-          fs.rmSync(lockFile, { force: true });
+      if (locked) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          // ignore
         }
-      } catch {
-        // ignore if already removed
       }
+      db.close();
     }
   }
 
   private writeUnlocked(login: WebLogin, cookieVersion: number): WebLogin {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    const key = resolveEncryptionKey();
+    if (!key) {
+      if (this.hasExistingEncryptedFile()) {
+        throw new Error(
+          "检测到已有加密的个人 Web 凭据文件，但当前环境缺少解密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key），拒绝降级覆盖",
+        );
+      }
+      throw new Error(
+        "保存个人 Web 凭据必须配置静态加密密钥（设置环境变量 PA_FEISHU_WEB_KEY 或通过 systemd LoadCredential 提供 CREDENTIALS_DIRECTORY/feishu-web-key），禁止明文写入磁盘",
+      );
+    }
     const tmp = path.join(path.dirname(this.file), `.${path.basename(this.file)}.${process.pid}.${Date.now()}.tmp`);
     const payload: WebLogin = {
       owner_id: login.owner_id,
@@ -477,10 +520,7 @@ export class WebLoginStore {
       cookies: login.cookies,
       updated_at: new Date().toISOString(),
     };
-    const key = resolveEncryptionKey();
-    const serialized = key
-      ? JSON.stringify(encryptPayload(JSON.stringify(payload), key), null, 2) + "\n"
-      : JSON.stringify(payload, null, 2) + "\n";
+    const serialized = JSON.stringify(encryptPayload(JSON.stringify(payload), key), null, 2) + "\n";
     let fd: number | undefined;
     try {
       fd = fs.openSync(tmp, "w", 0o600);

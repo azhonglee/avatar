@@ -91,9 +91,12 @@ function readVarint(buf: Uint8Array, offset: number): [bigint, number] {
   let pos = offset;
   while (pos < buf.length) {
     const b = buf[pos++];
-    if (shift >= 64n) throw new ProtoWireError("protobuf varint overflow");
+    // 第 10 字节位于 bit 63，仅允许 0x00 或 0x01（且不得再有续接位 0x80），否则超出 uint64 范围
+    if (shift >= 64n || (shift === 63n && b > 1)) {
+      throw new ProtoWireError("protobuf varint overflow");
+    }
     result |= BigInt(b & 0x7f) << shift;
-    if ((b & 0x80) === 0) return [BigInt.asUintN(64, result), pos];
+    if ((b & 0x80) === 0) return [result, pos];
     shift += 7n;
   }
   throw new ProtoWireError("truncated protobuf varint");

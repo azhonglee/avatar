@@ -4,7 +4,7 @@ import type { CtxDraftKind } from "../api/types.ts";
 import type { Effect } from "../ledger.ts";
 import { loadPrompt, runHarness } from "../harness.ts";
 import { render, truncate } from "../util.ts";
-import { BOUND_OWNER_KV_KEY } from "./personal-web.ts";
+import { BOUND_OWNER_KV_KEY, BOUND_WORKSPACE_OWNER_KV_KEY, isReadbackOnlyDelivery } from "./personal-web.ts";
 import type { ContextStore, DraftRow, ItemRow, Obs } from "./store.ts";
 
 /**
@@ -123,6 +123,15 @@ export class Drafter {
     return text;
   }
 
+  private activeBoundNativeOwner(): string | null {
+    const boundNative = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
+    if (!boundNative) return null;
+    const cfgWs = this.cfg.owner.open_id.trim();
+    const boundWs = (this.app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
+    if (cfgWs !== boundWs) return null;
+    return boundNative;
+  }
+
   async forItem(itemId: string, kind?: CtxDraftKind): Promise<DraftRow> {
     const it = this.store.item(itemId);
     if (!it) throw new Error(`没有这个事项：${itemId}`);
@@ -131,7 +140,7 @@ export class Drafter {
     const { target, label, conv } = this.target(it, k);
     const tz = this.cfg.owner.timezone;
     const p = this.store.project(it.project_id);
-    const activeNativeOwner = this.app.store.get(BOUND_OWNER_KV_KEY) ?? undefined;
+    const activeNativeOwner = this.activeBoundNativeOwner();
     const convText = conv
       ? this.store
           .convObs(conv.conv, Date.now() - 7 * DAY, 30, activeNativeOwner)
@@ -196,19 +205,30 @@ export class Drafter {
       if (lockedRoute && lockedRoute !== "pw.reply") {
         throw new Error(`草稿已绑定发送路由 ${lockedRoute}，拒绝切换为 pw.reply`);
       }
-      if (!this.cfg.context.personal_web.send_replies) {
-        throw new Error("该草稿目标来自个人 Web 实时消息；为避免偏离原话题，请在设置中开启 context.personal_web.send_replies 后再发送");
-      }
       if (!d.target.native_chat_id || !d.target.native_message_id) {
         throw new Error("该个人 Web 草稿缺少原会话或原消息 ID，无法发送");
       }
-      const ownerId = d.target.native_owner_id || String(obs?.meta.native_owner_id ?? "") || this.app.store.get(BOUND_OWNER_KV_KEY) || "";
+      const currentBound = this.activeBoundNativeOwner();
+      const ownerId = d.target.native_owner_id || String(obs?.meta.native_owner_id ?? "") || currentBound || "";
       if (!ownerId) {
         throw new Error("该个人 Web 草稿缺少绑定账号 ID，拒绝发送");
       }
-      const currentBound = this.app.store.get(BOUND_OWNER_KV_KEY);
-      if (currentBound && currentBound !== ownerId) {
+      if (!currentBound) {
+        throw new Error("当前工作区尚未完成有效个人 Web 账号绑定或工作区主人已变更，拒绝发送");
+      }
+      if (currentBound !== ownerId) {
         throw new Error(`该草稿归属账号 (${ownerId}) 与当前工作区绑定账号 (${currentBound}) 不一致，拒绝发送`);
+      }
+      // 若飞书已创建该精确草稿回复（仅缺回读确认），即使已关闭 send_replies 也放行只读回读恢复，绝不放行新发送
+      const readbackRecovery = isReadbackOnlyDelivery(this.app.store, {
+        draft_id: d.id,
+        owner_id: ownerId,
+        chat_id: d.target.native_chat_id,
+        message_id: d.target.native_message_id,
+        text: content,
+      });
+      if (!this.cfg.context.personal_web.send_replies && !readbackRecovery) {
+        throw new Error("该草稿目标来自个人 Web 实时消息；为避免偏离原话题，请在设置中开启 context.personal_web.send_replies 后再发送");
       }
       return {
         op: "pw.reply",

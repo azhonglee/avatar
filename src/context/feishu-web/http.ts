@@ -184,10 +184,12 @@ export async function fetchWithJar(jar: RecordingCookieJar, opts: HttpRequestOpt
     if (cookie) reqHeaders["Cookie"] = cookie;
     else delete reqHeaders["Cookie"];
 
+    const reqSnap = jar.snapshot();
     const res = await singleRequest(currentUrl, method, reqHeaders, body, timeoutMs, maxBytes, opts.signal);
     if (res.headers["set-cookie"]) {
-      jar.setFromHeaders(currentUrl, res.headers["set-cookie"]);
-      cookiesUpdated = true;
+      if (jar.setFromHeaders(currentUrl, res.headers["set-cookie"], Date.now(), reqSnap)) {
+        cookiesUpdated = true;
+      }
     }
 
     const isRedirect = res.status === 301 || res.status === 302 || res.status === 303 || res.status === 307 || res.status === 308;

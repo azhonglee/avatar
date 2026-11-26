@@ -91,6 +91,10 @@ export interface PersonalWebBridgeHooks {
   clientOptions?: FeishuWebClientOptions;
   /** 检查磁盘凭据变更（登出 / 重新登录 / Cookie 版本更新 / 绑定变更）的间隔，默认 5000ms */
   credentialWatchIntervalMs?: number;
+  /** 防抖合并期间最长等待毫秒数（防止高频会话持续重置防抖计时器导致饿死），默认 max(debounce_ms * 4, 15000) */
+  maxDebounceWaitMs?: number;
+  /** 单会话防抖期内最多保留的去重锚点数，达到后立即冲刷，默认 20 */
+  maxDebounceAnchors?: number;
 }
 
 const STATE_KV_KEY = "ctx.personal_web.state";
@@ -104,6 +108,51 @@ export function saveWorkspaceBinding(store: Store, nativeOwnerId: string, worksp
   store.set(BOUND_OWNER_KV_KEY, nativeOwnerId);
   if (workspaceOpenId.trim()) {
     store.set(BOUND_WORKSPACE_OWNER_KV_KEY, workspaceOpenId.trim());
+  }
+}
+
+/** 统一计算 pw.reply 幂等键（CID）与规范化正文哈希，供 effects / drafts / personal-web 共用（DRY） */
+export function computePwReplyCid(params: {
+  draft_id?: string;
+  effect_id?: string;
+  owner_id: string;
+  chat_id: string;
+  message_id: string;
+  text: string;
+}): { cid: string; normalizedText: string; textHash: string } {
+  const normalizedText = params.text.replace(/\r\n/g, "\n").trim();
+  const textHash = createHash("sha256").update(normalizedText).digest("hex");
+  const revKey = params.draft_id
+    ? `draft:${params.draft_id}:${params.owner_id}:${params.chat_id}:${params.message_id}:${normalizedText}`
+    : `effect:${params.effect_id ?? ""}`;
+  const cid = createHash("sha256").update(`avatar-pw\0${revKey}`).digest("hex").slice(0, 32);
+  return { cid, normalizedText, textHash };
+}
+
+/**
+ * 判断某份草稿对应的精确投递记录是否已在飞书创建（created / verified）而仅需回读校验或幂等确认：
+ *   - 仅当 owner_id、chat_id、message_id 与 text_hash 全部完全匹配该草稿时返回 true；
+ *   - 用于在 send_replies 关闭后仍允许对「已发包但上次未完成回读」的失败草稿执行只读核验恢复，而不放行任何新发送。
+ */
+export function isReadbackOnlyDelivery(
+  store: Store,
+  params: { draft_id: string; owner_id: string; chat_id: string; message_id: string; text: string },
+): boolean {
+  const { cid, textHash } = computePwReplyCid(params);
+  const raw = store.get(`pw.delivery.${cid}`);
+  if (!raw) return false;
+  try {
+    const rec = JSON.parse(raw) as Partial<DeliveryRecord>;
+    return (
+      (rec.state === "created" || rec.state === "verified") &&
+      !!rec.reply_id &&
+      rec.owner_id === params.owner_id &&
+      rec.chat_id === params.chat_id &&
+      rec.message_id === params.message_id &&
+      rec.text_hash === textHash
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -139,6 +188,7 @@ export class PersonalWebBridge {
   private stopCtrl: AbortController | undefined;
   private readonly debounceTimers = new Map<string, NodeJS.Timeout>();
   private readonly debouncedAnchors = new Map<string, Map<string, FastAnchor>>();
+  private readonly debounceFirstAt = new Map<string, number>();
   private readonly ocExclusionCache = new Map<string, OpenChatExclusionMeta>();
   private readonly initialCfgStat: string;
   private state: PersistedState;
@@ -166,9 +216,19 @@ export class PersonalWebBridge {
     return this.app.cfg;
   }
 
-  /** 当前有效绑定的个人 Web 原生账号 ID（用于按账号隔离存储查询与窗口组装） */
-  activeBoundNativeOwner(): string {
-    return this.app.store.get(BOUND_OWNER_KV_KEY) || this.loginStore.load()?.owner_id || "";
+  /**
+   * 当前工作区是否存在有效且与 config.owner.open_id 一致的个人 Web 账号绑定：
+   *   - 必须已由 web-login 显式写入 BOUND_OWNER_KV_KEY；
+   *   - 且 BOUND_WORKSPACE_OWNER_KV_KEY 必须与当前 config.yaml 中的 owner.open_id 完全一致。
+   * 绑定缺失或工作区主人变更时返回 null（调用方必须彻底拦截全部 pw:* 观测，绝不退化为无过滤）。
+   */
+  activeBoundNativeOwner(): string | null {
+    const boundNative = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
+    if (!boundNative) return null;
+    const cfgWs = this.cfg.owner.open_id.trim();
+    const boundWs = (this.app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
+    if (cfgWs !== boundWs) return null;
+    return boundNative;
   }
 
   private loadSavedState(): PersistedState | undefined {
@@ -248,20 +308,26 @@ export class PersonalWebBridge {
     for (const timer of this.debounceTimers.values()) clearTimeout(timer);
     this.debounceTimers.clear();
     this.debouncedAnchors.clear();
+    this.debounceFirstAt.clear();
   }
 
   private validateBoundOwner(login: WebLogin): void {
-    const bound = this.app.store.get(BOUND_OWNER_KV_KEY);
-    if (bound && bound !== login.owner_id) {
+    const bound = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
+    if (!bound) {
+      throw new SessionNeedsLoginError(
+        "当前工作区尚未完成个人 Web 账号显式绑定（即使通过 PA_FEISHU_WEB_CRED_FILE 指向已有凭据也不得静默绑定），请运行 `pa context web-login` 完成确认绑定",
+      );
+    }
+    if (bound !== login.owner_id) {
       throw new SessionNeedsLoginError(
         `个人 Web 凭据账号 (${login.owner_id}) 与当前工作区已绑定的账号 (${bound}) 不一致，请重新运行 pa context web-login`,
       );
     }
     const cfgWs = this.cfg.owner.open_id.trim();
     const boundWs = (this.app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
-    if (cfgWs && boundWs && boundWs !== cfgWs) {
+    if (cfgWs !== boundWs) {
       throw new SessionNeedsLoginError(
-        `当前 config.yaml 配置的主人 (${cfgWs}) 与个人 Web 凭据已绑定的工作区主人 (${boundWs}) 不一致；为防私聊泄漏给错误主人，已中止启动，请清理数据目录或重新扫码绑定`,
+        `当前 config.yaml 配置的主人 (${cfgWs || "未配置"}) 与个人 Web 凭据已绑定的工作区主人 (${boundWs || "未绑定"}) 不一致；为防私聊泄漏给错误主人，已中止启动，请清理数据目录或重新扫码绑定`,
       );
     }
   }
@@ -322,14 +388,20 @@ export class PersonalWebBridge {
     };
 
     while (!signal.aborted) {
-      const login = this.loginStore.load();
+      const inspected = this.loginStore.inspect();
+      const login = inspected.status === "ok" ? inspected.login : undefined;
       if (!login) {
         lastAttemptedKey = "";
         connectDenials = 0;
         connectDelayMs = 2_000;
-        const msg = "尚未完成个人 Web 扫码登录，请运行 `pa context web-login`";
+        const msg =
+          inspected.status === "missing_key"
+            ? "检测到已加密的个人 Web 凭据，但当前环境缺少解密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）"
+            : inspected.status === "plaintext_rejected"
+              ? "检测到未加密的明文个人 Web 凭据（已拒绝加载），请配置加密密钥后重新运行 `pa context web-login`"
+              : "尚未完成个人 Web 扫码登录，请运行 `pa context web-login`";
         handleState("needs_login", msg, false, "");
-        log("warn", "个人 Web 通道等待登录凭据", { file: this.loginStore.file });
+        log("warn", "个人 Web 通道等待有效凭据", { file: this.loginStore.file, status: inspected.status });
         await this.waitForCredentialChange(this.watchedStateKey(undefined), signal);
         continue;
       }
@@ -398,11 +470,7 @@ export class PersonalWebBridge {
         if (invalidatedByDisk || sessionCtrl.signal.aborted) continue;
 
         this.client = client;
-        if (!this.app.store.get(BOUND_OWNER_KV_KEY)) {
-          saveWorkspaceBinding(this.app.store, client.owner().id, this.cfg.owner.open_id);
-        } else if (!this.app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) && this.cfg.owner.open_id.trim()) {
-          this.app.store.set(BOUND_WORKSPACE_OWNER_KV_KEY, this.cfg.owner.open_id.trim());
-        }
+        // 严禁在常驻监听中静默创建或修改工作区账号绑定（仅允许经 pa context web-login 人工确认后绑定）
         connectDelayMs = 2_000;
         connectDenials = 0;
         if (client.owner().name && !this.app.store.get("ctx.owner_name")) {
@@ -509,6 +577,10 @@ export class PersonalWebBridge {
     return map;
   }
 
+  private openChatExclusionsKey(): string {
+    return [...this.collectOpenChatExclusions().keys()].sort().join(",");
+  }
+
   /** 仅收集显式 `pw_chat:<id>` 原生排除/静音规则（纯数字如 "2024" 保持既有群名关键词语义，避免误把老配置当原生 ID） */
   private collectNativeChatExclusions(): Map<string, string> {
     const map = new Map<string, string>();
@@ -567,12 +639,28 @@ export class PersonalWebBridge {
     if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(chatId)) return true;
     if (this.matchesDirectNativeIdDeny(pwConv)) return true;
 
+    const ensureFreshChatName = async (reason: string): Promise<void> => {
+      if (chatNameRefreshed) return;
+      if (!activeClient) {
+        throw new Error(`无在线个人 Web 客户端，无法实时刷新群名称以核验${reason}，按 fail-closed 暂缓入库`);
+      }
+      try {
+        chatName = (await activeClient.readChat(chatId, { force: true, signal })).name.trim();
+        chatNameRefreshed = true;
+      } catch {
+        throw new Error(`实时刷新群名称失败，无法核验${reason}，按 fail-closed 暂缓入库`);
+      }
+      if (!chatName) {
+        throw new Error(`群名称为空，无法核验${reason}，按 fail-closed 暂缓入库`);
+      }
+    };
+
     const nameRules = this.nameDenyPatterns();
     if (nameRules.length > 0) {
       if (kind === "group") {
-        if (!chatName) {
-          throw new Error("查询群名称失败，无法评估 groups_deny 名称排除规则，按 fail-closed 暂缓入库");
-        }
+        if (chatName && nameRules.some((d) => chatName.includes(d))) return true;
+        // 负向放行前必须使用实时刷新后的当前群名（避免群改名命中关键词后借缓存/旧标签逃逸）
+        await ensureFreshChatName("groups_deny 关键词排除规则");
         if (nameRules.some((d) => chatName.includes(d))) return true;
       } else if (nameRules.some((d) => convName.includes(d))) {
         return true;
@@ -594,13 +682,10 @@ export class PersonalWebBridge {
         if (!resolved.meta.name) {
           throw new Error(`排除规则 ${ocId} 缺少群名称，无法与当前个人 Web 群聊区分，按 fail-closed 暂缓入库`);
         }
-        if (!chatName) {
-          throw new Error(`查询群名称失败，无法与排除规则 ${ocId} 区分，按 fail-closed 暂缓入库`);
-        }
-        if (norm(chatName) === norm(resolved.meta.name)) return true;
+        if (chatName && norm(chatName) === norm(resolved.meta.name)) return true;
 
-        // 负向不匹配时，若任一侧来自缓存，则强制实时刷新双边群名后再决定是否放行（防群改名后缓存不同步逃逸）
-        if (resolved.fromCache || !chatNameRefreshed) {
+        // 负向不匹配时，若任一侧来自缓存或尚未实时刷新，强制刷新双边群名后再决定是否放行（防群改名后缓存不同步逃逸）
+        if (resolved.fromCache || !chatNameRefreshed || !chatName) {
           if (resolved.fromCache) {
             const freshOc = await this.resolveOpenChatMeta(ocId, { force: true });
             if (!freshOc) {
@@ -612,18 +697,8 @@ export class PersonalWebBridge {
               throw new Error(`排除规则 ${ocId} 缺少群名称，无法与当前个人 Web 群聊区分，按 fail-closed 暂缓入库`);
             }
           }
-          if (!chatNameRefreshed && activeClient) {
-            try {
-              chatName = (await activeClient.readChat(chatId, { force: true, signal })).name.trim();
-              chatNameRefreshed = true;
-            } catch {
-              throw new Error(`实时刷新群名称失败，无法与排除规则 ${ocId} 区分，按 fail-closed 暂缓入库`);
-            }
-            if (!chatName) {
-              throw new Error(`群名称为空，无法与排除规则 ${ocId} 区分，按 fail-closed 暂缓入库`);
-            }
-            if (nameRules.some((d) => chatName.includes(d))) return true;
-          }
+          await ensureFreshChatName(`排除规则 ${ocId}`);
+          if (nameRules.length > 0 && nameRules.some((d) => chatName.includes(d))) return true;
           if (norm(chatName) === norm(resolved.meta.name)) return true;
         }
       } else {
@@ -705,6 +780,8 @@ export class PersonalWebBridge {
     if (!this.cfg.context.sources.im) return "excluded";
 
     if (conv.startsWith("pw_chat:")) {
+      // 工作区主人变更或尚未完成绑定时，彻底阻断全部原生个人 Web 会话理解与提醒
+      if (!this.activeBoundNativeOwner()) return "excluded";
       const chatId = conv.slice("pw_chat:".length);
       if (this.store.isConvMutedById(conv) || this.store.isConvMutedById(chatId)) return "excluded";
       const latest = this.store.latestConvObs(conv);
@@ -712,7 +789,7 @@ export class PersonalWebBridge {
       const kind: "group" | "dm" = recordedType === "dm" ? "dm" : "group";
       const client = this.client;
       let chatName = "";
-      let chatNameFromCache = false;
+      let chatNameFromCache = true;
       if (kind === "group") {
         if (client) {
           try {
@@ -746,9 +823,9 @@ export class PersonalWebBridge {
     // oc_* 开放平台会话
     if (this.store.isConvMutedById(conv)) return "excluded";
     const latest = this.store.latestConvObs(conv);
-    const effectiveName = (convName || latest?.conv_name || "").trim();
-    const recordedType = classifyRecordedChatType(latest, effectiveName);
-    const isDm = recordedType === "dm";
+    let effectiveName = (convName || latest?.conv_name || "").trim();
+    let recordedType = classifyRecordedChatType(latest, effectiveName);
+    const nameRules = this.nameDenyPatterns();
     for (const raw of this.cfg.context.groups_deny) {
       const d = raw.trim();
       if (!d) continue;
@@ -758,8 +835,28 @@ export class PersonalWebBridge {
       }
     }
     const nativeExcl = nativeExclSnapshot ?? (await this.resolveNativeExclusionsForPolling());
-    if (isDm) return nativeExcl.dmsInconclusive ? "uncertain" : "allowed";
+    if (recordedType === "group" && effectiveName && nativeExcl.confirmedGroupNames.has(norm(effectiveName))) {
+      return "excluded";
+    }
+    // 当会话类型未知，或存在名称/原生群排除规则需核验当前最新群名时，避免直接凭陈旧库标签放行
+    if (recordedType === "unknown" && (nativeExcl.dmsInconclusive || nativeExcl.groupsInconclusive || nativeExcl.confirmedGroupNames.size > 0 || nameRules.length > 0)) {
+      const fresh = await this.resolveOpenChatMeta(conv, { force: true });
+      if (fresh) {
+        if (fresh.meta.chatType === "p2p") recordedType = "dm";
+        else if (fresh.meta.chatType === "group") recordedType = "group";
+        if (fresh.meta.name) effectiveName = fresh.meta.name;
+      }
+    }
+    if (recordedType === "dm") return nativeExcl.dmsInconclusive ? "uncertain" : "allowed";
+    if (recordedType === "unknown") {
+      if (effectiveName && nativeExcl.confirmedGroupNames.has(norm(effectiveName))) return "excluded";
+      if (effectiveName && nameRules.some((d) => effectiveName.includes(d))) return "excluded";
+      if (nativeExcl.dmsInconclusive || nativeExcl.groupsInconclusive) return "uncertain";
+      if ((nativeExcl.confirmedGroupNames.size > 0 || nameRules.length > 0) && !effectiveName) return "uncertain";
+      return "allowed";
+    }
     if (effectiveName && nativeExcl.confirmedGroupNames.has(norm(effectiveName))) return "excluded";
+    if (effectiveName && nameRules.some((d) => effectiveName.includes(d))) return "excluded";
     if (nativeExcl.groupsInconclusive) return "uncertain";
     if (nativeExcl.confirmedGroupNames.size > 0 && !effectiveName) return "uncertain";
     return "allowed";
@@ -824,45 +921,104 @@ export class PersonalWebBridge {
     if (!msg.id || !msg.conversationId || msg.unsupported) return;
     if (msg.conversationKind !== "group" && msg.conversationKind !== "dm") return;
     if (msg.senderType !== USER_SENDER_TYPE) return;
-    const text = msg.text.trim();
-    if (!text) return;
+    if (!msg.text.trim()) return;
 
     const activeClient = client ?? this.client;
     const ownerId = msg.ownerId || activeClient?.owner().id || this.loginStore.load()?.owner_id || "";
     const capturedSessionId = activeClient?.currentSessionId() ?? "";
-    const isMe = !!ownerId && msg.actorId === ownerId;
-    const pwConv = `pw_chat:${msg.conversationId}`;
-    const isAtMe = !isMe && !!ownerId && msg.mentions.some((m) => m.id === ownerId);
+
+    let effectiveMsg = msg;
+    const derive = (m: WebMessage) => {
+      const t = m.text.trim();
+      const clipped = t.slice(0, 2000);
+      const me = !!ownerId && m.actorId === ownerId;
+      const atMe = !me && !!ownerId && m.mentions.some((x) => x.id === ownerId);
+      return { text: t, clippedText: clipped, isMe: me, isAtMe: atMe, pwConv: `pw_chat:${m.conversationId}` };
+    };
+    let { text, clippedText, isMe, isAtMe, pwConv } = derive(effectiveMsg);
 
     // 1) 纯本地快速过滤：原生 ID 静音/禁用直接丢弃（零网络开销）
-    if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(msg.conversationId)) return;
+    if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(effectiveMsg.conversationId)) return;
     if (this.matchesDirectNativeIdDeny(pwConv)) return;
 
-    // 2) 范围外普通群消息在 readChat 之前立刻丢弃；若该消息 ID 此前曾以 @我 入库待处理，同步撤回避免模型对已撤销的 @我 提醒/起草
-    if (msg.conversationKind === "group" && !isMe && !isAtMe && !this.isGroupInScope(msg.conversationId, pwConv, ownerId)) {
-      this.store.retirePendingObs(`pw:${msg.id}`);
-      return;
+    // 2) 若同 ID 非背景观测已存在且本次推送与之冲突（文本/@mention 变化、已撤回或触发范围外撤回），
+    //    先向服务端权威回读 readMessage(id)，避免未 ACK 旧推送包重放回滚更新后的编辑或错误复活已撤回消息
+    const existing = this.store.obs(`pw:${effectiveMsg.id}`);
+    if (existing && existing.meta.background_only !== true) {
+      const existingWithdrawn = existing.meta.withdrawn === true;
+      const incomingRev = obsRevision({ text: clippedText, meta: { at_me: isAtMe, mentions: effectiveMsg.mentions } });
+      const revDiffers = obsRevision(existing) !== incomingRev;
+      const incomingOutOfScope =
+        effectiveMsg.conversationKind === "group" &&
+        !isAtMe &&
+        (this.cfg.context.groups === "allowlist" || !isMe) &&
+        !this.isGroupInScope(effectiveMsg.conversationId, pwConv, ownerId);
+      if (revDiffers || existingWithdrawn || incomingOutOfScope) {
+        if (activeClient) {
+          effectiveMsg = await activeClient.readMessage(effectiveMsg.id, signal);
+          if (signal?.aborted) {
+            throw new WebHttpError("aborted", "会话已中止，放弃提交推送观测");
+          }
+          if (
+            !effectiveMsg.id ||
+            !effectiveMsg.conversationId ||
+            effectiveMsg.unsupported ||
+            (effectiveMsg.conversationKind !== "group" && effectiveMsg.conversationKind !== "dm") ||
+            effectiveMsg.senderType !== USER_SENDER_TYPE ||
+            !effectiveMsg.text.trim()
+          ) {
+            return;
+          }
+          ({ text, clippedText, isMe, isAtMe, pwConv } = derive(effectiveMsg));
+          if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(effectiveMsg.conversationId)) return;
+          if (this.matchesDirectNativeIdDeny(pwConv)) return;
+          const authRev = obsRevision({ text: clippedText, meta: { at_me: isAtMe, mentions: effectiveMsg.mentions } });
+          const authOutOfScope =
+            effectiveMsg.conversationKind === "group" &&
+            !isAtMe &&
+            (this.cfg.context.groups === "allowlist" || !isMe) &&
+            !this.isGroupInScope(effectiveMsg.conversationId, pwConv, ownerId);
+          // 权威消息仍与本地已落库版本一致（且未撤回/未越界）：说明本次推送是陈旧重放，直接跳过不回滚
+          if (!existingWithdrawn && !authOutOfScope && obsRevision(existing) === authRev) {
+            return;
+          }
+        }
+      }
     }
 
-    // 3) 仅对可能入库的消息按需获取群名，再执行完整排除校验（含名称规则与实时 oc_* 复核）
+    if (effectiveMsg.conversationKind !== "group" && effectiveMsg.conversationKind !== "dm") return;
+    const convKind: "group" | "dm" = effectiveMsg.conversationKind;
+
+    // 3) 范围外普通群消息在 readChat 之前立刻丢弃（allowlist 模式下同样约束本人发出的群消息，不把未列白名单群的正文落库）；
+    //    若该消息 ID 此前曾以 @我 入库待处理，同步撤回避免模型对已撤销的 @我 提醒/起草
+    if (convKind === "group" && !isAtMe) {
+      const allowlistMode = this.cfg.context.groups === "allowlist";
+      if ((allowlistMode || !isMe) && !this.isGroupInScope(effectiveMsg.conversationId, pwConv, ownerId)) {
+        if (!isMe) this.store.retirePendingObs(`pw:${effectiveMsg.id}`);
+        return;
+      }
+    }
+
+    // 4) 仅对可能入库的消息按需获取群名，再执行完整排除校验（含名称规则与实时 oc_* 复核）
     let chatName = "";
-    if (msg.conversationKind === "group" && activeClient) {
+    if (convKind === "group" && activeClient) {
       try {
-        chatName = (await activeClient.readChat(msg.conversationId, { signal })).name.trim();
+        chatName = (await activeClient.readChat(effectiveMsg.conversationId, { signal })).name.trim();
       } catch {
         chatName = "";
       }
     }
 
     const convName =
-      msg.conversationKind === "dm"
-        ? `私聊：${isMe ? msg.conversationId : msg.actorId || msg.conversationId}`
-        : chatName || `群聊(${msg.conversationId})`;
+      convKind === "dm"
+        ? `私聊：${isMe ? effectiveMsg.conversationId : effectiveMsg.actorId || effectiveMsg.conversationId}`
+        : chatName || `群聊(${effectiveMsg.conversationId})`;
 
+    const ocExclBefore = this.openChatExclusionsKey();
     const excluded = await this.evaluateChatExclusion({
-      chatId: msg.conversationId,
+      chatId: effectiveMsg.conversationId,
       pwConv,
-      kind: msg.conversationKind,
+      kind: convKind,
       chatName,
       convName,
       activeClient,
@@ -871,7 +1027,7 @@ export class PersonalWebBridge {
     });
     if (excluded) return;
 
-    // 4) 落库前最终核验会话未被中止、登出或换号
+    // 5) 落库前最终核验会话代际、中止信号与当前采集策略（防止异步查询期间被关闭 sources.im、静音或收窄白名单后仍写入）
     if (signal?.aborted) {
       throw new WebHttpError("aborted", "会话已中止，放弃提交推送观测");
     }
@@ -882,37 +1038,56 @@ export class PersonalWebBridge {
       }
       this.validateBoundOwner(diskNow);
     }
-
-    if (msg.conversationKind === "group" && isMe) {
-      this.recordPwSpokenGroup(ownerId, pwConv, chatName, msg.createdAtMs || Date.now());
+    if (!this.cfg.context.sources.im) return;
+    if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(effectiveMsg.conversationId)) return;
+    if (this.isDirectlyDenied(pwConv, chatName || convName)) return;
+    if (this.openChatExclusionsKey() !== ocExclBefore) {
+      const excludedNow = await this.evaluateChatExclusion({
+        chatId: effectiveMsg.conversationId,
+        pwConv,
+        kind: convKind,
+        chatName,
+        convName,
+        activeClient,
+        chatNameFromCache: true,
+        signal,
+      });
+      if (excludedNow) return;
     }
 
-    const clippedText = text.slice(0, 2000);
+    if (effectiveMsg.conversationKind === "group" && isMe && this.cfg.context.groups !== "allowlist") {
+      this.recordPwSpokenGroup(ownerId, pwConv, chatName, effectiveMsg.createdAtMs || Date.now());
+    }
+    if (effectiveMsg.conversationKind === "group" && !isAtMe && !this.isGroupInScope(effectiveMsg.conversationId, pwConv, ownerId)) {
+      if (!isMe) this.store.retirePendingObs(`pw:${effectiveMsg.id}`);
+      return;
+    }
+
     const obs: Obs = {
-      id: `pw:${msg.id}`,
+      id: `pw:${effectiveMsg.id}`,
       source: "im",
-      kind: isMe ? "mine" : msg.conversationKind === "dm" ? "p2p" : isAtMe ? "at_me" : "group",
+      kind: isMe ? "mine" : effectiveMsg.conversationKind === "dm" ? "p2p" : isAtMe ? "at_me" : "group",
       conv: pwConv,
       conv_name: convName,
-      actor_id: msg.actorId,
-      actor_name: isMe ? this.app.store.get("ctx.owner_name") || activeClient?.owner().name || "我" : msg.actorId,
+      actor_id: effectiveMsg.actorId,
+      actor_name: isMe ? this.app.store.get("ctx.owner_name") || activeClient?.owner().name || "我" : effectiveMsg.actorId,
       is_me: isMe,
-      time: msg.createdAtMs || Date.now(),
+      time: effectiveMsg.createdAtMs || Date.now(),
       text: clippedText,
       url: "",
       meta: {
         transport: "personal_web",
         native_owner_id: ownerId,
-        native_message_id: msg.id,
-        native_chat_id: msg.conversationId,
-        native_root_id: msg.rootId || msg.id,
-        native_parent_id: msg.parentId,
-        thread_id: msg.threadId,
-        position: msg.position,
-        chat_type: msg.conversationKind === "dm" ? "p2p" : "group",
+        native_message_id: effectiveMsg.id,
+        native_chat_id: effectiveMsg.conversationId,
+        native_root_id: effectiveMsg.rootId || effectiveMsg.id,
+        native_parent_id: effectiveMsg.parentId,
+        thread_id: effectiveMsg.threadId,
+        position: effectiveMsg.position,
+        chat_type: effectiveMsg.conversationKind === "dm" ? "p2p" : "group",
         sender_type: "user",
         at_me: isAtMe,
-        mentions: msg.mentions,
+        mentions: effectiveMsg.mentions,
       },
     };
 
@@ -927,19 +1102,19 @@ export class PersonalWebBridge {
       pwCfg.fast_lane &&
       this.cfg.context.understand &&
       !isMe &&
-      (isAtMe || msg.conversationKind === "dm");
+      (isAtMe || effectiveMsg.conversationKind === "dm");
 
     if (!shouldFastLane) return;
 
     const revHash = createHash("sha256").update(obsRevision(obs)).digest("hex").slice(0, 12);
     const anchor: FastAnchor = {
-      id: msg.id,
-      conversationId: msg.conversationId,
-      rootId: msg.rootId,
-      parentId: msg.parentId,
-      threadId: msg.threadId,
-      position: msg.position,
-      createdAtMs: msg.createdAtMs,
+      id: effectiveMsg.id,
+      conversationId: effectiveMsg.conversationId,
+      rootId: effectiveMsg.rootId,
+      parentId: effectiveMsg.parentId,
+      threadId: effectiveMsg.threadId,
+      position: effectiveMsg.position,
+      createdAtMs: effectiveMsg.createdAtMs,
     };
     this.scheduleFastLane({
       conv: pwConv,
@@ -968,28 +1143,40 @@ export class PersonalWebBridge {
 
   private scheduleFastLane(trigger: FastTrigger): void {
     const key = trigger.conv;
+    const now = Date.now();
     let bucket = this.debouncedAnchors.get(key);
     if (!bucket) {
       bucket = new Map<string, FastAnchor>();
       this.debouncedAnchors.set(key, bucket);
+    }
+    if (!this.debounceFirstAt.has(key)) {
+      this.debounceFirstAt.set(key, now);
     }
     for (const a of trigger.anchors) bucket.set(a.id, a);
 
     const prev = this.debounceTimers.get(key);
     if (prev) clearTimeout(prev);
     const delay = this.cfg.context.personal_web.debounce_ms;
+    const maxAnchors = Math.max(1, this.hooks.maxDebounceAnchors ?? 20);
+    const maxWait = this.hooks.maxDebounceWaitMs ?? (delay > 0 ? Math.max(delay * 4, 15_000) : 0);
     const flush = () => {
+      const t = this.debounceTimers.get(key);
+      if (t) clearTimeout(t);
       this.debounceTimers.delete(key);
+      this.debounceFirstAt.delete(key);
       const collected = this.debouncedAnchors.get(key);
       this.debouncedAnchors.delete(key);
       const allAnchors = collected ? [...collected.values()] : trigger.anchors;
       this.fireFastTrigger({ ...trigger, anchors: allAnchors });
     };
-    if (delay <= 0) {
+    const elapsed = now - (this.debounceFirstAt.get(key) ?? now);
+    const remainingMax = Math.max(0, maxWait - elapsed);
+    const effectiveDelay = Math.min(delay, remainingMax);
+    if (effectiveDelay <= 0 || bucket.size >= maxAnchors) {
       flush();
       return;
     }
-    const timer = setTimeout(flush, delay);
+    const timer = setTimeout(flush, effectiveDelay);
     timer.unref?.();
     this.debounceTimers.set(key, timer);
   }
@@ -1047,6 +1234,7 @@ export class PersonalWebBridge {
     }
     if (!sessionStillValid()) return 0;
 
+    const ocExclBefore = this.openChatExclusionsKey();
     try {
       const excluded = await this.evaluateChatExclusion({
         chatId: primary.conversationId,
@@ -1097,7 +1285,30 @@ export class PersonalWebBridge {
         }
       }
       if (!collected.size) return 0;
+      // 落库前重新核验会话代际与全部采集策略（防止 readContext 在途期间被静音、收窄白名单或关闭 sources.im 后仍持久化背景）
+      if (signal?.aborted) return 0;
       if (!sessionStillValid()) return 0;
+      if (!this.cfg.context.sources.im) return 0;
+      if (this.store.isConvMutedById(conv) || this.store.isConvMutedById(primary.conversationId)) return 0;
+      if (this.isDirectlyDenied(conv, chatName || convName)) return 0;
+      if (!isDm && !this.isGroupInScope(primary.conversationId, conv, clientOwnerId)) return 0;
+      if (this.openChatExclusionsKey() !== ocExclBefore) {
+        try {
+          const excludedNow = await this.evaluateChatExclusion({
+            chatId: primary.conversationId,
+            pwConv: conv,
+            kind: isDm ? "dm" : "group",
+            chatName,
+            convName,
+            activeClient: client,
+            chatNameFromCache: true,
+            signal,
+          });
+          if (excludedNow) return 0;
+        } catch {
+          return 0;
+        }
+      }
       const ownerName = this.app.store.get("ctx.owner_name") || clientOwnerName || "我";
       const bg: Obs[] = [...collected.values()].map((m) => {
         const isMe = m.actorId === clientOwnerId;
@@ -1153,16 +1364,20 @@ export class PersonalWebBridge {
 
   /**
    * 核验共享的 send_replies 发送权限：
-   * 先查本进程配置，若磁盘 config.yaml 被另一进程（如 Web 控制台）修改过，则同步读取磁盘最新配置防止跨进程陈旧放行。
+   * 先查本进程配置；若配置来自磁盘文件且文件消失/不可 stat，按 fail-closed 中止新发送；
+   * 若磁盘 config.yaml 被另一进程（如 Web 控制台）修改过，同步读取磁盘最新配置防止跨进程陈旧放行。
    */
   private assertSendEnabled(): void {
     if (!this.cfg.context.personal_web.send_replies) {
       throw new Error("未开启个人 Web 回复（需在配置中设置 context.personal_web.send_replies: true）");
     }
     const cfgFile = this.cfg.file;
-    if (cfgFile && fs.existsSync(cfgFile)) {
+    if (cfgFile) {
       const curSig = statSignature(cfgFile);
-      if (curSig && curSig !== this.initialCfgStat) {
+      if (!curSig) {
+        throw new Error(`配置文件 ${cfgFile} 不存在或无法读取，无法核验 context.personal_web.send_replies 开关，按安全原则中止发送`);
+      }
+      if (curSig !== this.initialCfgStat) {
         try {
           const parsed = YAML.parse(fs.readFileSync(cfgFile, "utf8")) as {
             context?: { personal_web?: { send_replies?: boolean } };

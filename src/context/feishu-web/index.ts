@@ -34,7 +34,9 @@ export {
   WebLoginStore,
   type CookieDelta,
   type CookieRecord,
+  type CookieSnapshot,
   type WebLogin,
+  type WebLoginInspectResult,
 } from "./cookies.ts";
 export { fetchWithJar, getHeader, WEB_USER_AGENT, WebHttpError, type HttpRequestOptions, type HttpResponse } from "./http.ts";
 export { MAX_WIRE_BYTES, parseProto, ProtoFields, ProtoWireError, ProtoWriter } from "./proto.ts";

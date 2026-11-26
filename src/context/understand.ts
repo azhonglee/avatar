@@ -132,7 +132,7 @@ export class Understander {
   buildBatch(
     convs: { conv: string; conv_name: string; target_obs_id?: string }[],
     maxChars = 24_000,
-    activeNativeOwner?: string,
+    activeNativeOwner?: string | null,
   ): { prompt: string; obs: Obs[]; fresh: string[]; convs: string[] } {
     const tz = this.cfg.owner.timezone;
     const sections: string[] = [];
@@ -228,7 +228,7 @@ export class Understander {
     workId: string,
     convs: { conv: string; conv_name: string; target_obs_id?: string }[],
     signal?: AbortSignal,
-    activeNativeOwner?: string,
+    activeNativeOwner?: string | null,
   ): Promise<ApplyResult & { convs: string[]; fresh: number }> {
     this.processedCache.clear();
     const batch = this.buildBatch(convs, 24_000, activeNativeOwner);
@@ -264,13 +264,16 @@ export class Understander {
     }
   }
 
-  /** 写入模型结果。证据必须指向这批里真实存在的观测，否则丢弃（防幻觉）。 */
+  /**
+   * 写入模型结果（原子事务内校验）：
+   *   - 证据必须指向这批里真实存在的观测，且在提交时刻未被编辑、撤回或静音，否则丢弃（防幻觉及推理期并发编辑/撤回误触发提醒或任务）；
+   *   - 仅当整批 fresh 观测中仍有未过期观测时才应用结果，并在同一事务内按修订标记已处理。
+   */
   apply(out: UnderstandOut, obs: Obs[], fresh: string[]): ApplyResult {
     const res = emptyResult();
     const byId = new Map(obs.map((o) => [o.id, o]));
     const auto = this.cfg.context.autonomy;
     const minConf = this.cfg.context.min_confidence;
-    const validEv = (evs: { obs_id: string; quote: string }[]) => evs.filter((e) => byId.has(e.obs_id));
     const latestTime = (evs: { obs_id: string }[]) => Math.max(0, ...evs.map((e) => byId.get(e.obs_id)?.time ?? 0)) || Date.now();
     const batchProjects = new Map<string, ProjectRow>();
 
@@ -280,6 +283,46 @@ export class Understander {
     };
 
     this.store.tx(() => {
+      // 在同一 BEGIN IMMEDIATE 事务内核对本批观测当前修订、撤回状态与会话静音状态
+      const stillValidIds = new Set<string>();
+      const curStmt = this.store.db.prepare("SELECT conv, text, meta FROM ctx_obs WHERE id = ?");
+      const mutedCache = new Map<string, boolean>();
+      const isConvMuted = (conv: string): boolean => {
+        let v = mutedCache.get(conv);
+        if (v === undefined) {
+          v = this.store.isConvMutedById(conv);
+          mutedCache.set(conv, v);
+        }
+        return v;
+      };
+      for (const o of obs) {
+        const cur = curStmt.get(o.id) as { conv: string; text: string; meta: string } | undefined;
+        if (!cur || isConvMuted(cur.conv)) continue;
+        let curMeta: Record<string, unknown> = {};
+        try {
+          curMeta = cur.meta ? (JSON.parse(cur.meta) as Record<string, unknown>) : {};
+        } catch {
+          curMeta = {};
+        }
+        if (curMeta.withdrawn === true) continue;
+        if (obsRevision({ text: cur.text, meta: curMeta }) !== obsRevision(o)) continue;
+        stillValidIds.add(o.id);
+      }
+
+      const validFreshIds = fresh.filter((id) => stillValidIds.has(id));
+      if (fresh.length > 0 && validFreshIds.length === 0) {
+        // 本批全部新观测在推理期间都已被编辑、撤回或静音：整体放弃旧模型输出，绝不落库或触发提醒
+        res.rejected += out.items.length + out.knowledge.length + out.updates.length;
+        return;
+      }
+
+      const validEv = (evs: { obs_id: string; quote: string }[]) => {
+        const inBatch = evs.filter((e) => byId.has(e.obs_id));
+        if (!inBatch.length) return [];
+        if (inBatch.some((e) => !stillValidIds.has(e.obs_id))) return [];
+        return inBatch;
+      };
+
       // 先建顶层（被别人引用为上级的），再建子项目
       const parentNames = new Set(out.projects.map((p) => p.parent.trim()).filter(Boolean));
       const ordered = [...out.projects].sort((a, b) => Number(!!a.parent.trim()) - Number(!!b.parent.trim()) || Number(parentNames.has(b.name)) - Number(parentNames.has(a.name)));
@@ -384,25 +427,28 @@ export class Understander {
       for (const p of out.people) {
         if (!p.name.trim() || p.name.includes("【我】")) continue;
         const projects = p.projects.map((n) => resolveProject(n, Date.now())?.id).filter((x): x is string => !!x);
-        const fromObs = obs.find((o) => o.actor_name === p.name && o.actor_id.startsWith("ou_"));
+        const fromObs = obs.find((o) => stillValidIds.has(o.id) && o.actor_name === p.name && o.actor_id.startsWith("ou_"));
         this.store.upsertPerson({ id: p.open_id || fromObs?.actor_id || undefined, name: p.name.trim(), relation: p.relation, projects });
         res.people++;
       }
 
       for (const c of out.conflicts) {
-        const claims = c.claims.filter((cl) => byId.has(cl.obs_id)).map((cl) => ({ claim: cl.claim, obs_id: cl.obs_id, quote: cl.quote, time: byId.get(cl.obs_id)!.time }));
+        const inBatchClaims = c.claims.filter((cl) => byId.has(cl.obs_id));
+        if (inBatchClaims.some((cl) => !stillValidIds.has(cl.obs_id))) continue;
+        const claims = inBatchClaims.map((cl) => ({ claim: cl.claim, obs_id: cl.obs_id, quote: cl.quote, time: byId.get(cl.obs_id)!.time }));
         if (claims.length < 2) continue;
         const project = resolveProject(c.project, Date.now());
         this.store.addConflict({ project_id: project?.id ?? "", topic: c.topic, claims, ref: c.ref || undefined });
         res.conflicts++;
       }
+
+      this.store.markProcessed(
+        validFreshIds.flatMap((id) => {
+          const o = byId.get(id);
+          return o ? [{ id, rev: obsRevision(o) }] : [];
+        }),
+      );
     });
-    this.store.markProcessed(
-      fresh.flatMap((id) => {
-        const o = byId.get(id);
-        return o ? [{ id, rev: obsRevision(o) }] : [];
-      }),
-    );
     // 把 Meego 待办挂到具体项目
     return res;
   }
