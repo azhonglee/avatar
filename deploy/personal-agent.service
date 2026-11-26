@@ -16,10 +16,14 @@ RestartSec=10
 # 让 lark-cli / acpx / 各 harness 的命令行在 PATH 里（按你的安装位置调整）
 Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 # 若启用个人 Web 实时通道（context.personal_web.enabled: true），需提供静态加密密钥（禁止明文落盘）：
-# 推荐：若同时启用派单仓库校验，使用仅 root 可读的 0600 EnvironmentFile（服务用户无法从磁盘读取该文件，且子进程环境已自动剥离）：
-# EnvironmentFile=/etc/personal-agent/secrets.env（包含 PA_FEISHU_WEB_KEY=...）
-# 或使用 LoadCredential（需宿主机支持 bwrap / unshare -r -m 挂载命名空间遮罩，否则仓库校验命令会按安全策略拒绝运行）：
-# LoadCredential=feishu-web-key:/path/to/0400/feishu-web.key
+# 1) 用户级单元（~/.config/systemd/user/，systemctl --user 以当前用户运行，无法读取 root 属主文件）：
+#    使用用户自有 0600 密钥文件 + LoadCredential（或 systemd-creds encrypt 生成的 LoadCredentialEncrypted），
+#    并在宿主机安装 bubblewrap（bwrap），使派单校验/git 子进程在零特权挂载命名空间中自动遮罩 feishu-web-key：
+# LoadCredential=feishu-web-key:%h/.config/personal-agent/feishu-web.key
+# # 或：LoadCredentialEncrypted=feishu-web-key:%h/.config/personal-agent/feishu-web.key.cred
+# 2) 若宿主机不可用 bwrap / 用户命名空间且同时启用派单仓库校验，请改用系统级单元（/etc/systemd/system/，配合 User=personal-agent）：
+#    由 root 级 systemd 读取仅 root 可读（0600）的 EnvironmentFile=/etc/personal-agent/secrets.env（包含 PA_FEISHU_WEB_KEY=...）后再降权启动服务，
+#    子进程环境会自动剥离 PA_FEISHU_WEB_KEY 且服务用户无法从磁盘读取该文件。
 
 [Install]
 WantedBy=default.target

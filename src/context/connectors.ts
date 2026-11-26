@@ -125,12 +125,24 @@ export function loadKnownOpenGroupNames(store: App["store"]): Record<string, str
 }
 
 export function rememberOpenGroupName(store: App["store"], chatId: string, name: string): void {
-  const id = chatId.trim();
-  const clean = name.trim();
-  if (!id || !clean || clean === "群聊" || clean.startsWith("私聊")) return;
+  mergeKnownOpenGroupNames(store, new Map([[chatId, name]]));
+}
+
+/** 一次性合并增量学习到的开放平台群名，避免写事务内逐条重解析整个缓存或用旧快照覆盖在线监听刚刷新的群名 */
+export function mergeKnownOpenGroupNames(store: App["store"], delta: ReadonlyMap<string, string>): void {
+  if (delta.size === 0) return;
   const cur = loadKnownOpenGroupNames(store);
-  if (cur[id] === clean) return;
-  cur[id] = clean;
+  let changed = false;
+  for (const [rawId, rawName] of delta) {
+    const id = rawId.trim();
+    const clean = rawName.trim();
+    if (!id || !clean || clean === "群聊" || clean.startsWith("私聊")) continue;
+    if (cur[id] !== clean) {
+      cur[id] = clean;
+      changed = true;
+    }
+  }
+  if (!changed) return;
   const keys = Object.keys(cur);
   if (keys.length > 500) {
     for (const old of keys.slice(0, keys.length - 500)) delete cur[old];
@@ -509,7 +521,15 @@ export class Connectors {
       time: parseTime(m.create_time ?? m.time, this.cfg.owner.timezone),
       text: text.slice(0, 2000),
       url: m.chat_id ? `https://applink.feishu.cn/client/chat/open?openChatId=${m.chat_id}` : "",
-      meta: { chat_type: chatType, message_id: m.message_id ?? m.id, thread_id: m.thread_id ?? "", parent_id: m.parent_id ?? m.root_id ?? "", sender_type: senderType },
+      meta: {
+        chat_type: chatType,
+        message_id: m.message_id ?? m.id,
+        thread_id: m.thread_id ?? "",
+        parent_id: m.parent_id ?? m.root_id ?? "",
+        sender_type: senderType,
+        // 独立记录已验证的 @我 标记，确保白名单机器人（kind="bot"）在范围外群 @我 时不会被范围过滤永久丢弃
+        ...(kind === "at_me" ? { at_me: true } : {}),
+      },
     };
   }
 
@@ -566,13 +586,21 @@ export class Connectors {
     // 我发言过的群：记录最后发言时间，回看窗口内的群都继续读
     const spoken: Record<string, SpokenGroupEntry> = loadSpokenGroups(this.app.store);
     const knownNames: Record<string, string> = loadKnownOpenGroupNames(this.app.store);
+    // 仅追踪本轮轮询新学到的群名增量，提交时一次性合并进最新缓存，绝不把旧快照整体覆写回去
+    const learnedNames = new Map<string, string>();
+    const recordLearnedName = (cid: string, cname: string) => {
+      const clean = cname.trim();
+      if (!cid || !clean || clean === "群聊" || clean.startsWith("私聊")) return;
+      knownNames[cid] = clean;
+      if (cid.startsWith("oc_")) learnedNames.set(cid, clean);
+    };
     for (const m of mine) {
       if (m.chat_type === "group" || m.chat_type === "topic_group") {
         const at = parseTime(m.create_time, this.cfg.owner.timezone);
         const cur = spoken[m.chat_id];
         const cname = String(m.chat_name ?? cur?.name ?? "").trim();
         if (!cur || at > cur.at) spoken[m.chat_id] = { name: cname, at };
-        if (cname && m.chat_id) knownNames[m.chat_id] = cname;
+        if (cname && m.chat_id) recordLearnedName(m.chat_id, cname);
       }
     }
     for (const [id, v] of Object.entries(spoken)) if (v.at < now - lookback) delete spoken[id];
@@ -592,7 +620,7 @@ export class Connectors {
           const fresh = await getChatMeta(id);
           if (fresh?.name) {
             name = fresh.name;
-            knownNames[id] = name;
+            recordLearnedName(id, name);
           }
         }
         if (!isOpenGroupDirectlyDenied(this.cfg, this.store, id, name, nativeExcl)) {
@@ -773,8 +801,8 @@ export class Connectors {
         }
         if (chatName && chatId) {
           if (spoken[chatId]) spoken[chatId].name = chatName;
-          if (chatId.startsWith("oc_") && chatType.toLowerCase() !== "p2p" && chatName !== "群聊" && !chatName.startsWith("私聊")) {
-            knownNames[chatId] = chatName;
+          if (chatId.startsWith("oc_") && chatType.toLowerCase() !== "p2p") {
+            recordLearnedName(chatId, chatName);
           }
         }
         m.chat_name = chatName;
@@ -833,9 +861,7 @@ export class Connectors {
         }
         const n = this.store.addObs(obs);
         this.setKv("spoken_groups", JSON.stringify(spoken));
-        for (const [cid, cname] of Object.entries(knownNames)) {
-          rememberOpenGroupName(this.app.store, cid, cname);
-        }
+        mergeKnownOpenGroupNames(this.app.store, learnedNames);
         for (const [chatId, st] of chatPollState) {
           if (st.fetchFailed || st.hadInconclusiveRow || nativeExcl?.groupsInconclusive) {
             // 首次拉取该群即受阻时，持久化原始起点 startCur，防止随后推进 cursor.im.groups 跳过未拉到的历史消息

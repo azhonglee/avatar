@@ -16,7 +16,7 @@ const GIT_SAFE_ARGS = [
   "-c", "core.pager=cat",
 ];
 
-export async function tryGit(cwd: string, args: string[]): Promise<ProcResult> {
+export async function tryGit(cwd: string, args: string[], opts?: { input?: string }): Promise<ProcResult> {
   const baseEnv = prepareHarnessEnv();
   try {
     const safeSubArgs = args[0] === "diff" ? ["diff", "--no-ext-diff", ...args.slice(1)] : args;
@@ -25,6 +25,7 @@ export async function tryGit(cwd: string, args: string[]): Promise<ProcResult> {
     const wrapped = wrapCredentialIsolatedCommand("git", ["-C", cwd, ...GIT_SAFE_ARGS, ...safeSubArgs]);
     return await runProcess(wrapped.cmd, wrapped.args, {
       env: childEnv,
+      input: opts?.input,
       timeoutMs: 300_000,
     });
   } finally {
@@ -120,10 +121,43 @@ export function parseRemote(url: string): RemoteRef | undefined {
 }
 
 /**
+ * 检测分支（当前 worktree 索引或目标分支树）是否跟踪了 Git LFS 文件（filter=lfs）：
+ *   - 仅使用只读内置 git 命令（禁用仓库 hooks），不依赖本机是否安装 git-lfs；
+ *   - 返回 true 表示在禁用仓库 pre-push hook 的前提下，推送前必须显式执行受信任的 `git lfs push`。
+ */
+export async function branchUsesGitLfs(cwd: string, branch: string): Promise<boolean> {
+  const tree = await tryGit(cwd, ["ls-tree", "-r", "--name-only", "-z", `refs/heads/${branch}`]);
+  const listOut = tree.code === 0 ? tree.stdout : (await tryGit(cwd, ["ls-files", "-z"])).stdout;
+  if (!listOut) return false;
+  const attrs = await tryGit(cwd, ["check-attr", "--stdin", "-z", "filter"], { input: listOut });
+  if (attrs.code !== 0 || !attrs.stdout) return false;
+  const fields = attrs.stdout.split("\0");
+  // check-attr -z 输出按 <path>\0<attr>\0<value>\0 三元组排列
+  for (let i = 0; i + 2 < fields.length; i += 3) {
+    if (fields[i + 1] === "filter" && fields[i + 2] === "lfs") return true;
+  }
+  return false;
+}
+
+/**
  * 推送 pa/ 分支。只对我们自己的 pa/ 分支使用 --force-with-lease（返工后历史可能被改写），其他分支普通推送。
+ * 保持禁用仓库自定义 hooks（core.hooksPath=/dev/null）；若分支包含 Git LFS 跟踪文件，推送分支前先执行受信任的 `git lfs push`，
+ * 失败则立即中止推送并返回明确错误，防止远端只收到悬空 LFS 指针。
  * 被拒绝（远端有本地没有的提交）是永久错误；网络等其他失败可重试。
  */
 export async function pushBranch(cwd: string, remote: string, branch: string): Promise<{ ok: true } | { ok: false; rejected: boolean; message: string }> {
+  if (await branchUsesGitLfs(cwd, branch)) {
+    const lfs = await tryGit(cwd, ["lfs", "push", remote, `refs/heads/${branch}`]);
+    if (lfs.code !== 0) {
+      const lfsOut = `${lfs.stdout}\n${lfs.stderr}`.trim();
+      const missingLfs = /not a git command|git-lfs.*not found|No such file/i.test(lfsOut);
+      return {
+        ok: false,
+        rejected: missingLfs,
+        message: `检测到分支 ${branch} 包含 Git LFS 跟踪文件，但上传 LFS 对象失败（已禁用仓库 hooks 以保障安全；请确认本机已安装 git-lfs 并具备远端推送权限）：${lfsOut.slice(-600)}`,
+      };
+    }
+  }
   const force = branch.startsWith("pa/") ? ["--force-with-lease"] : [];
   const r = await tryGit(cwd, ["push", "--porcelain", ...force, remote, `refs/heads/${branch}:refs/heads/${branch}`]);
   if (r.code === 0) return { ok: true };

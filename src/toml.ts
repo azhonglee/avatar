@@ -467,16 +467,22 @@ class TomlParser {
     const startPos = this.pos;
     this.pos++;
     const out: TomlTable = emptyTable();
-    this.skipSpaces();
+    // 兼容 TOML 1.1（Codex CLI 使用的 Rust toml 语法）：允许内联表内换行、注释与末尾逗号
+    this.skipWsAndComments();
     if (this.peek() === "}") {
       this.pos++;
       this.sealedTables.add(out);
       return out;
     }
     while (true) {
-      this.skipSpaces();
-      if (this.eof() || this.peek() === "\n") {
-        throw new Error(`TOML 语法错误（${this.loc(startPos)}）：内联表未闭合或包含非法换行`);
+      this.skipWsAndComments();
+      if (this.eof()) {
+        throw new Error(`TOML 语法错误（${this.loc(startPos)}）：内联表未闭合`);
+      }
+      if (this.peek() === "}") {
+        this.pos++;
+        this.sealedTables.add(out);
+        return out;
       }
       const keyPos = this.pos;
       const path = this.parseKeyPath();
@@ -488,7 +494,7 @@ class TomlParser {
       this.skipSpaces();
       const val = this.parseValue();
       this.assignKey(out, path, val, keyPos);
-      this.skipSpaces();
+      this.skipWsAndComments();
       if (this.peek() === ",") {
         this.pos++;
         continue;

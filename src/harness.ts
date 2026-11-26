@@ -11,7 +11,10 @@ const FEISHU_WEB_KEY_CRED = "feishu-web-key";
 /** Linux kernel tmpfs magic number (`linux/magic.h`: `TMPFS_MAGIC`). */
 const LINUX_TMPFS_MAGIC = 0x01021994;
 
-type MountMaskBackend = { kind: "bwrap"; bin: string } | { kind: "unshare"; bin: string } | { kind: "none" };
+type MountMaskBackend =
+  | { kind: "bwrap"; bin: string }
+  | { kind: "unshare"; bin: string; setprivBin: string }
+  | { kind: "none" };
 let cachedMountMaskBackend: MountMaskBackend | undefined;
 
 function probeMountMaskBackend(): MountMaskBackend {
@@ -24,13 +27,18 @@ function probeMountMaskBackend(): MountMaskBackend {
       return cachedMountMaskBackend;
     }
   } catch {
-    // 尝试 unshare
+    // 尝试 unshare + setpriv 降权回退
   }
   try {
     const unshareBin = resolveBin("unshare");
-    const r = spawnSync(unshareBin, ["-r", "-m", "--", "true"], { timeout: 3_000, stdio: "ignore" });
+    const setprivBin = resolveBin("setpriv");
+    const r = spawnSync(
+      unshareBin,
+      ["-r", "-m", "--", setprivBin, "--bounding-set", "-all", "--inh-caps", "-all", "--ambient-caps", "-all", "--no-new-privs", "true"],
+      { timeout: 3_000, stdio: "ignore" },
+    );
     if (r.status === 0) {
-      cachedMountMaskBackend = { kind: "unshare", bin: unshareBin };
+      cachedMountMaskBackend = { kind: "unshare", bin: unshareBin, setprivBin };
       return cachedMountMaskBackend;
     }
   } catch {
@@ -40,13 +48,19 @@ function probeMountMaskBackend(): MountMaskBackend {
   return cachedMountMaskBackend;
 }
 
+/** 探测当前宿主机是否具备零特权挂载命名空间遮罩能力（bwrap 或 unshare + setpriv 永久降权） */
+export function hasCredentialMountIsolation(): boolean {
+  return probeMountMaskBackend().kind !== "none";
+}
+
 /**
  * 为仓库校验命令、git 子进程等同一 UID 下的不可信子进程提供内核级文件系统遮罩：
  *   - 若当前服务通过 systemd `LoadCredential` 在 `CREDENTIALS_DIRECTORY` 中暴露了 `feishu-web-key`，
  *     仅从环境变量剥离 `CREDENTIALS_DIRECTORY` 不足以阻止同 UID 子进程按绝对路径直接读取该文件；
- *   - 本函数优先用 `bwrap --bind /dev/null <keyFile>`（保留真实 UID/GID、零特权）或 `unshare -r -m` 在子进程独立挂载命名空间中
- *     将 `feishu-web-key` 覆盖挂载为 `/dev/null`，同时保持目录内其他无关凭据可读；
- *   - 若宿主机既无 `bwrap` 也无可用 `unshare -r -m`，则按 fail-closed 拒绝启动子进程，提示改用 root 只读 `EnvironmentFile` 或独立服务账号隔离。
+ *   - 本函数优先用 `bwrap --bind /dev/null <keyFile>`（保留真实 UID/GID、零特权、NoNewPrivs），
+ *     或在 `unshare -r -m` 挂载 `/dev/null` 后通过 `setpriv --bounding-set -all --inh-caps -all --ambient-caps -all --no-new-privs`
+ *     永久剥离挂载管理权限再 exec 目标命令（杜绝子进程 umount 绕过遮罩）；
+ *   - 若宿主机既无 `bwrap` 也无支持永久降权的 `unshare + setpriv`，则按 fail-closed 拒绝启动子进程。
  */
 export function wrapCredentialIsolatedCommand(
   cmd: string,
@@ -75,16 +89,20 @@ export function wrapCredentialIsolatedCommand(
     return { cmd: backend.bin, args: [...maskArgs, "--", cmd, ...args], isolated: true };
   }
   if (backend.kind === "unshare") {
+    if (!backend.setprivBin) {
+      throw new Error("unshare 回退缺少 setpriv，无法在启动子命令前永久剥离挂载权限，已按安全策略拒绝执行");
+    }
     const maskTargets = resolvedKeyFile !== path.resolve(keyFile) ? [path.resolve(keyFile), resolvedKeyFile] : [path.resolve(keyFile)];
+    // 严格兼容 POSIX sh：完成 bind-mount 遮罩后立刻用 setpriv 永久清空全部 capabilities 并置 NoNewPrivs，防止不可信子进程 umount
     const script =
       maskTargets.length === 2
-        ? 'mount --bind /dev/null "$1" && mount --bind /dev/null "$2" && shift 2 && exec "$@"'
-        : 'mount --bind /dev/null "$1" && shift && exec "$@"';
-    return { cmd: backend.bin, args: ["-r", "-m", "--", "sh", "-c", script, "_", ...maskTargets, cmd, ...args], isolated: true };
+        ? 'mount --bind /dev/null "$1" && mount --bind /dev/null "$2" && sp="$3" && shift 3 && exec "$sp" --bounding-set -all --inh-caps -all --ambient-caps -all --no-new-privs "$@"'
+        : 'mount --bind /dev/null "$1" && sp="$2" && shift 2 && exec "$sp" --bounding-set -all --inh-caps -all --ambient-caps -all --no-new-privs "$@"';
+    return { cmd: backend.bin, args: ["-r", "-m", "--", "sh", "-c", script, "_", ...maskTargets, backend.setprivBin, cmd, ...args], isolated: true };
   }
   throw new Error(
-    "检测到 CREDENTIALS_DIRECTORY 包含 feishu-web-key，但当前宿主机不支持 bwrap 或 unshare -r -m 挂载命名空间隔离；" +
-      "为防止仓库校验或 git 子进程按路径读取个人 Web 加密密钥，已拒绝执行。请安装 bubblewrap，或改用仅 root 可读的 EnvironmentFile / 独立服务账号部署。",
+    "检测到 CREDENTIALS_DIRECTORY 包含 feishu-web-key，但当前宿主机不支持 bwrap 或带 setpriv 降权的 unshare -r -m 挂载命名空间隔离；" +
+      "为防止仓库校验或 git 子进程按路径读取个人 Web 加密密钥，已拒绝执行。请安装 bubblewrap，或以独立系统服务账号配合 root 只读 EnvironmentFile 部署。",
   );
 }
 
@@ -244,8 +262,9 @@ function serializeTomlInlineValue(v: TomlValue): string {
   return serializeTomlScalar(v);
 }
 
-const BUILTIN_CODEX_PROVIDERS = new Set(["openai", "oss"]);
-const ALLOWED_CODEX_CREDENTIAL_STORES = new Set(["file", "keyring", "auto"]);
+// 对齐 Codex CLI 0.169+ 内置供应商与凭据存储白名单（ollama/lmstudio 无需 [model_providers.*]；oss 不是 provider ID）
+const BUILTIN_CODEX_PROVIDERS = new Set(["openai", "ollama", "lmstudio"]);
+const ALLOWED_CODEX_CREDENTIAL_STORES = new Set(["file", "keyring", "auto", "ephemeral"]);
 const SAFE_CODEX_TOP_SCALARS = new Set([
   "model",
   "model_provider",

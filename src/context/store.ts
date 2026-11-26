@@ -456,7 +456,7 @@ export class ContextStore {
     const owner = this.ownerClause(activeNativeOwner);
     const nw = ContextStore.NOT_WITHDRAWN;
     const mentionSql = opts?.onlyMentions
-      ? " AND kind = 'at_me' AND COALESCE(json_extract(meta, '$.at_me'), 1) != 0 AND COALESCE(json_extract(meta, '$.is_mention_me'), 1) != 0"
+      ? " AND (kind = 'at_me' OR json_extract(meta, '$.at_me') = 1) AND COALESCE(json_extract(meta, '$.at_me'), 1) != 0 AND COALESCE(json_extract(meta, '$.is_mention_me'), 1) != 0"
       : "";
     const fresh = this.db
       .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0${nw}${mentionSql}${owner.sql} ORDER BY time ASC, id ASC LIMIT ?`)
@@ -489,7 +489,7 @@ export class ContextStore {
     const owner = this.ownerClause(activeNativeOwner);
     const nw = ContextStore.NOT_WITHDRAWN;
     const mentionSql = opts?.onlyMentions
-      ? " AND kind = 'at_me' AND COALESCE(json_extract(meta, '$.at_me'), 1) != 0 AND COALESCE(json_extract(meta, '$.is_mention_me'), 1) != 0"
+      ? " AND (kind = 'at_me' OR json_extract(meta, '$.at_me') = 1) AND COALESCE(json_extract(meta, '$.at_me'), 1) != 0 AND COALESCE(json_extract(meta, '$.is_mention_me'), 1) != 0"
       : "";
     const target = this.db
       .prepare(`SELECT * FROM ctx_obs WHERE id = ? AND conv = ? AND processed = 0${nw}${mentionSql}${owner.sql}`)

@@ -54,10 +54,15 @@ export class ContextService {
     this.connectors = new Connectors(app, this.store, () => this.personalWeb.resolveNativeExclusionsForPolling());
     this.understander = new Understander(app, this.store);
     this.views = new ContextViews(app, this.store);
-    this.drafter = new Drafter(app, this.store, async (conv, obs) => {
-      const nativeExcl = await this.personalWeb.resolveNativeExclusionsForPolling();
-      return this.personalWeb.filterWindowByCurrentScope(conv, obs, nativeExcl);
-    });
+    this.drafter = new Drafter(
+      app,
+      this.store,
+      async (conv, obs) => {
+        const nativeExcl = await this.personalWeb.resolveNativeExclusionsForPolling();
+        return this.personalWeb.filterWindowByCurrentScope(conv, obs, nativeExcl);
+      },
+      (conv, convName) => this.personalWeb.checkConvAllowedForUnderstand(conv, convName),
+    );
     this.personalWeb = new PersonalWebBridge(app, this.store, {
       onFastTrigger: (t) => {
         this.enqueue(`fast:${t.conv}:${t.trigger_obs_id}:g${t.rev_gen}:${t.text_hash}`, {
@@ -161,15 +166,17 @@ export class ContextService {
         // 每轮最多理解 max_convs_per_cycle 个会话批次；并行跑 understand_parallel 批（通过绑定进程与唯一令牌的 SQLite 租约+心跳跨进程互斥）
         let budget = this.cfg.context.max_convs_per_cycle;
         const par = this.cfg.context.understand_parallel;
-        const activeSources = [
-          ...(this.cfg.context.sources.im ? ["im"] : []),
-          ...(this.cfg.context.sources.minutes ? ["minutes"] : []),
-          ...(this.cfg.context.sources.docs ? ["doc"] : []),
-        ];
         const skippedInCycle = new Set<string>();
         let policyRestarts = 0;
         while (budget > 0 && !signal?.aborted) {
           if (this.isWorkspaceOwnerMismatched() || !this.cfg.context.understand) break;
+          // 每轮动态重算启用的来源，防止运行中途关闭文档/妙记开关后后续批次仍选中已停用来源
+          const activeSources = [
+            ...(this.cfg.context.sources.im ? ["im"] : []),
+            ...(this.cfg.context.sources.minutes ? ["minutes"] : []),
+            ...(this.cfg.context.sources.docs ? ["doc"] : []),
+          ];
+          if (!activeSources.length) break;
           const activeNativeOwner = this.personalWeb.activeBoundNativeOwner();
           // 在解析原生排除快照与筛选候选之前捕获策略签名，确保筛选过程一旦发生静音/白名单/开关变化就重启筛选而非带着旧快照送模型
           const selectionPolicySig = this.personalWeb.policySignature();
@@ -966,13 +973,21 @@ export function registerContext(app: App): ContextService | undefined {
       ]
         .filter(Boolean)
         .join("\n\n");
-      const r = await commands.exec("dispatch.create", { summary: it.title.slice(0, 120), description, harness: a.harness, repo: a.repo }, ctx);
+      const originOwner = app.cfg.owner.open_id.trim();
+      const r = await commands.exec(
+        "dispatch.create",
+        { summary: it.title.slice(0, 120), description, harness: a.harness, repo: a.repo },
+        { ...ctx, contextOwner: originOwner },
+      );
       if (r.target) {
-        const originOwner = app.cfg.owner.open_id.trim();
         app.store.set(`ctx.dispatch_owner.${r.target}`, originOwner);
         const createdWork = ledger.get(r.target);
-        if (createdWork?.ref) {
-          app.store.set(`ctx.dispatch_ref_owner.${createdWork.ref}`, originOwner);
+        // 无论 dispatch.create 返回的是 work ID（dispatch:<guid>:…）还是尚未对账的纯任务 GUID，均同步写入 ref 归属映射
+        const taskGuid =
+          createdWork?.ref ||
+          (r.target.startsWith("dispatch:") ? (r.target.split(":")[1] ?? "") : r.target);
+        if (taskGuid) {
+          app.store.set(`ctx.dispatch_ref_owner.${taskGuid}`, originOwner);
         }
       }
       svc.store.setItemField(it.id, { meta: { delegated: r.target ?? "" } });

@@ -1,3 +1,4 @@
+import { isContextDerivedDispatchBlocked } from "./api/queries.ts";
 import type { App } from "./app.ts";
 import type { UsageSummary } from "./api/types.ts";
 import { setUsageRecorder } from "./harness.ts";
@@ -129,7 +130,7 @@ interface StepRow {
   ref: string | null;
 }
 
-export function usageSummary(app: Pick<App, "cfg" | "ledger">, daysIn: number, now = Date.now()): UsageSummary {
+export function usageSummary(app: Pick<App, "cfg" | "ledger"> & { store?: App["store"] }, daysIn: number, now = Date.now()): UsageSummary {
   const { cfg, ledger } = app;
   const tz = cfg.owner.timezone;
   const days = Math.min(Math.max(Math.floor(daysIn) || 1, 1), 90);
@@ -167,7 +168,15 @@ export function usageSummary(app: Pick<App, "cfg" | "ledger">, daysIn: number, n
     h.runs += 1;
     h.duration_ms += r.duration_ms;
     byHarness.set(r.harness, h);
-    if (r.kind === "dispatch" && r.ref) byCard.set(r.ref, (byCard.get(r.ref) ?? 0) + r.cost_usd);
+    if (r.kind === "dispatch" && r.ref) {
+      const blocked =
+        !!app.store &&
+        (isContextDerivedDispatchBlocked({ cfg, ledger, store: app.store }, r.work_id) ||
+          isContextDerivedDispatchBlocked({ cfg, ledger, store: app.store }, r.ref));
+      if (!blocked) {
+        byCard.set(r.ref, (byCard.get(r.ref) ?? 0) + r.cost_usd);
+      }
+    }
   }
   // 花费最多的任务：同一张卡片的所有派单合计，链接到最新一次派单
   const top = [...byCard.entries()]

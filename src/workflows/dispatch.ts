@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+import { isContextDerivedDispatchBlocked } from "../api/queries.ts";
 import type { Board, BoardTask } from "../board.ts";
 import { repoSpec, type Config } from "../config.ts";
 import { tryGit } from "../delivery/git.ts";
@@ -324,6 +325,14 @@ export class Dispatcher {
   async advance(start: Item, ctx: Ctx): Promise<void> {
     let it = start;
     for (;;) {
+      if (
+        isContextDerivedDispatchBlocked({ cfg: this.cfg, store: this.store, ledger: this.ledger }, it.id) ||
+        isContextDerivedDispatchBlocked({ cfg: this.cfg, store: this.store, ledger: this.ledger }, it.ref)
+      ) {
+        this.finish(it, "errored", "owner_isolated", []);
+        log("warn", "该派单源自旧工作区主人的工作上下文，已按主人隔离中止执行", { work: it.id, task: it.ref });
+        return;
+      }
       if (this.ledger.isCancelled(it.id)) {
         this.finish(it, "cancelled", "cancelled", [comment(it.payload.guid, `⏹️ ${REASON_TEXT.cancelled}。已有改动保留在工作目录${it.payload.cwd ? `：${it.payload.cwd}` : ""}。`)]);
         return;

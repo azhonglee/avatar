@@ -111,8 +111,137 @@ const STATE_KV_KEY = "ctx.personal_web.state";
 export const BOUND_OWNER_KV_KEY = "ctx.personal_web.bound_owner_id";
 export const BOUND_WORKSPACE_OWNER_KV_KEY = "ctx.personal_web.bound_workspace_open_id";
 export const PENDING_CRED_COMMIT_KV_KEY = "ctx.personal_web.pending_cred_commit";
+export const REVOKED_AT_KV_KEY = "ctx.personal_web.revoked_at";
+export const REVOKED_SESSIONS_KV_KEY = "ctx.personal_web.revoked_sessions";
+export const ACTIVE_SESSION_KV_KEY = "ctx.personal_web.active_session_id";
 export function pwSpokenGroupsKey(ownerId: string): string {
   return `ctx.pw_spoken_groups.${ownerId}`;
+}
+
+function loadRevokedSessionIds(store: Store): Set<string> {
+  try {
+    const arr = JSON.parse(store.get(REVOKED_SESSIONS_KV_KEY) ?? "[]");
+    if (Array.isArray(arr)) return new Set(arr.filter((x): x is string => typeof x === "string" && !!x.trim()));
+  } catch {
+    // ignore
+  }
+  return new Set();
+}
+
+/**
+ * 吊销当前工作区的个人 Web 会话：
+ *   - 清理当前进程解析到的本地凭据文件（并仅清理同路径的 pending 恢复标记）；
+ *   - 同时在共享 SQLite 中持久化工作区级吊销标记与已知 session_id 黑名单，
+ *     即使常驻进程使用了不同的 `PA_FEISHU_WEB_CRED_FILE`，监听、入库与 pw.reply 发送也会立刻中止并转入 needs_login。
+ */
+export function revokeWorkspacePersonalWebSession(app: App): { fileRemoved: boolean; credFile: string } {
+  const loginStore = new WebLoginStore(app.cfg.dataDir);
+  const existingOnDisk = loginStore.load();
+  const existed = fs.existsSync(loginStore.file);
+  loginStore.clear();
+
+  const revokedIds = loadRevokedSessionIds(app.store);
+  const addId = (sid: string | undefined) => {
+    const clean = (sid ?? "").trim();
+    if (clean) revokedIds.add(clean);
+  };
+  addId(existingOnDisk?.session_id);
+  addId(app.store.get(ACTIVE_SESSION_KV_KEY));
+  try {
+    const saved = JSON.parse(app.store.get(STATE_KV_KEY) ?? "null") as { session_id?: string } | null;
+    addId(saved?.session_id);
+  } catch {
+    // ignore
+  }
+  const capped = [...revokedIds].slice(-50);
+  app.store.set(REVOKED_SESSIONS_KV_KEY, JSON.stringify(capped));
+  app.store.set(REVOKED_AT_KV_KEY, String(Date.now()));
+  app.store.set(ACTIVE_SESSION_KV_KEY, "");
+
+  // 仅当 pending 恢复标记属于当前凭据路径时才清理，避免干扰自定义路径的未完成提交
+  try {
+    const rawPending = (app.store.get(PENDING_CRED_COMMIT_KV_KEY) ?? "").trim();
+    if (rawPending) {
+      const parsed = JSON.parse(rawPending) as { file?: string; session_id?: string };
+      addId(parsed.session_id);
+      if (!parsed.file || parsed.file === loginStore.file) {
+        app.store.set(PENDING_CRED_COMMIT_KV_KEY, "");
+      }
+      app.store.set(REVOKED_SESSIONS_KV_KEY, JSON.stringify([...revokedIds].slice(-50)));
+    }
+  } catch {
+    // ignore
+  }
+
+  app.store.set(
+    STATE_KV_KEY,
+    JSON.stringify({
+      state: "needs_login",
+      owner_id: "",
+      owner_name: "",
+      session_id: "",
+      cookie_version: 0,
+      since: Date.now(),
+      last_message_at: null,
+      last_error: "已手动登出",
+    }),
+  );
+  return { fileRemoved: existed, credFile: loginStore.file };
+}
+
+/**
+ * 检查当前数据目录是否已存在任何归属于旧主人的上下文状态（不仅限 `pw:*` 观测，还包含轮询私聊/群观测、事项、草稿、
+ * 项目、知识、冲突、信号、上下文派单/卡片任务与历史审计）。更换工作区主人或更换绑定账号前必须确保上下文库干净。
+ */
+export function hasExistingOwnerContextState(app: App): boolean {
+  const db = app.store.db;
+  const hasTable = (name: string) =>
+    !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+  const nonEmpty = (table: string) => hasTable(table) && !!db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get();
+  for (const tbl of [
+    "ctx_obs",
+    "ctx_project",
+    "ctx_item",
+    "ctx_knowledge",
+    "ctx_update",
+    "ctx_person",
+    "ctx_conflict",
+    "ctx_draft",
+    "ctx_feedback",
+    "ctx_mute_conv",
+    "signals",
+  ]) {
+    if (nonEmpty(tbl)) return true;
+  }
+  if (hasTable("work")) {
+    const ctxWork = db
+      .prepare(
+        `SELECT 1 FROM work
+          WHERE kind = 'context'
+             OR ref LIKE 'card:ctx-%'
+             OR ref LIKE 'ctx-draft:%'
+             OR (ref LIKE 'context:%' AND ref != 'context:pw-needs-login')
+          LIMIT 1`,
+      )
+      .get();
+    if (ctxWork) return true;
+  }
+  if (hasTable("audit")) {
+    const ctxAudit = db.prepare("SELECT 1 FROM audit WHERE command LIKE 'context.%' LIMIT 1").get();
+    if (ctxAudit) return true;
+  }
+  if (hasTable("kv")) {
+    const ctxKv = db
+      .prepare(
+        `SELECT 1 FROM kv
+          WHERE (k LIKE 'ctx.dispatch_owner.%' OR k LIKE 'ctx.dispatch_ref_owner.%' OR k IN ('ctx.spoken_groups', 'ctx.owner_name', 'ctx.last_error'))
+            AND v != '' AND v != '{}'
+          LIMIT 1`,
+      )
+      .get();
+    if (ctxKv) return true;
+  }
+  return false;
 }
 
 export function saveWorkspaceBinding(store: Store, nativeOwnerId: string, workspaceOpenId: string): void {
@@ -273,6 +402,8 @@ export class PersonalWebBridge {
     const pw = this.cfg.context.personal_web;
     return [
       this.cfg.context.sources.im ? 1 : 0,
+      this.cfg.context.sources.minutes ? 1 : 0,
+      this.cfg.context.sources.docs ? 1 : 0,
       this.cfg.context.understand ? 1 : 0,
       pw.enabled ? 1 : 0,
       pw.fast_lane ? 1 : 0,
@@ -328,10 +459,14 @@ export class PersonalWebBridge {
     const localKeyMissing = inspected.status === "missing_key";
     // 若交互式 shell 未注入 systemd 凭据密钥（missing_key），但常驻进程本身在线且处于有效状态，
     // 将常驻运行态与本地密钥可读性分开判断，避免把在线 listening 误报成 needs_login
-    const daemonHealthyWithoutLocalKey = localKeyMissing && daemonLive && saved.state !== "needs_login" && !!saved.owner_id;
-    const loggedIn = !!login || daemonHealthyWithoutLocalKey;
+    const revokedAt = (this.app.store.get(REVOKED_AT_KV_KEY) ?? "").trim();
+    const revokedSessions = loadRevokedSessionIds(this.app.store);
+    const loginRevoked = !!revokedAt || (!!login?.session_id && revokedSessions.has(login.session_id));
+    const daemonHealthyWithoutLocalKey = !revokedAt && localKeyMissing && daemonLive && saved.state !== "needs_login" && !!saved.owner_id;
+    const loggedIn = (!!login && !loginRevoked) || daemonHealthyWithoutLocalKey;
     const staleSavedSession =
       !!login &&
+      !loginRevoked &&
       saved.state === "needs_login" &&
       ((!!login.session_id && saved.session_id !== login.session_id) ||
         (!!saved.owner_id && saved.owner_id !== login.owner_id) ||
@@ -344,7 +479,9 @@ export class PersonalWebBridge {
       lastError = "";
     } else if (!loggedIn) {
       state = "needs_login";
-      if (localKeyMissing && !lastError) {
+      if (loginRevoked && !lastError) {
+        lastError = "已手动登出";
+      } else if (localKeyMissing && !lastError) {
         lastError = "当前环境缺少解密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）";
       }
     } else if (ACTIVE_STATES.has(state as ListenerState) && !daemonLive) {
@@ -383,6 +520,17 @@ export class PersonalWebBridge {
   }
 
   private validateBoundOwner(login: WebLogin): void {
+    const revokedAt = (this.app.store.get(REVOKED_AT_KV_KEY) ?? "").trim();
+    if (revokedAt) {
+      throw new SessionNeedsLoginError(
+        "当前工作区的个人 Web 会话已通过 `pa context web-logout` 吊销，请重新运行 `pa context web-login`",
+      );
+    }
+    if (login.session_id && loadRevokedSessionIds(this.app.store).has(login.session_id)) {
+      throw new SessionNeedsLoginError(
+        `当前凭据文件的个人 Web 会话 (${login.session_id}) 已被吊销，请使用新凭据或重新运行 \`pa context web-login\``,
+      );
+    }
     const bound = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
     if (!bound) {
       throw new SessionNeedsLoginError(
@@ -403,12 +551,13 @@ export class PersonalWebBridge {
     }
   }
 
-  /** 失败休眠后的唤醒键：包含 cookie_version 与 updated_at（与活跃长连接的 sessionKeyOf 分离），确保同会话内其他进程轮换 Cookie 后立即唤醒重试 */
+  /** 失败休眠后的唤醒键：包含 cookie_version、updated_at 与吊销状态（与活跃长连接的 sessionKeyOf 分离），确保同会话轮换或重登后立即唤醒 */
   private credentialWatchKey(login: WebLogin | undefined): string {
     const bound = this.app.store.get(BOUND_OWNER_KV_KEY) ?? "";
     const boundWs = this.app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "";
-    if (!login) return `none|${bound}|${boundWs}`;
-    return `${login.owner_id}:${login.session_id ?? ""}:v${login.cookie_version ?? 1}:${login.updated_at ?? ""}|${bound}|${boundWs}`;
+    const revoked = this.app.store.get(REVOKED_AT_KV_KEY) ?? "";
+    if (!login) return `none|${bound}|${boundWs}|${revoked}`;
+    return `${login.owner_id}:${login.session_id ?? ""}:v${login.cookie_version ?? 1}:${login.updated_at ?? ""}|${bound}|${boundWs}|${revoked}`;
   }
 
   /** 活跃长连接的会话代际键（仅含账号与 session_id，不因同会话 Cookie 轮换主动断开健康长连接） */
@@ -518,6 +667,7 @@ export class PersonalWebBridge {
         if (this.client && (latest.cookie_version ?? 1) > this.client.currentCookieVersion()) {
           this.client.syncFromDisk(latest);
           lastObservedWatchKey = this.credentialWatchKey(latest);
+          lastAttemptedKey = lastObservedWatchKey;
         }
       }, watchInterval);
       credWatcher.unref?.();
@@ -535,7 +685,9 @@ export class PersonalWebBridge {
                 sessionCtrl.abort();
                 return null;
               }
+              // 本进程自身落盘的 Cookie 轮换同步更新 lastAttemptedKey，避免下轮误判为外部新凭据而清零 connectDenials
               lastObservedWatchKey = this.credentialWatchKey(saved);
+              lastAttemptedKey = lastObservedWatchKey;
               if (saved.owner_name && !this.app.store.get("ctx.owner_name")) {
                 this.app.store.set("ctx.owner_name", saved.owner_name);
               }
@@ -870,6 +1022,8 @@ export class PersonalWebBridge {
     convName: string,
     nativeExclSnapshot?: NativePollingExclusions,
   ): Promise<"allowed" | "excluded" | "uncertain"> {
+    if (conv.startsWith("minutes:")) return this.cfg.context.sources.minutes ? "allowed" : "excluded";
+    if (conv.startsWith("doc:")) return this.cfg.context.sources.docs ? "allowed" : "excluded";
     if (!conv.startsWith("pw_chat:") && !conv.startsWith("oc_")) return "allowed";
     if (!this.cfg.context.sources.im) return "excluded";
 
@@ -1056,7 +1210,11 @@ export class PersonalWebBridge {
 
     if (this.isGroupConvInCurrentScope(conv, nativeExcl)) return window;
     return window.filter(
-      (o) => o.kind === "at_me" && o.meta.at_me !== false && o.meta.is_mention_me !== false && o.meta.withdrawn !== true,
+      (o) =>
+        (o.kind === "at_me" || o.meta.at_me === true) &&
+        o.meta.at_me !== false &&
+        o.meta.is_mention_me !== false &&
+        o.meta.withdrawn !== true,
     );
   }
 
@@ -1214,7 +1372,10 @@ export class PersonalWebBridge {
       });
       if (excludedNow) return;
       if (!checkFinalIngestSync()) return;
-      if (this.openChatExclusionsKey() !== ocExclRetry) return;
+      if (this.openChatExclusionsKey() !== ocExclRetry) {
+        // 排除规则连续两次在异步查询期间变化：抛可重试错误暂缓 ACK，防止 handlePush 误确认导致合法消息丢失
+        throw new Error("推送入库期间排除规则连续变化，暂缓 ACK 留待飞书重投");
+      }
     }
 
     if (effectiveMsg.conversationKind === "group" && isMe && this.cfg.context.groups !== "allowlist") {
@@ -1868,7 +2029,13 @@ export async function verifyWorkspaceOwnerBinding(
 ): Promise<void> {
   const loginStore = new WebLoginStore(app.cfg.dataDir);
   const boundId = app.store.get(BOUND_OWNER_KV_KEY) || loginStore.load()?.owner_id || "";
-  if (boundId && boundId !== login.owner_id) {
+  const configuredOpenId = app.cfg.owner.open_id.trim();
+  const boundWorkspaceOpenId = (app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
+  const prevWorkspaceOpenId = boundWorkspaceOpenId || (app.store.get("owner.open_id") ?? "").trim();
+  const workspaceOwnerChanging = !!prevWorkspaceOpenId && configuredOpenId !== prevWorkspaceOpenId;
+  const nativeOwnerChanging = !!boundId && boundId !== login.owner_id;
+
+  if (nativeOwnerChanging) {
     if (!opts.forceSwitch) {
       throw new Error(
         `本工作区已绑定个人 Web 账号 ${boundId}，但本次扫码账号为 ${login.owner_id}（${login.owner_name || "无昵称"}）。` +
@@ -1876,16 +2043,19 @@ export async function verifyWorkspaceOwnerBinding(
       );
     }
     const ctxStore = new ContextStore(app.store.db);
-    if (ctxStore.hasOtherNativeOwnerObs(login.owner_id)) {
+    if (ctxStore.hasOtherNativeOwnerObs(login.owner_id) || hasExistingOwnerContextState(app)) {
       throw new Error(
-        `当前数据目录已包含原账号 (${boundId}) 的个人 Web 历史观测；为防止旧账号私聊与【我】消息混入新账号图谱，拒绝原地换号。` +
+        `当前数据目录已包含原账号 (${boundId}) 的历史上下文数据；为防止旧账号私聊、草稿或待办泄漏给新账号，拒绝原地换号。` +
           "请先使用全新的 data_dir 后再执行 pa context web-login。",
       );
     }
   }
-
-  const configuredOpenId = app.cfg.owner.open_id.trim();
-  const boundWorkspaceOpenId = (app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
+  if (workspaceOwnerChanging && hasExistingOwnerContextState(app)) {
+    throw new Error(
+      `当前工作区主人已从 ${prevWorkspaceOpenId} 变更为 ${configuredOpenId || "（未配置）"}，且数据目录中仍存在旧主人的上下文观测、事项、草稿或待发动作；` +
+        "为防止重新绑定后旧主人的上下文数据泄漏给新主人，拒绝原地重绑，请先使用全新的 data_dir。",
+    );
+  }
 
   let cliVerified = false;
   let cliOpenId = "";
@@ -1962,6 +2132,8 @@ export function commitWorkspaceLogin(
       const boundId = (app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim() || loginStore.load()?.owner_id || "";
       const configuredOpenId = app.cfg.owner.open_id.trim();
       const boundWorkspaceOpenId = (app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
+      const prevWorkspaceOpenId = boundWorkspaceOpenId || (app.store.get("owner.open_id") ?? "").trim();
+      const workspaceOwnerChanging = !!prevWorkspaceOpenId && configuredOpenId !== prevWorkspaceOpenId;
 
       if (boundId && boundId !== login.owner_id) {
         if (!opts.forceSwitch) {
@@ -1970,11 +2142,16 @@ export function commitWorkspaceLogin(
           );
         }
         const ctxStore = new ContextStore(app.store.db);
-        if (ctxStore.hasOtherNativeOwnerObs(login.owner_id)) {
+        if (ctxStore.hasOtherNativeOwnerObs(login.owner_id) || hasExistingOwnerContextState(app)) {
           throw new Error(
-            `提交绑定时检测到当前数据目录包含其他账号或无归属的个人 Web 历史观测，拒绝原地换号；请使用全新的 data_dir。`,
+            `提交绑定时检测到当前数据目录包含原账号或无归属的历史观测、事项或草稿，拒绝原地换号；请使用全新的 data_dir。`,
           );
         }
+      }
+      if (workspaceOwnerChanging && hasExistingOwnerContextState(app)) {
+        throw new Error(
+          `提交绑定时检测到工作区主人已从 ${prevWorkspaceOpenId} 变更为 ${configuredOpenId || "（未配置）"} 且数据目录非空，拒绝原地重绑以防旧主人数据泄漏；请使用全新的 data_dir。`,
+        );
       }
 
       const sameNativeOwner = !!boundId && boundId === login.owner_id;
@@ -1993,6 +2170,8 @@ export function commitWorkspaceLogin(
       staged = stage(login);
       const saved = staged.payload;
       saveWorkspaceBinding(app.store, saved.owner_id, configuredOpenId);
+      app.store.set(REVOKED_AT_KV_KEY, "");
+      app.store.set(ACTIVE_SESSION_KV_KEY, saved.session_id ?? "");
       app.store.set(
         PENDING_CRED_COMMIT_KV_KEY,
         JSON.stringify({

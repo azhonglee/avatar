@@ -430,6 +430,20 @@ function decryptPayload(env: EncryptedEnvelope, key: Buffer): string {
  *   - 支持通过 `PA_FEISHU_WEB_CRED_FILE` 将凭据存放在工作区外；
  *   - 跨进程互斥复用 Node 22 内置 SQLite (`BEGIN IMMEDIATE`) 的内核级 POSIX 文件锁，崩溃由操作系统自动原子释放，无陈旧锁竞态。
  */
+/** 同步父目录元数据，确保 rename 在掉电后也持久化到目录项（某些平台不支持目录 fsync 时安全忽略） */
+function fsyncDir(dirPath: string): void {
+  try {
+    const fd = fs.openSync(dirPath, "r");
+    try {
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    // 部分文件系统或平台不支持目录 fsync，尽力持久化
+  }
+}
+
 export class WebLoginStore {
   readonly file: string;
   readonly lockFile: string;
@@ -574,6 +588,7 @@ export class WebLoginStore {
       fd = undefined;
       fs.chmodSync(tmp, 0o600);
       fs.renameSync(tmp, targetPath);
+      fsyncDir(path.dirname(targetPath));
     } catch (e) {
       if (fd !== undefined) {
         try {
@@ -619,6 +634,7 @@ export class WebLoginStore {
           payload,
           commitFile: () => {
             fs.renameSync(this.stagedFile, this.file);
+            fsyncDir(path.dirname(this.file));
           },
           abortFile: () => {
             fs.rmSync(this.stagedFile, { force: true });
@@ -672,6 +688,7 @@ export class WebLoginStore {
           let installed = false;
           if (stagedNow && path.resolve(stagedPath) === path.resolve(this.stagedFile)) {
             fs.renameSync(stagedPath, this.file);
+            fsyncDir(path.dirname(this.file));
             installed = true;
           } else {
             const cur = this.load();

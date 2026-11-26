@@ -174,28 +174,36 @@ export function overview(app: App): Overview {
 
 export type DispatchFilter = "active" | "attention" | "review" | "done" | "all";
 
-/** 判断某条派单（或其关联任务 ref / 重试链路）是否源自工作上下文委派且归属的旧主人与当前配置 owner.open_id 不一致 */
+/** 判断某条派单（或其关联任务 ref / 卡片 key / 重试链路）是否源自工作上下文委派且归属的旧主人与当前配置 owner.open_id 不一致 */
 export function isContextDerivedDispatchBlocked(app: Pick<App, "cfg" | "store" | "ledger">, dispatchId: string): boolean {
   if (!dispatchId) return false;
   const curOwner = app.cfg.owner.open_id.trim();
-  const w = app.ledger.get(dispatchId);
-  const directOrigin = (app.store.get(`ctx.dispatch_owner.${dispatchId}`) ?? "").trim();
+  const normalized = dispatchId.startsWith("card:") ? dispatchId.slice("card:".length) : dispatchId;
+  const w = app.ledger.get(normalized);
+  const parsedGuid = normalized.startsWith("dispatch:") ? (normalized.split(":")[1] ?? "") : "";
+  const directOrigin = (app.store.get(`ctx.dispatch_owner.${normalized}`) ?? "").trim();
   const refOrigin = (w?.ref ? app.store.get(`ctx.dispatch_ref_owner.${w.ref}`) : undefined)?.trim() ?? "";
-  const idAsRefOrigin = (app.store.get(`ctx.dispatch_ref_owner.${dispatchId}`) ?? "").trim();
-  const originOwner = directOrigin || refOrigin || idAsRefOrigin;
+  const idAsRefOrigin = (app.store.get(`ctx.dispatch_ref_owner.${normalized}`) ?? "").trim();
+  const parsedGuidOrigin = parsedGuid ? (app.store.get(`ctx.dispatch_ref_owner.${parsedGuid}`) ?? "").trim() : "";
+  const originOwner = directOrigin || refOrigin || idAsRefOrigin || parsedGuidOrigin;
   if (originOwner && originOwner !== curOwner) return true;
   if (!hasWorkspaceOwnerMismatch(app.store, curOwner)) return false;
   if (originOwner) return true;
-  // 兜底兼容升级前已通过 item_delegate 创建但尚未写 ctx.dispatch_owner.<id> 的派单（含同 ref 的重试派单）
+  // 兜底兼容升级前已通过 item_delegate 创建但尚未写 ctx.dispatch_owner.<id> 的派单（含同 ref 的重试派单与卡片 key）
   try {
     const hasTable = app.store.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ctx_item'").get();
     if (!hasTable) return false;
     const directRow = app.store.db
       .prepare("SELECT 1 FROM ctx_item WHERE json_extract(meta, '$.delegated') = ? LIMIT 1")
-      .get(dispatchId);
+      .get(normalized);
     if (directRow) return true;
-    if (w?.ref) {
-      for (const peer of app.ledger.list({ kinds: ["dispatch"], ref: w.ref, limit: 20 })) {
+    const candidateRef = w?.ref || parsedGuid || normalized;
+    if (candidateRef) {
+      const refRow = app.store.db
+        .prepare("SELECT 1 FROM ctx_item WHERE json_extract(meta, '$.delegated') = ? LIMIT 1")
+        .get(candidateRef);
+      if (refRow) return true;
+      for (const peer of app.ledger.list({ kinds: ["dispatch"], ref: candidateRef, limit: 20 })) {
         const peerRow = app.store.db
           .prepare("SELECT 1 FROM ctx_item WHERE json_extract(meta, '$.delegated') = ? LIMIT 1")
           .get(peer.id);
@@ -276,12 +284,25 @@ function effectSummary(e: Effect): string {
 }
 
 export function auditViews(app: App, target?: string, limit = 50): AuditView[] {
-  const ownerMismatch = hasWorkspaceOwnerMismatch(app.store, app.cfg.owner.open_id);
+  const curOwner = app.cfg.owner.open_id.trim();
+  const ownerMismatch = hasWorkspaceOwnerMismatch(app.store, curOwner);
   return app.ledger
     .auditLog(limit, target)
     .filter((a) => {
       if (ownerMismatch && a.command.startsWith("context.")) return false;
       if (a.target && isContextDerivedDispatchBlocked(app, a.target)) return false;
+      // 嵌套委派命令（如 context.item_delegate 调用 dispatch.create 失败时无派单 ID）通过 args.__context_owner 保留主人归属隔离
+      if (a.args) {
+        try {
+          const parsed = JSON.parse(a.args) as { __context_owner?: unknown };
+          if (typeof parsed.__context_owner === "string") {
+            const origin = parsed.__context_owner.trim();
+            if ((origin && origin !== curOwner) || ownerMismatch) return false;
+          }
+        } catch {
+          // ignore malformed args json
+        }
+      }
       return true;
     })
     .map((a) => ({ id: a.id, at: a.at, source: a.source, command: a.command, target: a.target, ok: !!a.ok, message: a.message }));

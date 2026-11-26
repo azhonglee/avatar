@@ -71,26 +71,38 @@ import {
   type WebEndpoints,
   type WebMessage,
 } from "../src/context/feishu-web/index.ts";
-import { selectEffectiveOpenGroups } from "../src/context/connectors.ts";
+import { loadKnownOpenGroupNames, rememberOpenGroupName, selectEffectiveOpenGroups } from "../src/context/connectors.ts";
 import { ContextService } from "../src/context/index.ts";
 import {
   BOUND_OWNER_KV_KEY,
   BOUND_WORKSPACE_OWNER_KV_KEY,
   commitWorkspaceLogin,
   computePwReplyCid,
+  hasExistingOwnerContextState,
   hasWorkspaceOwnerMismatch,
   PENDING_CRED_COMMIT_KV_KEY,
   PersonalWebBridge,
   pwSpokenGroupsKey,
+  REVOKED_AT_KV_KEY,
+  revokeWorkspacePersonalWebSession,
   saveWorkspaceBinding,
   verifyWorkspaceOwnerBinding,
 } from "../src/context/personal-web.ts";
 import { obsRevision, type Obs } from "../src/context/store.ts";
-import { tryGit } from "../src/delivery/git.ts";
+import { branchUsesGitLfs, pushBranch, tryGit } from "../src/delivery/git.ts";
 import { runDoctor } from "../src/doctor.ts";
-import { extractSafeCodexProviderArgs, extractSafeCodexProviderConfig, mergeHarnessEnv, prepareHarnessEnv, wrapCredentialIsolatedCommand } from "../src/harness.ts";
+import { effectHandler } from "../src/effects.ts";
+import {
+  extractSafeCodexProviderArgs,
+  extractSafeCodexProviderConfig,
+  hasCredentialMountIsolation,
+  mergeHarnessEnv,
+  prepareHarnessEnv,
+  wrapCredentialIsolatedCommand,
+} from "../src/harness.ts";
 import { SettingsService } from "../src/settings.ts";
 import { parseToml } from "../src/toml.ts";
+import { usageSummary } from "../src/usage.ts";
 import { runProcess } from "../src/util.ts";
 import { Dispatcher } from "../src/workflows/dispatch.ts";
 
@@ -1678,6 +1690,7 @@ test("存储、范围、并发、草稿解耦、登出/绑定、热加载与离�
     const { item: askItem } = svc.store.upsertItem({ title: "确认下午发布窗口", kind: "ask_me", priority: "high", source: "im", confidence: 0.95 });
     svc.store.addEvidence("item", askItem.id, "pw:pre_draft_1", "麻烦确认下今天下午的发布窗口", now);
     assert.equal(svc.draftable(askItem), true, "send_replies=false 时仍允许起草");
+    (svc.personalWeb as unknown as { client?: FeishuWebClient }).client = client;
     fs.writeFileSync(path.join(ctxDir, "draft.txt"), "下午 4 点可以发布。");
     const preDraft = await svc.drafter.forItem(askItem.id, "reply");
     assert.equal(preDraft.status, "proposed");
@@ -3948,12 +3961,19 @@ test("Codex 第六轮回归：派生上下文主人隔离、Codex 供应商保�
     // 3) [R6 P1-3] Dispatcher.runVerifyCommand 与 delivery/git.ts 剥离 PA_FEISHU_WEB_KEY 与含 feishu-web-key 的 CREDENTIALS_DIRECTORY
     const gitRepo = makeTmp("pa-r6-git-");
     await runProcess("git", ["init", "-q", gitRepo]);
-    process.env.CREDENTIALS_DIRECTORY = mixedCredDir;
-    const gitEnvOut = await tryGit(gitRepo, ["-c", "alias.envdump=!env", "envdump"]);
-    assert.equal(gitEnvOut.code, 0);
-    assert.ok(!gitEnvOut.stdout.includes("PA_FEISHU_WEB_KEY="), "git 子进程不得继承 PA_FEISHU_WEB_KEY");
-    assert.ok(!gitEnvOut.stdout.includes(`CREDENTIALS_DIRECTORY=${mixedCredDir}`), "git 子进程不得继承原始混合 CREDENTIALS_DIRECTORY");
-    delete process.env.CREDENTIALS_DIRECTORY;
+    if (hasCredentialMountIsolation()) {
+      process.env.CREDENTIALS_DIRECTORY = mixedCredDir;
+    }
+    try {
+      const gitEnvOut = await tryGit(gitRepo, ["-c", "alias.envdump=!env", "envdump"]);
+      assert.equal(gitEnvOut.code, 0);
+      assert.ok(!gitEnvOut.stdout.includes("PA_FEISHU_WEB_KEY="), "git 子进程不得继承 PA_FEISHU_WEB_KEY");
+      if (hasCredentialMountIsolation()) {
+        assert.ok(!gitEnvOut.stdout.includes(`CREDENTIALS_DIRECTORY=${mixedCredDir}`), "git 子进程不得继承原始混合 CREDENTIALS_DIRECTORY");
+      }
+    } finally {
+      delete process.env.CREDENTIALS_DIRECTORY;
+    }
 
     // 4) [R6 P2-18] syncFromRecords(preservePendingDelta=true) 保留未冲突的待落盘 Cookie 轮换
     const mergeJar = RecordingCookieJar.fromRecords(
@@ -4150,8 +4170,10 @@ data_dir: ${dir}
     const now = Date.now();
     const nowSec = Math.floor(now / 1000);
 
-    // 先验证 Dispatcher.runVerifyCommand 剥离 PA_FEISHU_WEB_KEY 与 CREDENTIALS_DIRECTORY
-    process.env.CREDENTIALS_DIRECTORY = mixedCredDir;
+    // 先验证 Dispatcher.runVerifyCommand 剥离 PA_FEISHU_WEB_KEY 与（宿主机支持挂载隔离时的）CREDENTIALS_DIRECTORY
+    if (hasCredentialMountIsolation()) {
+      process.env.CREDENTIALS_DIRECTORY = mixedCredDir;
+    }
     fs.mkdirSync(path.join(dir, "runs", "g_r6_ver"), { recursive: true });
     const dispatcher = new Dispatcher(app.cfg, app.ledger, app.store, app.board);
     app.ledger.enqueue({
@@ -4173,16 +4195,22 @@ data_dir: ${dir}
       },
     });
     const verifyWork = app.ledger.get("dispatch:r6-verify")!;
-    const checkRes = await (
-      dispatcher as unknown as {
-        runVerifyCommand(it: typeof verifyWork, ctx: { attempt: number; signal: AbortSignal }): Promise<{ status: string; detail: string }>;
-      }
-    ).runVerifyCommand(verifyWork, { attempt: 1, signal: new AbortController().signal });
-    delete process.env.CREDENTIALS_DIRECTORY;
+    let checkRes: { status: string; detail: string };
+    try {
+      checkRes = await (
+        dispatcher as unknown as {
+          runVerifyCommand(it: typeof verifyWork, ctx: { attempt: number; signal: AbortSignal }): Promise<{ status: string; detail: string }>;
+        }
+      ).runVerifyCommand(verifyWork, { attempt: 1, signal: new AbortController().signal });
+    } finally {
+      delete process.env.CREDENTIALS_DIRECTORY;
+    }
     assert.equal(checkRes.status, "pass", checkRes.detail);
     const verifyLog = fs.readFileSync(path.join(dir, "runs", "g_r6_ver", "verify-1-1.log"), "utf8");
     assert.ok(!verifyLog.includes("PA_FEISHU_WEB_KEY="), "verify 命令日志绝不能包含 PA_FEISHU_WEB_KEY");
-    assert.ok(!verifyLog.includes(`CREDENTIALS_DIRECTORY=${mixedCredDir}`), "verify 命令不得继承原始混合 CREDENTIALS_DIRECTORY");
+    if (hasCredentialMountIsolation()) {
+      assert.ok(!verifyLog.includes(`CREDENTIALS_DIRECTORY=${mixedCredDir}`), "verify 命令不得继承原始混合 CREDENTIALS_DIRECTORY");
+    }
 
     // 8) [R6 P2-13] commitWorkspaceLogin 原子加锁重验：首次登录成功后，并发第二个账号不得静默覆写；含无归属/旧账号观测时即使 forceSwitch 也拒绝
     const loginA = { owner_id: "7001", owner_name: "张三", cookies: baseCookies };
@@ -5565,7 +5593,7 @@ test("Codex 第八轮回归：挂载命名空间密钥隔离、草稿范围过�
   const mock = await startMockFeishuWebServer();
   let app: ReturnType<typeof createApp> | undefined;
   try {
-    // 1) [R8 P1-1] 挂载命名空间隔离 feishu-web-key：即使子进程按原 CREDENTIALS_DIRECTORY 绝对路径读取也读不到密钥，同时无关凭据仍可读；无隔离后端时 fail-closed
+    // 1) [R8 P1-1 + R9 P1-1 & P2-20] 无隔离后端时 fail-closed；unshare 回退强制要求 setpriv 永久降权；tryGit 禁用 hooks/external diff 同时保留正常内部 diff
     const isoCredDir = makeTmp("pa-r8-iso-creds-");
     const isoKeyFile = path.join(isoCredDir, "feishu-web-key");
     const isoOtherFile = path.join(isoCredDir, "other-service-token");
@@ -5576,33 +5604,31 @@ test("Codex 第八轮回归：挂载命名空间密钥隔离、草稿范围过�
       /bwrap|unshare|拒绝执行/,
       "无挂载命名空间后端时必须 fail-closed 拒绝启动子进程",
     );
-    const wrappedRead = wrapCredentialIsolatedCommand(
-      "sh",
-      ["-c", `cat "$1" 2>/dev/null || true; printf "|"; cat "$2" 2>/dev/null || true`, "_", isoKeyFile, isoOtherFile],
-      { CREDENTIALS_DIRECTORY: isoCredDir },
+    assert.throws(
+      () => wrapCredentialIsolatedCommand("sh", ["-c", "true"], { CREDENTIALS_DIRECTORY: isoCredDir }, { forceBackend: { kind: "unshare", bin: "unshare", setprivBin: "" } }),
+      /setpriv|拒绝执行/,
+      "unshare 回退缺少 setpriv 时必须拒绝执行",
     );
-    assert.equal(wrappedRead.isolated, true, "存在 feishu-web-key 时必须启用挂载命名空间遮罩");
-    const isoRes = await runProcess(wrappedRead.cmd, wrappedRead.args, { timeoutMs: 15_000 });
-    assert.equal(isoRes.code, 0, isoRes.stderr);
-    const [maskedKeyOut, otherOut] = isoRes.stdout.split("|");
-    assert.equal(maskedKeyOut, "", "子进程即使按绝对路径直接 cat CREDENTIALS_DIRECTORY/feishu-web-key 也绝不能读出密钥");
-    assert.equal(otherOut, "KEEP_OTHER_TOKEN_R8", "同目录内无关凭据应保持可读");
+    const unshareWrapped = wrapCredentialIsolatedCommand(
+      "sh",
+      ["-c", "true"],
+      { CREDENTIALS_DIRECTORY: isoCredDir },
+      { forceBackend: { kind: "unshare", bin: "unshare", setprivBin: "/usr/bin/setpriv" } },
+    );
+    assert.equal(unshareWrapped.isolated, true);
+    assert.ok(unshareWrapped.args.some((a) => a.includes("--bounding-set -all") && a.includes("--no-new-privs")), "unshare 回退必须通过 setpriv 永久剥离全部 capabilities");
+    assert.ok(unshareWrapped.args.includes("/usr/bin/setpriv"));
 
-    // tryGit 在 CREDENTIALS_DIRECTORY 存在 feishu-web-key 时同样自动隔离，且禁用仓库 hooks / external diff 同时保留正常内部 diff
+    // tryGit 禁用仓库 hooks / external diff 同时保留正常内部 diff（实际挂载命名空间集成测试已拆至下方按宿主机能力条件执行）
     const testRepo = makeTmp("pa-r8-git-");
-    process.env.CREDENTIALS_DIRECTORY = isoCredDir;
-    try {
-      assert.equal((await tryGit(testRepo, ["init", "-q"])).code, 0);
-      fs.writeFileSync(path.join(testRepo, "a.txt"), "line1\n");
-      assert.equal((await tryGit(testRepo, ["add", "a.txt"])).code, 0);
-      assert.equal((await tryGit(testRepo, ["commit", "-qm", "init"])).code, 0);
-      fs.writeFileSync(path.join(testRepo, "a.txt"), "line1\nline2\n");
-      const diffRes = await tryGit(testRepo, ["diff", "--no-color"]);
-      assert.equal(diffRes.code, 0, diffRes.stderr);
-      assert.match(diffRes.stdout, /\+line2/, "禁用 diff.external 后内部 diff 必须正常输出");
-    } finally {
-      delete process.env.CREDENTIALS_DIRECTORY;
-    }
+    assert.equal((await tryGit(testRepo, ["init", "-q"])).code, 0);
+    fs.writeFileSync(path.join(testRepo, "a.txt"), "line1\n");
+    assert.equal((await tryGit(testRepo, ["add", "a.txt"])).code, 0);
+    assert.equal((await tryGit(testRepo, ["commit", "-qm", "init"])).code, 0);
+    fs.writeFileSync(path.join(testRepo, "a.txt"), "line1\nline2\n");
+    const diffRes = await tryGit(testRepo, ["diff", "--no-color"]);
+    assert.equal(diffRes.code, 0, diffRes.stderr);
+    assert.match(diffRes.stdout, /\+line2/, "禁用 diff.external 后内部 diff 必须正常输出");
 
     // 2) [R8 P1-6, P1-7, P2-12, P2-13, P2-14] TOML 重复键拒绝、错误不含原始值、URL 含凭据拒绝、保留 cli_auth_credentials_store、点号供应商内联表编码
     assert.throws(
@@ -6294,6 +6320,659 @@ context:
       }
     } finally {
       await rotMock.close();
+    }
+  } finally {
+    if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevKey;
+    if (prevCredFile === undefined) delete process.env.PA_FEISHU_WEB_CRED_FILE;
+    else process.env.PA_FEISHU_WEB_CRED_FILE = prevCredFile;
+    if (prevCredDir === undefined) delete process.env.CREDENTIALS_DIRECTORY;
+    else process.env.CREDENTIALS_DIRECTORY = prevCredDir;
+    if (prevCtxDir === undefined) delete process.env.CTX_DIR;
+    else process.env.CTX_DIR = prevCtxDir;
+    app?.store.db.close();
+    await mock.close();
+  }
+});
+
+test(
+  "挂载命名空间密钥隔离集成测试（宿主机支持 bwrap / unshare+setpriv 时运行）",
+  { skip: !hasCredentialMountIsolation() },
+  async () => {
+    const prevCredDir = process.env.CREDENTIALS_DIRECTORY;
+    const isoCredDir = makeTmp("pa-r9-mount-creds-");
+    const isoKeyFile = path.join(isoCredDir, "feishu-web-key");
+    const isoOtherFile = path.join(isoCredDir, "other-service-token");
+    fs.writeFileSync(isoKeyFile, "SUPER_SECRET_FEISHU_KEY_R9", { mode: 0o400 });
+    fs.writeFileSync(isoOtherFile, "KEEP_OTHER_TOKEN_R9", { mode: 0o400 });
+    try {
+      // 1) 默认首选后端（bwrap）：遮罩 feishu-web-key、保留无关凭据、永久无特权无法 umount
+      const wrappedDefault = wrapCredentialIsolatedCommand(
+        "sh",
+        ["-c", `umount "$1" 2>/dev/null || true; cat "$1" 2>/dev/null || true; printf "|"; cat "$2" 2>/dev/null || true`, "_", isoKeyFile, isoOtherFile],
+        { CREDENTIALS_DIRECTORY: isoCredDir },
+      );
+      assert.equal(wrappedDefault.isolated, true);
+      const rDefault = await runProcess(wrappedDefault.cmd, wrappedDefault.args, { timeoutMs: 15_000 });
+      assert.equal(rDefault.code, 0, rDefault.stderr);
+      const [keyOut, otherOut] = rDefault.stdout.split("|");
+      assert.equal(keyOut, "", "子进程即使尝试 umount 后按绝对路径 cat feishu-web-key 也绝不能读出密钥");
+      assert.equal(otherOut, "KEEP_OTHER_TOKEN_R9", "同目录无关凭据保持可读");
+
+      // 2) 若宿主机同时具备 unshare + setpriv：验证回退路径同样彻底剥离挂载权限（CapEff=0, 无法 umount）
+      const probeSetpriv = await runProcess("unshare", ["-r", "-m", "--", "setpriv", "--bounding-set", "-all", "--inh-caps", "-all", "--ambient-caps", "-all", "--no-new-privs", "true"], { timeoutMs: 5_000 });
+      if (probeSetpriv.code === 0) {
+        const wrappedUnshare = wrapCredentialIsolatedCommand(
+          "sh",
+          ["-c", `umount "$1" 2>/dev/null || true; cat "$1" 2>/dev/null || true; printf "|"; grep -E "^CapEff:" /proc/self/status`, "_", isoKeyFile],
+          { CREDENTIALS_DIRECTORY: isoCredDir },
+          { forceBackend: { kind: "unshare", bin: "unshare", setprivBin: "setpriv" } },
+        );
+        const rUnshare = await runProcess(wrappedUnshare.cmd, wrappedUnshare.args, { timeoutMs: 15_000 });
+        assert.equal(rUnshare.code, 0, rUnshare.stderr);
+        const [uKeyOut, capLine] = rUnshare.stdout.split("|");
+        assert.equal(uKeyOut, "", "unshare+setpriv 回退下子进程无法 umount 遮罩且读不到 feishu-web-key");
+        assert.match(capLine ?? "", /0000000000000000/, "unshare+setpriv 回退下 CapEff 必须为全 0");
+      }
+
+      // 3) tryGit 在 CREDENTIALS_DIRECTORY 包含 feishu-web-key 时自动隔离且正常执行 git
+      const gitRepo = makeTmp("pa-r9-mount-git-");
+      process.env.CREDENTIALS_DIRECTORY = isoCredDir;
+      assert.equal((await tryGit(gitRepo, ["init", "-q"])).code, 0);
+      fs.writeFileSync(path.join(gitRepo, "f.txt"), "v1\n");
+      assert.equal((await tryGit(gitRepo, ["add", "f.txt"])).code, 0);
+      assert.equal((await tryGit(gitRepo, ["commit", "-qm", "init"])).code, 0);
+    } finally {
+      if (prevCredDir === undefined) delete process.env.CREDENTIALS_DIRECTORY;
+      else process.env.CREDENTIALS_DIRECTORY = prevCredDir;
+    }
+  },
+);
+
+test("Codex 第九轮回归：跨路径 web-logout 吊销、换主人全库干净校验、手动起草排除复检、纯 GUID 委派归属、派单卡片与 worker/交付/用量/失败审计主人隔离、白名单机器人 @我、动态文档/妙记开关、连续排除变更暂缓 ACK、Codex 0.169 白名单与多行内联表、Git LFS 推送保护、本地轮换不重置拒登计数与群名增量合并", async () => {
+  const prevKey = process.env.PA_FEISHU_WEB_KEY;
+  const prevCredFile = process.env.PA_FEISHU_WEB_CRED_FILE;
+  const prevCredDir = process.env.CREDENTIALS_DIRECTORY;
+  const prevCtxDir = process.env.CTX_DIR;
+  process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
+  delete process.env.PA_FEISHU_WEB_CRED_FILE;
+  delete process.env.CREDENTIALS_DIRECTORY;
+
+  const mock = await startMockFeishuWebServer();
+  let app: ReturnType<typeof createApp> | undefined;
+  try {
+    // 1) [R9 P2-13 & P2-14] Codex 0.169 内置供应商（ollama/lmstudio 接受、oss 拒绝）、凭据存储（ephemeral 接受）与多行带尾逗号 TOML 1.1 内联表
+    const tomlHome = makeTmp("pa-r9-codex-");
+    fs.writeFileSync(path.join(tomlHome, "config.toml"), 'model_provider = "ollama"\ncli_auth_credentials_store = "ephemeral"\n');
+    const ollamaCfg = extractSafeCodexProviderConfig({ CODEX_HOME: tomlHome }, [], false);
+    assert.ok(ollamaCfg.args.includes('model_provider="ollama"'), "内置 ollama 无需 [model_providers.ollama] 表即可通过");
+    assert.ok(ollamaCfg.args.includes('cli_auth_credentials_store="ephemeral"'), "必须保留 cli_auth_credentials_store=ephemeral");
+
+    fs.writeFileSync(path.join(tomlHome, "config.toml"), 'model_provider = "lmstudio"\n');
+    assert.ok(extractSafeCodexProviderConfig({ CODEX_HOME: tomlHome }, [], false).args.includes('model_provider="lmstudio"'), "内置 lmstudio 无需供应商表即可通过");
+
+    fs.writeFileSync(path.join(tomlHome, "config.toml"), 'model_provider = "oss"\n');
+    assert.throws(() => extractSafeCodexProviderConfig({ CODEX_HOME: tomlHome }, [], false), /oss/, "Codex 0.169 不接受无表定义的 model_provider=oss");
+
+    const multilineToml = [
+      'model_provider = "corp_ml"',
+      "model_providers = {",
+      "  # TOML 1.1 多行内联表与末尾逗号",
+      "  corp_ml = {",
+      '    name = "Multiline GW",',
+      '    base_url = "https://ml.corp.internal/v1",',
+      '    http_headers = {',
+      '      Authorization = "Bearer ml-secret-r9",',
+      "    },",
+      "  },",
+      "}",
+    ].join("\n");
+    fs.writeFileSync(path.join(tomlHome, "config.toml"), multilineToml);
+    const parsedMl = parseToml(multilineToml);
+    assert.equal(((parsedMl.model_providers as Record<string, Record<string, unknown>>).corp_ml).name, "Multiline GW");
+    const mlCfg = extractSafeCodexProviderConfig({ CODEX_HOME: tomlHome }, [], false);
+    assert.ok(mlCfg.args.includes('model_provider="corp_ml"'));
+    assert.ok(Object.values(mlCfg.extraEnv).includes("Bearer ml-secret-r9"));
+    assert.ok(!mlCfg.args.some((a) => a.includes("ml-secret-r9")));
+
+    // 2) [R9 P2-15] Git LFS 交付保护：禁用仓库 hooks 仍能识别 filter=lfs，且在 git-lfs 不可用/失败时中止推送而非推悬空指针
+    const lfsRepo = makeTmp("pa-r9-lfs-");
+    const lfsBare = makeTmp("pa-r9-lfs-bare-");
+    assert.equal((await tryGit(lfsBare, ["init", "--bare", "-q"])).code, 0);
+    assert.equal((await tryGit(lfsRepo, ["init", "-q"])).code, 0);
+    assert.equal((await tryGit(lfsRepo, ["checkout", "-qb", "pa/r9-lfs"])).code, 0);
+    fs.writeFileSync(path.join(lfsRepo, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+    fs.writeFileSync(path.join(lfsRepo, "weights.bin"), "fake-lfs-pointer-content\n");
+    assert.equal((await tryGit(lfsRepo, ["add", ".gitattributes", "weights.bin"])).code, 0);
+    assert.equal((await tryGit(lfsRepo, ["commit", "-qm", "add lfs file"])).code, 0);
+    assert.equal((await tryGit(lfsRepo, ["remote", "add", "origin", lfsBare])).code, 0);
+    assert.equal(await branchUsesGitLfs(lfsRepo, "pa/r9-lfs"), true, "必须通过 git check-attr 识别 LFS 跟踪文件");
+    // 放一个会写标志文件的恶意 pre-push hook，验证它绝不被执行；同时先验证 LFS 上传失败时阻断推送（不推悬空指针），再验证可用 LFS 端点时受信任上传成功
+    const hookMarker = path.join(lfsRepo, "hook-ran.txt");
+    fs.writeFileSync(path.join(lfsRepo, ".git", "hooks", "pre-push"), `#!/bin/sh\necho pwned > ${JSON.stringify(hookMarker)}\nexit 0\n`, { mode: 0o755 });
+    assert.equal((await tryGit(lfsRepo, ["config", "lfs.url", "http://127.0.0.1:1/unreachable-lfs"])).code, 0);
+    const lfsFailRes = await pushBranch(lfsRepo, "origin", "pa/r9-lfs");
+    assert.equal(fs.existsSync(hookMarker), false, "仓库 pre-push hook 绝不能被执行");
+    assert.equal(lfsFailRes.ok, false, "LFS 上传失败时必须阻止普通 git push");
+    if (!lfsFailRes.ok) {
+      assert.match(lfsFailRes.message, /Git LFS/, "错误信息应明确提示 Git LFS 上传失败");
+    }
+    const bareRefsAfterFail = (await tryGit(lfsBare, ["branch", "-a"])).stdout.trim();
+    assert.equal(bareRefsAfterFail, "", "LFS 上传失败后绝不能把悬空分支推上远端");
+    // 撤销失效 lfs.url：若宿主机装有 git-lfs，验证受信任的 git lfs push + git push 完整成功且仓库 hook 依然未执行
+    assert.equal((await tryGit(lfsRepo, ["config", "--unset", "lfs.url"])).code, 0);
+    const hasGitLfs = (await runProcess("git", ["lfs", "version"], { timeoutMs: 3_000 })).code === 0;
+    if (hasGitLfs) {
+      const lfsOkRes = await pushBranch(lfsRepo, "origin", "pa/r9-lfs");
+      assert.equal(lfsOkRes.ok, true, `宿主机具备 git-lfs 时应在不跑仓库 hooks 的前提下完成 LFS 上传并推送：${!lfsOkRes.ok ? lfsOkRes.message : ""}`);
+      assert.equal(fs.existsSync(hookMarker), false, "LFS 推送成功期间仓库 pre-push hook 依然绝不被执行");
+      assert.match((await tryGit(lfsBare, ["branch", "-a"])).stdout, /pa\/r9-lfs/);
+    }
+
+    // 3) 搭建完整 Working Context 测试环境
+    const dir = makeTmp("pa-r9-ctx-");
+    const ctxDir = makeTmp("pa-r9-lark-");
+    process.env.CTX_DIR = ctxDir;
+    const callsLog = path.join(dir, "calls.log");
+    const harnessScript = path.join(dir, "fake-r9-harness.mjs");
+    const gateFlagFile = path.join(dir, "r9-gate.flag");
+    const enteredFlagFile = path.join(dir, "r9-entered.flag");
+    const responseJsonFile = path.join(dir, "r9-response.json");
+    fs.writeFileSync(responseJsonFile, JSON.stringify({ projects: [], items: [], knowledge: [], updates: [], people: [], conflicts: [] }));
+    fs.writeFileSync(
+      harnessScript,
+      `#!/usr/bin/env node
+import fs from "node:fs";
+const prompt = fs.readFileSync(0, "utf8");
+fs.appendFileSync(${JSON.stringify(callsLog)}, JSON.stringify({ prompt }) + "\\n");
+if (fs.existsSync(${JSON.stringify(gateFlagFile)})) {
+  fs.writeFileSync(${JSON.stringify(enteredFlagFile)}, "1");
+  const deadline = Date.now() + 8000;
+  while (fs.existsSync(${JSON.stringify(gateFlagFile)}) && Date.now() < deadline) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+}
+if (prompt.includes("草稿") || prompt.includes("答复或进展")) {
+  process.stdout.write("收到，我这边处理。\\n");
+} else {
+  process.stdout.write(fs.readFileSync(${JSON.stringify(responseJsonFile)}, "utf8") + "\\n");
+}
+`,
+      { mode: 0o755 },
+    );
+    const cfgFile = path.join(dir, "config.yaml");
+    fs.writeFileSync(
+      cfgFile,
+      `
+data_dir: ${dir}
+bins:
+  lark: ${path.join(STUBS, "ctx-lark")}
+  bytedcli: ${path.join(STUBS, "ctx-bytedcli")}
+owner:
+  open_id: ou_owner_a
+harnesses:
+  mock_ctx:
+    type: codex-exec
+    cmd: ${harnessScript}
+roles:
+  brain: mock_ctx
+cards:
+  enabled: true
+context:
+  enabled: true
+  harness: mock_ctx
+  groups: allowlist
+  max_groups: 5
+  groups_allow: []
+  groups_deny: []
+  bot_allow: ["MeegoBot"]
+  sources:
+    meego: false
+    tasks: false
+    im: true
+    minutes: true
+    calendar: false
+    docs: true
+  personal_web:
+    enabled: true
+    fast_lane: true
+    pre_draft: false
+    send_replies: true
+    debounce_ms: 0
+`,
+    );
+    app = createApp(loadConfig(cfgFile));
+    const svc = new ContextService(app);
+    const now = Date.now();
+    const nowSec = Math.floor(now / 1000);
+    fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner_a", user_name: "张三" }));
+
+    // 4) [R9 P1-3] 变更工作区主人时必须确保整个上下文库干净（即便库里零 pw:* 行，只有轮询来的 im:* / 草稿 / 事项，也绝不允许换主人重绑）
+    svc.store.addObs([
+      {
+        id: "im:r9_polled_dm_a",
+        source: "im",
+        kind: "p2p",
+        conv: "oc_r9_dm_a",
+        conv_name: "私聊：王五",
+        actor_id: "ou_ww",
+        actor_name: "王五",
+        is_me: false,
+        time: now - 5_000,
+        text: "主人A的轮询私聊机密",
+        url: "",
+        meta: { chat_type: "p2p" },
+      },
+    ]);
+    assert.equal(hasExistingOwnerContextState(app), true);
+    app.store.set(BOUND_OWNER_KV_KEY, "7001");
+    app.store.set(BOUND_WORKSPACE_OWNER_KV_KEY, "ou_owner_a");
+    app.cfg.owner.open_id = "ou_owner_b";
+    const rebindLogin = {
+      owner_id: "7002",
+      owner_name: "李四",
+      session_id: "sess_r9_rebind_b",
+      cookie_version: 1,
+      cookies: [{ name: "session", value: "b_cookie", domain: "internal-api-lark-api.feishu.cn", path: "/" }],
+      updated_at: new Date().toISOString(),
+    };
+    await assert.rejects(
+      () => verifyWorkspaceOwnerBinding(app!, rebindLogin, { forceSwitch: true, allowNameMismatch: true, allowUnverifiedOwner: true }),
+      /历史上下文|数据目录|全新的 data_dir/,
+      "存在主人A的轮询私聊（即使无 pw:* 观测）时，verifyWorkspaceOwnerBinding 必须拒绝切到主人B",
+    );
+    assert.throws(
+      () => commitWorkspaceLogin(app!, rebindLogin, { forceSwitch: true, allowUnverifiedOwner: true }),
+      /历史上下文|数据目录|全新的 data_dir/,
+      "commitWorkspaceLogin 同样必须拒绝在非空上下文库上切换工作区主人",
+    );
+    // 即使只改工作区主人而保持同一原生 ID（7001），非空上下文库也必须拒绝重绑
+    assert.throws(
+      () => commitWorkspaceLogin(app!, { ...rebindLogin, owner_id: "7001", owner_name: "张三" }, { allowUnverifiedOwner: true }),
+      /工作区主人|非空|全新的 data_dir/,
+    );
+    app.cfg.owner.open_id = "ou_owner_a";
+
+    // 正常为主人 A 绑定登录
+    const customDaemonCred = path.join(dir, "daemon-custom-r9.json");
+    process.env.PA_FEISHU_WEB_CRED_FILE = customDaemonCred;
+    const daemonSavedLogin = commitWorkspaceLogin(
+      app,
+      {
+        owner_id: "7001",
+        owner_name: "张三",
+        session_id: "sess_r9_daemon_custom",
+        cookie_version: 1,
+        cookies: [{ name: "session", value: "valid_cookie", domain: "internal-api-lark-api.feishu.cn", path: "/" }],
+        updated_at: new Date().toISOString(),
+      },
+      { allowUnverifiedOwner: true },
+    );
+    const daemonBridge = new PersonalWebBridge(app, svc.store, {
+      onFastTrigger: () => undefined,
+      onReconnect: () => undefined,
+      onNeedsLogin: () => undefined,
+      credentialWatchIntervalMs: 30,
+      clientOptions: { endpoints: mock.endpoints },
+    });
+    const daemonHandle = daemonBridge.start();
+    try {
+      await waitUntil(() => daemonBridge.status().state === "listening", 4_000);
+      // 5) [R9 P1-2] 交互 shell 未设 PA_FEISHU_WEB_CRED_FILE（指向默认文件）执行 web-logout：仍必须立刻吊销使用自定义文件的常驻会话与发送能力！
+      delete process.env.PA_FEISHU_WEB_CRED_FILE;
+      const logoutRes = revokeWorkspacePersonalWebSession(app);
+      assert.equal(logoutRes.fileRemoved, false, "默认路径本无文件，但工作区级吊销标记仍已写入");
+      assert.ok(app.store.get(REVOKED_AT_KV_KEY), "必须持久化工作区吊销标记");
+      await waitUntil(() => daemonBridge.status().state === "needs_login", 4_000);
+      assert.equal(daemonBridge.status().logged_in, false, "吊销后 status() 必须报告未登录");
+      // 发送也必须立即被拒（即使自定义路径凭据文件仍在磁盘上）
+      await assert.rejects(
+        () => daemonBridge.sendVerifiedReply({ owner_id: "7001", chat_id: "9901", message_id: "m_revoked", text: "不应发出", cid: "cid_r9_revoked" }),
+        /吊销|web-logout/,
+        "跨路径 web-logout 后常驻进程绝不能继续发送 pw.reply",
+      );
+      // 即使之后在默认路径重新 web-login（清除了全局 revoked_at），旧自定义路径里的已吊销 session_id 也必须继续被拒！
+      commitWorkspaceLogin(
+        app,
+        {
+          owner_id: "7001",
+          owner_name: "张三",
+          session_id: "sess_r9_new_default",
+          cookie_version: 1,
+          cookies: [{ name: "session", value: "new_cookie", domain: "internal-api-lark-api.feishu.cn", path: "/" }],
+          updated_at: new Date().toISOString(),
+        },
+        { allowUnverifiedOwner: true },
+      );
+      await assert.rejects(
+        () => daemonBridge.sendVerifiedReply({ owner_id: "7001", chat_id: "9901", message_id: "m_revoked2", text: "旧会话不应复活", cid: "cid_r9_revoked2" }),
+        /已.*吊销|重新运行/,
+        "旧自定义凭据文件中已吊销的 session_id 绝不能在新路径重登后复活",
+      );
+      assert.equal(daemonSavedLogin.session_id, "sess_r9_daemon_custom");
+    } finally {
+      daemonHandle.stop();
+      delete process.env.PA_FEISHU_WEB_CRED_FILE;
+    }
+
+    // 6) [R9 P1-4] 手动起草回复前完整复核会话排除/静音规则（包括 DM）：静音 DM 后手动 drafter.forItem 必须拒绝且不调模型
+    const { item: dmDraftItem } = svc.store.upsertItem({ title: "回复王五私聊", kind: "ask_me", priority: "high", source: "im" });
+    svc.store.addEvidence("item", dmDraftItem.id, "im:r9_polled_dm_a", "主人A的轮询私聊机密", now - 5_000);
+    svc.store.muteConv("oc_r9_dm_a", "私聊：王五", true);
+    fs.writeFileSync(callsLog, "");
+    await assert.rejects(
+      () => svc.drafter.forItem(dmDraftItem.id, "reply"),
+      /静音|排除/,
+      "静音私聊后手动起草回复必须在调用模型前被拦截",
+    );
+    assert.equal(fs.readFileSync(callsLog, "utf8").trim(), "", "被排除的手动草稿绝不能向模型发送任何私聊消息");
+    svc.store.muteConv("oc_r9_dm_a", "", false);
+
+    // 7) [R9 P2-10] 白名单机器人（kind="bot"）在范围外群 @我：必须记录 meta.at_me=true 并通过 SQL 预筛与范围过滤
+    const origLarkRun = app.lark.run.bind(app.lark);
+    app.lark.run = async (args: string[], opts?: Parameters<typeof origLarkRun>[1]) => {
+      if (args[0] === "im" && args[1] === "+messages-search") {
+        if (args.includes("--is-at-me")) {
+          return {
+            messages: [
+              {
+                message_id: "om_r9_bot_atme",
+                chat_id: "oc_r9_out_group",
+                chat_name: "范围外机器人群",
+                chat_type: "group",
+                create_time: String(nowSec),
+                sender: { id: "cli_meego", name: "MeegoBot", sender_type: "app" },
+                content: "@张三 你的需求流转到待验收",
+              },
+            ],
+          };
+        }
+        return { messages: [] };
+      }
+      return origLarkRun(args, opts);
+    };
+    try {
+      await svc.connectors.pullIm();
+    } finally {
+      app.lark.run = origLarkRun;
+    }
+    const botMentionObs = svc.store.obs("im:om_r9_bot_atme");
+    assert.ok(botMentionObs, "白名单机器人的 @我 消息应正常入库");
+    assert.equal(botMentionObs!.kind, "bot");
+    assert.equal(botMentionObs!.meta.at_me, true, "白名单机器人 @我 必须独立保存 meta.at_me=true");
+    const onlyMentionWin = svc.store.convWindow("oc_r9_out_group", 60, 12, null, { onlyMentions: true });
+    assert.deepEqual(onlyMentionWin.map((o) => o.id), ["im:om_r9_bot_atme"], "SQL onlyMentions 预筛必须保留白名单机器人的真实 @我");
+    assert.deepEqual(
+      svc.personalWeb.filterWindowByCurrentScope("oc_r9_out_group", [botMentionObs!]).map((o) => o.id),
+      ["im:om_r9_bot_atme"],
+      "filterWindowByCurrentScope 必须保留白名单机器人的真实 @我",
+    );
+    svc.store.markProcessed(["im:om_r9_bot_atme", "im:r9_polled_dm_a"]);
+
+    // 8) [R9 P2-11] 周期中途关闭 docs / minutes 来源开关：推理中途关闭 minutes 后本批被拒，且同周期后续批次不再选择已停用来源
+    svc.store.addObs([
+      {
+        id: "minutes:r9_min_1",
+        source: "minutes",
+        kind: "minutes",
+        conv: "minutes:r9_min_1",
+        conv_name: "会议：周会",
+        actor_id: "",
+        actor_name: "智能纪要",
+        is_me: false,
+        time: now - 2_000,
+        text: "机密会议纪要内容",
+        url: "",
+        meta: {},
+      },
+      {
+        id: "doc:r9_doc_1",
+        source: "doc",
+        kind: "doc_comment",
+        conv: "doc:https://feishu.cn/docx/r9",
+        conv_name: "文档评论",
+        actor_id: "",
+        actor_name: "文档评论@我",
+        is_me: false,
+        time: now - 1_000,
+        text: "机密文档评论内容",
+        url: "",
+        meta: {},
+      },
+    ]);
+    app.cfg.context.sources.im = false;
+    fs.writeFileSync(
+      responseJsonFile,
+      JSON.stringify({
+        projects: [],
+        items: [{ title: "会议待办", kind: "meeting_action", priority: "high", evidence: [{ obs_id: "minutes:r9_min_1", quote: "机密会议纪要" }] }],
+        knowledge: [],
+        updates: [],
+        people: [],
+        conflicts: [],
+      }),
+    );
+    fs.writeFileSync(gateFlagFile, "hold");
+    fs.rmSync(enteredFlagFile, { force: true });
+    // 将 max_convs_per_cycle 设为 2、并行 1，推理第一批中途同时关闭 minutes 和 docs
+    const prevMaxConvs = app.cfg.context.max_convs_per_cycle;
+    app.cfg.context.max_convs_per_cycle = 2;
+    const srcCycleP = svc.cycle("work:r9-sources-mid-off");
+    await waitUntil(() => fs.existsSync(enteredFlagFile), 5_000);
+    app.cfg.context.sources.minutes = false;
+    app.cfg.context.sources.docs = false;
+    fs.rmSync(gateFlagFile, { force: true });
+    const srcRep = await srcCycleP;
+    app.cfg.context.max_convs_per_cycle = prevMaxConvs;
+    app.cfg.context.sources.im = true;
+    assert.equal(srcRep.created, 0, "推理中途停用 minutes/docs 后绝不能提交结果");
+    assert.equal(svc.store.obsPending("minutes:r9_min_1"), true);
+    assert.equal(svc.store.obsPending("doc:r9_doc_1"), true);
+    svc.store.markProcessed(["minutes:r9_min_1", "doc:r9_doc_1"]);
+
+    // 9) [R9 P2-12] handleMessage 在排除规则连续变更两次时必须抛出可重试错误暂缓 ACK（绝不返回 undefined 误确认丢消息）
+    fs.writeFileSync(
+      path.join(ctxDir, "lark.json"),
+      JSON.stringify({
+        user_open_id: "ou_owner_a",
+        user_name: "张三",
+        chat_meta: {
+          oc_r9_unrelated_1: { name: "无关群1", chat_mode: "group" },
+          oc_r9_unrelated_2: { name: "无关群2", chat_mode: "group" },
+        },
+      }),
+    );
+    const clientA = await FeishuWebClient.connect(svc.personalWeb.loginStore.load()!, {
+      endpoints: mock.endpoints,
+      onSessionConfirmed: (u, d) => svc.personalWeb.loginStore.saveIfSessionMatches(u, d),
+    });
+    const origEvalExcl = (svc.personalWeb as unknown as { evaluateChatExclusion: (...a: unknown[]) => Promise<boolean> }).evaluateChatExclusion.bind(svc.personalWeb);
+    let evalCalls = 0;
+    (svc.personalWeb as unknown as { evaluateChatExclusion: (...a: unknown[]) => Promise<boolean> }).evaluateChatExclusion = async (...args: unknown[]) => {
+      evalCalls++;
+      const res = await origEvalExcl(...args);
+      // 第一次与第二次排除查询期间都变更无关的 oc_* 静音集合
+      svc.store.muteConv(`oc_r9_unrelated_${evalCalls}`, "无关群", true);
+      return res;
+    };
+    const doubleFlipBuf = buildNativeMessage({ id: "r9_double_flip", chatId: "9902", chatKind: CHAT_KIND_P2P, actorId: "7002", createdAtSec: nowSec, text: "不能被误 ACK 丢掉的私聊" });
+    mock.addMessage("r9_double_flip", doubleFlipBuf);
+    mock.setChatKind("9902", CHAT_KIND_P2P);
+    try {
+      await assert.rejects(
+        () => svc.personalWeb.handleMessage(decodeMessage(doubleFlipBuf, "7001"), clientA),
+        /暂缓 ACK|连续变化/,
+        "排除规则连续变化两次时必须抛错暂缓 ACK，防止 handlePush 误确认丢消息",
+      );
+    } finally {
+      (svc.personalWeb as unknown as { evaluateChatExclusion: (...a: unknown[]) => Promise<boolean> }).evaluateChatExclusion = origEvalExcl;
+      svc.store.muteConv("oc_r9_unrelated_1", "", false);
+      svc.store.muteConv("oc_r9_unrelated_2", "", false);
+    }
+
+    // 10) [R9 P2-17] pullIm 仅合并本轮增量学到的群名，绝不覆盖在线监听在轮询等待期间刚刷新的群名
+    rememberOpenGroupName(app.store, "oc_r9_live_renamed", "旧名称");
+    const origLarkMerge = app.lark.run.bind(app.lark);
+    app.lark.run = async (args: string[], opts?: Parameters<typeof origLarkMerge>[1]) => {
+      if (args[0] === "im" && args[1] === "+messages-search") {
+        // 模拟轮询 await Feishu 期间，在线监听刷新了 oc_r9_live_renamed 的群名
+        rememberOpenGroupName(app!.store, "oc_r9_live_renamed", "实时监听刷新后的新名称");
+        return { messages: [] };
+      }
+      return origLarkMerge(args, opts);
+    };
+    try {
+      await svc.connectors.pullIm();
+    } finally {
+      app.lark.run = origLarkMerge;
+    }
+    assert.equal(
+      loadKnownOpenGroupNames(app.store).oc_r9_live_renamed,
+      "实时监听刷新后的新名称",
+      "pullIm 提交不得用轮询前快照把在线监听刷新后的群名写回旧名称",
+    );
+
+    // 11) [R9 P1-5, P1-6, P1-7, P1-8, P2-9] 纯 GUID 委派归属、失败委派审计隔离、派单卡片投递隔离、worker/交付恢复重检、用量 top_tasks 隔离
+    const origCreateTask = app.board.createTask.bind(app.board);
+    const origReconcile = app.dispatcher.reconcile.bind(app.dispatcher);
+    // 11a) 失败的 context.item_delegate -> dispatch.create 失败（无派单 ID）：审计项通过 __context_owner 保留隔离
+    const { item: secretItem } = svc.store.upsertItem({ title: "主人A绝密收购方案", kind: "ask_me", priority: "high", source: "im" });
+    app.board.createTask = async () => {
+      throw new Error("看板接口临时报错");
+    };
+    await assert.rejects(() => app!.commands.exec("context.item_delegate", { id: secretItem.id }, { source: "web", actor: "owner" }));
+
+    // 11b) 成功的 context.item_delegate，但 reconcile 尚未创建 work（dispatch.create 仅返回纯任务 GUID）
+    const delayedGuid = "guid_r9_delayed_only";
+    app.board.createTask = async () => delayedGuid;
+    app.dispatcher.reconcile = async () => ({ enqueued: 0, cancelled: 0, deferred: 0 });
+    try {
+      const delGuidRes = await app.commands.exec("context.item_delegate", { id: secretItem.id }, { source: "web", actor: "owner" });
+      assert.equal(delGuidRes.target, delayedGuid, "模拟 reconcile 未即时建 work 时返回纯任务 GUID");
+    } finally {
+      app.board.createTask = origCreateTask;
+      app.dispatcher.reconcile = origReconcile;
+    }
+    // 稍后 reconcile 才真正创建 dispatch:<guid>:1，同时产生步骤花费、派单卡片、交付任务与排队中的派单任务
+    const delayedDispatchId = `dispatch:${delayedGuid}:1`;
+    app.ledger.enqueue({
+      id: delayedDispatchId,
+      kind: "dispatch",
+      ref: delayedGuid,
+      state: "queued",
+      payload: { guid: delayedGuid, summary: "主人A绝密收购方案", description: "来自私聊证据", harness: "mock_ctx", reviewer: "", verify: "", cwd: "", branch: "pa/r9-sec", base: "", round: 1, maxRounds: 1, checkpoints: {}, report: "", feedback: "", history: [] },
+    });
+    const costStepId = app.ledger.startStep({ work_id: delayedDispatchId, name: "worker#1", harness: "mock_ctx" });
+    app.ledger.endStep(costStepId, "ok", "done");
+    app.ledger.setStepUsage(costStepId, { tokens_in: 5000, tokens_out: 1000, cost_usd: 0.42 });
+
+    // 切到主人 B 后验证全部 5 条路径都被严格隔离！
+    app.cfg.owner.open_id = "ou_owner_b";
+    try {
+      // (a) 失败的 dispatch.create 嵌套审计条不得向主人 B 暴露私密标题
+      const auditForB = Q.auditViews(app, undefined, 100);
+      assert.ok(!auditForB.some((a) => a.target.includes("绝密收购方案") || a.message.includes("绝密收购方案")), "失败的委派内部 dispatch.create 审计必须对新主人隐藏");
+
+      // (b) 纯 GUID 延迟创建的 dispatch:<guid>:1 必须被识别为旧主人上下文派单
+      assert.equal(Q.isContextDerivedDispatchBlocked(app, delayedDispatchId), true, "仅凭任务 GUID 写入的 ctx.dispatch_ref_owner 必须拦截后续创建的 dispatch work");
+      assert.ok(!Q.listDispatches(app, {}).some((d) => d.id === delayedDispatchId));
+      await assert.rejects(() => Q.dispatchDetail(app!, delayedDispatchId), /主人隔离|阻断/);
+
+      // (c) /api/usage 的 top_tasks 不得暴露旧主人上下文派单标题与 ID，但总花费仍准确
+      const usageForB = usageSummary(app, 7);
+      assert.ok(usageForB.total_usd >= 0.42, "聚合总花费不受影响");
+      assert.ok(!usageForB.top_tasks.some((t) => t.dispatch_id === delayedDispatchId || t.summary.includes("绝密收购方案")), "top_tasks 绝不能向新主人暴露旧主人的上下文派单标题");
+
+      // (d) 派单卡片（card:dispatch:<guid>）投递前按原始归属主人拦截，绝不发给主人 B
+      let cardSentToB = false;
+      const origLarkCard = app.lark.run.bind(app.lark);
+      app.lark.run = async (...args: Parameters<typeof origLarkCard>) => {
+        cardSentToB = true;
+        return origLarkCard(...args);
+      };
+      try {
+        const fxHandler = effectHandler(app.cfg, app.ledger, app.board, app.lark, app.store, app.effectHooks);
+        app.ledger.enqueue({
+          id: "fx:r9-card-dispatch-guid",
+          kind: "effect",
+          ref: `card:dispatch:${delayedGuid}`,
+          state: "pending",
+          payload: { op: "card.upsert", args: { key: `dispatch:${delayedGuid}`, card: { header: { title: { content: "主人A绝密收购方案" } } } } },
+        });
+        const cardItem = app.ledger.claim("effect", 30_000)!;
+        await assert.rejects(() => fxHandler.run(cardItem as never, { signal: new AbortController().signal, attempt: 1 }), /主人隔离|阻断/);
+        assert.equal(cardSentToB, false, "旧主人上下文派单卡片绝不能投递给新主人 B");
+      } finally {
+        app.lark.run = origLarkCard;
+      }
+
+      // (e) 恢复执行中的 dispatch worker 与 delivery worker（create_pr）必须在任何外部动作前按主人隔离中止
+      const dispClaimed = app.ledger.claim("dispatch", 30_000)!;
+      assert.equal(dispClaimed.id, delayedDispatchId);
+      await app.dispatcher.advance(dispClaimed as never, { signal: new AbortController().signal, attempt: 1 });
+      const dispAfter = app.ledger.get(delayedDispatchId)!;
+      assert.equal(dispAfter.state, "errored");
+      assert.equal(dispAfter.reason, "owner_isolated", "dispatch worker 恢复旧主人上下文派单时必须按主人隔离中止");
+
+      const deliveryId = `delivery:${delayedDispatchId}:create_pr:${now}`;
+      app.ledger.enqueue({
+        id: deliveryId,
+        kind: "delivery",
+        ref: delayedDispatchId,
+        state: "pending",
+        payload: { action: "create_pr", dispatch_id: delayedDispatchId, guid: delayedGuid },
+      });
+      await app.engine.drain(["delivery"]);
+      const delAfter = app.ledger.get(deliveryId)!;
+      assert.equal(delAfter.state, "errored");
+      assert.match(delAfter.error, /主人隔离/, "delivery worker 恢复旧主人上下文交付任务时必须按主人隔离中止");
+    } finally {
+      app.cfg.owner.open_id = "ou_owner_a";
+    }
+
+    // 12) [R9 P2-16] 本地 verifyOwner 轮换 Cookie 后若 metadata 返回 401：绝不能把自身轮换当成外部新凭据而清零 connectDenials，3 次后必须进入 needs_login
+    const denialBridge = new PersonalWebBridge(app, svc.store, {
+      onFastTrigger: () => undefined,
+      onReconnect: () => undefined,
+      onNeedsLogin: () => undefined,
+      credentialWatchIntervalMs: 30,
+      clientOptions: { endpoints: mock.endpoints },
+    });
+    denialBridge.loginStore.save({
+      owner_id: "7001",
+      owner_name: "张三",
+      session_id: "sess_r9_denial_loop",
+      cookie_version: 1,
+      cookies: [{ name: "session", value: "v1", domain: "internal-api-lark-api.feishu.cn", path: "/" }],
+      updated_at: new Date().toISOString(),
+    });
+    const origConnectDenial = FeishuWebClient.connect;
+    const origSetTimeout = globalThis.setTimeout;
+    let denialAttempts = 0;
+    // 仅把 runSupervisor 的 30s reverifying 退避压缩到 5ms 便于测试精确验证 3 次拒登收敛
+    globalThis.setTimeout = ((fn: (...a: unknown[]) => void, ms?: number, ...rest: unknown[]) =>
+      origSetTimeout(fn, ms === 30_000 ? 5 : ms, ...rest)) as typeof setTimeout;
+    FeishuWebClient.connect = async (loginArg, opts) => {
+      denialAttempts++;
+      // 模拟每次 connect 时 verifyOwner 都通过 onSessionConfirmed 落盘了新 cookie_version，随后 metadata 返回 401 credential_denied
+      opts?.onSessionConfirmed?.(
+        { ...loginArg, cookies: [{ name: "session", value: `rot_${denialAttempts}`, domain: "internal-api-lark-api.feishu.cn", path: "/" }] },
+        {
+          upserts: [{ name: "session", value: `rot_${denialAttempts}`, domain: "internal-api-lark-api.feishu.cn", path: "/" }],
+          deletes: [],
+          baseValues: { "session\0internal-api-lark-api.feishu.cn\0/": loginArg.cookies[0]?.value ?? null },
+        },
+      );
+      throw new WebHttpError("credential_denied", "metadata 401", 401);
+    };
+    const denialHandle = denialBridge.start();
+    try {
+      await waitUntil(() => denialBridge.status().state === "needs_login", 4_000);
+      assert.equal(denialAttempts, 3, "本地自身落盘的 Cookie 轮换绝不能清零 connectDenials，必须恰好在 3 次拒登后进入 needs_login");
+    } finally {
+      denialHandle.stop();
+      FeishuWebClient.connect = origConnectDenial;
+      globalThis.setTimeout = origSetTimeout;
     }
   } finally {
     if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;

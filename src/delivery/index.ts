@@ -336,6 +336,15 @@ export function registerDelivery(app: App): void {
     maxAttempts: MAX_ATTEMPTS,
     async run(item) {
       const p = item.payload;
+      if (
+        isContextDerivedDispatchBlocked(app, p.dispatch_id) ||
+        (!!p.guid && isContextDerivedDispatchBlocked(app, p.guid))
+      ) {
+        const msg = "该派单源自旧工作区主人的工作上下文，已按主人隔离中止交付";
+        ledger.transition(item, { state: "errored", terminal: true, outcome: "errored", error: msg, payload: { ...p, message: msg } });
+        log("warn", "主人隔离中止交付", { work: item.id, dispatch: p.dispatch_id, action: p.action });
+        return;
+      }
       try {
         switch (p.action) {
           case "create_pr":

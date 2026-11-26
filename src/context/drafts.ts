@@ -29,10 +29,17 @@ export class Drafter {
   app: App;
   store: ContextStore;
   filterObs?: (conv: string, obs: Obs[]) => Obs[] | Promise<Obs[]>;
-  constructor(app: App, store: ContextStore, filterObs?: (conv: string, obs: Obs[]) => Obs[] | Promise<Obs[]>) {
+  checkConvAllowed?: (conv: string, convName: string) => Promise<"allowed" | "excluded" | "uncertain">;
+  constructor(
+    app: App,
+    store: ContextStore,
+    filterObs?: (conv: string, obs: Obs[]) => Obs[] | Promise<Obs[]>,
+    checkConvAllowed?: (conv: string, convName: string) => Promise<"allowed" | "excluded" | "uncertain">,
+  ) {
     this.app = app;
     this.store = store;
     this.filterObs = filterObs;
+    this.checkConvAllowed = checkConvAllowed;
   }
   private get cfg() {
     return this.app.cfg;
@@ -151,6 +158,16 @@ export class Drafter {
     const k = kind ?? defaultDraftKind(it);
     if (!k || k === "weekly_report") throw new Error("这个事项没有合适的草稿类型");
     const { target, label, conv } = this.target(it, k);
+    if (conv && this.checkConvAllowed) {
+      const elig = await this.checkConvAllowed(conv.conv, conv.conv_name);
+      if (elig !== "allowed") {
+        throw new Error(
+          elig === "excluded"
+            ? "该会话已被静音或排除，已停止起草回复"
+            : "无法实时确认该会话的排除状态，已按安全策略暂缓起草回复",
+        );
+      }
+    }
     const tz = this.cfg.owner.timezone;
     const p = this.store.project(it.project_id);
     const activeNativeOwner = this.activeBoundNativeOwner();
