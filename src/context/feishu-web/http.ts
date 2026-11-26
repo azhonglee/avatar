@@ -16,13 +16,15 @@ export const WEB_USER_AGENT =
 export const DEFAULT_HTTP_TIMEOUT_MS = 20_000;
 export const MAX_REDIRECTS = 30;
 
-const CROSS_HOST_STRIP_HEADERS = new Set(["x-flow-key", "x-web-id", "x-proxy-unit"]);
+const CROSS_HOST_STRIP_HEADERS = new Set(["x-flow-key", "x-web-id", "x-proxy-unit", "x-csrf-token"]);
 
 export interface HttpResponse {
   status: number;
   headers: Record<string, string | string[] | undefined>;
   body: Buffer;
   url: string;
+  /** 本次请求（含重定向跳）是否收到过 Set-Cookie 响应头 */
+  cookiesUpdated?: boolean;
 }
 
 export interface HttpRequestOptions {
@@ -172,6 +174,8 @@ export async function fetchWithJar(jar: RecordingCookieJar, opts: HttpRequestOpt
   let method: "GET" | "POST" = opts.method;
   let body = opts.body === undefined ? undefined : Buffer.isBuffer(opts.body) ? opts.body : Buffer.from(opts.body, "utf8");
   let headers: Record<string, string> = { ...(opts.headers ?? {}) };
+  let cookiesUpdated = false;
+  const hadCsrfHeader = Object.keys(headers).some((k) => k.toLowerCase() === "x-csrf-token");
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     validateTarget(currentUrl, allowInsecureHttp, opts.extraAllowedHosts);
@@ -181,11 +185,14 @@ export async function fetchWithJar(jar: RecordingCookieJar, opts: HttpRequestOpt
     else delete reqHeaders["Cookie"];
 
     const res = await singleRequest(currentUrl, method, reqHeaders, body, timeoutMs, maxBytes, opts.signal);
-    jar.setFromHeaders(currentUrl, res.headers["set-cookie"]);
+    if (res.headers["set-cookie"]) {
+      jar.setFromHeaders(currentUrl, res.headers["set-cookie"]);
+      cookiesUpdated = true;
+    }
 
     const isRedirect = res.status === 301 || res.status === 302 || res.status === 303 || res.status === 307 || res.status === 308;
     const loc = getHeader(res.headers, "location");
-    if (!isRedirect || !loc) return res;
+    if (!isRedirect || !loc) return { ...res, cookiesUpdated };
 
     if (hop >= MAX_REDIRECTS) {
       throw new WebHttpError("redirect_rejected", "个人 Web 重定向次数超过上限");
@@ -197,6 +204,10 @@ export async function fetchWithJar(jar: RecordingCookieJar, opts: HttpRequestOpt
       const cleaned: Record<string, string> = {};
       for (const [k, v] of Object.entries(headers)) {
         if (!CROSS_HOST_STRIP_HEADERS.has(k.toLowerCase())) cleaned[k] = v;
+      }
+      if (hadCsrfHeader) {
+        const destCsrf = jar.cookieValue(nextUrl, "swp_csrf_token");
+        if (destCsrf) cleaned["x-csrf-token"] = destCsrf;
       }
       headers = cleaned;
     }

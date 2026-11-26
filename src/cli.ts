@@ -3,6 +3,7 @@ import { parseArgs } from "node:util";
 import { createApp, initApp, runConfiguredJob, runDaemon, runDispatchOnce, sendBrief } from "./app.ts";
 import { loadConfig } from "./config.ts";
 import { beginLogin, FeishuWebClient, pollLogin, renderQrSvg, renderQrTerminal, WebLoginStore } from "./context/feishu-web/index.ts";
+import { BOUND_OWNER_KV_KEY, verifyWorkspaceOwnerBinding } from "./context/personal-web.ts";
 import { decide, type Profile } from "./guard.ts";
 import { consoleBaseUrl, isLoopbackHost, resolveConsoleHost, serverToken } from "./server/index.ts";
 import { formatReport, runDoctor } from "./doctor.ts";
@@ -175,7 +176,15 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
     return;
   }
   if (sub === "web-login") {
-    const { values } = parseArgs({ args: more, options: { out: { type: "string" } }, allowPositionals: true });
+    const { values } = parseArgs({
+      args: more,
+      options: {
+        out: { type: "string" },
+        "force-switch-account": { type: "boolean" },
+        "allow-name-mismatch": { type: "boolean" },
+      },
+      allowPositionals: true,
+    });
     console.log("正在向飞书申请个人 Web 登录二维码…");
     const challenge = await beginLogin();
     console.log("\n" + renderQrTerminal(challenge.qrCode) + "\n");
@@ -197,13 +206,20 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
           if (st === "approved") console.log("✅ 已确认，正在验证账号并保存凭据…");
         },
       });
+      await verifyWorkspaceOwnerBinding(app, login, {
+        forceSwitch: !!values["force-switch-account"],
+        allowNameMismatch: !!values["allow-name-mismatch"],
+      });
       const store = new WebLoginStore(app.cfg.dataDir);
       store.save(login);
+      app.store.set(BOUND_OWNER_KV_KEY, login.owner_id);
       if (login.owner_name && !app.store.get("ctx.owner_name")) app.store.set("ctx.owner_name", login.owner_name);
       console.log(`✅ 个人 Web 登录成功：${login.owner_name || "(无昵称)"}（ID: ${login.owner_id}）`);
       console.log(`凭据已以 0600 权限保存到：${store.file}`);
       if (!app.cfg.context.personal_web.enabled) {
         console.log("提示：在 config.yaml 里把 context.personal_web.enabled 设为 true 并重启 `pa run` 即可开启秒级实时接收。");
+      } else {
+        console.log("提示：若 `pa run` 正在运行，将在数秒内自动加载新凭据并重连。");
       }
     } finally {
       process.off("SIGINT", onSig);
@@ -225,7 +241,7 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
     }
     if (verify) {
       if (!login) throw new Error("尚未登录，请先运行 `pa context web-login`");
-      const client = await FeishuWebClient.connect(login, { onSessionConfirmed: (u) => store.save(u) });
+      const client = await FeishuWebClient.connect(login, { onSessionConfirmed: (u) => store.saveIfSessionMatches(u) });
       console.log(`✅ 在线核验通过：${client.owner().name}（ID: ${client.owner().id}）`);
     }
     return;
@@ -233,8 +249,11 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
   if (sub === "web-logout") {
     const store = new WebLoginStore(app.cfg.dataDir);
     store.clear();
-    app.store.db.prepare("DELETE FROM kv WHERE k = ?").run("ctx.personal_web.state");
-    console.log(`已清除个人 Web 登录凭据（${store.file}）。`);
+    app.store.set(
+      "ctx.personal_web.state",
+      JSON.stringify({ state: "needs_login", owner_id: "", owner_name: "", since: Date.now(), last_message_at: null, last_error: "已手动登出" }),
+    );
+    console.log(`已清除个人 Web 登录凭据（${store.file}）。若 pa run 正在运行，将在数秒内自动断开会话且不会回写旧凭据。`);
     return;
   }
   throw new Error("用法：pa context run | today | split <项目> | digest [morning|evening] [--print] | web-login [--out qr.svg] | web-status [--verify] | web-logout");

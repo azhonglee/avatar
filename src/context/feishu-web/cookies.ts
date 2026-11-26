@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -19,6 +20,8 @@ export interface WebLogin {
   cookies: CookieRecord[];
   owner_id: string;
   owner_name: string;
+  /** 每次扫码登录生成的唯一会话代际标识，用于区分登出或重新登录，防止旧常驻进程覆盖新凭据 */
+  session_id?: string;
   updated_at?: string;
 }
 
@@ -252,6 +255,7 @@ export class WebLoginStore {
         cookies: parsed.cookies,
         owner_id: parsed.owner_id,
         owner_name: typeof parsed.owner_name === "string" ? parsed.owner_name : "",
+        session_id: typeof parsed.session_id === "string" && parsed.session_id ? parsed.session_id : undefined,
         updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : undefined,
       };
     } catch {
@@ -259,12 +263,17 @@ export class WebLoginStore {
     }
   }
 
-  save(login: WebLogin): void {
+  currentSessionId(): string | undefined {
+    return this.load()?.session_id;
+  }
+
+  save(login: WebLogin): WebLogin {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     const tmp = path.join(path.dirname(this.file), `.${path.basename(this.file)}.${process.pid}.${Date.now()}.tmp`);
     const payload: WebLogin = {
       owner_id: login.owner_id,
       owner_name: login.owner_name,
+      session_id: login.session_id || crypto.randomUUID(),
       cookies: login.cookies,
       updated_at: new Date().toISOString(),
     };
@@ -282,6 +291,21 @@ export class WebLoginStore {
       fs.rmSync(tmp, { force: true });
       throw e;
     }
+    return payload;
+  }
+
+  /**
+   * 仅当磁盘上的凭据文件仍然存在且属于同一会话代际（session_id + owner_id）时才写回轮换后的 Cookie。
+   * 若已被 `web-logout` 清除或已被新一次 `web-login` 覆盖，返回 false 且绝不覆写。
+   */
+  saveIfSessionMatches(login: WebLogin): boolean {
+    const current = this.load();
+    if (!current) return false;
+    if (current.owner_id !== login.owner_id) return false;
+    if (current.session_id && login.session_id && current.session_id !== login.session_id) return false;
+    if (current.session_id && !login.session_id) return false;
+    this.save({ ...login, session_id: current.session_id ?? login.session_id });
+    return true;
   }
 
   clear(): void {

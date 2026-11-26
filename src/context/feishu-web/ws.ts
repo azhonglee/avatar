@@ -2,15 +2,18 @@ import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
 import type net from "node:net";
+import { WebHttpError } from "./http.ts";
 import { MAX_WIRE_BYTES } from "./proto.ts";
 
 /**
  * Zero-dependency RFC 6455 WebSocket client built directly on Node's http/https upgrade API.
  * Supports custom handshake headers (Origin, User-Agent), strict max frame bounds,
- * automatic Pong replies, fragmented binary/text frames, and async backpressure reads.
+ * bounded receive queue with TCP socket pause/resume backpressure, automatic Pong replies,
+ * and fragmented binary/text frames.
  */
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const DEFAULT_MAX_QUEUE_BYTES = 16 * 1024 * 1024; // 16 MiB aggregate cap
 
 const OP_CONT = 0x0;
 const OP_TEXT = 0x1;
@@ -28,6 +31,7 @@ export interface DialWebSocketOptions {
   headers?: Record<string, string>;
   handshakeTimeoutMs?: number;
   maxFrameBytes?: number;
+  maxQueueBytes?: number;
   signal?: AbortSignal;
 }
 
@@ -68,17 +72,21 @@ function buildClientFrame(opcode: number, payload: Uint8Array): Buffer {
 export class BinaryWebSocket {
   private readonly socket: net.Socket;
   private readonly maxFrameBytes: number;
+  private readonly maxQueueBytes: number;
   private buf: Buffer = Buffer.alloc(0);
   private fragOpcode: number | null = null;
   private fragChunks: Buffer[] = [];
   private fragBytes = 0;
   private readonly queue: WebSocketFrame[] = [];
+  private queuedBytes = 0;
+  private paused = false;
   private readonly waiters: Waiter[] = [];
   private closedErr: Error | null = null;
 
-  constructor(socket: net.Socket, initialHead: Buffer, maxFrameBytes = MAX_WIRE_BYTES) {
+  constructor(socket: net.Socket, initialHead: Buffer, maxFrameBytes = MAX_WIRE_BYTES, maxQueueBytes = DEFAULT_MAX_QUEUE_BYTES) {
     this.socket = socket;
     this.maxFrameBytes = maxFrameBytes;
+    this.maxQueueBytes = Math.max(maxQueueBytes, 1024);
 
     socket.on("data", (chunk: Buffer) => this.onData(chunk));
     socket.on("error", (err) => this.fail(err));
@@ -91,6 +99,7 @@ export class BinaryWebSocket {
   static dial(address: string, opts: DialWebSocketOptions = {}): Promise<BinaryWebSocket> {
     const handshakeTimeoutMs = opts.handshakeTimeoutMs ?? 20_000;
     const maxFrameBytes = opts.maxFrameBytes ?? MAX_WIRE_BYTES;
+    const maxQueueBytes = opts.maxQueueBytes ?? DEFAULT_MAX_QUEUE_BYTES;
     const parsed = new URL(address);
     const isTls = parsed.protocol === "wss:" || parsed.protocol === "https:";
     const mod = isTls ? https : http;
@@ -140,15 +149,20 @@ export class BinaryWebSocket {
         const accept = String(res.headers["sec-websocket-accept"] ?? "");
         if (res.statusCode !== 101 || accept !== expectedAccept) {
           socket.destroy();
-          finish(() => reject(new Error(`WebSocket 握手校验失败 (status=${res.statusCode})`)));
+          finish(() => reject(new WebHttpError("http_error", `WebSocket 握手校验失败 (status=${res.statusCode})`, res.statusCode)));
           return;
         }
-        finish(() => resolve(new BinaryWebSocket(socket, head, maxFrameBytes)));
+        finish(() => resolve(new BinaryWebSocket(socket, head, maxFrameBytes, maxQueueBytes)));
       });
 
       req.on("response", (res) => {
         res.resume();
-        finish(() => reject(new Error(`WebSocket 握手被拒绝 (HTTP ${res.statusCode ?? 0})`)));
+        const status = res.statusCode ?? 0;
+        if (status === 401 || status === 403) {
+          finish(() => reject(new WebHttpError("credential_denied", `WebSocket 握手鉴权被拒绝 (HTTP ${status})`, status)));
+          return;
+        }
+        finish(() => reject(new WebHttpError("http_error", `WebSocket 握手被拒绝 (HTTP ${status})`, status)));
       });
 
       req.on("error", (err) => {
@@ -270,13 +284,25 @@ export class BinaryWebSocket {
 
   private enqueue(frame: WebSocketFrame): void {
     const w = this.waiters.shift();
-    if (w) w.resolve(frame);
-    else this.queue.push(frame);
+    if (w) {
+      w.resolve(frame);
+      return;
+    }
+    this.queuedBytes += frame.data.length;
+    if (this.queuedBytes > this.maxQueueBytes) {
+      this.protocolError(`WebSocket 接收队列超过内存上限 (${this.maxQueueBytes} bytes)`);
+      return;
+    }
+    this.queue.push(frame);
+    if (!this.paused && this.queuedBytes >= Math.floor(this.maxQueueBytes / 2)) {
+      this.paused = true;
+      this.socket.pause();
+    }
   }
 
   private protocolError(message: string): void {
-    this.close();
     this.fail(new Error(message));
+    this.close();
   }
 
   private fail(err: Error): void {
@@ -323,7 +349,15 @@ export class BinaryWebSocket {
   }
 
   read(timeoutMs: number, signal?: AbortSignal): Promise<WebSocketFrame> {
-    if (this.queue.length > 0) return Promise.resolve(this.queue.shift()!);
+    if (this.queue.length > 0) {
+      const frame = this.queue.shift()!;
+      this.queuedBytes = Math.max(0, this.queuedBytes - frame.data.length);
+      if (this.paused && this.queuedBytes <= Math.floor(this.maxQueueBytes / 4)) {
+        this.paused = false;
+        this.socket.resume();
+      }
+      return Promise.resolve(frame);
+    }
     if (this.closedErr) return Promise.reject(this.closedErr);
     if (signal?.aborted) return Promise.reject(new Error("WebSocket 读取已取消"));
     return new Promise((resolve, reject) => {

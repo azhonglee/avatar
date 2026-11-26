@@ -292,6 +292,7 @@ export function encodeReplyPacket(
   cid: string,
   segments: RichSegment[],
   inThread: boolean,
+  parentId = rootId,
 ): Buffer {
   const content = new ProtoWriter().bytes(14, encodeRichText(segments)).finish();
   const req = new ProtoWriter()
@@ -299,7 +300,7 @@ export function encodeReplyPacket(
     .bytes(2, content)
     .str(3, chatId);
   if (rootId) {
-    req.str(4, rootId).str(5, rootId);
+    req.str(4, rootId).str(5, parentId || rootId);
   }
   req.str(6, cid).uint(7, 1).uint(9, 1);
   if (inThread && rootId) req.uint(12, 1);

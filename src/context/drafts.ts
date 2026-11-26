@@ -35,7 +35,7 @@ export class Drafter {
     return this.app.cfg;
   }
 
-  /** 草稿的发送目标：回复哪条消息 / 发到哪个会话 / 评论哪个 Meego 工作项 */
+  /** 草稿的发送目标：回复哪条消息 / 发到哪个会话 / 评论哪个 Meego 工作项（起草本身不发消息，允许为个人 Web 实时消息先起草） */
   target(it: ItemRow, kind: CtxDraftKind): { target: Record<string, string>; label: string; conv?: Obs } {
     if (kind === "meego_comment") {
       const key = String(it.meta.project_key ?? "");
@@ -47,17 +47,18 @@ export class Drafter {
     const any = fromOther ?? this.store.lastEvidenceObs("item", it.id, (o) => o.source === "im");
     if (!any) throw new Error("找不到这个事项对应的飞书会话，没法起草消息");
     if (kind === "reply" && fromOther) {
-      // 若个人 Web 消息已被跨通道回填了开放平台 message_id，优先走标准 lark-cli 回复
       const openMsgId = String(fromOther.meta.open_message_id ?? "");
-      const openChatId = String(fromOther.meta.open_chat_id ?? "");
+      const openChatId = String(fromOther.meta.open_chat_id ?? "") || this.store.convAlias(fromOther.conv)?.open_conv || "";
       if (fromOther.meta.transport === "personal_web" && !openMsgId) {
-        if (this.cfg.context.personal_web.send_replies && fromOther.meta.native_message_id && fromOther.meta.native_chat_id) {
+        if (fromOther.meta.native_message_id && fromOther.meta.native_chat_id) {
           return {
             target: {
               transport: "personal_web",
+              obs_id: fromOther.id,
               native_message_id: String(fromOther.meta.native_message_id),
               native_chat_id: String(fromOther.meta.native_chat_id),
               native_root_id: String(fromOther.meta.native_root_id ?? fromOther.meta.native_message_id),
+              ...(openChatId ? { chat_id: openChatId } : {}),
               url: fromOther.url,
             },
             label: `回复 ${fromOther.actor_name || "对方"}（${fromOther.conv_name} · 个人 Web）`,
@@ -66,15 +67,16 @@ export class Drafter {
         }
         if (openChatId) {
           return {
-            target: { chat_id: openChatId, url: fromOther.url },
+            target: { obs_id: fromOther.id, chat_id: openChatId, url: fromOther.url },
             label: `回复 ${fromOther.actor_name || "对方"}（${fromOther.conv_name}）`,
             conv: fromOther,
           };
         }
-        throw new Error("该消息来自个人 Web 实时通道，尚未补齐开放平台消息 ID；可在配置开启 context.personal_web.send_replies 或等下一轮飞书采集");
+        throw new Error("该消息缺少可回复的消息标识");
       }
       return {
         target: {
+          obs_id: fromOther.id,
           message_id: openMsgId || String(fromOther.meta.message_id ?? fromOther.id.replace(/^im:/, "")),
           chat_id: openChatId || fromOther.conv,
           url: fromOther.url,
@@ -83,12 +85,13 @@ export class Drafter {
         conv: fromOther,
       };
     }
-    const openChatId = String(any.meta.open_chat_id ?? "");
+    const openChatId = String(any.meta.open_chat_id ?? "") || this.store.convAlias(any.conv)?.open_conv || "";
     if (any.meta.transport === "personal_web" && !openChatId) {
-      if (this.cfg.context.personal_web.send_replies && any.meta.native_message_id && any.meta.native_chat_id) {
+      if (any.meta.native_message_id && any.meta.native_chat_id) {
         return {
           target: {
             transport: "personal_web",
+            obs_id: any.id,
             native_message_id: String(any.meta.native_message_id),
             native_chat_id: String(any.meta.native_chat_id),
             native_root_id: String(any.meta.native_root_id ?? any.meta.native_message_id),
@@ -98,10 +101,10 @@ export class Drafter {
           conv: any,
         };
       }
-      throw new Error("该会话来自个人 Web 实时通道，尚未补齐开放平台会话 ID；可开启 context.personal_web.send_replies 或等下一轮飞书采集");
+      throw new Error("该会话缺少可发送的会话标识");
     }
     return {
-      target: { chat_id: openChatId || any.conv, url: any.url },
+      target: { obs_id: any.id, chat_id: openChatId || any.conv, url: any.url },
       label: `${kind === "followup" ? "跟进" : "发到"} ${any.conv_name}${it.counterpart ? `（${it.counterpart}）` : ""}`,
       conv: any,
     };
@@ -187,38 +190,55 @@ export class Drafter {
     return this.store.addDraft({ item_id: "", project_id: "", kind: "weekly_report", target: { title: `周报 ${date}` }, target_label: `我的文档库 · 周报 ${date}`, content });
   }
 
-  /** 确认草稿：变成对外动作（outbox） */
+  /** 确认草稿：变成对外动作（outbox）；确认时再根据最新观测决定走开放平台还是个人 Web 协议 */
   effectFor(d: DraftRow, content: string): Effect {
+    const obs = d.target.obs_id ? this.store.obs(d.target.obs_id) : undefined;
+    const enrichedMsgId = String(obs?.meta.open_message_id ?? "");
+    const enrichedChatId = String(obs?.meta.open_chat_id ?? "") || (obs ? this.store.convAlias(obs.conv)?.open_conv ?? "" : "");
+
     switch (d.kind) {
-      case "reply":
+      case "reply": {
+        const openMsg = d.target.message_id || enrichedMsgId;
+        if (openMsg) return { op: "im.reply", args: { message_id: openMsg, text: content, draft_id: d.id } };
         if (d.target.transport === "personal_web" && d.target.native_chat_id && d.target.native_message_id) {
-          return {
-            op: "pw.reply",
-            args: {
-              chat_id: d.target.native_chat_id,
-              message_id: d.target.native_message_id,
-              root_id: d.target.native_root_id,
-              text: content,
-              draft_id: d.id,
-            },
-          };
+          if (this.cfg.context.personal_web.send_replies) {
+            return {
+              op: "pw.reply",
+              args: {
+                chat_id: d.target.native_chat_id,
+                message_id: d.target.native_message_id,
+                root_id: d.target.native_root_id,
+                text: content,
+                draft_id: d.id,
+              },
+            };
+          }
+          const openChat = d.target.chat_id || enrichedChatId;
+          if (openChat) return { op: "im.send", args: { chat_id: openChat, text: content, draft_id: d.id } };
+          throw new Error("该草稿目标来自个人 Web 实时消息，尚未补齐开放平台消息 ID；可在设置中开启 context.personal_web.send_replies 或等下一轮飞书采集后再发送");
         }
-        if (d.target.message_id) return { op: "im.reply", args: { message_id: d.target.message_id, text: content, draft_id: d.id } };
-        return { op: "im.send", args: { chat_id: d.target.chat_id, text: content, draft_id: d.id } };
-      case "followup":
+        return { op: "im.send", args: { chat_id: d.target.chat_id || enrichedChatId, text: content, draft_id: d.id } };
+      }
+      case "followup": {
+        const openChat = d.target.chat_id || enrichedChatId;
+        if (openChat) return { op: "im.send", args: { chat_id: openChat, text: content, draft_id: d.id } };
         if (d.target.transport === "personal_web" && d.target.native_chat_id && d.target.native_message_id) {
-          return {
-            op: "pw.reply",
-            args: {
-              chat_id: d.target.native_chat_id,
-              message_id: d.target.native_message_id,
-              root_id: d.target.native_root_id,
-              text: content,
-              draft_id: d.id,
-            },
-          };
+          if (this.cfg.context.personal_web.send_replies) {
+            return {
+              op: "pw.reply",
+              args: {
+                chat_id: d.target.native_chat_id,
+                message_id: d.target.native_message_id,
+                root_id: d.target.native_root_id,
+                text: content,
+                draft_id: d.id,
+              },
+            };
+          }
+          throw new Error("该跟进草稿来自个人 Web 实时会话，尚未补齐开放平台会话 ID；可开启 context.personal_web.send_replies 或等下一轮飞书采集后再发送");
         }
         return { op: "im.send", args: { chat_id: d.target.chat_id, text: content, draft_id: d.id } };
+      }
       case "meego_comment":
         return { op: "meego.comment", args: { project_key: d.target.project_key, work_item_id: d.target.work_item_id, content, draft_id: d.id } };
       case "weekly_report":

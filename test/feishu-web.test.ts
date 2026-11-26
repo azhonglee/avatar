@@ -22,6 +22,7 @@ import { loadConfig } from "../src/config.ts";
 import {
   ACCESS_KEY_SALT,
   beginLogin,
+  BinaryWebSocket,
   CHAT_KIND_GROUP,
   CHAT_KIND_P2P,
   CHAT_KIND_TOPIC,
@@ -41,12 +42,15 @@ import {
   encodeReplyPacket,
   encodeRichText,
   FeishuWebClient,
+  fetchWithJar,
   isAllowedFeishuHost,
   MSG_CARD,
   MSG_MERGE_FORWARD,
   MSG_POST,
   MSG_SHARE_CHAT,
   MSG_TEXT,
+  normalizeNativeId,
+  parseJsonPreserveNativeIds,
   parseProto,
   pollLogin,
   ProtoWireError,
@@ -55,6 +59,7 @@ import {
   renderQrSvg,
   renderQrTerminal,
   replyInThread,
+  SessionNeedsLoginError,
   unwrapGatewayPayload,
   USER_SENDER_TYPE,
   WebHttpError,
@@ -64,7 +69,9 @@ import {
   type WebMessage,
 } from "../src/context/feishu-web/index.ts";
 import { ContextService } from "../src/context/index.ts";
+import { BOUND_OWNER_KV_KEY, PersonalWebBridge, verifyWorkspaceOwnerBinding } from "../src/context/personal-web.ts";
 import { runDoctor } from "../src/doctor.ts";
+import { SettingsService } from "../src/settings.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const STUBS = path.join(ROOT, "test/stubs");
@@ -398,12 +405,17 @@ interface MockWebServer {
   close: () => Promise<void>;
   acks: string[];
   heartbeats: number;
-  sentReplies: { chatId: string; rootId: string; cid: string; text: string; inThread: boolean }[];
+  sentReplies: { chatId: string; rootId: string; parentId: string; cid: string; text: string; inThread: boolean }[];
   wsHeaders: http.IncomingHttpHeaders[];
   wsQueries: URLSearchParams[];
   setProfileStatus: (status: number) => void;
+  setTicketStatus: (status: number) => void;
+  setWsUpgradeStatus: (status: number) => void;
+  setChatModeFail: (fail: boolean) => void;
+  setGatewayRotateCookie: (val: string) => void;
   setRedirectEvil: (on: boolean) => void;
   setTamperReadback: (on: boolean) => void;
+  setFailReadbackCount: (n: number) => void;
   addMessage: (id: string, data: Buffer) => void;
   setHistory: (chatId: string, byPos: Record<number, Buffer>) => void;
 }
@@ -411,8 +423,13 @@ interface MockWebServer {
 async function startMockFeishuWebServer(): Promise<MockWebServer> {
   let pollCount = 0;
   let profileStatus = 200;
+  let ticketStatus = 200;
+  let wsUpgradeStatus = 101;
+  let chatModeFail = false;
+  let gatewayRotateCookie = "";
   let redirectEvil = false;
   let tamperReadback = false;
+  let failReadbackCount = 0;
   const acks: string[] = [];
   let heartbeats = 0;
   const sentReplies: MockWebServer["sentReplies"] = [];
@@ -495,6 +512,11 @@ async function startMockFeishuWebServer(): Promise<MockWebServer> {
     }
 
     if (url.pathname === "/suite/passport/frontier_ticket/") {
+      if (ticketStatus !== 200) {
+        res.writeHead(ticketStatus, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ code: ticketStatus }));
+        return;
+      }
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ code: 0, ticket: "ticket_live_42" }));
       return;
@@ -504,25 +526,40 @@ async function startMockFeishuWebServer(): Promise<MockWebServer> {
       const pkt = parseProto(body);
       const cmd = pkt.uint(3);
       const payload = parseProto(pkt.bytes(5));
+      const gwHeaders: Record<string, string> = { "Content-Type": "application/x-protobuf" };
+      if (gatewayRotateCookie) gwHeaders["Set-Cookie"] = `session=${gatewayRotateCookie}; Path=/; Max-Age=86400`;
       if (cmd === CMD_READ_MESSAGE) {
         const id = payload.str(1);
+        if (failReadbackCount > 0 && id.startsWith("reply_")) {
+          failReadbackCount--;
+          res.writeHead(503);
+          res.end();
+          return;
+        }
         const found = messages.get(id);
         const resp = new ProtoWriter();
         if (found) resp.bytes(1, new ProtoWriter().str(1, id).bytes(2, found).finish());
-        res.writeHead(200, { "Content-Type": "application/x-protobuf" });
+        res.writeHead(200, gwHeaders);
         res.end(buildGatewayResponse(resp.finish()));
         return;
       }
       if (cmd === CMD_CHAT_MODE) {
+        if (chatModeFail) {
+          res.writeHead(500);
+          res.end();
+          return;
+        }
         const chatId = payload.str(1);
+        const chatName =
+          chatId.startsWith("dm_") ? "" : chatId === "8002" ? "未列入的群" : chatId === "8003" ? "绝密群" : "Ark 发布协同群";
         const chatRec = new ProtoWriter()
           .str(1, chatId)
           .uint(2, chatId.startsWith("dm_") ? CHAT_KIND_P2P : CHAT_KIND_GROUP)
-          .str(4, chatId.startsWith("dm_") ? "" : "Ark 发布协同群")
+          .str(4, chatName)
           .uint(39, 0)
           .finish();
         const resp = new ProtoWriter().bytes(1, new ProtoWriter().str(1, chatId).bytes(2, chatRec).finish()).finish();
-        res.writeHead(200, { "Content-Type": "application/x-protobuf" });
+        res.writeHead(200, gwHeaders);
         res.end(buildGatewayResponse(resp));
         return;
       }
@@ -534,7 +571,7 @@ async function startMockFeishuWebServer(): Promise<MockWebServer> {
           const m = byPos[Number(p)];
           if (m) resp.bytes(1, new ProtoWriter().str(1, String(p)).bytes(2, m).finish());
         }
-        res.writeHead(200, { "Content-Type": "application/x-protobuf" });
+        res.writeHead(200, gwHeaders);
         res.end(buildGatewayResponse(resp.finish()));
         return;
       }
@@ -544,9 +581,10 @@ async function startMockFeishuWebServer(): Promise<MockWebServer> {
         const text = rich.str(2);
         const chatId = payload.str(3);
         const rootId = payload.str(4);
+        const parentId = payload.str(5) || rootId;
         const cid = payload.str(6);
         const inThread = payload.uint(12) === 1;
-        sentReplies.push({ chatId, rootId, cid, text, inThread });
+        sentReplies.push({ chatId, rootId, parentId, cid, text, inThread });
 
         const replyId = `reply_${nextReplySeq++}`;
         const created = buildNativeMessage({
@@ -557,13 +595,13 @@ async function startMockFeishuWebServer(): Promise<MockWebServer> {
           kind: MSG_TEXT,
           text: tamperReadback ? "被篡改的正文" : text,
           rootId,
-          parentId: rootId,
+          parentId,
           threadId: inThread ? `th_${rootId}` : "",
           cid,
         });
         messages.set(replyId, created);
         const resp = new ProtoWriter().bytes(1, created).finish();
-        res.writeHead(200, { "Content-Type": "application/x-protobuf" });
+        res.writeHead(200, gwHeaders);
         res.end(buildGatewayResponse(resp));
         return;
       }
@@ -580,6 +618,11 @@ async function startMockFeishuWebServer(): Promise<MockWebServer> {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     wsHeaders.push(req.headers);
     wsQueries.push(url.searchParams);
+    if (wsUpgradeStatus !== 101) {
+      socket.write(`HTTP/1.1 ${wsUpgradeStatus} Denied\r\nContent-Length: 0\r\n\r\n`);
+      socket.end();
+      return;
+    }
     const key = String(req.headers["sec-websocket-key"] ?? "");
     const accept = crypto.createHash("sha1").update(key + WS_GUID).digest("base64");
     socket.write(
@@ -652,11 +695,26 @@ async function startMockFeishuWebServer(): Promise<MockWebServer> {
     setProfileStatus: (s) => {
       profileStatus = s;
     },
+    setTicketStatus: (s) => {
+      ticketStatus = s;
+    },
+    setWsUpgradeStatus: (s) => {
+      wsUpgradeStatus = s;
+    },
+    setChatModeFail: (f) => {
+      chatModeFail = f;
+    },
+    setGatewayRotateCookie: (v) => {
+      gatewayRotateCookie = v;
+    },
     setRedirectEvil: (on) => {
       redirectEvil = on;
     },
     setTamperReadback: (on) => {
       tamperReadback = on;
+    },
+    setFailReadbackCount: (n) => {
+      failReadbackCount = n;
     },
     addMessage: (id, data) => messages.set(id, data),
     setHistory: (chatId, byPos) => historyByChat.set(chatId, byPos),
@@ -876,7 +934,7 @@ test("Working Context 集成：个人 Web @我 秒级快通道 + 预起草不自
       roles: { brain: "claude" },
       owner: { open_id: "ou_owner" },
       cards: { enabled: true },
-      engine: { retry_base_ms: 20, retry_max_ms: 50, tick_ms: 50 },
+      engine: { retry_base_ms: 20, retry_max_ms: 50, tick_ms: 50, effect_attempts: 2 },
       context: {
         harness: "cx",
         groups_deny: ["9999"],
@@ -971,7 +1029,37 @@ test("Working Context 集成：个人 Web @我 秒级快通道 + 预起草不自
     const nudgeFx = app.ledger.list({ kinds: ["effect"], ref: `card:ctx-item:${it.id}`, limit: 10 });
     assert.ok(nudgeFx.length >= 1, "快通道高优先级事项立刻发提醒卡片");
 
-    // 3) 跨通道指纹去重：10 分钟后 lark-cli 轮询到同一条消息（om_open_100），不重复入库、不重新标为待处理，而是回填开放平台元数据
+    // 3) 用户显式确认草稿（尚未补齐开放平台 ID）→ 经 pw.reply 投递（带回读校验）→ 状态变为 sent
+    //    先模拟回读连续失败 2 次（耗尽 effect_attempts=2 让草稿进入 failed），验证用户重新批准同一草稿时
+    //    复用相同 CID、不重发第二条，只补做独立回读并变为 sent！
+    mock.setFailReadbackCount(2);
+    const bridgeWithMock = new PersonalWebBridge(app, svc.store, {
+      onFastTrigger: () => undefined,
+      onReconnect: () => undefined,
+      onNeedsLogin: () => undefined,
+      clientOptions: { endpoints: mock.endpoints },
+    });
+    app.effectHooks.pwReply = async (args) => {
+      await bridgeWithMock.sendVerifiedReply(args);
+    };
+    await app.commands.exec("context.draft_approve", { id: drafts[0].id }, { source: "web", actor: "owner" });
+    await app.engine.drain(["effect"]);
+    await new Promise((r) => setTimeout(r, 40));
+    await app.engine.drain(["effect"]);
+    assert.equal(mock.sentReplies.length, 1, "首次发出后即使引擎重试也绝不重发第二条");
+    assert.equal(app.ext.context!.drafts("failed").find((d) => d.id === drafts[0].id)?.status, "failed");
+
+    // 再次确认同一草稿（新 effect ID）：必须复用同一个 CID，只跑独立回读，绝不再发第二条！
+    await app.commands.exec("context.draft_approve", { id: drafts[0].id }, { source: "web", actor: "owner" });
+    await app.engine.drain(["effect"]);
+    assert.equal(mock.sentReplies.length, 1, "重新批准同一草稿也绝不发送第二条重复消息");
+    assert.equal(mock.sentReplies[0].chatId, "8001");
+    assert.equal(mock.sentReplies[0].rootId, "pw_msg_100");
+    assert.equal(mock.sentReplies[0].parentId, "pw_msg_100");
+    assert.equal(mock.sentReplies[0].text, "收到，我正在看网关日志，10 分钟内同步结论。");
+    assert.equal(app.ext.context!.drafts("sent").find((d) => d.id === drafts[0].id)?.status, "sent");
+
+    // 4) 跨通道 1 对 1 指纹去重与 alt_id 编辑更新
     const beforePending = svc.store.pendingCount();
     const added = svc.store.addObs([
       {
@@ -989,23 +1077,39 @@ test("Working Context 集成：个人 Web @我 秒级快通道 + 预起草不自
         meta: { message_id: "om_open_100", chat_type: "group" },
       },
     ]);
-    assert.equal(added, 0, "同内容 ±15s 内不重复插入");
+    assert.equal(added, 0, "同群同内容 ±15s 内不重复插入");
     assert.equal(svc.store.pendingCount(), beforePending, "不重复触发理解");
-    assert.equal(svc.store.obs("im:om_open_100"), undefined);
     const enriched = svc.store.obs("pw:pw_msg_100")!;
+    assert.equal(svc.store.obs("im:om_open_100")?.id, "pw:pw_msg_100", "通过 alt_id 定位到规范观测");
     assert.equal(enriched.meta.open_message_id, "om_open_100");
     assert.equal(enriched.meta.open_chat_id, "oc_open_8001");
     assert.equal(enriched.actor_name, "李四");
     assert.match(enriched.url, /oc_open_8001/);
 
-    // 4) 用户显式确认草稿 → 经 pw.reply 投递（带回读校验）→ 状态变为 sent
-    await app.commands.exec("context.draft_approve", { id: drafts[0].id }, { source: "web", actor: "owner" });
-    await app.engine.drain(["effect"]);
-    assert.equal(mock.sentReplies.length, 1, "用户确认后只发一次");
-    assert.equal(mock.sentReplies[0].chatId, "8001");
-    assert.equal(mock.sentReplies[0].rootId, "pw_msg_100");
-    assert.equal(mock.sentReplies[0].text, "收到，我正在看网关日志，10 分钟内同步结论。");
-    assert.equal(app.ext.context!.drafts("sent").find((d) => d.id === drafts[0].id)?.status, "sent");
+    // 经开放平台 ID 投递编辑更新：应原地更新规范行并重新标为待处理，而非新增重复行
+    const edited = svc.store.addObs([
+      {
+        id: "im:om_open_100",
+        source: "im",
+        kind: "at_me",
+        conv: "oc_open_8001",
+        conv_name: "Ark 发布协同群",
+        actor_id: "ou_li",
+        actor_name: "李四",
+        is_me: false,
+        time: nowSec * 1000 + 2_000,
+        text: "@张三 线上接口 500 已定位到网关超时，帮忙确认下回滚",
+        url: "https://applink.feishu.cn/client/chat/open?openChatId=oc_open_8001",
+        meta: { message_id: "om_open_100", chat_type: "group" },
+      },
+    ]);
+    assert.equal(edited, 1);
+    assert.match(svc.store.obs("pw:pw_msg_100")!.text, /已定位到网关超时/);
+    assert.equal(
+      (svc.store.db.prepare("SELECT COUNT(*) AS n FROM ctx_obs WHERE id = 'im:om_open_100'").get() as { n: number }).n,
+      0,
+      "不创建重复行",
+    );
     // 5) 过滤边界：本人回显 / 禁用群 / 非白名单机器人不触发快通道；对方私聊触发快通道
     const fastBefore = app.ledger.list({ kinds: ["context"], ref: "fast", limit: 50 }).length;
     await svc.personalWeb.handleMessage(
@@ -1037,6 +1141,524 @@ test("Working Context 集成：个人 Web @我 秒级快通道 + 预起草不自
       client,
     );
     assert.equal(app.ledger.list({ kinds: ["context"], ref: "fast", limit: 50 }).length, fastBefore + 1, "对方私聊立即触发快通道");
+  } finally {
+    app?.store.db.close();
+    if (prevCtxDir === undefined) delete process.env.CTX_DIR;
+    else process.env.CTX_DIR = prevCtxDir;
+    await mock.close();
+  }
+});
+
+// ───────── 7. Codex Review 专项回归测试 ─────────
+
+test("协议加固回归：64 位无损账号 ID、跨主机剥离 x-csrf-token、WS 401 分类、队列上限、话题子回复 parentId、网关 Cookie 轮换与保活 401", async () => {
+  // 1) 64 位原生 ID 无损解析，拒绝不安全浮点
+  const parsed = parseJsonPreserveNativeIds<{ data: { user: { id: string }; step_info: { front_user_id: string } } }>(
+    `{"data":{"user":{"id":7123456789012345678},"step_info":{"front_user_id":7987654321098765432}}}`,
+  );
+  assert.equal(parsed.data.user.id, "7123456789012345678");
+  assert.equal(parsed.data.step_info.front_user_id, "7987654321098765432");
+  assert.throws(() => normalizeNativeId(7123456789012345678), /安全整数/);
+
+  // 2) 跨主机重定向必须剥离 x-csrf-token
+  let destCsrf: string | undefined;
+  const destSrv = http.createServer((req, res) => {
+    destCsrf = req.headers["x-csrf-token"] as string | undefined;
+    res.writeHead(200);
+    res.end("ok");
+  });
+  await new Promise<void>((r) => destSrv.listen(0, "127.0.0.1", () => r()));
+  const destPort = (destSrv.address() as { port: number }).port;
+  const srcSrv = http.createServer((_req, res) => {
+    res.writeHead(302, { Location: `http://localhost:${destPort}/target` });
+    res.end();
+  });
+  await new Promise<void>((r) => srcSrv.listen(0, "127.0.0.1", () => r()));
+  const srcPort = (srcSrv.address() as { port: number }).port;
+  try {
+    const jar = new RecordingCookieJar(["127.0.0.1", "localhost"]);
+    jar.setFromHeaders(new URL(`http://127.0.0.1:${srcPort}/`), "swp_csrf_token=secret_1; Path=/");
+    const r = await fetchWithJar(jar, {
+      method: "GET",
+      url: `http://127.0.0.1:${srcPort}/start`,
+      headers: { "x-csrf-token": "secret_1" },
+      allowInsecureHttp: true,
+      extraAllowedHosts: ["127.0.0.1", "localhost"],
+    });
+    assert.equal(r.status, 200);
+    assert.equal(destCsrf, undefined, "跨主机重定向后不能把原主机 x-csrf-token 带过去");
+  } finally {
+    srcSrv.closeAllConnections();
+    destSrv.closeAllConnections();
+    await Promise.all([new Promise<void>((r) => srcSrv.close(() => r())), new Promise<void>((r) => destSrv.close(() => r()))]);
+  }
+
+  // 3) Mock 服务回归：WS 401 分类、队列内存上限、话题内子回复 parentId != rootId、网关 Cookie 轮换、保活 401 退出
+  const mock = await startMockFeishuWebServer();
+  try {
+    const rotated: string[] = [];
+    const client = await FeishuWebClient.connect(
+      {
+        owner_id: "7001",
+        owner_name: "张三",
+        session_id: "sess_gen_1",
+        cookies: [
+          { name: "session", value: "sess_live_1", domain: "127.0.0.1", path: "/" },
+          { name: "passport_web_did", value: "did_test_123", domain: "127.0.0.1", path: "/" },
+        ],
+      },
+      {
+        endpoints: mock.endpoints,
+        onSessionConfirmed: (l) => {
+          const s = l.cookies.find((c) => c.name === "session")?.value;
+          if (s) rotated.push(s);
+        },
+        heartbeatIntervalMs: 500,
+        keepaliveIntervalMs: 35,
+        socketIdleTimeoutMs: 5_000,
+        reconnectBaseMs: 15,
+        reconnectCeilingMs: 30,
+        sessionDenialThreshold: 3,
+        sessionDenialRetryMs: 15,
+        maxQueueBytes: 2048,
+      },
+    );
+
+    // 网关返回 Set-Cookie 应立即触发持久化回调
+    mock.setGatewayRotateCookie("sess_gw_rotated_3");
+    await client.readChat("8001", { force: true });
+    assert.ok(rotated.includes("sess_gw_rotated_3"), "网关成功调用轮换的 Cookie 立即持久化");
+    mock.setGatewayRotateCookie("");
+
+    // 话题内回复子消息：rootId 与 parentId 必须分别保留并独立回读校验
+    mock.addMessage(
+      "sub_reply_2",
+      buildNativeMessage({
+        id: "sub_reply_2",
+        chatId: "8001",
+        actorId: "7002",
+        text: "话题里的追问",
+        rootId: "root_topic_1",
+        parentId: "root_topic_1",
+        threadId: "th_root_topic_1",
+      }),
+    );
+    const threadRep = await client.sendVerifiedReply({
+      chatId: "8001",
+      messageId: "sub_reply_2",
+      rootId: "root_topic_1",
+      text: "针对这条追问的回复",
+      cid: "cid_thread_parent_01",
+    });
+    assert.equal(threadRep.rootId, "root_topic_1");
+    assert.equal(threadRep.parentId, "sub_reply_2");
+    assert.equal(mock.sentReplies.at(-1)!.rootId, "root_topic_1");
+    assert.equal(mock.sentReplies.at(-1)!.parentId, "sub_reply_2");
+
+    // WS 握手返回 401 必须归类为 credential_denied 而不是普通网络错误
+    mock.setWsUpgradeStatus(401);
+    await assert.rejects(
+      BinaryWebSocket.dial(mock.endpoints.websocketUrl),
+      (e: unknown) => e instanceof WebHttpError && e.code === "credential_denied" && e.status === 401,
+    );
+    mock.setWsUpgradeStatus(101);
+
+    // 接收队列超限时主动断开保护内存，并保留真实错误原因
+    const ws = await BinaryWebSocket.dial(mock.endpoints.websocketUrl, { maxQueueBytes: 1024 });
+    const bigPayload = buildNativeMessage({ id: "big_1", chatId: "8001", actorId: "7002", text: "A".repeat(400) });
+    for (let i = 0; i < 6; i++) mock.pushMessage(`sid_q_${i}`, [bigPayload], false);
+    await new Promise((r) => setTimeout(r, 40));
+    await assert.rejects(
+      (async () => {
+        for (let i = 0; i < 10; i++) await ws.read(200);
+      })(),
+      /接收队列超过内存上限/,
+    );
+    ws.close();
+
+    // 保活期间返回 401 必须中断长连接并进入 3 次核验 → SessionNeedsLoginError
+    const kaStates: ListenerState[] = [];
+    const ctrl = new AbortController();
+    const listenPromise = client.listen({
+      signal: ctrl.signal,
+      onState: (s) => {
+        kaStates.push(s);
+        if (s === "listening") mock.setProfileStatus(401);
+      },
+      onMessage: () => undefined,
+    });
+    await assert.rejects(listenPromise, SessionNeedsLoginError);
+    assert.equal(kaStates.at(-1), "needs_login");
+  } finally {
+    await mock.close();
+  }
+});
+
+test("存储、范围、并发、草稿解耦、登出/绑定、热加载与离线状态回归", async () => {
+  const mock = await startMockFeishuWebServer();
+  const dir = makeTmp("pa-pw-reg-");
+  const ctxDir = path.join(dir, "ctx");
+  fs.mkdirSync(ctxDir, { recursive: true });
+  const prevCtxDir = process.env.CTX_DIR;
+  process.env.CTX_DIR = ctxDir;
+
+  const cfgFile = path.join(dir, "config.yaml");
+  fs.writeFileSync(
+    cfgFile,
+    [
+      `data_dir: ${JSON.stringify(path.join(dir, "data"))}`,
+      "bins:",
+      `  lark: ${JSON.stringify(path.join(STUBS, "ctx-lark"))}`,
+      `  acpx: ${JSON.stringify(path.join(STUBS, "acpx"))}`,
+      `  bytedcli: ${JSON.stringify(path.join(STUBS, "ctx-bytedcli"))}`,
+      "harnesses:",
+      "  claude: { agent: claude }",
+      `  cx: { type: codex-exec, cmd: ${JSON.stringify(path.join(STUBS, "ctx-codex"))} }`,
+      "roles: { brain: claude }",
+      "owner: { open_id: ou_owner }",
+      "engine: { retry_base_ms: 20, retry_max_ms: 50, tick_ms: 50 }",
+      "context:",
+      "  harness: cx",
+      "  groups: allowlist",
+      "  groups_allow: []",
+      "  groups_deny: [oc_secret_8003]",
+      "  personal_web:",
+      "    enabled: true",
+      "    fast_lane: true",
+      "    debounce_ms: 0",
+      "    pre_draft: true",
+      "    send_replies: false",
+    ].join("\n") + "\n",
+  );
+
+  let app: ReturnType<typeof createApp> | undefined;
+  try {
+    app = createApp(loadConfig(cfgFile));
+    const svc = new ContextService(app);
+    const now = Date.now();
+
+    // 1) [P1-1] 不同群两条相同的「收到」绝不能跨群误合并或误绑定 open_message_id
+    svc.store.addObs([
+      {
+        id: "pw:short_a",
+        source: "im",
+        kind: "group",
+        conv: "pw_chat:101",
+        conv_name: "A 群",
+        actor_id: "7010",
+        actor_name: "甲",
+        is_me: false,
+        time: now,
+        text: "收到",
+        url: "",
+        meta: { transport: "personal_web", native_message_id: "short_a", native_chat_id: "101", chat_type: "group" },
+      },
+      {
+        id: "im:om_short_b",
+        source: "im",
+        kind: "group",
+        conv: "oc_group_b",
+        conv_name: "B 群",
+        actor_id: "ou_yi",
+        actor_name: "乙",
+        is_me: false,
+        time: now + 1000,
+        text: "收到",
+        url: "https://applink.feishu.cn/client/chat/open?openChatId=oc_group_b",
+        meta: { message_id: "om_short_b", chat_type: "group" },
+      },
+    ]);
+    assert.ok(svc.store.obs("pw:short_a") && svc.store.obs("im:om_short_b"));
+    assert.equal(svc.store.obs("pw:short_a")!.meta.open_message_id, undefined, "不同群短文本绝不误绑定");
+
+    // 2) [P2-3] 背景观测在首次真实投递时必须提升为 processed = 0
+    svc.store.addBackgroundObs([
+      {
+        id: "pw:bg_dm_1",
+        source: "im",
+        kind: "p2p",
+        conv: "pw_chat:dm_9",
+        conv_name: "私聊：王五",
+        actor_id: "7099",
+        actor_name: "王五",
+        is_me: false,
+        time: now - 60_000,
+        text: "刚才忘了说，今天上线前要加索引",
+        url: "",
+        meta: { transport: "personal_web", chat_type: "p2p" },
+      },
+    ]);
+    assert.equal(svc.store.pendingConvs(50).some((c) => c.conv === "pw_chat:dm_9"), false);
+    const promoted = svc.store.addObs([
+      {
+        id: "pw:bg_dm_1",
+        source: "im",
+        kind: "p2p",
+        conv: "pw_chat:dm_9",
+        conv_name: "私聊：王五",
+        actor_id: "7099",
+        actor_name: "王五",
+        is_me: false,
+        time: now - 60_000,
+        text: "刚才忘了说，今天上线前要加索引",
+        url: "",
+        meta: { transport: "personal_web", chat_type: "p2p" },
+      },
+    ]);
+    assert.equal(promoted, 1, "首次真实投递必须将 background_only 提升为待处理");
+    assert.equal(svc.store.pendingConvs(50).some((c) => c.conv === "pw_chat:dm_9"), true);
+
+    // 3) [P2-1] 积压 80 条时，convWindowAround 必须包含触发消息，同时更早积压仍留待常规周期
+    const backlog = Array.from({ length: 80 }, (_, i) => ({
+      id: `pw:bk_${i}`,
+      source: "im" as const,
+      kind: "group",
+      conv: "pw_chat:backlog_1",
+      conv_name: "高流量群",
+      actor_id: "7010",
+      actor_name: "某人",
+      is_me: false,
+      time: now - 100_000 + i * 1000,
+      text: `普通消息 ${i}`,
+      url: "",
+      meta: {},
+    }));
+    backlog.push({
+      id: "pw:bk_urgent",
+      source: "im",
+      kind: "at_me",
+      conv: "pw_chat:backlog_1",
+      conv_name: "高流量群",
+      actor_id: "7010",
+      actor_name: "某人",
+      is_me: false,
+      time: now,
+      text: "@张三 紧急回滚",
+      url: "",
+      meta: {},
+    });
+    svc.store.addObs(backlog);
+    const fastWin = svc.store.convWindowAround("pw_chat:backlog_1", "pw:bk_urgent", 20, 5);
+    assert.ok(fastWin.some((o) => o.id === "pw:bk_urgent"), "快通道窗口必须包含触发消息");
+    assert.ok(!fastWin.some((o) => o.id === "pw:bk_0"), "过早无关积压留给常规周期");
+
+    // 4) [P2-5] 会话别名共享轮询历史与 Web 推送；[P1-3] oc_ 禁用群阻断对应 pw_chat 且 readChat 失败时 fail-closed
+    svc.store.addObs([
+      {
+        id: "im:om_sec_old",
+        source: "im",
+        kind: "group",
+        conv: "oc_secret_8003",
+        conv_name: "绝密群",
+        actor_id: "ou_a",
+        actor_name: "A",
+        is_me: false,
+        time: now - 5000,
+        text: "历史消息",
+        url: "",
+        meta: { chat_type: "group" },
+      },
+    ]);
+    const loginStore = new WebLoginStore(app.cfg.dataDir);
+    const savedLogin = loginStore.save({
+      owner_id: "7001",
+      owner_name: "张三",
+      cookies: [
+        { name: "session", value: "sess_live_1", domain: "127.0.0.1", path: "/" },
+        { name: "passport_web_did", value: "did_test_123", domain: "127.0.0.1", path: "/" },
+      ],
+    });
+    const client = await FeishuWebClient.connect(savedLogin, { endpoints: mock.endpoints });
+
+    // [P1-2] groups=allowlist 且 allowlist=[]：非 @我 群消息不入库；sources.im=false 全部不入库
+    await svc.personalWeb.handleMessage(
+      decodeMessage(buildNativeMessage({ id: "pw_unlisted_1", chatId: "8002", actorId: "7002", text: "未列入群的普通闲聊" }), "7001"),
+      client,
+    );
+    assert.equal(svc.store.obs("pw:pw_unlisted_1"), undefined, "allowlist 外的非 @我 群消息绝不入库");
+
+    // [P1-3] oc_secret_8003 在 groups_deny 里，通过群名「绝密群」反查到 oc_secret_8003 后必须拒绝入库
+    await svc.personalWeb.handleMessage(
+      decodeMessage(
+        buildNativeMessage({
+          id: "pw_secret_1",
+          chatId: "8003",
+          actorId: "7002",
+          richBytes: encodeRichText([{ text: "@张三", mentionId: "7001" }, { text: " 绝密内容" }]),
+        }),
+        "7001",
+      ),
+      client,
+    );
+    assert.equal(svc.store.obs("pw:pw_secret_1"), undefined, "oc_ 禁用群同样阻断个人 Web 推送");
+
+    // readChat 失败且存在排除规则时 fail-closed（抛错暂缓 ACK，不落库）
+    mock.setChatModeFail(true);
+    await assert.rejects(
+      svc.personalWeb.handleMessage(
+        decodeMessage(
+          buildNativeMessage({
+            id: "pw_unknown_chat_1",
+            chatId: "8099",
+            actorId: "7002",
+            richBytes: encodeRichText([{ text: "@张三", mentionId: "7001" }, { text: " 未知群名" }]),
+          }),
+          "7001",
+        ),
+        client,
+      ),
+      /暂缓入库/,
+    );
+    assert.equal(svc.store.obs("pw:pw_unknown_chat_1"), undefined);
+    mock.setChatModeFail(false);
+
+    // [P1-2] sources.im = false 时连私聊也不入库
+    app.cfg.context.sources.im = false;
+    await svc.personalWeb.handleMessage(
+      decodeMessage(buildNativeMessage({ id: "pw_im_off", chatId: "dm_99", actorId: "7003", chatKind: CHAT_KIND_P2P, text: "关闭 im 来源" }), "7001"),
+      client,
+    );
+    assert.equal(svc.store.obs("pw:pw_im_off"), undefined);
+    app.cfg.context.sources.im = true;
+
+    // [P2-14] hydrateContext 过滤非白名单机器人
+    const nowSec = Math.floor(now / 1000);
+    mock.setHistory("8001", {
+      1: buildNativeMessage({ id: "h_bot_drop", chatId: "8001", actorId: "bot_x", senderType: 2, text: "Jenkins spam", position: 1, createdAtSec: nowSec - 60 }),
+      2: buildNativeMessage({ id: "h_human_ok", chatId: "8001", actorId: "7002", senderType: 1, text: "人类上下文", position: 2, createdAtSec: nowSec - 30 }),
+    });
+    const bridgeForHydrate = new PersonalWebBridge(app, svc.store, {
+      onFastTrigger: () => undefined,
+      onReconnect: () => undefined,
+      onNeedsLogin: () => undefined,
+      clientOptions: { endpoints: mock.endpoints },
+    });
+    // 挂上 live client 测试 hydrateContext
+    (bridgeForHydrate as unknown as { client?: FeishuWebClient }).client = client;
+    await bridgeForHydrate.hydrateContext(
+      { id: "h_anchor", conversationId: "8001", rootId: "", parentId: "", threadId: "", position: 3, createdAtMs: nowSec * 1000 },
+      "pw_chat:8001",
+      "Ark 发布协同群",
+    );
+    assert.equal(svc.store.obs("pw:h_bot_drop"), undefined, "补读历史同样过滤非白名单机器人");
+    assert.ok(svc.store.obs("pw:h_human_ok"), "人类历史背景正常写入");
+
+    // [P2-6] pre_draft=true 且 send_replies=false 时仍应生成待确认草稿；未补齐 om_ 前确认给清晰错误，补齐后可走 im.reply
+    svc.store.addObs([
+      {
+        id: "pw:pre_draft_1",
+        source: "im",
+        kind: "at_me",
+        conv: "pw_chat:8001",
+        conv_name: "Ark 发布协同群",
+        actor_id: "7002",
+        actor_name: "王五",
+        is_me: false,
+        time: now,
+        text: "@张三 麻烦确认下今天下午的发布窗口",
+        url: "",
+        meta: { transport: "personal_web", native_message_id: "pre_draft_1", native_chat_id: "8001", native_root_id: "pre_draft_1", chat_type: "group" },
+      },
+    ]);
+    const { item: askItem } = svc.store.upsertItem({ title: "确认下午发布窗口", kind: "ask_me", priority: "high", source: "im", confidence: 0.95 });
+    svc.store.addEvidence("item", askItem.id, "pw:pre_draft_1", "麻烦确认下今天下午的发布窗口", now);
+    assert.equal(svc.draftable(askItem), true, "send_replies=false 时仍允许起草");
+    fs.writeFileSync(path.join(ctxDir, "draft.txt"), "下午 4 点可以发布。");
+    const preDraft = await svc.drafter.forItem(askItem.id, "reply");
+    assert.equal(preDraft.status, "proposed");
+    await assert.rejects(
+      app.commands.exec("context.draft_approve", { id: preDraft.id }, { source: "web", actor: "owner" }),
+      /context\.personal_web\.send_replies/,
+    );
+    // lark-cli 补齐开放平台 ID 后，无需重新起草，确认直接走 im.reply
+    svc.store.addObs([
+      {
+        id: "im:om_window_1",
+        source: "im",
+        kind: "at_me",
+        conv: "oc_window_8001",
+        conv_name: "Ark 发布协同群",
+        actor_id: "ou_ww",
+        actor_name: "王五",
+        is_me: false,
+        time: now + 1000,
+        text: "@张三 麻烦确认下今天下午的发布窗口",
+        url: "https://applink.feishu.cn/client/chat/open?openChatId=oc_window_8001",
+        meta: { message_id: "om_window_1", chat_type: "group" },
+      },
+    ]);
+    const fxAfterEnrich = svc.drafter.effectFor(preDraft, "下午 4 点可以发布。");
+    assert.equal(fxAfterEnrich.op, "im.reply");
+    assert.equal((fxAfterEnrich.args as { message_id: string }).message_id, "om_window_1");
+
+    // [P2-2] 同会话并发占用保护：fastCycle 遇到已在处理的会话返回 busy: true
+    (svc as unknown as { activeConvs: Set<string> }).activeConvs.add(svc.store.canonicalConv("pw_chat:8001"));
+    const busyRes = await svc.fastCycle("context:fast:test-busy", { conv: "pw_chat:8001", conv_name: "Ark 发布协同群", trigger_obs_id: "pw:pre_draft_1" });
+    assert.equal(busyRes.busy, true);
+    (svc as unknown as { activeConvs: Set<string> }).activeConvs.delete(svc.store.canonicalConv("pw_chat:8001"));
+
+    // [P2-17] 防抖定时器里 onFastTrigger 抛错绝不能产生未捕获异常崩溃进程
+    const throwingBridge = new PersonalWebBridge(app, svc.store, {
+      onFastTrigger: () => {
+        throw new Error("SQLITE_BUSY");
+      },
+      onReconnect: () => undefined,
+      onNeedsLogin: () => undefined,
+    });
+    app.cfg.context.personal_web.debounce_ms = 10;
+    await throwingBridge.handleMessage(
+      decodeMessage(buildNativeMessage({ id: "pw_timer_err", chatId: "dm_88", actorId: "7088", chatKind: CHAT_KIND_P2P, text: "触发防抖异常测试" }), "7001"),
+      client,
+    );
+    await new Promise((r) => setTimeout(r, 40));
+    throwingBridge.stop();
+
+    // [P1-5] 账号绑定校验：禁止误扫他人账号或切换账号覆盖
+    app.store.set(BOUND_OWNER_KV_KEY, "7001");
+    app.store.set("ctx.owner_name", "张三");
+    await assert.rejects(
+      verifyWorkspaceOwnerBinding(app, { owner_id: "9999", owner_name: "张三", cookies: [] }),
+      /已绑定个人 Web 账号 7001/,
+    );
+    await assert.rejects(
+      verifyWorkspaceOwnerBinding(app, { owner_id: "7001", owner_name: "别人账号", cookies: [] }),
+      /与当前工作区主人「张三」.*不一致/,
+    );
+
+    // [P1-4] + [P2-8] 运行中登出：删除凭据文件后常驻监听迅速断开且绝不回写旧凭据；ticket 持续 401 时停止重试不再循环
+    const liveBridge = new PersonalWebBridge(app, svc.store, {
+      onFastTrigger: () => undefined,
+      onReconnect: () => undefined,
+      onNeedsLogin: () => undefined,
+      credentialWatchIntervalMs: 30,
+      clientOptions: { endpoints: mock.endpoints, heartbeatIntervalMs: 500, sessionDenialRetryMs: 15 },
+    });
+    const handle = liveBridge.start();
+    await waitUntil(() => liveBridge.status().state === "listening");
+    loginStore.clear();
+    await waitUntil(() => liveBridge.status().state === "needs_login");
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(loginStore.exists(), false, "登出后旧常驻会话绝不能把凭据写回磁盘");
+    handle.stop();
+
+    // [P3-1] 离线状态区分：无活跃 daemon.heartbeat 时即使 KV 里存着 listening，status() 也返回 stopped 且保留 last_message_at
+    app.store.set(
+      "ctx.personal_web.state",
+      JSON.stringify({ state: "listening", owner_id: "7001", owner_name: "张三", since: now, last_message_at: now - 1000, last_error: "" }),
+    );
+    loginStore.save({ owner_id: "7001", owner_name: "张三", cookies: savedLogin.cookies });
+    app.store.set("daemon.heartbeat", `host:1|${now - 120_000}`);
+    const offlineSt = svc.personalWeb.status(now);
+    assert.equal(offlineSt.state, "stopped", "守护进程心跳超时后不应误报实时在线");
+    assert.equal(offlineSt.last_message_at, now - 1000, "保留最近消息时间用于诊断");
+
+    // [P2-12] 三层嵌套冷字段 context.personal_web.enabled 不被热加载覆盖，同层热字段 fast_lane 立即生效
+    const settingsSvc = new SettingsService(app);
+    const putRes = await settingsSvc.put({ context: { personal_web: { enabled: false, fast_lane: false } } });
+    assert.equal(putRes.ok, true);
+    assert.equal(putRes.restart_required, true);
+    assert.equal(app.cfg.context.personal_web.enabled, true, "冷字段在重启前保持原值，状态不与实际运行中的长连接脱节");
+    assert.equal(app.cfg.context.personal_web.fast_lane, false, "热字段立即生效");
   } finally {
     app?.store.db.close();
     if (prevCtxDir === undefined) delete process.env.CTX_DIR;

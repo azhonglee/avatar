@@ -4,6 +4,8 @@ export {
   decodeLoginPoll,
   DEFAULT_ENDPOINTS,
   loadWebMetadata,
+  normalizeNativeId,
+  parseJsonPreserveNativeIds,
   pollLogin,
   QR_LOGIN_TIMEOUT_MS,
   QR_POLL_INTERVAL_MS,
@@ -16,6 +18,7 @@ export {
 } from "./auth.ts";
 export {
   FeishuWebClient,
+  SessionNeedsLoginError,
   type FeishuWebClientOptions,
   type ListenerState,
   type VerifiedReplyInput,

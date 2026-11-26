@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { hasSessionCookie, RecordingCookieJar, type CookieRecord, type WebLogin } from "./cookies.ts";
 import { fetchWithJar, getHeader, WEB_USER_AGENT, WebHttpError } from "./http.ts";
 
@@ -63,9 +64,33 @@ export interface NativeProfile {
   name: string;
 }
 
+const LOSSLESS_ID_KEYS = new Set(["id", "front_user_id"]);
+
+/**
+ * 解析 JSON 时无损保留 64 位原生账号 ID（如 7123456789012345678），避免 IEEE-754 double 舍入导致 owner 错配。
+ * 优先使用 Node 22+ 原生 JSON.parse reviver 的 context.source；若运行环境不支持则拒绝非安全整数。
+ */
+export function parseJsonPreserveNativeIds<T>(text: string): T {
+  const parseWithCtx = JSON.parse as (
+    src: string,
+    reviver: (key: string, value: unknown, context?: { source?: string }) => unknown,
+  ) => unknown;
+  return parseWithCtx(text, (key, value, ctx) => {
+    if (LOSSLESS_ID_KEYS.has(key) && typeof value === "number" && ctx?.source && /^-?\d+$/.test(ctx.source)) {
+      return ctx.source;
+    }
+    return value;
+  }) as T;
+}
+
 export function normalizeNativeId(raw: unknown): string {
   if (typeof raw === "string") return raw.trim();
-  if (typeof raw === "number" && Number.isFinite(raw)) return String(raw);
+  if (typeof raw === "number") {
+    if (!Number.isSafeInteger(raw)) {
+      throw new WebHttpError("http_error", "飞书原生账号 ID 超出安全整数范围且未能无损解析");
+    }
+    return String(raw);
+  }
   return "";
 }
 
@@ -135,7 +160,7 @@ export async function readNativeProfile(
   }
   let parsed: { code?: number; data?: { user?: { id?: unknown; name?: string } } };
   try {
-    parsed = JSON.parse(res.body.toString("utf8")) as typeof parsed;
+    parsed = parseJsonPreserveNativeIds<typeof parsed>(res.body.toString("utf8"));
   } catch {
     // 200 with non-JSON body (interstitial / throttle) is transient, never a definitive sign-out
     throw new WebHttpError("http_error", "个人 Web 资料响应暂不可解析", res.status);
@@ -259,7 +284,7 @@ export function decodeLoginPoll(body: Buffer): PollDecision {
     };
   };
   try {
-    parsed = JSON.parse(body.toString("utf8")) as typeof parsed;
+    parsed = parseJsonPreserveNativeIds<typeof parsed>(body.toString("utf8"));
   } catch {
     return { approved: false, scanned: false, ownerId: "", unreadable: true };
   }
@@ -336,6 +361,7 @@ export async function pollLogin(
       cookies: jar.records(),
       owner_id: profile.id,
       owner_name: profile.name,
+      session_id: crypto.randomUUID(),
       updated_at: new Date().toISOString(),
     };
   };

@@ -57,9 +57,17 @@ export type ListenerState =
   | "needs_login"
   | "stopped";
 
+export class SessionNeedsLoginError extends WebHttpError {
+  constructor(message: string, status?: number, cause?: unknown) {
+    super("credential_denied", message, status, cause);
+    this.name = "SessionNeedsLoginError";
+  }
+}
+
 export interface FeishuWebClientOptions {
   endpoints?: Partial<WebEndpoints>;
-  onSessionConfirmed?: (login: WebLogin) => void;
+  /** 返回 false 表示本地凭据已被登出或替换为新会话，客户端应停止继续使用当前会话 */
+  onSessionConfirmed?: (login: WebLogin) => boolean | void;
   heartbeatIntervalMs?: number;
   socketIdleTimeoutMs?: number;
   keepaliveIntervalMs?: number;
@@ -69,6 +77,7 @@ export interface FeishuWebClientOptions {
   sessionDenialRetryMs?: number;
   sessionHealthyAfterMs?: number;
   chatCacheTtlMs?: number;
+  maxQueueBytes?: number;
 }
 
 export interface VerifiedReplyInput {
@@ -84,6 +93,7 @@ export interface VerifiedReplyInput {
 export interface VerifiedReplyResult {
   replyId: string;
   rootId: string;
+  parentId: string;
   threadId: string;
   verified: boolean;
 }
@@ -179,9 +189,11 @@ export class FeishuWebClient {
       | "chatCacheTtlMs"
     >
   >;
-  private onSessionConfirmed?: (login: WebLogin) => void;
+  private readonly maxQueueBytes?: number;
+  private onSessionConfirmed?: (login: WebLogin) => boolean | void;
   private ownerId: string;
   private ownerName: string;
+  private readonly sessionId?: string;
   private deviceId = "";
   private appKey = "";
   private readonly chatCache = new Map<string, { meta: ChatMeta; expiresAt: number }>();
@@ -191,7 +203,9 @@ export class FeishuWebClient {
     this.jar = jar;
     this.ownerId = login.owner_id;
     this.ownerName = login.owner_name;
+    this.sessionId = login.session_id;
     this.onSessionConfirmed = options.onSessionConfirmed;
+    this.maxQueueBytes = options.maxQueueBytes;
     const heartbeat = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_MS;
     this.opts = {
       heartbeatIntervalMs: heartbeat,
@@ -227,25 +241,31 @@ export class FeishuWebClient {
     return { id: this.ownerId, name: this.ownerName };
   }
 
+  currentSessionId(): string | undefined {
+    return this.sessionId;
+  }
+
   /** Live snapshot including any cookies rotated by Feishu since login. */
   session(): WebLogin {
     return {
       owner_id: this.ownerId,
       owner_name: this.ownerName,
+      ...(this.sessionId ? { session_id: this.sessionId } : {}),
       cookies: this.jar.records(),
       updated_at: new Date().toISOString(),
     };
   }
 
-  setSessionObserver(cb: ((login: WebLogin) => void) | undefined): void {
+  setSessionObserver(cb: ((login: WebLogin) => boolean | void) | undefined): void {
     this.onSessionConfirmed = cb;
   }
 
-  private notifySessionConfirmed(): void {
+  private notifySessionConfirmed(): boolean {
     try {
-      this.onSessionConfirmed?.(this.session());
+      return this.onSessionConfirmed?.(this.session()) !== false;
     } catch {
       // observer errors must not break protocol loop
+      return true;
     }
   }
 
@@ -294,7 +314,9 @@ export class FeishuWebClient {
     if (res.status !== 200) {
       throw new WebHttpError("http_error", `个人 Web 网关请求被拒绝 (HTTP ${res.status})`, res.status);
     }
-    return unwrapGatewayPayload(res.body);
+    const unpacked = unwrapGatewayPayload(res.body);
+    if (res.cookiesUpdated) this.notifySessionConfirmed();
+    return unpacked;
   }
 
   /** Fetch one native message by its numeric message ID (command 8). */
@@ -412,7 +434,7 @@ export class FeishuWebClient {
     return [...dedup.values()].sort((a, b) => a.createdAtMs - b.createdAtMs).slice(-limit);
   }
 
-  /** Send a text reply once with a deterministic CID (command 5). */
+  /** Send a text reply once with a deterministic CID (command 5), preserving both root and selected parent IDs. */
   async sendReply(
     chatId: string,
     rootId: string,
@@ -420,8 +442,9 @@ export class FeishuWebClient {
     segments: RichSegment[],
     inThread: boolean,
     signal?: AbortSignal,
+    parentId = rootId,
   ): Promise<WebMessage> {
-    const packet = encodeReplyPacket(chatId, rootId, cid, segments, inThread);
+    const packet = encodeReplyPacket(chatId, rootId, cid, segments, inThread, parentId);
     const data = await this.gateway(CMD_SEND_MESSAGE, undefined, { cid, packet, signal });
     const resp = parseProto(data, MAX_WIRE_BYTES);
     const created = decodeMessage(resp.bytes(1), this.ownerId);
@@ -431,14 +454,56 @@ export class FeishuWebClient {
     return created;
   }
 
+  /** Independent readback verification for an already-created reply ID. */
+  async verifyReplyReadback(params: {
+    replyId: string;
+    chatId: string;
+    rootId: string;
+    parentId: string;
+    cid: string;
+    text: string;
+    threaded: boolean;
+    signal?: AbortSignal;
+  }): Promise<VerifiedReplyResult> {
+    const normalizeText = (s: string) => s.replace(/\r\n/g, "\n").trim();
+    const expectedText = normalizeText(params.text);
+    const readback = await this.readMessage(params.replyId, params.signal);
+    const verified =
+      readback.id === params.replyId &&
+      readback.senderType === USER_SENDER_TYPE &&
+      readback.actorId === this.ownerId &&
+      readback.conversationId === params.chatId &&
+      readback.rootId === params.rootId &&
+      readback.parentId === params.parentId &&
+      readback.cid === params.cid &&
+      (!params.threaded || (!!readback.threadId && !readback.sendToChat)) &&
+      normalizeText(readback.text) === expectedText;
+    if (!verified) {
+      throw new Error("个人 Web 回复回读校验未通过（消息身份、父消息或正文不一致）");
+    }
+    return {
+      replyId: readback.id,
+      rootId: params.rootId,
+      parentId: params.parentId,
+      threadId: readback.threadId,
+      verified: true,
+    };
+  }
+
   /**
    * Verified personal reply (used only after explicit human confirmation of a draft):
    *   1. Pre-send check: reads the original message to confirm it still exists in the expected chat.
    *   2. Reads chat kind & mode to determine explicit thread reply flag.
-   *   3. Sends ONCE with fixed CID.
-   *   4. Independent readback check verifying owner, chat, root, CID, and text.
+   *   3. Sends ONCE with fixed CID, preserving both rootId and selected parentId.
+   *   4. Independent readback check verifying owner, chat, root, parent, CID, and text.
    */
-  async sendVerifiedReply(input: VerifiedReplyInput): Promise<VerifiedReplyResult> {
+  async sendVerifiedReply(
+    input: VerifiedReplyInput,
+    hooks?: {
+      onBeforeSend?: (meta: { rootId: string; parentId: string; threaded: boolean }) => void;
+      onCreated?: (meta: { replyId: string; rootId: string; parentId: string; threaded: boolean }) => void;
+    },
+  ): Promise<VerifiedReplyResult> {
     const normalizeText = (s: string) => s.replace(/\r\n/g, "\n").trim();
     const text = normalizeText(input.text);
     if (!text) throw new Error("回复内容不能为空");
@@ -447,6 +512,7 @@ export class FeishuWebClient {
       throw new Error("原消息所属会话与草稿目标不一致，拒绝发送");
     }
     const actualRoot = original.rootId || original.id;
+    const actualParent = original.id;
     if (input.rootId && input.rootId !== actualRoot) {
       throw new Error("原消息根话题与草稿记录不一致，拒绝发送");
     }
@@ -456,31 +522,21 @@ export class FeishuWebClient {
       throw new Error(`不支持的个人会话类型：${chat.kind}`);
     }
     const inThread = replyInThread(chat.kind, chat.mode);
-    const created = await this.sendReply(input.chatId, actualRoot, input.cid, [{ text }], inThread, input.signal);
-
-    // Independent readback verification
-    const readback = await this.readMessage(created.id, input.signal);
     const threaded = group || inThread;
-    const verified =
-      readback.id === created.id &&
-      readback.senderType === USER_SENDER_TYPE &&
-      readback.actorId === this.ownerId &&
-      readback.conversationId === input.chatId &&
-      readback.rootId === actualRoot &&
-      readback.parentId === actualRoot &&
-      readback.cid === input.cid &&
-      (!threaded || (!!readback.threadId && !readback.sendToChat)) &&
-      normalizeText(readback.text) === text;
+    hooks?.onBeforeSend?.({ rootId: actualRoot, parentId: actualParent, threaded });
+    const created = await this.sendReply(input.chatId, actualRoot, input.cid, [{ text }], inThread, input.signal, actualParent);
+    hooks?.onCreated?.({ replyId: created.id, rootId: actualRoot, parentId: actualParent, threaded });
 
-    if (!verified) {
-      throw new Error("个人 Web 回复回读校验未通过（消息身份或正文不一致）");
-    }
-    return {
-      replyId: readback.id,
+    return this.verifyReplyReadback({
+      replyId: created.id,
+      chatId: input.chatId,
       rootId: actualRoot,
-      threadId: readback.threadId,
-      verified: true,
-    };
+      parentId: actualParent,
+      cid: input.cid,
+      text,
+      threaded,
+      signal: input.signal,
+    });
   }
 
   // ───────── Frontier WSS Push Listener ─────────
@@ -513,6 +569,7 @@ export class FeishuWebClient {
     if (!parsed.ticket) {
       throw new WebHttpError("http_error", "长连接票据暂不可用");
     }
+    if (res.cookiesUpdated) this.notifySessionConfirmed();
     const accessKey = crypto
       .createHash("md5")
       .update(`2${this.appKey}${this.deviceId}${ACCESS_KEY_SALT}`)
@@ -583,7 +640,7 @@ export class FeishuWebClient {
         const msg = err instanceof Error ? err.message : String(err);
         report(decision.state, msg);
         if (decision.giveUp) {
-          throw err;
+          throw new SessionNeedsLoginError(msg, err instanceof WebHttpError ? err.status : undefined, err);
         }
         try {
           await sleep(decision.waitMs, params.signal);
@@ -602,7 +659,9 @@ export class FeishuWebClient {
     onWarn?: (message: string) => void,
   ): Promise<void> {
     await this.verifyOwner(outerSignal);
-    this.notifySessionConfirmed();
+    if (!this.notifySessionConfirmed()) {
+      throw new WebHttpError("aborted", "本地凭据已被登出或更新");
+    }
     const wsAddress = await this.buildSocketUrl(outerSignal);
 
     const ws = await BinaryWebSocket.dial(wsAddress, {
@@ -610,6 +669,7 @@ export class FeishuWebClient {
         "User-Agent": WEB_USER_AGENT,
         Origin: this.endpoints.messengerOrigin,
       },
+      maxQueueBytes: this.maxQueueBytes,
       signal: outerSignal,
     });
 
@@ -629,17 +689,28 @@ export class FeishuWebClient {
     }, this.opts.heartbeatIntervalMs);
     hbTimer.unref?.();
 
-    // Session keepalive loop (30m): touches profile so rotated cookies are persisted
+    // Session keepalive loop (30m): touches profile so rotated cookies are persisted,
+    // and escalates definitive credential denials or owner mismatches out of the socket loop.
+    let keepaliveFatal: Error | null = null;
     const kaTimer = setInterval(() => {
       void readNativeProfile(this.jar, this.endpoints, { signal: loopCtrl.signal })
         .then((p) => {
-          if (p.id === this.ownerId) {
-            if (p.name) this.ownerName = p.name;
-            this.notifySessionConfirmed();
+          if (p.id !== this.ownerId) {
+            keepaliveFatal = new WebHttpError("credential_denied", "保活核验发现个人 Web 账号与已授权账号不一致");
+            ws.close();
+            return;
+          }
+          if (p.name) this.ownerName = p.name;
+          if (!this.notifySessionConfirmed()) {
+            keepaliveFatal = new WebHttpError("aborted", "本地凭据已被登出或更新");
+            ws.close();
           }
         })
-        .catch(() => {
-          // transient keepalive error handled on next connect
+        .catch((err: unknown) => {
+          if (isCredentialDenied(err)) {
+            keepaliveFatal = err as Error;
+            ws.close();
+          }
         });
     }, this.opts.keepaliveIntervalMs);
     kaTimer.unref?.();
@@ -651,6 +722,7 @@ export class FeishuWebClient {
       onState("listening");
       while (!loopCtrl.signal.aborted) {
         const frame = await ws.read(this.opts.socketIdleTimeoutMs, loopCtrl.signal);
+        if (keepaliveFatal) throw keepaliveFatal;
         if (frame.kind !== "binary") continue;
 
         let packet: ReturnType<typeof decodeFrame>;
@@ -687,6 +759,10 @@ export class FeishuWebClient {
           await ws.writeBinary(encodeAckFrame(sid), 15_000, loopCtrl.signal);
         }
       }
+      if (keepaliveFatal) throw keepaliveFatal;
+    } catch (err) {
+      if (keepaliveFatal) throw keepaliveFatal;
+      throw err;
     } finally {
       clearInterval(hbTimer);
       clearInterval(kaTimer);

@@ -365,15 +365,9 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
         `运行 ${code("bin/pa context web-login")} 使用本人飞书 App 扫码登录`,
       );
     }
-    let state = "idle";
-    let lastError = "";
-    try {
-      const saved = JSON.parse(store.get("ctx.personal_web.state") ?? "null") as { state?: string; last_error?: string } | null;
-      if (saved?.state) state = saved.state;
-      if (saved?.last_error) lastError = saved.last_error;
-    } catch {
-      // ignore malformed kv
-    }
+    const pw = app.ext.context?.status().personal_web;
+    const state = pw?.state ?? "idle";
+    const lastError = pw?.last_error ?? "";
     if (state === "needs_login") {
       return warn(
         `会话已失效（${lastError || "需要重新扫码"}）`,

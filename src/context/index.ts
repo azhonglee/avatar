@@ -46,6 +46,8 @@ export class ContextService {
   drafter: Drafter;
   personalWeb: PersonalWebBridge;
   running = false;
+  /** 正在理解中的规范会话键集合：避免常规周期与快通道、或同会话多个快通道并发重复理解同一批观测 */
+  private readonly activeConvs = new Set<string>();
 
   constructor(app: App) {
     this.app = app;
@@ -141,11 +143,21 @@ export class ContextService {
         let budget = this.cfg.context.max_convs_per_cycle;
         const par = this.cfg.context.understand_parallel;
         while (budget > 0 && !signal?.aborted) {
-          const pending = this.store.pendingConvs(Math.min(budget, 8 * par));
+          const pending = this.store
+            .pendingConvs(Math.min(budget, 8 * par) + this.activeConvs.size)
+            .filter((c) => !this.activeConvs.has(this.store.canonicalConv(c.conv)))
+            .slice(0, Math.min(budget, 8 * par));
           if (!pending.length) break;
+          const claimed = pending.map((c) => this.store.canonicalConv(c.conv));
+          claimed.forEach((k) => this.activeConvs.add(k));
           const groups: (typeof pending)[] = Array.from({ length: Math.min(par, pending.length) }, () => []);
           pending.forEach((c, i) => groups[i % groups.length].push(c));
-          const results = await Promise.allSettled(groups.map((g) => this.understander.runBatch(workId, g, signal)));
+          let results: PromiseSettledResult<Awaited<ReturnType<Understander["runBatch"]>>>[];
+          try {
+            results = await Promise.allSettled(groups.map((g) => this.understander.runBatch(workId, g, signal)));
+          } finally {
+            claimed.forEach((k) => this.activeConvs.delete(k));
+          }
           if (signal?.aborted) throw new Error("aborted");
           let progress = 0;
           results.forEach((res, gi) => {
@@ -203,39 +215,51 @@ export class ContextService {
 
   /**
    * 快通道单会话理解：收到个人 Web 的「@我」或对方私聊时触发，
-   * 不等待 10 分钟定时周期与全量来源采集，直接理解当前会话并立刻推送提醒卡片（可选预起草，仍需你确认才发）。
+   * 不等待 10 分钟定时周期与全量来源采集，直接以触发消息为中心构建窗口理解并立刻推送提醒卡片（可选预起草，仍需你确认才发）。
+   * 若该会话正在被另一批次理解，返回 busy: true 由调度层延迟重排，避免重复扣费与重复写入。
    */
   async fastCycle(
     workId: string,
     p: { conv: string; conv_name: string; trigger_obs_id: string; anchor?: FastAnchor },
     signal?: AbortSignal,
-  ): Promise<{ fresh: number; created: number; nudged: number; pre_drafted: number }> {
+  ): Promise<{ busy?: boolean; fresh: number; created: number; nudged: number; pre_drafted: number }> {
     if (!this.cfg.context.understand) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
-    await this.ensureOwnerName();
-    if (p.anchor) {
-      await this.personalWeb.hydrateContext(p.anchor, p.conv, p.conv_name, signal);
-    }
-    const window = this.store.convWindow(p.conv);
-    if (!window.length) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
-    const r = await this.understander.runBatch(workId, [{ conv: p.conv, conv_name: p.conv_name }], signal);
-    relinkMeegoItems(this.store);
-    this.store.mergeConflicts();
-    this.markNotImportant();
-    this.syncDrafts();
-    const nudged = this.nudge(r.created);
-    this.autonomy(r.created);
-
-    // 可选：为高优先级「别人在等你」自动预起草回复草稿（只起草，绝不自动发送）
-    let preDrafted = 0;
-    if (this.cfg.context.personal_web.pre_draft) {
-      for (const c of r.created) {
-        const it = this.store.item(c.id);
-        if (!it || it.status !== "open" || it.kind !== "ask_me" || it.priority !== "high") continue;
-        if (it.meta.needs_review || it.feedback === "unimportant" || !this.draftable(it)) continue;
-        if (this.enqueue(`draft:${it.id}:reply:fast`, { task: "draft", item_id: it.id, kind: "reply" })) preDrafted++;
+    const claimKey = this.store.canonicalConv(p.conv);
+    if (this.activeConvs.has(claimKey)) return { busy: true, fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+    this.activeConvs.add(claimKey);
+    try {
+      await this.ensureOwnerName();
+      if (p.anchor) {
+        await this.personalWeb.hydrateContext(p.anchor, p.conv, p.conv_name, signal);
       }
+      const window = this.store.convWindowAround(p.conv, p.trigger_obs_id);
+      if (!window.length) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+      const r = await this.understander.runBatch(
+        workId,
+        [{ conv: p.conv, conv_name: p.conv_name, target_obs_id: p.trigger_obs_id }],
+        signal,
+      );
+      relinkMeegoItems(this.store);
+      this.store.mergeConflicts();
+      this.markNotImportant();
+      this.syncDrafts();
+      const nudged = this.nudge(r.created);
+      this.autonomy(r.created);
+
+      // 可选：为高优先级「别人在等你」自动预起草回复草稿（只起草，绝不自动发送）
+      let preDrafted = 0;
+      if (this.cfg.context.personal_web.pre_draft) {
+        for (const c of r.created) {
+          const it = this.store.item(c.id);
+          if (!it || it.status !== "open" || it.kind !== "ask_me" || it.priority !== "high") continue;
+          if (it.meta.needs_review || it.feedback === "unimportant" || !this.draftable(it)) continue;
+          if (this.enqueue(`draft:${it.id}:reply:fast`, { task: "draft", item_id: it.id, kind: "reply" })) preDrafted++;
+        }
+      }
+      return { fresh: r.fresh, created: r.created.length, nudged, pre_drafted: preDrafted };
+    } finally {
+      this.activeConvs.delete(claimKey);
     }
-    return { fresh: r.fresh, created: r.created.length, nudged, pre_drafted: preDrafted };
   }
 
   private async ensureOwnerName(): Promise<void> {
@@ -419,6 +443,10 @@ export class ContextService {
         }
         if (p.task === "fast") {
           const r = await this.fastCycle(item.id, p, ctx.signal);
+          if (r.busy) {
+            this.app.ledger.release(item.id, { nextAt: Date.now() + 2_000, refund: true });
+            return;
+          }
           this.app.ledger.transition(item, { state: "done", terminal: true, payload: { ...p, result: r } as never });
           return;
         }
@@ -757,7 +785,12 @@ export function registerContext(app: App): ContextService | undefined {
       if (!d) throw new CommandError("not_found", "没有这份草稿");
       const content = a.content?.trim() || d.content;
       if (!content.trim()) throw new CommandError("invalid", "内容不能为空");
-      const effect = svc.drafter.effectFor(d, content);
+      let effect: Effect;
+      try {
+        effect = svc.drafter.effectFor(d, content);
+      } catch (e) {
+        throw new CommandError("invalid", errMsg(e));
+      }
       if (!svc.store.casDraft(d.id, ["proposed", "failed"], "approved", content)) {
         throw new CommandError("conflict", d.status === "sent" ? "已经发送过了" : d.status === "discarded" ? "草稿已丢弃" : "正在发送中");
       }
