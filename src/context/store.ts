@@ -9,7 +9,7 @@ import { isDeadOwner } from "../ledger.ts";
 export function obsRevision(o: { text: string; meta?: Record<string, unknown> }): string {
   const meta = o.meta ?? {};
   const rawMentions = Array.isArray(meta.mentions) ? meta.mentions : [];
-  if (meta.at_me === undefined && rawMentions.length === 0) return o.text;
+  if (!meta.at_me && rawMentions.length === 0) return o.text;
   const mentionsSig = rawMentions
     .map((m) => {
       const rec = m as { id?: unknown; start?: unknown; end?: unknown };
@@ -318,12 +318,19 @@ export class ContextStore {
           const curVer = typeof curMeta.edit_version === "number" && Number.isFinite(curMeta.edit_version) ? curMeta.edit_version : undefined;
           const nextVer = typeof o.meta?.edit_version === "number" && Number.isFinite(o.meta.edit_version) ? o.meta.edit_version : undefined;
           if (curVer !== undefined && nextVer !== undefined && nextVer < curVer) continue;
-          const revChanged = obsRevision({ text: String(cur.text ?? ""), meta: curMeta }) !== obsRevision(o);
+          const curEffectiveMeta =
+            curMeta.at_me === undefined && String(cur.kind ?? "") === "at_me" ? { ...curMeta, at_me: true } : curMeta;
+          const incomingMeta = o.meta ?? {};
+          const nextMeta: Record<string, unknown> = { ...curEffectiveMeta, ...incomingMeta };
+          delete nextMeta.background_only;
+          delete nextMeta.withdrawn;
+          // 按即将落库的合并后元数据比对修订：未确认的省略（undefined）保留原值且不误触发重开，确认移除（at_me: false）则清除旧标记且后续重复投递幂等
+          const revChanged =
+            obsRevision({ text: String(cur.text ?? ""), meta: curEffectiveMeta }) !==
+            obsRevision({ text: o.text, meta: nextMeta });
           if (wasBgOnly || wasWithdrawn || revChanged) {
             const prevGen = typeof curMeta.edit_gen === "number" && Number.isFinite(curMeta.edit_gen) ? curMeta.edit_gen : 0;
-            const mergedMeta: Record<string, unknown> = { ...curMeta, ...(o.meta ?? {}), edit_gen: prevGen + 1 };
-            delete mergedMeta.background_only;
-            delete mergedMeta.withdrawn;
+            const mergedMeta: Record<string, unknown> = { ...nextMeta, edit_gen: prevGen + 1 };
             upd.run(
               o.kind,
               o.conv_name || String(cur.conv_name ?? ""),

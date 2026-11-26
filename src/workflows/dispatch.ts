@@ -232,6 +232,10 @@ export class Dispatcher {
     };
 
     for (const guid of plan.redo) {
+      if (isContextDerivedDispatchBlocked({ cfg: this.cfg, store: this.store, ledger: this.ledger }, guid)) {
+        log("warn", "跳过归属旧主人的上下文委派卡片再派", { task: guid });
+        continue;
+      }
       const loc = await locate(guid);
       if (!loc) continue;
       if (hasLeft(loc, activeSections) || loc.sectionGuid !== this.board.section("dispatch")) {
@@ -241,6 +245,10 @@ export class Dispatcher {
       if (this.enqueue(cards.find((c) => c.guid === guid)!.task)) enqueued++;
     }
     for (const guid of plan.enqueue) {
+      if (isContextDerivedDispatchBlocked({ cfg: this.cfg, store: this.store, ledger: this.ledger }, guid)) {
+        log("warn", "跳过归属旧主人的上下文委派卡片入队", { task: guid });
+        continue;
+      }
       if (this.enqueue(cards.find((c) => c.guid === guid)!.task)) enqueued++;
     }
     for (const id of plan.suspects) {

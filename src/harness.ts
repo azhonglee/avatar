@@ -262,8 +262,8 @@ function serializeTomlInlineValue(v: TomlValue): string {
   return serializeTomlScalar(v);
 }
 
-// 对齐 Codex CLI 0.169+ 内置供应商与凭据存储白名单（ollama/lmstudio 无需 [model_providers.*]；oss 不是 provider ID）
-const BUILTIN_CODEX_PROVIDERS = new Set(["openai", "ollama", "lmstudio"]);
+// 对齐 Codex CLI 0.169+ 内置供应商与凭据存储白名单（无需 [model_providers.*]；oss 不是 provider ID）
+const BUILTIN_CODEX_PROVIDERS = new Set(["openai", "ollama", "lmstudio", "amazon-bedrock", "gcp"]);
 const ALLOWED_CODEX_CREDENTIAL_STORES = new Set(["file", "keyring", "auto", "ephemeral"]);
 const SAFE_CODEX_TOP_SCALARS = new Set([
   "model",

@@ -195,7 +195,7 @@ export function selectEffectiveOpenGroups(params: {
   const maxGroups = Math.max(0, cfg.context.max_groups);
 
   const resolveName = (id: string, fallback = ""): string => {
-    const first = (fallback || spoken[id]?.name || knownNames?.[id] || "").trim();
+    const first = (fallback || knownNames?.[id] || spoken[id]?.name || "").trim();
     if (first && first !== "群聊" && !first.startsWith("私聊")) return first;
     const obsName = (store.latestConvObs(id)?.conv_name ?? "").trim();
     return obsName && obsName !== "群聊" && !obsName.startsWith("私聊") ? obsName : "";
@@ -440,9 +440,9 @@ export class Connectors {
       .sort()
       .join("|");
     const deny = [...this.cfg.context.groups_deny].map((s) => s.trim()).sort().join("|");
-    // 保留 groups_allow 顺序：在 max_groups 截断下，白名单顺序变化同样改变选中群集合
+    // 保留 groups_allow 顺序：在 max_groups 截断下，白名单顺序变化同样改变选中群集合；包含 lookback_days 以感知 spoken 回看窗口变化
     const allow = this.cfg.context.groups_allow.map((s) => s.trim()).join("|");
-    return `${this.cfg.context.sources.im ? 1 : 0};${this.cfg.context.groups};${this.cfg.context.max_groups};${allow};${deny};${mutes}`;
+    return `${this.cfg.context.sources.im ? 1 : 0};${this.cfg.context.groups};${this.cfg.context.max_groups};${this.cfg.context.lookback_days};${allow};${deny};${mutes}`;
   }
 
   private async resolveCurrentChatMeta(chatId: string): Promise<{ name: string; chatType: "p2p" | "group" | "" } | undefined> {
@@ -499,7 +499,7 @@ export class Connectors {
     return "allowed";
   }
 
-  private toObs(m: Raw, kind: string, me: string): Obs | undefined {
+  private toObs(m: Raw, kind: string, me: string, atMeWindowStartMs?: number): Obs | undefined {
     const sender = m.sender ?? {};
     const senderType = String(sender.sender_type ?? sender.type ?? m.sender_type ?? "");
     const msgType = String(m.msg_type ?? m.message_type ?? "");
@@ -509,6 +509,17 @@ export class Connectors {
     const isMe = senderId === me;
     const text = textOf(m.content ?? m.text ?? "");
     if (!text) return undefined;
+    const msgTime = parseTime(m.create_time ?? m.time, this.cfg.owner.timezone);
+    // 独立记录 @我 判定状态：
+    //   - 命中 --is-at-me 时记 at_me: true（确保白名单机器人 kind="bot" 也被识别为真实 @我）；
+    //   - 落在本次 --is-at-me 查询窗口内但未命中时，明确记 at_me: false（用于覆盖已被编辑移除的旧 @我 标记）；
+    //   - 早于 --is-at-me 查询窗口的历史消息未参与本次 @我 检索，省略 at_me 以保留原值不误清。
+    const atMeMeta: Record<string, unknown> =
+      kind === "at_me"
+        ? { at_me: true }
+        : atMeWindowStartMs !== undefined && msgTime >= atMeWindowStartMs
+          ? { at_me: false }
+          : {};
     return {
       id: `im:${m.message_id ?? m.id}`,
       source: "im",
@@ -518,7 +529,7 @@ export class Connectors {
       actor_id: senderId,
       actor_name: String(sender.name ?? m.sender_name ?? ""),
       is_me: isMe,
-      time: parseTime(m.create_time ?? m.time, this.cfg.owner.timezone),
+      time: msgTime,
       text: text.slice(0, 2000),
       url: m.chat_id ? `https://applink.feishu.cn/client/chat/open?openChatId=${m.chat_id}` : "",
       meta: {
@@ -527,8 +538,7 @@ export class Connectors {
         thread_id: m.thread_id ?? "",
         parent_id: m.parent_id ?? m.root_id ?? "",
         sender_type: senderType,
-        // 独立记录已验证的 @我 标记，确保白名单机器人（kind="bot"）在范围外群 @我 时不会被范围过滤永久丢弃
-        ...(kind === "at_me" ? { at_me: true } : {}),
+        ...atMeMeta,
       },
     };
   }
@@ -559,7 +569,9 @@ export class Connectors {
     let policySig = this.pollingPolicySignature();
     const initialGroupsMode = this.cfg.context.groups;
     const initialMaxGroups = this.cfg.context.max_groups;
+    const initialLookbackDays = this.cfg.context.lookback_days;
     const initialAllowOrder = this.cfg.context.groups_allow.map((s) => s.trim()).join("|");
+    const atMeWindowStartMs = Math.ceil((sinceAtMe - 5 * 60_000) / 1000) * 1000;
     let nativeExcl = this.nativeExclusions ? await this.nativeExclusions() : undefined;
 
     const metaCache = new Map<string, { name: string; chatType: "p2p" | "group" | "" } | null>();
@@ -607,25 +619,51 @@ export class Connectors {
 
     const scannedGroups = !nativeExcl?.groupsInconclusive;
     const needsNameForRanking = this.hasNameDenyPatterns() || !!(nativeExcl && nativeExcl.confirmedGroupNames.size > 0);
-    if (scannedGroups && this.cfg.context.groups === "allowlist" && needsNameForRanking) {
-      const seenAllow = new Set<string>();
-      let allowedCount = 0;
-      for (const raw of this.cfg.context.groups_allow) {
-        const id = raw.trim();
-        if (!id || seenAllow.has(id) || id.startsWith("pw_chat:") || /^\d+$/.test(id)) continue;
-        seenAllow.add(id);
-        let name = (spoken[id]?.name || knownNames[id] || this.store.latestConvObs(id)?.conv_name || "").trim();
+    if (scannedGroups && needsNameForRanking && this.cfg.context.max_groups > 0) {
+      const refreshCandidateNameIfNeeded = async (id: string, fallbackName = ""): Promise<string> => {
+        let name = (knownNames[id] || spoken[id]?.name || fallbackName || this.store.latestConvObs(id)?.conv_name || "").trim();
         if (name === "群聊" || name.startsWith("私聊")) name = "";
-        if (!name) {
+        // 若名称缺失，或旧缓存名称正触发按名称排除，实时刷新一次当前群名（避免改名后的白名单/发言群永远困在旧排除缓存里）
+        const excludedByCachedName = !!name && isOpenGroupDirectlyDenied(this.cfg, this.store, id, name, nativeExcl);
+        if (!name || excludedByCachedName) {
           const fresh = await getChatMeta(id);
           if (fresh?.name) {
             name = fresh.name;
+            if (spoken[id]) spoken[id].name = name;
             recordLearnedName(id, name);
           }
         }
-        if (!isOpenGroupDirectlyDenied(this.cfg, this.store, id, name, nativeExcl)) {
-          allowedCount++;
-          if (allowedCount >= this.cfg.context.max_groups) break;
+        return name;
+      };
+      const isDeniedByDirectId = (id: string) =>
+        this.store.isConvMutedById(id) || this.cfg.context.groups_deny.some((d) => d.trim() === id);
+
+      if (this.cfg.context.groups === "allowlist") {
+        const seenAllow = new Set<string>();
+        let allowedCount = 0;
+        for (const raw of this.cfg.context.groups_allow) {
+          const id = raw.trim();
+          if (!id || seenAllow.has(id) || id.startsWith("pw_chat:") || /^\d+$/.test(id)) continue;
+          seenAllow.add(id);
+          if (isDeniedByDirectId(id)) continue;
+          const name = await refreshCandidateNameIfNeeded(id);
+          if (!isOpenGroupDirectlyDenied(this.cfg, this.store, id, name, nativeExcl)) {
+            allowedCount++;
+            if (allowedCount >= this.cfg.context.max_groups) break;
+          }
+        }
+      } else {
+        let allowedCount = 0;
+        const candidates = Object.entries(spoken)
+          .filter(([, v]) => v.at >= now - lookback)
+          .sort((a, b) => b[1].at - a[1].at);
+        for (const [id, v] of candidates) {
+          if (isDeniedByDirectId(id)) continue;
+          const name = await refreshCandidateNameIfNeeded(id, v.name);
+          if (!isOpenGroupDirectlyDenied(this.cfg, this.store, id, name, nativeExcl)) {
+            allowedCount++;
+            if (allowedCount >= this.cfg.context.max_groups) break;
+          }
         }
       }
     }
@@ -723,6 +761,7 @@ export class Connectors {
       if (
         this.cfg.context.groups !== initialGroupsMode ||
         this.cfg.context.max_groups !== initialMaxGroups ||
+        this.cfg.context.lookback_days !== initialLookbackDays ||
         this.cfg.context.groups_allow.map((s) => s.trim()).join("|") !== initialAllowOrder ||
         (!latestExcl?.groupsInconclusive) !== scannedGroups
       ) {
@@ -842,7 +881,7 @@ export class Connectors {
           dropped++;
           continue;
         }
-        const o = this.toObs(m, entry.kind, me);
+        const o = this.toObs(m, entry.kind, me, atMeWindowStartMs);
         if (o) obs.push(o);
       }
 

@@ -380,10 +380,18 @@ class TomlParser {
         return "\f";
       case "r":
         return "\r";
+      case "e":
+        return "\x1b";
       case '"':
         return '"';
       case "\\":
         return "\\";
+      case "x": {
+        const hex = this.src.slice(this.pos, this.pos + 2);
+        if (!/^[0-9a-fA-F]{2}$/.test(hex)) throw new Error(`TOML 语法错误（${this.loc(startPos)}）：非法 \\x 转义`);
+        this.pos += 2;
+        return String.fromCodePoint(parseInt(hex, 16));
+      }
       case "u": {
         const hex = this.src.slice(this.pos, this.pos + 4);
         if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error(`TOML 语法错误（${this.loc(startPos)}）：非法 \\u 转义`);
@@ -538,7 +546,10 @@ class TomlParser {
       const num = Number(cleaned);
       if (Number.isFinite(num)) return num;
     }
-    if (/^\d{4}-\d{2}-\d{2}(?:[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})?)?$/.test(raw) || /^\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(raw)) {
+    if (
+      /^\d{4}-\d{2}-\d{2}(?:[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:[Zz]|[+-]\d{2}:\d{2})?)?$/.test(raw) ||
+      /^\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(raw)
+    ) {
       return raw;
     }
     // 绝不把原始标量值写进错误信息，防止未加引号的凭据泄漏到日志或状态字段

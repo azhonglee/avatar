@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
-import { isContextDerivedDispatchBlocked } from "./api/queries.ts";
+import { isContextDerivedDispatchBlocked, isWorkBlockedByOwner } from "./api/queries.ts";
 import type { CommandName, DeliveryStatus } from "./api/types.ts";
 import { CommandError, S, type Commands } from "./commands.ts";
 import type { Config } from "./config.ts";
@@ -59,7 +59,7 @@ function terminalDispatch(d: Pick<CoreDeps, "cfg" | "store" | "ledger">, id: str
 
 /** 注册不依赖可选模块的核心命令。 */
 export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
-  const { cfg, ledger, board, dispatcher } = d;
+  const { cfg, store, ledger, board, dispatcher } = d;
   const harnessName = z.string().refine((h) => !!cfg.harnesses[h], { message: "未定义的执行者" });
 
   commands.register({
@@ -75,12 +75,20 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
         .optional(),
     }),
     target: (a) => a.summary,
-    run: async (a) => {
+    run: async (a, ctx) => {
       const summary = `${a.harness ? `[${a.harness}] ` : ""}${a.summary}`;
       const description = [a.description ?? "", a.repo ? `repo: ${a.repo}` : ""].filter(Boolean).join("\n");
       const guid = await board.createTask({ summary, description, section: "dispatch" });
+      // 在对账前立即持久化 GUID 归属：即使后续 board 读取/对账失败，远端已建任务也已绑定原主人
+      const contextOwner = ctx.contextOwner?.trim();
+      if (contextOwner) {
+        store.set(`ctx.dispatch_ref_owner.${guid}`, contextOwner);
+      }
       await dispatcher.reconcile();
       const w = ledger.latest("dispatch", guid);
+      if (contextOwner && w?.id) {
+        store.set(`ctx.dispatch_owner.${w.id}`, contextOwner);
+      }
       return { ok: true, message: "已创建派单，进度会实时更新", target: w?.id ?? guid };
     },
   });
@@ -144,6 +152,7 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
     run: async (a) => {
       const w = ledger.get(a.id);
       if (!w) throw new CommandError("not_found", `没有这项工作：${a.id}`);
+      if (isWorkBlockedByOwner(d, w)) throw new CommandError("conflict", "该工作项源自旧工作区主人的工作上下文，已按主人隔离阻断操作");
       if (w.kind === "dispatch") throw new CommandError("invalid", "派单请用“重试”或“返工”");
       if (!ledger.revive(a.id)) throw new CommandError("conflict", "只有失败落定的工作可以重试");
       return { ok: true, message: "已重新排队", target: a.id };

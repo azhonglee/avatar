@@ -130,15 +130,18 @@ function loadRevokedSessionIds(store: Store): Set<string> {
 
 /**
  * 吊销当前工作区的个人 Web 会话：
- *   - 清理当前进程解析到的本地凭据文件（并仅清理同路径的 pending 恢复标记）；
- *   - 同时在共享 SQLite 中持久化工作区级吊销标记与已知 session_id 黑名单，
- *     即使常驻进程使用了不同的 `PA_FEISHU_WEB_CRED_FILE`，监听、入库与 pw.reply 发送也会立刻中止并转入 needs_login。
+ *   - 优先在共享 SQLite 中原子/顺序持久化工作区级吊销标记、黑名单 session_id 与 needs_login 状态，
+ *     确保即使本地凭据目录只读、文件锁超时或常驻进程使用不同的 `PA_FEISHU_WEB_CRED_FILE`，监听、入库与 pw.reply 发送也会立刻中止；
+ *   - 随后尽力清理当前进程解析到的本地凭据文件，并将文件清理异常作为 `fileError` 独立返回而非阻断吊销。
  */
-export function revokeWorkspacePersonalWebSession(app: App): { fileRemoved: boolean; credFile: string } {
+export function revokeWorkspacePersonalWebSession(app: App): { fileRemoved: boolean; credFile: string; fileError?: string } {
   const loginStore = new WebLoginStore(app.cfg.dataDir);
-  const existingOnDisk = loginStore.load();
-  const existed = fs.existsSync(loginStore.file);
-  loginStore.clear();
+  let existingOnDisk: WebLogin | undefined;
+  try {
+    existingOnDisk = loginStore.load();
+  } catch {
+    existingOnDisk = undefined;
+  }
 
   const revokedIds = loadRevokedSessionIds(app.store);
   const addId = (sid: string | undefined) => {
@@ -153,26 +156,29 @@ export function revokeWorkspacePersonalWebSession(app: App): { fileRemoved: bool
   } catch {
     // ignore
   }
-  const capped = [...revokedIds].slice(-50);
-  app.store.set(REVOKED_SESSIONS_KV_KEY, JSON.stringify(capped));
-  app.store.set(REVOKED_AT_KV_KEY, String(Date.now()));
-  app.store.set(ACTIVE_SESSION_KV_KEY, "");
 
-  // 仅当 pending 恢复标记属于当前凭据路径时才清理，避免干扰自定义路径的未完成提交
+  let clearPending = false;
   try {
     const rawPending = (app.store.get(PENDING_CRED_COMMIT_KV_KEY) ?? "").trim();
     if (rawPending) {
       const parsed = JSON.parse(rawPending) as { file?: string; session_id?: string };
       addId(parsed.session_id);
       if (!parsed.file || parsed.file === loginStore.file) {
-        app.store.set(PENDING_CRED_COMMIT_KV_KEY, "");
+        clearPending = true;
       }
-      app.store.set(REVOKED_SESSIONS_KV_KEY, JSON.stringify([...revokedIds].slice(-50)));
     }
   } catch {
     // ignore
   }
 
+  // 先提交共享数据库吊销标记，再做本地文件清理（即使文件目录只读或锁超时也已完成工作区吊销）
+  const capped = [...revokedIds].slice(-50);
+  app.store.set(REVOKED_SESSIONS_KV_KEY, JSON.stringify(capped));
+  app.store.set(REVOKED_AT_KV_KEY, String(Date.now()));
+  app.store.set(ACTIVE_SESSION_KV_KEY, "");
+  if (clearPending) {
+    app.store.set(PENDING_CRED_COMMIT_KV_KEY, "");
+  }
   app.store.set(
     STATE_KV_KEY,
     JSON.stringify({
@@ -186,7 +192,65 @@ export function revokeWorkspacePersonalWebSession(app: App): { fileRemoved: bool
       last_error: "已手动登出",
     }),
   );
-  return { fileRemoved: existed, credFile: loginStore.file };
+
+  let fileRemoved = false;
+  let fileError: string | undefined;
+  try {
+    const existed = fs.existsSync(loginStore.file);
+    loginStore.clear();
+    fileRemoved = existed;
+  } catch (err) {
+    fileError = errMsg(err);
+  }
+  return { fileRemoved, credFile: loginStore.file, ...(fileError ? { fileError } : {}) };
+}
+
+/**
+ * 校验某份本地个人 Web 凭据在当前工作区是否仍被授权使用：
+ *   - 工作区未被 web-logout 吊销（REVOKED_AT_KV_KEY 为空）；
+ *   - 凭据 session_id 不在工作区已吊销会话集合内；
+ *   - 若工作区已记录当前活跃会话代际（ACTIVE_SESSION_KV_KEY），凭据 session_id 必须与之匹配（防止跨文件旧会话继续监听/核验/回写 Cookie）；
+ *   - 已显式绑定个人 Web 账号且与 login.owner_id、cfg.owner.open_id 一致。
+ */
+export function assertLoginAuthorizedForWorkspace(
+  app: Pick<App, "cfg" | "store">,
+  login: WebLogin,
+): void {
+  const revokedAt = (app.store.get(REVOKED_AT_KV_KEY) ?? "").trim();
+  if (revokedAt) {
+    throw new SessionNeedsLoginError(
+      "当前工作区的个人 Web 会话已通过 `pa context web-logout` 吊销，请重新运行 `pa context web-login`",
+    );
+  }
+  if (login.session_id && loadRevokedSessionIds(app.store).has(login.session_id)) {
+    throw new SessionNeedsLoginError(
+      `当前凭据文件的个人 Web 会话 (${login.session_id}) 已被吊销，请使用新凭据或重新运行 \`pa context web-login\``,
+    );
+  }
+  const activeSession = (app.store.get(ACTIVE_SESSION_KV_KEY) ?? "").trim();
+  if (activeSession && (login.session_id ?? "").trim() !== activeSession) {
+    throw new SessionNeedsLoginError(
+      `当前凭据文件的个人 Web 会话 (${login.session_id || "未标注"}) 已被更新的登录会话 (${activeSession}) 取代，请切换至最新凭据文件或重新运行 \`pa context web-login\``,
+    );
+  }
+  const bound = (app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
+  if (!bound) {
+    throw new SessionNeedsLoginError(
+      "当前工作区尚未完成个人 Web 账号显式绑定（即使通过 PA_FEISHU_WEB_CRED_FILE 指向已有凭据也不得静默绑定），请运行 `pa context web-login` 完成确认绑定",
+    );
+  }
+  if (bound !== login.owner_id) {
+    throw new SessionNeedsLoginError(
+      `个人 Web 凭据账号 (${login.owner_id}) 与当前工作区已绑定的账号 (${bound}) 不一致，请重新运行 pa context web-login`,
+    );
+  }
+  const cfgWs = app.cfg.owner.open_id.trim();
+  const boundWs = (app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
+  if (cfgWs !== boundWs) {
+    throw new SessionNeedsLoginError(
+      `当前 config.yaml 配置的主人 (${cfgWs || "未配置"}) 与个人 Web 凭据已绑定的工作区主人 (${boundWs || "未绑定"}) 不一致；为防私聊泄漏给错误主人，已中止启动，请清理数据目录或重新扫码绑定`,
+    );
+  }
 }
 
 /**
@@ -342,6 +406,7 @@ export class PersonalWebBridge {
   private readonly debouncedAnchors = new Map<string, Map<string, FastAnchor>>();
   private readonly debounceFirstAt = new Map<string, number>();
   private readonly ocExclusionCache = new Map<string, OpenChatExclusionMeta>();
+  private readonly pwGroupNameCache = new Map<string, string>();
   private readonly initialCfgStat: string;
   private state: PersistedState;
 
@@ -409,6 +474,7 @@ export class PersonalWebBridge {
       pw.fast_lane ? 1 : 0,
       this.cfg.context.groups,
       this.cfg.context.max_groups,
+      this.cfg.context.lookback_days,
       allow,
       deny,
       mutes,
@@ -457,20 +523,51 @@ export class PersonalWebBridge {
     const enabled = this.cfg.context.personal_web.enabled;
     const daemonLive = this.isDaemonLive(now);
     const localKeyMissing = inspected.status === "missing_key";
-    // 若交互式 shell 未注入 systemd 凭据密钥（missing_key），但常驻进程本身在线且处于有效状态，
-    // 将常驻运行态与本地密钥可读性分开判断，避免把在线 listening 误报成 needs_login
+    const localCredUnavailable = inspected.status === "missing_key" || inspected.status === "missing";
     const revokedAt = (this.app.store.get(REVOKED_AT_KV_KEY) ?? "").trim();
     const revokedSessions = loadRevokedSessionIds(this.app.store);
-    const loginRevoked = !!revokedAt || (!!login?.session_id && revokedSessions.has(login.session_id));
-    const daemonHealthyWithoutLocalKey = !revokedAt && localKeyMissing && daemonLive && saved.state !== "needs_login" && !!saved.owner_id;
-    const loggedIn = (!!login && !loginRevoked) || daemonHealthyWithoutLocalKey;
+    const activeSession = (this.app.store.get(ACTIVE_SESSION_KV_KEY) ?? "").trim();
+    const boundNative = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
+    const boundWs = (this.app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
+    const cfgWs = this.cfg.owner.open_id.trim();
+    const ownerMismatch = hasWorkspaceOwnerMismatch(this.app.store, cfgWs);
+
+    let loginAuthorized = false;
+    let loginAuthErr = "";
+    if (login) {
+      try {
+        assertLoginAuthorizedForWorkspace(this.app, login);
+        loginAuthorized = true;
+      } catch (err) {
+        loginAuthErr = errMsg(err);
+      }
+    }
+
+    const savedSessionRevoked = !!revokedAt || (!!saved.session_id && revokedSessions.has(saved.session_id));
+    const savedSessionSuperseded = !!activeSession && !!saved.session_id && saved.session_id !== activeSession;
+    const savedOwnerMatches =
+      !!saved.owner_id &&
+      (!boundNative || saved.owner_id === boundNative) &&
+      (!boundWs || boundWs === cfgWs) &&
+      !ownerMismatch;
+
+    // 若交互式 shell 未注入 systemd 凭据密钥（missing_key）或使用默认路径找不到 systemd 的自定义凭据文件（missing），
+    // 但常驻进程本身在线且持有未吊销、未过期的有效会话，将常驻运行态与本地文件可读性分开判断，避免把在线 listening 误报成 needs_login
+    const daemonHealthyWithoutLocalCred =
+      !revokedAt &&
+      !savedSessionRevoked &&
+      !savedSessionSuperseded &&
+      savedOwnerMatches &&
+      localCredUnavailable &&
+      daemonLive &&
+      saved.state !== "needs_login";
+    const loggedIn = loginAuthorized || daemonHealthyWithoutLocalCred;
     const staleSavedSession =
-      !!login &&
-      !loginRevoked &&
+      loginAuthorized &&
       saved.state === "needs_login" &&
-      ((!!login.session_id && saved.session_id !== login.session_id) ||
-        (!!saved.owner_id && saved.owner_id !== login.owner_id) ||
-        (typeof saved.cookie_version === "number" && (login.cookie_version ?? 1) > saved.cookie_version));
+      ((!!login?.session_id && saved.session_id !== login.session_id) ||
+        (!!saved.owner_id && saved.owner_id !== login?.owner_id) ||
+        (typeof saved.cookie_version === "number" && (login?.cookie_version ?? 1) > saved.cookie_version));
 
     let state: string = staleSavedSession ? "stopped" : saved.state;
     let lastError = staleSavedSession ? "" : saved.last_error;
@@ -479,8 +576,10 @@ export class PersonalWebBridge {
       lastError = "";
     } else if (!loggedIn) {
       state = "needs_login";
-      if (loginRevoked && !lastError) {
+      if (revokedAt && !lastError) {
         lastError = "已手动登出";
+      } else if (loginAuthErr && !lastError) {
+        lastError = loginAuthErr;
       } else if (localKeyMissing && !lastError) {
         lastError = "当前环境缺少解密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）";
       }
@@ -491,8 +590,8 @@ export class PersonalWebBridge {
       enabled,
       logged_in: loggedIn,
       state,
-      owner_id: login?.owner_id || saved.owner_id,
-      owner_name: login?.owner_name || saved.owner_name,
+      owner_id: (loginAuthorized ? login?.owner_id : "") || (loggedIn ? saved.owner_id : ""),
+      owner_name: (loginAuthorized ? login?.owner_name : "") || (loggedIn ? saved.owner_name : ""),
       last_message_at: saved.last_message_at,
       last_error: lastError,
     };
@@ -520,44 +619,17 @@ export class PersonalWebBridge {
   }
 
   private validateBoundOwner(login: WebLogin): void {
-    const revokedAt = (this.app.store.get(REVOKED_AT_KV_KEY) ?? "").trim();
-    if (revokedAt) {
-      throw new SessionNeedsLoginError(
-        "当前工作区的个人 Web 会话已通过 `pa context web-logout` 吊销，请重新运行 `pa context web-login`",
-      );
-    }
-    if (login.session_id && loadRevokedSessionIds(this.app.store).has(login.session_id)) {
-      throw new SessionNeedsLoginError(
-        `当前凭据文件的个人 Web 会话 (${login.session_id}) 已被吊销，请使用新凭据或重新运行 \`pa context web-login\``,
-      );
-    }
-    const bound = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
-    if (!bound) {
-      throw new SessionNeedsLoginError(
-        "当前工作区尚未完成个人 Web 账号显式绑定（即使通过 PA_FEISHU_WEB_CRED_FILE 指向已有凭据也不得静默绑定），请运行 `pa context web-login` 完成确认绑定",
-      );
-    }
-    if (bound !== login.owner_id) {
-      throw new SessionNeedsLoginError(
-        `个人 Web 凭据账号 (${login.owner_id}) 与当前工作区已绑定的账号 (${bound}) 不一致，请重新运行 pa context web-login`,
-      );
-    }
-    const cfgWs = this.cfg.owner.open_id.trim();
-    const boundWs = (this.app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
-    if (cfgWs !== boundWs) {
-      throw new SessionNeedsLoginError(
-        `当前 config.yaml 配置的主人 (${cfgWs || "未配置"}) 与个人 Web 凭据已绑定的工作区主人 (${boundWs || "未绑定"}) 不一致；为防私聊泄漏给错误主人，已中止启动，请清理数据目录或重新扫码绑定`,
-      );
-    }
+    assertLoginAuthorizedForWorkspace(this.app, login);
   }
 
-  /** 失败休眠后的唤醒键：包含 cookie_version、updated_at 与吊销状态（与活跃长连接的 sessionKeyOf 分离），确保同会话轮换或重登后立即唤醒 */
+  /** 失败休眠后的唤醒键：包含 cookie_version、updated_at、吊销状态与当前活跃会话代际（与活跃长连接的 sessionKeyOf 分离），确保同会话轮换或跨文件重登后立即唤醒 */
   private credentialWatchKey(login: WebLogin | undefined): string {
     const bound = this.app.store.get(BOUND_OWNER_KV_KEY) ?? "";
     const boundWs = this.app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "";
     const revoked = this.app.store.get(REVOKED_AT_KV_KEY) ?? "";
-    if (!login) return `none|${bound}|${boundWs}|${revoked}`;
-    return `${login.owner_id}:${login.session_id ?? ""}:v${login.cookie_version ?? 1}:${login.updated_at ?? ""}|${bound}|${boundWs}|${revoked}`;
+    const active = this.app.store.get(ACTIVE_SESSION_KV_KEY) ?? "";
+    if (!login) return `none|${bound}|${boundWs}|${revoked}|${active}`;
+    return `${login.owner_id}:${login.session_id ?? ""}:v${login.cookie_version ?? 1}:${login.updated_at ?? ""}|${bound}|${boundWs}|${revoked}|${active}`;
   }
 
   /** 活跃长连接的会话代际键（仅含账号与 session_id，不因同会话 Cookie 轮换主动断开健康长连接） */
@@ -679,6 +751,13 @@ export class PersonalWebBridge {
           {
             ...this.hooks.clientOptions,
             onSessionConfirmed: (updated, delta) => {
+              try {
+                this.validateBoundOwner(updated);
+              } catch {
+                invalidatedByDisk = true;
+                sessionCtrl.abort();
+                return null;
+              }
               const saved = this.loginStore.saveIfSessionMatches(updated, delta);
               if (!saved) {
                 invalidatedByDisk = true;
@@ -838,11 +917,46 @@ export class PersonalWebBridge {
     return this.cfg.context.groups_deny.some((raw) => raw.trim() === pwConv);
   }
 
-  private isDirectlyDenied(pwConv: string, chatName: string): boolean {
+  /** 收集已确认的开放平台群排除名称（来自 ocExclusionCache、ctx_mute_conv 标签、open_group_names 与 spoken_groups），供原生群排位截断前剔除 */
+  private confirmedOpenGroupDenyNames(): Set<string> {
+    const out = new Set<string>();
+    const ocRules = this.collectOpenChatExclusions();
+    if (ocRules.size === 0) return out;
+    const now = Date.now();
+    const knownNames = loadKnownOpenGroupNames(this.app.store);
+    const spoken = loadSpokenGroups(this.app.store);
+    for (const [ocId, muteLabel] of ocRules) {
+      const cached = this.ocExclusionCache.get(ocId);
+      if (cached && cached.expiresAt > now) {
+        if (cached.chatType === "p2p") continue;
+        if (cached.name) out.add(norm(cached.name));
+        continue;
+      }
+      const latest = this.store.latestConvObs(ocId);
+      const recordedType = classifyRecordedChatType(latest);
+      if (recordedType === "dm") continue;
+      const name = (
+        knownNames[ocId] ||
+        spoken[ocId]?.name ||
+        muteLabel ||
+        (recordedType === "group" ? (latest?.conv_name ?? "") : "")
+      ).trim();
+      if (name && name !== "群聊" && !name.startsWith("私聊")) {
+        out.add(norm(name));
+      }
+    }
+    return out;
+  }
+
+  private isDirectlyDenied(pwConv: string, chatName: string, confirmedOcDenyNames?: Set<string>): boolean {
     const rawId = pwConv.startsWith("pw_chat:") ? pwConv.slice("pw_chat:".length) : pwConv;
     if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(rawId)) return true;
     if (this.matchesDirectNativeIdDeny(pwConv)) return true;
     if (chatName && this.nameDenyPatterns().some((d) => chatName.includes(d))) return true;
+    if (chatName) {
+      const ocDeny = confirmedOcDenyNames ?? this.confirmedOpenGroupDenyNames();
+      if (ocDeny.has(norm(chatName))) return true;
+    }
     return false;
   }
 
@@ -1136,14 +1250,79 @@ export class PersonalWebBridge {
     this.app.store.set(pwSpokenGroupsKey(ownerId), JSON.stringify(spoken));
   }
 
+  private resolvePwGroupName(k: string, spoken: Record<string, { name: string; at: number }>): string {
+    const cached = (this.pwGroupNameCache.get(k) ?? "").trim();
+    if (cached && !/^群聊\(\d+\)$/.test(cached) && !cached.startsWith("私聊")) return cached;
+    const fromSpoken = (spoken[k]?.name ?? "").trim();
+    if (fromSpoken && !/^群聊\(\d+\)$/.test(fromSpoken)) return fromSpoken;
+    const fromObs = (this.store.latestConvObs(k)?.conv_name ?? "").trim();
+    return fromObs && !/^群聊\(\d+\)$/.test(fromObs) && !fromObs.startsWith("私聊") ? fromObs : "";
+  }
+
+  /**
+   * 仅在存在跨通道 oc_* 排除或关键词排除且当前群因名额限制可能落选时，按需补全排在前面的候选原生群名称与 oc_* 群名缓存，
+   * 确保被静音/排除的跨通道同名群在 max_groups 截断前被剔除，不挤占未静音群的名额。
+   */
+  private async ensureCrossTransportScopeMeta(
+    ownerId: string,
+    activeClient?: FeishuWebClient,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const ocRules = this.collectOpenChatExclusions();
+    const hasNameRules = this.nameDenyPatterns().length > 0;
+    if (ocRules.size === 0 && !hasNameRules) return;
+    const now = Date.now();
+    for (const [ocId] of ocRules) {
+      const cached = this.ocExclusionCache.get(ocId);
+      if (!cached || cached.expiresAt <= now) {
+        await this.resolveOpenChatMeta(ocId);
+      }
+    }
+    if (!activeClient || this.cfg.context.max_groups <= 0) return;
+    const spoken = ownerId ? this.loadPwSpokenGroups(ownerId) : {};
+    const ocDeny = this.confirmedOpenGroupDenyNames();
+    const candidates: string[] =
+      this.cfg.context.groups === "allowlist"
+        ? [
+            ...new Set(
+              this.cfg.context.groups_allow
+                .map((s) => s.trim())
+                .filter((s) => s.startsWith("pw_chat:") || /^\d+$/.test(s))
+                .map((s) => (s.startsWith("pw_chat:") ? s : `pw_chat:${s}`)),
+            ),
+          ]
+        : Object.entries(spoken)
+            .filter(([, v]) => v.at >= now - this.cfg.context.lookback_days * DAY_MS)
+            .sort((a, b) => b[1].at - a[1].at)
+            .map(([k]) => (k.startsWith("pw_chat:") ? k : `pw_chat:${k}`));
+
+    let allowedCount = 0;
+    for (const k of candidates) {
+      const rawId = k.slice("pw_chat:".length);
+      if (this.store.isConvMutedById(k) || this.store.isConvMutedById(rawId) || this.matchesDirectNativeIdDeny(k)) continue;
+      let name = this.resolvePwGroupName(k, spoken);
+      const excludedByName = !!name && this.isDirectlyDenied(k, name, ocDeny);
+      if (!name || excludedByName) {
+        try {
+          const meta = await activeClient.readChat(rawId, { force: excludedByName, signal });
+          if (meta.name.trim()) {
+            name = meta.name.trim();
+            this.pwGroupNameCache.set(k, name);
+          }
+        } catch {
+          // ignore best-effort metadata refresh during ranking
+        }
+      }
+      if (!this.isDirectlyDenied(k, name, ocDeny)) {
+        allowedCount++;
+        if (allowedCount >= this.cfg.context.max_groups) break;
+      }
+    }
+  }
+
   private isGroupInScope(chatId: string, pwConv: string, ownerId: string): boolean {
     const spoken = ownerId ? this.loadPwSpokenGroups(ownerId) : {};
-    const resolvePwName = (k: string): string => {
-      const fromSpoken = (spoken[k]?.name ?? "").trim();
-      if (fromSpoken && !/^群聊\(\d+\)$/.test(fromSpoken)) return fromSpoken;
-      const fromObs = (this.store.latestConvObs(k)?.conv_name ?? "").trim();
-      return fromObs && !/^群聊\(\d+\)$/.test(fromObs) && !fromObs.startsWith("私聊") ? fromObs : "";
-    };
+    const ocDeny = this.confirmedOpenGroupDenyNames();
     if (this.cfg.context.groups === "allowlist") {
       const nativeAllow = [
         ...new Set(
@@ -1151,7 +1330,7 @@ export class PersonalWebBridge {
             .map((s) => s.trim())
             .filter((s) => s.startsWith("pw_chat:") || /^\d+$/.test(s))
             .map((s) => (s.startsWith("pw_chat:") ? s : `pw_chat:${s}`))
-            .filter((k) => !this.isDirectlyDenied(k, resolvePwName(k))),
+            .filter((k) => !this.isDirectlyDenied(k, this.resolvePwGroupName(k, spoken), ocDeny)),
         ),
       ].slice(0, this.cfg.context.max_groups);
       return nativeAllow.includes(pwConv);
@@ -1159,7 +1338,7 @@ export class PersonalWebBridge {
     if (!ownerId) return false;
     const cutoff = Date.now() - this.cfg.context.lookback_days * DAY_MS;
     const ranked = Object.entries(spoken)
-      .filter(([k, v]) => v.at >= cutoff && !this.isDirectlyDenied(k, v.name || resolvePwName(k)))
+      .filter(([k, v]) => v.at >= cutoff && !this.isDirectlyDenied(k, this.resolvePwGroupName(k, spoken) || v.name, ocDeny))
       .sort((a, b) => b[1].at - a[1].at)
       .slice(0, this.cfg.context.max_groups);
     return ranked.some(([k]) => k === pwConv || k === chatId);
@@ -1283,11 +1462,16 @@ export class PersonalWebBridge {
           if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(effectiveMsg.conversationId)) return;
           if (this.matchesDirectNativeIdDeny(pwConv)) return;
           const authRev = obsRevision({ text: clippedText, meta: { at_me: isAtMe, mentions: effectiveMsg.mentions } });
-          const authOutOfScope =
-            effectiveMsg.conversationKind === "group" &&
-            !isAtMe &&
-            (this.cfg.context.groups === "allowlist" || !isMe) &&
-            !this.isGroupInScope(effectiveMsg.conversationId, pwConv, ownerId);
+          let authInScope =
+            effectiveMsg.conversationKind !== "group" ||
+            isAtMe ||
+            (this.cfg.context.groups !== "allowlist" && isMe) ||
+            this.isGroupInScope(effectiveMsg.conversationId, pwConv, ownerId);
+          if (!authInScope) {
+            await this.ensureCrossTransportScopeMeta(ownerId, activeClient, signal);
+            authInScope = this.isGroupInScope(effectiveMsg.conversationId, pwConv, ownerId);
+          }
+          const authOutOfScope = !authInScope;
           // 权威消息仍与本地已落库版本一致（且未撤回/未越界）：说明本次推送是陈旧重放，直接跳过不回滚
           if (!existingWithdrawn && !authOutOfScope && obsRevision(existing) === authRev) {
             return;
@@ -1300,12 +1484,16 @@ export class PersonalWebBridge {
     const convKind: "group" | "dm" = effectiveMsg.conversationKind;
 
     // 3) 范围外普通群消息在 readChat 之前立刻丢弃（allowlist 模式下同样约束本人发出的群消息，不把未列白名单群的正文落库）；
+    //    若存在跨通道 oc_* 静音/排除规则导致排位名额可能释放，先按需刷新排位元数据后再判断；
     //    若该消息 ID 此前曾以 @我 入库待处理，同步撤回避免模型对已撤销的 @我 提醒/起草
     if (convKind === "group" && !isAtMe) {
       const allowlistMode = this.cfg.context.groups === "allowlist";
       if ((allowlistMode || !isMe) && !this.isGroupInScope(effectiveMsg.conversationId, pwConv, ownerId)) {
-        if (!isMe) this.store.retirePendingObs(`pw:${effectiveMsg.id}`);
-        return;
+        await this.ensureCrossTransportScopeMeta(ownerId, activeClient, signal);
+        if (!this.isGroupInScope(effectiveMsg.conversationId, pwConv, ownerId)) {
+          if (!isMe) this.store.retirePendingObs(`pw:${effectiveMsg.id}`);
+          return;
+        }
       }
     }
 
@@ -1314,6 +1502,7 @@ export class PersonalWebBridge {
     if (convKind === "group" && activeClient) {
       try {
         chatName = (await activeClient.readChat(effectiveMsg.conversationId, { signal })).name.trim();
+        if (chatName) this.pwGroupNameCache.set(pwConv, chatName);
       } catch {
         chatName = "";
       }
@@ -1840,7 +2029,14 @@ export class PersonalWebBridge {
     if (!client) {
       client = await FeishuWebClient.connect(diskLogin, {
         ...this.hooks.clientOptions,
-        onSessionConfirmed: (updated, delta) => this.loginStore.saveIfSessionMatches(updated, delta),
+        onSessionConfirmed: (updated, delta) => {
+          try {
+            this.validateBoundOwner(updated);
+          } catch {
+            return null;
+          }
+          return this.loginStore.saveIfSessionMatches(updated, delta);
+        },
       });
     }
     if (client.owner().id !== args.owner_id) {

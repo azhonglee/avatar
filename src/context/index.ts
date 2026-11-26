@@ -11,7 +11,7 @@ import type { Effect, NotifyKind } from "../ledger.ts";
 import { deepFind, errMsg, log, truncate } from "../util.ts";
 import { draftCard, eveningCard, itemCard, KIND_LABEL, morningCard, type CtxRenderCtx } from "./cards.ts";
 import { Connectors, relinkMeegoItems } from "./connectors.ts";
-import { defaultDraftKind, Drafter } from "./drafts.ts";
+import { defaultDraftKind, Drafter, DraftTargetIneligibleError } from "./drafts.ts";
 import { hasWorkspaceOwnerMismatch, PersonalWebBridge, type FastAnchor } from "./personal-web.ts";
 import { ContextStore, type ItemRow } from "./store.ts";
 import { splitProject, Understander, UnderstandParseError, type SplitResult } from "./understand.ts";
@@ -738,32 +738,25 @@ export class ContextService {
             return;
           }
           if (p.auto) {
-            // 自动预起草执行前复用完整入队资格判据与目标会话排除校验，防止开关关闭、事项降级/变更或会话静音后仍送模型
+            // 自动预起草执行前复用完整入队资格判据，防止开关关闭或事项降级后仍送模型
             const it = this.store.item(p.item_id);
             if (!this.canAutoPreDraft(it)) {
               this.app.ledger.transition(item, { state: "skipped", terminal: true });
               return;
             }
-            const k = p.kind ?? defaultDraftKind(it);
-            if (k && k !== "weekly_report") {
-              try {
-                const { conv } = this.drafter.target(it, k);
-                if (conv) {
-                  const elig = await this.personalWeb.checkConvAllowedForUnderstand(conv.conv, conv.conv_name);
-                  if (elig !== "allowed") {
-                    this.app.ledger.transition(item, { state: "skipped", terminal: true });
-                    return;
-                  }
-                }
-              } catch {
-                this.app.ledger.transition(item, { state: "skipped", terminal: true });
-                return;
-              }
-            }
           }
-          const d = await this.drafter.forItem(p.item_id, p.kind);
-          this.app.ledger.transition(item, { state: "done", terminal: true, payload: { ...p, draft_id: d.id } as never });
-          this.renderDraft(d.id);
+          try {
+            const d = await this.drafter.forItem(p.item_id, p.kind);
+            this.app.ledger.transition(item, { state: "done", terminal: true, payload: { ...p, draft_id: d.id } as never });
+            this.renderDraft(d.id);
+          } catch (err) {
+            // 已入队的自动预起草若目标会话/消息已被静音、排除或移出采集范围，静默跳过不送模型也不刷失败通知
+            if (p.auto && err instanceof DraftTargetIneligibleError) {
+              this.app.ledger.transition(item, { state: "skipped", terminal: true });
+              return;
+            }
+            throw err;
+          }
           return;
         }
         if (p.task === "split") {

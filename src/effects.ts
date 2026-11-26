@@ -1,4 +1,4 @@
-import { isContextDerivedDispatchBlocked } from "./api/queries.ts";
+import { isWorkBlockedByOwner } from "./api/queries.ts";
 import type { Board, SectionKey } from "./board.ts";
 import { computePwReplyCid, hasWorkspaceOwnerMismatch } from "./context/personal-web.ts";
 import { deepFind, runProcess } from "./util.ts";
@@ -44,14 +44,9 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
       if (isContextEffect && hasWorkspaceOwnerMismatch(store, cfg.owner.open_id)) {
         throw new Error("当前工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已阻断上下文通知与外部动作投递以防跨账号泄漏");
       }
-      // 归属旧主人的上下文委派派单卡片（card:dispatch:<guid> 含原地更新失败后的重发路径）及任务操作，同样严格按主人隔离
-      const dispatchOwnerCandidates = [
-        item.ref,
-        e.op === "card.upsert" ? e.args.key : "",
-        "guid" in e.args && typeof e.args.guid === "string" ? e.args.guid : "",
-      ].filter(Boolean);
-      if (dispatchOwnerCandidates.some((id) => isContextDerivedDispatchBlocked({ cfg, store, ledger }, id))) {
-        throw new Error("该派单卡片或外部动作源自旧工作区主人的工作上下文，已按主人隔离阻断投递");
+      // 归属旧主人的上下文委派派单卡片（card:dispatch:<guid>）、失败告警卡片（failure:<workId>）及任务操作，同样严格按主人隔离
+      if (isWorkBlockedByOwner({ cfg, store, ledger }, item)) {
+        throw new Error("该派单卡片、失败告警或外部动作源自旧工作区主人的工作上下文，已按主人隔离阻断投递");
       }
       if (e.op === "notify" || e.op === "card.upsert") {
         const g = hooks.gate?.(e.args.kind, e);

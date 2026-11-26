@@ -4,6 +4,7 @@ import { createApp, initApp, runConfiguredJob, runDaemon, runDispatchOnce, sendB
 import { loadConfig } from "./config.ts";
 import { beginLogin, FeishuWebClient, pollLogin, renderQrSvg, renderQrTerminal, WebLoginStore } from "./context/feishu-web/index.ts";
 import {
+  assertLoginAuthorizedForWorkspace,
   BOUND_OWNER_KV_KEY,
   BOUND_WORKSPACE_OWNER_KV_KEY,
   commitWorkspaceLogin,
@@ -91,7 +92,7 @@ async function main(): Promise<void> {
     case "context":
       return context(app, rest);
     case "status":
-      return void console.log(statusText(app.ledger));
+      return void console.log(statusText(app.ledger, { cfg: app.cfg, store: app.store }));
     case "console": {
       const token = serverToken(app, rest.includes("--rotate"));
       const displayHost = resolveConsoleHost(cfg.server.host);
@@ -149,8 +150,12 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
   const [sub, ...more] = rest;
   // 个人 Web 凭据管理不依赖 context.enabled（关闭模块后仍必须能 web-logout / 查看状态 / 重新登录）
   if (sub === "web-logout") {
-    const { fileRemoved, credFile } = revokeWorkspacePersonalWebSession(app);
-    if (fileRemoved) {
+    const { fileRemoved, credFile, fileError } = revokeWorkspacePersonalWebSession(app);
+    if (fileError) {
+      console.log("已写入工作区个人 Web 会话吊销标记，正在运行的常驻监听与回复发送将立即中止。");
+      console.error(`⚠️ 清理本地凭据文件失败（${credFile}）：${fileError}；请手动删除该文件。`);
+      process.exitCode = 1;
+    } else if (fileRemoved) {
       console.log(`已清除个人 Web 登录凭据（${credFile}）并写入工作区吊销标记。若 pa run 正在运行，将在数秒内自动断开会话且不会回写旧凭据。`);
     } else {
       console.log(
@@ -165,17 +170,29 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
     store.reconcilePendingCommit(app.store, PENDING_CRED_COMMIT_KV_KEY);
     const inspected = store.inspect();
     const login = inspected.status === "ok" ? inspected.login : undefined;
+    let loginAuthErr: Error | undefined;
+    if (login) {
+      try {
+        assertLoginAuthorizedForWorkspace(app, login);
+      } catch (err) {
+        loginAuthErr = err instanceof Error ? err : new Error(errMsg(err));
+      }
+    }
     const ctx = app.ext.context;
     const st = ctx?.status().personal_web;
     const pwCfg = app.cfg.context.personal_web;
     console.log(`启用状态：${app.cfg.context.enabled && pwCfg.enabled ? "已启用" : "未启用"}（context.enabled=${app.cfg.context.enabled}，fast_lane=${pwCfg.fast_lane}，debounce_ms=${pwCfg.debounce_ms}，pre_draft=${pwCfg.pre_draft}，send_replies=${pwCfg.send_replies}）`);
     const fileNote = login
-      ? `已登录 ${login.owner_name || login.owner_id}，更新于 ${login.updated_at ?? "未知"}`
+      ? loginAuthErr
+        ? `本地凭据不可用于当前工作区（${loginAuthErr.message}）`
+        : `已登录 ${login.owner_name || login.owner_id}，更新于 ${login.updated_at ?? "未知"}`
       : inspected.status === "missing_key"
         ? "凭据已加密但当前环境缺少密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）"
         : inspected.status === "plaintext_rejected"
           ? "检测到未加密明文凭据（已拒绝加载，请配置密钥后重新 web-login）"
-          : "未登录";
+          : st?.logged_in
+            ? `当前路径无本地文件（常驻进程正以其他凭据路径运行，状态：${st.state}）`
+            : "未登录";
     console.log(`凭据文件：${store.file}（${fileNote}）`);
     if (st) {
       console.log(`常驻状态：${st.state}${st.last_message_at ? `，最近消息 ${new Date(st.last_message_at).toLocaleString("zh-CN", { timeZone: app.cfg.owner.timezone, hour12: false })}` : ""}`);
@@ -188,7 +205,17 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
         }
         throw new Error("尚未登录，请先运行 `pa context web-login`");
       }
-      const client = await FeishuWebClient.connect(login, { onSessionConfirmed: (u, d) => store.saveIfSessionMatches(u, d) });
+      if (loginAuthErr) throw loginAuthErr;
+      const client = await FeishuWebClient.connect(login, {
+        onSessionConfirmed: (u, d) => {
+          try {
+            assertLoginAuthorizedForWorkspace(app, u);
+          } catch {
+            return null;
+          }
+          return store.saveIfSessionMatches(u, d);
+        },
+      });
       console.log(`✅ 在线核验通过：${client.owner().name}（ID: ${client.owner().id}）`);
     }
     return;

@@ -25,6 +25,14 @@ export function defaultDraftKind(it: ItemRow): CtxDraftKind | undefined {
   return undefined;
 }
 
+/** 草稿目标会话或目标消息因静音/排除/移出采集范围而不可起草时抛出（用于区分自动预起草跳过与真实故障） */
+export class DraftTargetIneligibleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DraftTargetIneligibleError";
+  }
+}
+
 export class Drafter {
   app: App;
   store: ContextStore;
@@ -45,85 +53,159 @@ export class Drafter {
     return this.app.cfg;
   }
 
-  /** 草稿的发送目标：回复哪条消息 / 发到哪个会话 / 评论哪个 Meego 工作项（起草本身不发消息；严格跳过已撤回及无主/跨账号个人 Web 证据） */
-  target(it: ItemRow, kind: CtxDraftKind): { target: Record<string, string>; label: string; conv?: Obs } {
-    if (kind === "meego_comment") {
-      const key = String(it.meta.project_key ?? "");
-      const id = String(it.meta.work_item_id ?? "");
-      if (!key || !id) throw new Error("这个事项没有关联 Meego 工作项");
-      return { target: { project_key: key, work_item_id: id, url: String(it.meta.url ?? "") }, label: `Meego #${id} 评论` };
+  private isEligibleImObs(o: Obs, activeNativeOwner: string | null): boolean {
+    if (o.source !== "im" || o.meta.withdrawn === true) return false;
+    if (o.id.startsWith("pw:") || o.meta.transport === "personal_web") {
+      const obsOwner = String(o.meta.native_owner_id ?? "").trim();
+      return !!activeNativeOwner && obsOwner === activeNativeOwner;
     }
-    const activeNativeOwner = this.activeBoundNativeOwner();
-    const isEligibleImObs = (o: Obs): boolean => {
-      if (o.source !== "im" || o.meta.withdrawn === true) return false;
-      if (o.id.startsWith("pw:") || o.meta.transport === "personal_web") {
-        const obsOwner = String(o.meta.native_owner_id ?? "").trim();
-        return !!activeNativeOwner && obsOwner === activeNativeOwner;
-      }
-      return true;
-    };
-    const fromOther = this.store.lastEvidenceObs("item", it.id, (o) => isEligibleImObs(o) && !o.is_me);
-    const any = fromOther ?? this.store.lastEvidenceObs("item", it.id, isEligibleImObs);
-    if (!any) throw new Error("找不到这个事项对应的飞书会话，没法起草消息");
-    if (kind === "reply" && fromOther) {
-      if (fromOther.meta.transport === "personal_web") {
-        if (fromOther.meta.native_message_id && fromOther.meta.native_chat_id) {
-          const nativeOwnerId = String(fromOther.meta.native_owner_id ?? "").trim();
+    return true;
+  }
+
+  private buildTargetForObs(
+    it: ItemRow,
+    kind: CtxDraftKind,
+    obs: Obs,
+    asReplyToOther: boolean,
+  ): { target: Record<string, string>; label: string; conv: Obs } {
+    if (asReplyToOther) {
+      if (obs.meta.transport === "personal_web") {
+        if (obs.meta.native_message_id && obs.meta.native_chat_id) {
+          const nativeOwnerId = String(obs.meta.native_owner_id ?? "").trim();
           if (!nativeOwnerId) throw new Error("该个人 Web 消息缺少归属账号标识（native_owner_id），拒绝起草");
           return {
             target: {
               transport: "personal_web",
-              obs_id: fromOther.id,
+              obs_id: obs.id,
               native_owner_id: nativeOwnerId,
-              native_message_id: String(fromOther.meta.native_message_id),
-              native_chat_id: String(fromOther.meta.native_chat_id),
-              native_root_id: String(fromOther.meta.native_root_id ?? fromOther.meta.native_message_id),
-              url: fromOther.url,
+              native_message_id: String(obs.meta.native_message_id),
+              native_chat_id: String(obs.meta.native_chat_id),
+              native_root_id: String(obs.meta.native_root_id ?? obs.meta.native_message_id),
+              url: obs.url,
             },
-            label: `回复 ${fromOther.actor_name || "对方"}（${fromOther.conv_name} · 个人 Web）`,
-            conv: fromOther,
+            label: `回复 ${obs.actor_name || "对方"}（${obs.conv_name} · 个人 Web）`,
+            conv: obs,
           };
         }
         throw new Error("该个人 Web 消息缺少可回复的原消息标识");
       }
-      const openMsgId = String(fromOther.meta.message_id ?? fromOther.id.replace(/^im:/, ""));
+      const openMsgId = String(obs.meta.message_id ?? obs.id.replace(/^im:/, ""));
       if (!openMsgId) throw new Error("该消息缺少可回复的消息标识");
       return {
         target: {
-          obs_id: fromOther.id,
+          obs_id: obs.id,
           message_id: openMsgId,
-          chat_id: fromOther.conv,
-          url: fromOther.url,
+          chat_id: obs.conv,
+          url: obs.url,
         },
-        label: `回复 ${fromOther.actor_name || "对方"}（${fromOther.conv_name}）`,
-        conv: fromOther,
+        label: `回复 ${obs.actor_name || "对方"}（${obs.conv_name}）`,
+        conv: obs,
       };
     }
-    if (any.meta.transport === "personal_web") {
-      if (any.meta.native_message_id && any.meta.native_chat_id) {
-        const nativeOwnerId = String(any.meta.native_owner_id ?? "").trim();
+    if (obs.meta.transport === "personal_web") {
+      if (obs.meta.native_message_id && obs.meta.native_chat_id) {
+        const nativeOwnerId = String(obs.meta.native_owner_id ?? "").trim();
         if (!nativeOwnerId) throw new Error("该个人 Web 会话缺少归属账号标识（native_owner_id），拒绝起草");
         return {
           target: {
             transport: "personal_web",
-            obs_id: any.id,
+            obs_id: obs.id,
             native_owner_id: nativeOwnerId,
-            native_message_id: String(any.meta.native_message_id),
-            native_chat_id: String(any.meta.native_chat_id),
-            native_root_id: String(any.meta.native_root_id ?? any.meta.native_message_id),
-            url: any.url,
+            native_message_id: String(obs.meta.native_message_id),
+            native_chat_id: String(obs.meta.native_chat_id),
+            native_root_id: String(obs.meta.native_root_id ?? obs.meta.native_message_id),
+            url: obs.url,
           },
-          label: `${kind === "followup" ? "跟进" : "回复"} ${any.conv_name}（个人 Web）`,
-          conv: any,
+          label: `${kind === "followup" ? "跟进" : "回复"} ${obs.conv_name}（个人 Web）`,
+          conv: obs,
         };
       }
       throw new Error("该个人 Web 会话缺少可发送的消息标识");
     }
     return {
-      target: { obs_id: any.id, chat_id: any.conv, url: any.url },
-      label: `${kind === "followup" ? "跟进" : "发到"} ${any.conv_name}${it.counterpart ? `（${it.counterpart}）` : ""}`,
-      conv: any,
+      target: { obs_id: obs.id, chat_id: obs.conv, url: obs.url },
+      label: `${kind === "followup" ? "跟进" : "发到"} ${obs.conv_name}${it.counterpart ? `（${it.counterpart}）` : ""}`,
+      conv: obs,
     };
+  }
+
+  /** 草稿的发送目标：回复哪条消息 / 发到哪个会话 / 评论哪个 Meego 工作项（起草本身不发消息；严格跳过已撤回及无主/跨账号个人 Web 证据） */
+  target(it: ItemRow, kind: CtxDraftKind): { target: Record<string, string>; label: string; conv?: Obs } {
+    if (kind === "meego_comment") {
+      const key = String(it.meta.project_key ?? "");
+      const id = String(it.meta.work_item_id ?? "");
+      if (!key || !id) throw new DraftTargetIneligibleError("这个事项没有关联 Meego 工作项");
+      return { target: { project_key: key, work_item_id: id, url: String(it.meta.url ?? "") }, label: `Meego #${id} 评论` };
+    }
+    const activeNativeOwner = this.activeBoundNativeOwner();
+    const fromOther = this.store.lastEvidenceObs("item", it.id, (o) => this.isEligibleImObs(o, activeNativeOwner) && !o.is_me);
+    const any = fromOther ?? this.store.lastEvidenceObs("item", it.id, (o) => this.isEligibleImObs(o, activeNativeOwner));
+    if (!any) throw new DraftTargetIneligibleError("找不到这个事项对应的飞书会话，没法起草消息");
+    return this.buildTargetForObs(it, kind, any, kind === "reply" && !!fromOther);
+  }
+
+  /**
+   * 按当前排除规则与群采集范围解析起草目标：
+   *   - 按时间倒序遍历事项全部有效 IM 证据（优先对方消息，再回退本人消息）；
+   *   - 逐条校验会话排除状态（checkConvAllowed）与目标证据本身的范围资格（filterObs）；
+   *   - 若最新证据因群被移出白名单/静音而失效，自动改选事项上的其他有效目标；若全部目标均不在当前范围内，在调用模型前立即停止。
+   */
+  async resolveEligibleTarget(it: ItemRow, kind: CtxDraftKind): Promise<{ target: Record<string, string>; label: string; conv?: Obs }> {
+    if (kind === "meego_comment") return this.target(it, kind);
+    const activeNativeOwner = this.activeBoundNativeOwner();
+    const allObs: Obs[] = [];
+    const seenIds = new Set<string>();
+    for (const e of this.store.evidence("item", it.id, 50)) {
+      if (seenIds.has(e.obs_id)) continue;
+      const o = this.store.obs(e.obs_id);
+      if (o && this.isEligibleImObs(o, activeNativeOwner)) {
+        seenIds.add(o.id);
+        allObs.push(o);
+      }
+    }
+    if (!allObs.length) throw new DraftTargetIneligibleError("找不到这个事项对应的飞书会话，没法起草消息");
+    const ordered = [...allObs.filter((o) => !o.is_me), ...allObs.filter((o) => o.is_me)];
+    const convAllowedCache = new Map<string, "allowed" | "excluded" | "uncertain">();
+    let sawExcluded = false;
+    let sawUncertain = false;
+    let sawOutOfScope = false;
+
+    for (const cand of ordered) {
+      if (this.checkConvAllowed) {
+        let elig = convAllowedCache.get(cand.conv);
+        if (elig === undefined) {
+          elig = await this.checkConvAllowed(cand.conv, cand.conv_name);
+          convAllowedCache.set(cand.conv, elig);
+        }
+        if (elig === "excluded") {
+          sawExcluded = true;
+          continue;
+        }
+        if (elig === "uncertain") {
+          sawUncertain = true;
+          continue;
+        }
+      }
+      if (this.filterObs) {
+        const checkedSelf = await this.filterObs(cand.conv, [cand]);
+        if (!checkedSelf.length) {
+          sawOutOfScope = true;
+          continue;
+        }
+      }
+      return this.buildTargetForObs(it, kind, cand, kind === "reply" && !cand.is_me);
+    }
+
+    if (sawUncertain) {
+      throw new DraftTargetIneligibleError("无法实时确认该会话的排除状态，已按安全策略暂缓起草回复");
+    }
+    if (sawExcluded) {
+      throw new DraftTargetIneligibleError("该会话已被静音或排除，已停止起草回复");
+    }
+    if (sawOutOfScope) {
+      throw new DraftTargetIneligibleError("该事项对应的目标消息已不在当前采集范围内，已停止起草回复");
+    }
+    throw new DraftTargetIneligibleError("找不到这个事项对应的飞书会话，没法起草消息");
   }
 
   private async llm(prompt: string, name: string): Promise<string> {
@@ -157,30 +239,17 @@ export class Drafter {
     if (!it) throw new Error(`没有这个事项：${itemId}`);
     const k = kind ?? defaultDraftKind(it);
     if (!k || k === "weekly_report") throw new Error("这个事项没有合适的草稿类型");
-    const { target, label, conv } = this.target(it, k);
-    if (conv && this.checkConvAllowed) {
-      const elig = await this.checkConvAllowed(conv.conv, conv.conv_name);
-      if (elig !== "allowed") {
-        throw new Error(
-          elig === "excluded"
-            ? "该会话已被静音或排除，已停止起草回复"
-            : "无法实时确认该会话的排除状态，已按安全策略暂缓起草回复",
-        );
-      }
-    }
+    const { target, label, conv } = await this.resolveEligibleTarget(it, k);
     const tz = this.cfg.owner.timezone;
     const p = this.store.project(it.project_id);
     const activeNativeOwner = this.activeBoundNativeOwner();
     const rawConvObs = conv ? this.store.convObs(conv.conv, Date.now() - 7 * DAY, 30, activeNativeOwner) : [];
     const scopedConvObs = conv && this.filterObs ? await this.filterObs(conv.conv, rawConvObs) : rawConvObs;
-    // 若触发证据本身在最近 30 条窗口外被较新的范围外普通群消息挤出，仅在该证据通过当前范围过滤时将其补回
-    let effectiveConvObs = scopedConvObs;
-    if (conv && !scopedConvObs.some((o) => o.id === conv.id)) {
-      const checkedSelf = this.filterObs ? await this.filterObs(conv.conv, [conv]) : [conv];
-      if (checkedSelf.length) {
-        effectiveConvObs = [...scopedConvObs, ...checkedSelf].sort((a, b) => a.time - b.time);
-      }
-    }
+    // 若已确认合法的目标证据被最近 30 条窗口外的较新消息挤出，将其补回提示词上下文
+    const effectiveConvObs =
+      conv && !scopedConvObs.some((o) => o.id === conv.id)
+        ? [...scopedConvObs, conv].sort((a, b) => a.time - b.time)
+        : scopedConvObs;
     const convText = effectiveConvObs.length
       ? effectiveConvObs
           .map((o) => `${fmt(o.time, tz)} ${o.is_me ? "【我】" : o.actor_name}: ${truncate(o.text, 300)}`)

@@ -120,46 +120,75 @@ export function parseRemote(url: string): RemoteRef | undefined {
   return undefined;
 }
 
+const ZERO_OID = "0000000000000000000000000000000000000000";
+
 /**
- * 检测分支（当前 worktree 索引或目标分支树）是否跟踪了 Git LFS 文件（filter=lfs）：
+ * 检测分支（含当前树及待推送提交历史，包括先添加后删除的 LFS 文件）是否涉及 Git LFS 对象：
  *   - 仅使用只读内置 git 命令（禁用仓库 hooks），不依赖本机是否安装 git-lfs；
- *   - 返回 true 表示在禁用仓库 pre-push hook 的前提下，推送前必须显式执行受信任的 `git lfs push`。
+ *   - 既检查分支顶端 `.gitattributes` 的 `filter=lfs`，也用 `git log -S` 扫描待推送提交历史中的 LFS 指针（涵盖历史提交添加后又被后续提交删除的 LFS 对象）。
  */
-export async function branchUsesGitLfs(cwd: string, branch: string): Promise<boolean> {
+export async function branchUsesGitLfs(cwd: string, branch: string, remoteSha?: string): Promise<boolean> {
   const tree = await tryGit(cwd, ["ls-tree", "-r", "--name-only", "-z", `refs/heads/${branch}`]);
   const listOut = tree.code === 0 ? tree.stdout : (await tryGit(cwd, ["ls-files", "-z"])).stdout;
-  if (!listOut) return false;
-  const attrs = await tryGit(cwd, ["check-attr", "--stdin", "-z", "filter"], { input: listOut });
-  if (attrs.code !== 0 || !attrs.stdout) return false;
-  const fields = attrs.stdout.split("\0");
-  // check-attr -z 输出按 <path>\0<attr>\0<value>\0 三元组排列
-  for (let i = 0; i + 2 < fields.length; i += 3) {
-    if (fields[i + 1] === "filter" && fields[i + 2] === "lfs") return true;
+  if (listOut) {
+    const attrs = await tryGit(cwd, ["check-attr", "--stdin", "-z", "filter"], { input: listOut });
+    if (attrs.code === 0 && attrs.stdout) {
+      const fields = attrs.stdout.split("\0");
+      for (let i = 0; i + 2 < fields.length; i += 3) {
+        if (fields[i + 1] === "filter" && fields[i + 2] === "lfs") return true;
+      }
+    }
   }
-  return false;
+  // 扫描待推送提交范围（若远端基线提交在本地存在则只扫增量，否则扫整条分支历史）中是否出现过 Git LFS 指针
+  let revSpec = `refs/heads/${branch}`;
+  if (remoteSha && remoteSha !== ZERO_OID) {
+    const hasRemoteCommit = (await tryGit(cwd, ["cat-file", "-e", `${remoteSha}^{commit}`])).code === 0;
+    if (hasRemoteCommit) revSpec = `${remoteSha}..refs/heads/${branch}`;
+  }
+  const histPtr = await tryGit(cwd, ["log", "-n", "1", "--format=%H", "-S", "version https://git-lfs.github.com/spec/v1", revSpec]);
+  return histPtr.code === 0 && histPtr.stdout.trim().length > 0;
 }
 
 /**
  * 推送 pa/ 分支。只对我们自己的 pa/ 分支使用 --force-with-lease（返工后历史可能被改写），其他分支普通推送。
- * 保持禁用仓库自定义 hooks（core.hooksPath=/dev/null）；若分支包含 Git LFS 跟踪文件，推送分支前先执行受信任的 `git lfs push`，
+ * 保持禁用仓库自定义 hooks（core.hooksPath=/dev/null）；若分支或待推送历史涉及 Git LFS 对象，
+ * 推送前通过 Git LFS 官方的 `git lfs pre-push` 按实际推送引用范围上传所有历史与当前引用的 LFS 对象，
  * 失败则立即中止推送并返回明确错误，防止远端只收到悬空 LFS 指针。
  * 被拒绝（远端有本地没有的提交）是永久错误；网络等其他失败可重试。
  */
 export async function pushBranch(cwd: string, remote: string, branch: string): Promise<{ ok: true } | { ok: false; rejected: boolean; message: string }> {
-  if (await branchUsesGitLfs(cwd, branch)) {
-    const lfs = await tryGit(cwd, ["lfs", "push", remote, `refs/heads/${branch}`]);
+  const localRef = `refs/heads/${branch}`;
+  const localShaRes = await tryGit(cwd, ["rev-parse", localRef]);
+  const localSha = localShaRes.code === 0 ? localShaRes.stdout.trim() : "";
+  const lsRemote = await tryGit(cwd, ["ls-remote", remote, localRef]);
+  const remoteSha =
+    lsRemote.code === 0
+      ? (lsRemote.stdout
+          .trim()
+          .split(/\s+/)[0]
+          ?.trim() || ZERO_OID)
+      : ZERO_OID;
+
+  if (await branchUsesGitLfs(cwd, branch, remoteSha)) {
+    const urlRes = await tryGit(cwd, ["config", "--get", `remote.${remote}.url`]);
+    const rUrl = urlRes.code === 0 ? urlRes.stdout.trim() : "";
+    const lfsArgs = ["lfs", "pre-push", remote, ...(rUrl ? [rUrl] : [])];
+    const stdinLine = localSha ? `${localRef} ${localSha} ${localRef} ${remoteSha}\n` : "";
+    const lfs = stdinLine
+      ? await tryGit(cwd, lfsArgs, { input: stdinLine })
+      : await tryGit(cwd, ["lfs", "push", remote, localRef]);
     if (lfs.code !== 0) {
       const lfsOut = `${lfs.stdout}\n${lfs.stderr}`.trim();
       const missingLfs = /not a git command|git-lfs.*not found|No such file/i.test(lfsOut);
       return {
         ok: false,
         rejected: missingLfs,
-        message: `检测到分支 ${branch} 包含 Git LFS 跟踪文件，但上传 LFS 对象失败（已禁用仓库 hooks 以保障安全；请确认本机已安装 git-lfs 并具备远端推送权限）：${lfsOut.slice(-600)}`,
+        message: `检测到分支 ${branch}（含待推送提交历史）涉及 Git LFS 对象，但上传 LFS 对象失败（已禁用仓库 hooks 以保障安全；请确认本机已安装 git-lfs 并具备远端推送权限）：${lfsOut.slice(-600)}`,
       };
     }
   }
   const force = branch.startsWith("pa/") ? ["--force-with-lease"] : [];
-  const r = await tryGit(cwd, ["push", "--porcelain", ...force, remote, `refs/heads/${branch}:refs/heads/${branch}`]);
+  const r = await tryGit(cwd, ["push", "--porcelain", ...force, remote, `${localRef}:${localRef}`]);
   if (r.code === 0) return { ok: true };
   const out = `${r.stdout}\n${r.stderr}`.trim();
   return { ok: false, rejected: /rejected|stale info|non-fast-forward/i.test(out), message: out.slice(-800) };

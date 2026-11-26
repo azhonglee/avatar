@@ -399,6 +399,9 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
     }
     const login = inspected.status === "ok" ? inspected.login : undefined;
     if (!login) {
+      if (inspected.status === "missing" && pw && pw.logged_in && pw.state === "listening") {
+        return ok(`${pw.owner_name || pw.owner_id}（常驻进程在线监听中；当前默认路径无本地凭据文件，常驻服务可能使用了自定义 PA_FEISHU_WEB_CRED_FILE）`);
+      }
       return warn(
         "已启用但尚未扫码登录（期间仍由每 10 分钟的飞书轮询兜底）",
         `配置加密密钥后运行 ${code("bin/pa context web-login --allow-unverified-owner")} 使用本人飞书 App 扫码登录`,

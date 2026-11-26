@@ -1,3 +1,4 @@
+import { isContextDerivedDispatchBlocked } from "../api/queries.ts";
 import type { Board, BoardTask } from "../board.ts";
 import { toBoardTask } from "../board.ts";
 import type { Config } from "../config.ts";
@@ -21,20 +22,25 @@ export async function buildBrief(
   const now = Date.now();
   const tz = cfg.owner.timezone;
   const dayEnd = endOfLocalDay(now, tz);
+  const isTaskVisible = (t: BoardTask) => !isContextDerivedDispatchBlocked({ cfg, store, ledger }, t.guid);
   const mine = findItems(
     await lark.run(["task", "+get-my-tasks", "--complete=false", "--page-all"], { as: "user" }),
     "guid",
-  ).map(toBoardTask);
+  )
+    .map(toBoardTask)
+    .filter(isTaskVisible);
 
   const overdue = mine.filter((t) => t.dueMs !== null && t.dueMs < now);
   const today = mine.filter((t) => t.dueMs !== null && t.dueMs >= now && t.dueMs <= dayEnd);
   const tomorrow = mine.filter((t) => t.dueMs !== null && t.dueMs > dayEnd && t.dueMs <= dayEnd + 86_400_000);
-  const pending = await board.listSection("pending");
-  const review = await board.listSection("review");
-  const attention = await board.listSection("attention");
+  const pending = (await board.listSection("pending")).filter(isTaskVisible);
+  const review = (await board.listSection("review")).filter(isTaskVisible);
+  const attention = (await board.listSection("attention")).filter(isTaskVisible);
   const since = now - 86_400_000;
-  // 派单统计按验收结果（outcome）算，而不是按执行者退出码
-  const dispatches = ledger.recent(["dispatch"], since);
+  // 派单统计按验收结果（outcome）算，而不是按执行者退出码；按主人隔离过滤旧主人上下文委派的派单
+  const dispatches = ledger
+    .recent(["dispatch"], since)
+    .filter((w) => !isContextDerivedDispatchBlocked({ cfg, store, ledger }, w.id));
   const count = (s: string) => dispatches.filter((w) => w.state === s).length;
   const inFlight = dispatches.filter((w) => !w.terminal).length;
   const failures = ledger.failuresSince(since);
