@@ -20,9 +20,18 @@ export interface WebLogin {
   cookies: CookieRecord[];
   owner_id: string;
   owner_name: string;
+  /** 可选：若飞书资料接口返回 open_id，用于与 config.yaml 的 owner.open_id 做强身份绑定核验 */
+  owner_open_id?: string;
   /** 每次扫码登录生成的唯一会话代际标识，用于区分登出或重新登录，防止旧常驻进程覆盖新凭据 */
   session_id?: string;
+  /** 同会话代际内的单调递增 Cookie 版本号，防止多进程并发轮换 Cookie 时互相回滚 */
+  cookie_version?: number;
   updated_at?: string;
+}
+
+export interface CookieDelta {
+  upserts: CookieRecord[];
+  deletes: string[];
 }
 
 export function isAllowedFeishuHost(host: string, extraAllowed?: Iterable<string>): boolean {
@@ -114,6 +123,8 @@ export function parseSetCookieHeader(header: string): ParsedSetCookie | undefine
 
 export class RecordingCookieJar {
   private readonly values = new Map<string, CookieRecord>();
+  private readonly dirtyUpserts = new Map<string, CookieRecord>();
+  private readonly dirtyDeletes = new Set<string>();
   private readonly extraAllowed?: Set<string>;
 
   constructor(extraAllowedHosts?: Iterable<string>) {
@@ -179,9 +190,51 @@ export class RecordingCookieJar {
         ...(expiresMs && expiresMs > nowMs ? { expires_at: new Date(expiresMs).toISOString() } : {}),
       };
       const key = this.keyOf(record);
-      if (remove) this.values.delete(key);
-      else this.values.set(key, record);
+      if (remove) {
+        this.values.delete(key);
+        this.dirtyUpserts.delete(key);
+        this.dirtyDeletes.add(key);
+      } else {
+        this.values.set(key, record);
+        this.dirtyDeletes.delete(key);
+        this.dirtyUpserts.set(key, { ...record });
+      }
     }
+  }
+
+  /** 读取自上次持久化以来本客户端实际收到的 Set-Cookie 增量，用于同会话多进程无冲突合并 */
+  peekDelta(): CookieDelta {
+    return {
+      upserts: [...this.dirtyUpserts.values()].map((c) => ({ ...c })),
+      deletes: [...this.dirtyDeletes],
+    };
+  }
+
+  clearDelta(): void {
+    this.dirtyUpserts.clear();
+    this.dirtyDeletes.clear();
+  }
+
+  /** 用磁盘上更新版本的同会话 Cookie 快照刷新内存罐（不丢失调用后继续收到的新 Cookie） */
+  syncFromRecords(cookies: CookieRecord[], nowMs = Date.now()): void {
+    const next = new Map<string, CookieRecord>();
+    for (const c of cookies) {
+      const domain = c.domain.replace(/^\.+/, "").toLowerCase();
+      if (!c.name || !isAllowedFeishuHost(domain, this.extraAllowed)) continue;
+      if (isExpired(c, nowMs)) continue;
+      const normalized: CookieRecord = {
+        name: c.name,
+        value: c.value,
+        domain,
+        path: c.path && c.path.startsWith("/") ? c.path : "/",
+        ...(c.host_only ? { host_only: true } : {}),
+        ...(c.expires_at ? { expires_at: c.expires_at } : {}),
+      };
+      next.set(this.keyOf(normalized), normalized);
+    }
+    this.values.clear();
+    for (const [k, v] of next) this.values.set(k, v);
+    this.clearDelta();
   }
 
   /** Return all non-expired matching cookies sorted by longest path first (RFC 6265 §5.4). */
@@ -255,7 +308,9 @@ export class WebLoginStore {
         cookies: parsed.cookies,
         owner_id: parsed.owner_id,
         owner_name: typeof parsed.owner_name === "string" ? parsed.owner_name : "",
+        owner_open_id: typeof parsed.owner_open_id === "string" && parsed.owner_open_id ? parsed.owner_open_id : undefined,
         session_id: typeof parsed.session_id === "string" && parsed.session_id ? parsed.session_id : undefined,
+        cookie_version: typeof parsed.cookie_version === "number" && Number.isFinite(parsed.cookie_version) ? parsed.cookie_version : 1,
         updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : undefined,
       };
     } catch {
@@ -304,13 +359,15 @@ export class WebLoginStore {
     }
   }
 
-  private writeUnlocked(login: WebLogin): WebLogin {
+  private writeUnlocked(login: WebLogin, cookieVersion: number): WebLogin {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     const tmp = path.join(path.dirname(this.file), `.${path.basename(this.file)}.${process.pid}.${Date.now()}.tmp`);
     const payload: WebLogin = {
       owner_id: login.owner_id,
       owner_name: login.owner_name,
+      ...(login.owner_open_id ? { owner_open_id: login.owner_open_id } : {}),
       session_id: login.session_id || crypto.randomUUID(),
+      cookie_version: cookieVersion,
       cookies: login.cookies,
       updated_at: new Date().toISOString(),
     };
@@ -338,22 +395,58 @@ export class WebLoginStore {
   }
 
   save(login: WebLogin): WebLogin {
-    return this.withLock(() => this.writeUnlocked(login));
+    return this.withLock(() => this.writeUnlocked(login, 1));
   }
 
   /**
-   * 跨进程加锁核验：仅当磁盘上的凭据文件仍然存在且属于同一会话代际（session_id + owner_id）时才写回轮换后的 Cookie。
-   * 若已被 `web-logout` 清除或已被新一次 `web-login` 覆盖，返回 false 且绝不覆写。
+   * 跨进程加锁核验并按版本号合并：
+   *   - 若磁盘凭据已被 web-logout 删除或已被新一次 web-login（不同 session_id / owner_id）替换，返回 null 且绝不覆写；
+   *   - 若同会话内另一进程（如 web-status --verify 与 daemon 并行）已写入更高版本 Cookie，则仅把本次新增/变更的 delta 合并到最新快照上，绝不回滚已轮换的新 Cookie；
+   *   - 返回合并后的最新磁盘 WebLogin，调用方可据此刷新本地 CookieJar 与版本号。
    */
-  saveIfSessionMatches(login: WebLogin): boolean {
+  saveIfSessionMatches(login: WebLogin, delta?: CookieDelta): WebLogin | null {
     return this.withLock(() => {
       const current = this.load();
-      if (!current) return false;
-      if (current.owner_id !== login.owner_id) return false;
-      if (current.session_id && login.session_id && current.session_id !== login.session_id) return false;
-      if (current.session_id && !login.session_id) return false;
-      this.writeUnlocked({ ...login, session_id: current.session_id ?? login.session_id });
-      return true;
+      if (!current) return null;
+      if (current.owner_id !== login.owner_id) return null;
+      if (current.session_id && login.session_id && current.session_id !== login.session_id) return null;
+      if (current.session_id && !login.session_id) return null;
+
+      const curVer = current.cookie_version ?? 1;
+      const baseVer = login.cookie_version ?? curVer;
+      const hasDelta = !!delta && (delta.upserts.length > 0 || delta.deletes.length > 0);
+
+      if (curVer > baseVer) {
+        // 磁盘上已有更新版本的同会话 Cookie：若无增量变更则直接返回磁盘最新快照，绝不回滚
+        if (!hasDelta) return current;
+        const merged = new Map<string, CookieRecord>();
+        const keyOf = (c: Pick<CookieRecord, "domain" | "path" | "name">) => `${c.domain.replace(/^\.+/, "").toLowerCase()}\0${c.path || "/"}\0${c.name}`;
+        for (const c of current.cookies) merged.set(keyOf(c), c);
+        for (const k of delta.deletes) merged.delete(k);
+        for (const c of delta.upserts) merged.set(keyOf(c), c);
+        return this.writeUnlocked(
+          {
+            ...current,
+            owner_name: login.owner_name || current.owner_name,
+            owner_open_id: login.owner_open_id || current.owner_open_id,
+            cookies: [...merged.values()],
+          },
+          curVer + 1,
+        );
+      }
+
+      if (delta && !hasDelta && login.owner_name === current.owner_name && (!login.owner_open_id || login.owner_open_id === current.owner_open_id)) {
+        return current;
+      }
+
+      return this.writeUnlocked(
+        {
+          ...login,
+          owner_open_id: login.owner_open_id || current.owner_open_id,
+          session_id: current.session_id ?? login.session_id,
+        },
+        curVer + 1,
+      );
     });
   }
 

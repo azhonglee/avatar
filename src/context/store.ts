@@ -1,6 +1,23 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { CtxDraftKind, CtxItemKind, CtxItemStatus, CtxPriority, CtxSource } from "../api/types.ts";
+import { isDeadOwner } from "../ledger.ts";
+
+/**
+ * 计算观测的内容修订签名：包含正文及真实 @mention 标识（防止将普通 "@姓名" 编辑为真实 @mention 时被误判为无变更）。
+ */
+export function obsRevision(o: { text: string; meta?: Record<string, unknown> }): string {
+  const meta = o.meta ?? {};
+  const rawMentions = Array.isArray(meta.mentions) ? meta.mentions : [];
+  if (meta.at_me === undefined && rawMentions.length === 0) return o.text;
+  const mentionsSig = rawMentions
+    .map((m) => {
+      const rec = m as { id?: unknown; start?: unknown; end?: unknown };
+      return `${String(rec.id ?? "")}:${String(rec.start ?? "")}:${String(rec.end ?? "")}`;
+    })
+    .join(",");
+  return `${o.text}\0at=${meta.at_me ? "1" : "0"}\0m=${mentionsSig}`;
+}
 
 /**
  * 工作图谱存储：观测（原始信号）→ 项目 / 事项 / 知识 / 动态 / 人 / 冲突 / 草稿，每条事实挂证据。
@@ -240,6 +257,12 @@ export class ContextStore {
         target TEXT NOT NULL DEFAULT '{}', target_label TEXT NOT NULL DEFAULT '', content TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'proposed', error TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL, updated INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS ctx_mute_conv (conv TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS ctx_conv_claim (
+        conv TEXT PRIMARY KEY,
+        holder TEXT NOT NULL,
+        proc_owner TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
     `);
     // 迁移：子项目
     const cols = new Set((db.prepare("PRAGMA table_info(ctx_project)").all() as { name: string }[]).map((c) => c.name));
@@ -291,12 +314,12 @@ export class ContextStore {
         } else {
           const curMeta = j<Record<string, unknown>>(cur.meta, {});
           const wasBgOnly = curMeta.background_only === true;
-          const textChanged = String(cur.text ?? "") !== o.text;
-          if (wasBgOnly || textChanged) {
+          const revChanged = obsRevision({ text: String(cur.text ?? ""), meta: curMeta }) !== obsRevision(o);
+          if (wasBgOnly || revChanged) {
             const mergedMeta: Record<string, unknown> = { ...curMeta, ...(o.meta ?? {}) };
             delete mergedMeta.background_only;
             upd.run(
-              wasBgOnly ? o.kind : String(cur.kind ?? o.kind),
+              wasBgOnly || revChanged ? o.kind : String(cur.kind ?? o.kind),
               o.conv_name || String(cur.conv_name ?? ""),
               o.actor_name || String(cur.actor_name ?? ""),
               o.text,
@@ -399,16 +422,15 @@ export class ContextStore {
     }
     fresh.sort((a, b) => Number(a.time) - Number(b.time) || String(a.id).localeCompare(String(b.id)));
     const includedIds = new Set(fresh.map((r) => String(r.id)));
-    const t0 = Number(fresh[0].time);
-    const before = (
+    // 独立拉取紧贴触发消息之前的最近背景（以 targetTime 为锚点而非最早积压 t0，防止刚补读的近邻背景被旧积压挤出）
+    const beforeTrigger = (
       this.db
         .prepare("SELECT * FROM ctx_obs WHERE conv = ? AND time <= ? ORDER BY time DESC, id DESC LIMIT ?")
-        .all(conv, t0, context + includedIds.size) as Row[]
+        .all(conv, targetTime, context + includedIds.size) as Row[]
     )
       .filter((r) => !includedIds.has(String(r.id)))
-      .slice(0, context)
-      .reverse();
-    before.forEach((r) => includedIds.add(String(r.id)));
+      .slice(0, context);
+    beforeTrigger.forEach((r) => includedIds.add(String(r.id)));
 
     // 显式补齐话题根消息与被引用父消息锚点（即使早于最近 context 条也能被模型看到）
     const targetMeta = j<Record<string, unknown>>(target.meta, {});
@@ -423,8 +445,9 @@ export class ContextStore {
         includedIds.add(String(row.id));
       }
     }
-    anchors.sort((a, b) => Number(a.time) - Number(b.time) || String(a.id).localeCompare(String(b.id)));
-    return [...anchors, ...before, ...fresh].map((r) => this.toObs(r));
+    const combined = [...anchors, ...beforeTrigger, ...fresh];
+    combined.sort((a, b) => Number(a.time) - Number(b.time) || String(a.id).localeCompare(String(b.id)));
+    return combined.map((r) => this.toObs(r));
   }
 
   convObs(conv: string, since: number, limit = 80): Obs[] {
@@ -432,29 +455,57 @@ export class ContextStore {
     return rows.map((r) => this.toObs(r)).reverse();
   }
 
+  latestConvObs(conv: string): Obs | undefined {
+    const row = this.db.prepare("SELECT * FROM ctx_obs WHERE conv = ? ORDER BY time DESC LIMIT 1").get(conv) as Row | undefined;
+    return row ? this.toObs(row) : undefined;
+  }
+
   /**
-   * 标记观测为已处理；传入 `{ id, text }` 时仅当当前正文与送给模型的正文一致才标记，
-   * 防止模型推理期间到达的消息编辑被旧批次静默吞掉。
+   * 标记观测为已处理；传入 `{ id, rev }` 或 `{ id, text }` 时仅当当前修订与送给模型的版本一致才标记，
+   * 防止模型推理期间到达的正文或 @mention 编辑被旧批次静默吞掉。
    */
-  markProcessed(entries: (string | { id: string; text: string })[]): void {
+  markProcessed(entries: (string | { id: string; text?: string; rev?: string })[]): void {
     const get = this.db.prepare("SELECT text, meta FROM ctx_obs WHERE id = ?");
-    const upd = this.db.prepare("UPDATE ctx_obs SET processed = 1, meta = ? WHERE id = ? AND text = ?");
+    const upd = this.db.prepare("UPDATE ctx_obs SET processed = 1, meta = ? WHERE id = ? AND text = ? AND meta = ?");
     this.tx(() => {
       for (const entry of entries) {
         const id = typeof entry === "string" ? entry : entry.id;
+        const expectedRev = typeof entry === "string" ? undefined : entry.rev;
         const expectedText = typeof entry === "string" ? undefined : entry.text;
         const cur = get.get(id) as { text: string; meta: string } | undefined;
         if (!cur) continue;
-        if (expectedText !== undefined && cur.text !== expectedText) continue;
         const m = j<Record<string, unknown>>(cur.meta, {});
+        if (expectedRev !== undefined && obsRevision({ text: cur.text, meta: m }) !== expectedRev) continue;
+        if (expectedRev === undefined && expectedText !== undefined && cur.text !== expectedText) continue;
         if (m.background_only) delete m.background_only;
-        upd.run(JSON.stringify(m), id, cur.text);
+        upd.run(JSON.stringify(m), id, cur.text, cur.meta);
       }
     });
   }
 
+  /** 跨进程会话理解占坑：防止常驻进程快通道与命令行 `pa context run` 并发理解同一会话 */
+  claimConv(conv: string, holder: string, procOwner: string, ttlMs = 15 * 60_000, now = Date.now()): boolean {
+    return this.tx(() => {
+      const cur = this.db.prepare("SELECT holder, proc_owner, expires_at FROM ctx_conv_claim WHERE conv = ?").get(conv) as
+        | { holder: string; proc_owner: string; expires_at: number }
+        | undefined;
+      if (cur && cur.holder !== holder && cur.expires_at > now && !isDeadOwner(cur.proc_owner, procOwner)) {
+        return false;
+      }
+      this.db
+        .prepare("INSERT OR REPLACE INTO ctx_conv_claim (conv, holder, proc_owner, expires_at) VALUES (?, ?, ?, ?)")
+        .run(conv, holder, procOwner, now + ttlMs);
+      return true;
+    });
+  }
+
+  releaseConv(conv: string, holder: string): void {
+    this.db.prepare("DELETE FROM ctx_conv_claim WHERE conv = ? AND holder = ?").run(conv, holder);
+  }
+
   muteConv(conv: string, name: string, muted: boolean): void {
-    if (muted) this.db.prepare("INSERT OR REPLACE INTO ctx_mute_conv (conv, name, at) VALUES (?, ?, ?)").run(conv, name, Date.now());
+    const resolvedName = name || (muted ? this.latestConvObs(conv)?.conv_name ?? "" : "");
+    if (muted) this.db.prepare("INSERT OR REPLACE INTO ctx_mute_conv (conv, name, at) VALUES (?, ?, ?)").run(conv, resolvedName, Date.now());
     else this.db.prepare("DELETE FROM ctx_mute_conv WHERE conv = ?").run(conv);
     if (muted) this.db.prepare("UPDATE ctx_obs SET processed = 1 WHERE conv = ?").run(conv);
   }

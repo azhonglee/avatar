@@ -46,13 +46,11 @@ export class ContextService {
   drafter: Drafter;
   personalWeb: PersonalWebBridge;
   running = false;
-  /** 正在理解中的规范会话键集合：避免常规周期与快通道、或同会话多个快通道并发重复理解同一批观测 */
-  private readonly activeConvs = new Set<string>();
 
   constructor(app: App) {
     this.app = app;
     this.store = new ContextStore(app.store.db);
-    this.connectors = new Connectors(app, this.store);
+    this.connectors = new Connectors(app, this.store, () => this.personalWeb.resolveNativeExclusionsForPolling());
     this.understander = new Understander(app, this.store);
     this.views = new ContextViews(app, this.store);
     this.drafter = new Drafter(app, this.store);
@@ -139,24 +137,37 @@ export class ContextService {
       await this.ensureOwnerName();
       const created: ItemRow[] = [];
       if (this.cfg.context.understand) {
-        // 每轮最多理解 max_convs_per_cycle 个会话批次；并行跑 understand_parallel 批（会话互不重叠）
+        // 每轮最多理解 max_convs_per_cycle 个会话批次；并行跑 understand_parallel 批（通过 SQLite 租约跨进程互斥）
         let budget = this.cfg.context.max_convs_per_cycle;
         const par = this.cfg.context.understand_parallel;
+        const skippedInCycle = new Set<string>();
         while (budget > 0 && !signal?.aborted) {
-          const pending = this.store
-            .pendingConvs(Math.min(budget, 8 * par) + this.activeConvs.size)
-            .filter((c) => !this.activeConvs.has(c.conv))
-            .slice(0, Math.min(budget, 8 * par));
-          if (!pending.length) break;
-          const claimed = pending.map((c) => c.conv);
-          claimed.forEach((k) => this.activeConvs.add(k));
+          const candidates = this.store
+            .pendingConvs(Math.min(budget, 8 * par) + skippedInCycle.size + 8)
+            .filter((c) => !skippedInCycle.has(c.conv));
+          const eligible: typeof candidates = [];
+          for (const c of candidates) {
+            if (eligible.length >= Math.min(budget, 8 * par)) break;
+            const decision = await this.personalWeb.checkConvAllowedForUnderstand(c.conv, c.conv_name);
+            if (decision !== "allowed") {
+              skippedInCycle.add(c.conv);
+              continue;
+            }
+            if (!this.store.claimConv(c.conv, workId, this.app.ledger.owner)) {
+              skippedInCycle.add(c.conv);
+              continue;
+            }
+            eligible.push(c);
+          }
+          if (!eligible.length) break;
+          const pending = eligible;
           const groups: (typeof pending)[] = Array.from({ length: Math.min(par, pending.length) }, () => []);
           pending.forEach((c, i) => groups[i % groups.length].push(c));
           let results: PromiseSettledResult<Awaited<ReturnType<Understander["runBatch"]>>>[];
           try {
             results = await Promise.allSettled(groups.map((g) => this.understander.runBatch(workId, g, signal)));
           } finally {
-            claimed.forEach((k) => this.activeConvs.delete(k));
+            for (const c of pending) this.store.releaseConv(c.conv, workId);
           }
           if (signal?.aborted) throw new Error("aborted");
           let progress = 0;
@@ -223,17 +234,26 @@ export class ContextService {
     p: { conv: string; conv_name: string; trigger_obs_id: string; anchor?: FastAnchor },
     signal?: AbortSignal,
   ): Promise<{ busy?: boolean; fresh: number; created: number; nudged: number; pre_drafted: number }> {
-    if (!this.cfg.context.understand || !this.cfg.context.sources.im) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
-    if (this.store.isConvMutedById(p.conv)) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
-    const claimKey = p.conv;
-    if (this.activeConvs.has(claimKey)) return { busy: true, fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
-    this.activeConvs.add(claimKey);
+    if (
+      !this.cfg.context.understand ||
+      !this.cfg.context.sources.im ||
+      !this.cfg.context.personal_web.enabled ||
+      !this.cfg.context.personal_web.fast_lane
+    ) {
+      return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+    }
+    const eligBefore = await this.personalWeb.checkConvAllowedForUnderstand(p.conv, p.conv_name);
+    if (eligBefore !== "allowed") return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+    if (!this.store.claimConv(p.conv, workId, this.app.ledger.owner)) {
+      return { busy: true, fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+    }
     try {
       await this.ensureOwnerName();
       if (p.anchor) {
         await this.personalWeb.hydrateContext(p.anchor, p.conv, p.conv_name, signal);
       }
-      if (this.store.isConvMutedById(p.conv)) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+      const eligAfter = await this.personalWeb.checkConvAllowedForUnderstand(p.conv, p.conv_name);
+      if (eligAfter !== "allowed") return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
       const window = this.store.convWindowAround(p.conv, p.trigger_obs_id);
       if (!window.length) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
       const r = await this.understander.runBatch(
@@ -261,7 +281,7 @@ export class ContextService {
       }
       return { fresh: r.fresh, created: r.created.length, nudged, pre_drafted: preDrafted };
     } finally {
-      this.activeConvs.delete(claimKey);
+      this.store.releaseConv(p.conv, workId);
     }
   }
 

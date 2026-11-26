@@ -6,7 +6,7 @@ import {
   resolveEndpoints,
   type WebEndpoints,
 } from "./auth.ts";
-import { RecordingCookieJar, type WebLogin } from "./cookies.ts";
+import { RecordingCookieJar, type CookieDelta, type WebLogin } from "./cookies.ts";
 import { fetchWithJar, WEB_USER_AGENT, WebHttpError } from "./http.ts";
 import { MAX_WIRE_BYTES, parseProto, ProtoWriter } from "./proto.ts";
 import {
@@ -66,8 +66,12 @@ export class SessionNeedsLoginError extends WebHttpError {
 
 export interface FeishuWebClientOptions {
   endpoints?: Partial<WebEndpoints>;
-  /** 返回 false 表示本地凭据已被登出或替换为新会话，客户端应停止继续使用当前会话 */
-  onSessionConfirmed?: (login: WebLogin) => boolean | void;
+  /**
+   * 收到可信会话确认 / Cookie 轮换时回调：
+   *   - 返回 false / null 表示本地凭据已被登出或替换为新会话，客户端应停止继续使用当前会话；
+   *   - 返回合并后的 WebLogin 对象时，客户端据此同步最新 cookie_version 与磁盘快照（防止多进程互相回滚 Cookie）。
+   */
+  onSessionConfirmed?: (login: WebLogin, delta: CookieDelta) => WebLogin | boolean | null | void;
   heartbeatIntervalMs?: number;
   socketIdleTimeoutMs?: number;
   keepaliveIntervalMs?: number;
@@ -192,10 +196,12 @@ export class FeishuWebClient {
     >
   >;
   private readonly maxQueueBytes?: number;
-  private onSessionConfirmed?: (login: WebLogin) => boolean | void;
+  private onSessionConfirmed?: (login: WebLogin, delta: CookieDelta) => WebLogin | boolean | null | void;
   private ownerId: string;
   private ownerName: string;
+  private ownerOpenId?: string;
   private readonly sessionId?: string;
+  private cookieVersion: number;
   private deviceId = "";
   private appKey = "";
   private readonly chatCache = new Map<string, { meta: ChatMeta; expiresAt: number }>();
@@ -205,7 +211,9 @@ export class FeishuWebClient {
     this.jar = jar;
     this.ownerId = login.owner_id;
     this.ownerName = login.owner_name;
+    this.ownerOpenId = login.owner_open_id;
     this.sessionId = login.session_id;
+    this.cookieVersion = login.cookie_version ?? 1;
     this.onSessionConfirmed = options.onSessionConfirmed;
     this.maxQueueBytes = options.maxQueueBytes;
     const heartbeat = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_MS;
@@ -222,7 +230,7 @@ export class FeishuWebClient {
     };
   }
 
-  /** Connect an approved login, verify owner identity, and load Web SDK metadata. */
+  /** Connect an approved login, verify owner identity (persisting any rotated cookies immediately), and load Web SDK metadata. */
   static async connect(
     login: WebLogin,
     options: FeishuWebClientOptions = {},
@@ -232,6 +240,9 @@ export class FeishuWebClient {
     const jar = RecordingCookieJar.fromRecords(login.cookies, ep.extraAllowedHosts);
     const client = new FeishuWebClient(jar, login, options);
     await client.verifyOwner(signal);
+    if (!client.notifySessionConfirmed()) {
+      throw new WebHttpError("aborted", "本地凭据已被登出或更新");
+    }
     const meta = await loadWebMetadata(jar, ep, { signal });
     client.deviceId = meta.deviceId;
     client.appKey = meta.appKey;
@@ -247,24 +258,55 @@ export class FeishuWebClient {
     return this.sessionId;
   }
 
+  currentCookieVersion(): number {
+    return this.cookieVersion;
+  }
+
+  /** 同步磁盘上更新版本的同会话 Cookie（例如其他进程刚完成了 Cookie 轮换） */
+  syncFromDisk(login: WebLogin): void {
+    if (login.owner_id !== this.ownerId) return;
+    if (this.sessionId && login.session_id && login.session_id !== this.sessionId) return;
+    const nextVer = login.cookie_version ?? 1;
+    if (nextVer <= this.cookieVersion) return;
+    this.jar.syncFromRecords(login.cookies);
+    this.cookieVersion = nextVer;
+    if (login.owner_name) this.ownerName = login.owner_name;
+    if (login.owner_open_id) this.ownerOpenId = login.owner_open_id;
+  }
+
   /** Live snapshot including any cookies rotated by Feishu since login. */
   session(): WebLogin {
     return {
       owner_id: this.ownerId,
       owner_name: this.ownerName,
+      ...(this.ownerOpenId ? { owner_open_id: this.ownerOpenId } : {}),
       ...(this.sessionId ? { session_id: this.sessionId } : {}),
+      cookie_version: this.cookieVersion,
       cookies: this.jar.records(),
       updated_at: new Date().toISOString(),
     };
   }
 
-  setSessionObserver(cb: ((login: WebLogin) => boolean | void) | undefined): void {
+  setSessionObserver(cb: ((login: WebLogin, delta: CookieDelta) => WebLogin | boolean | null | void) | undefined): void {
     this.onSessionConfirmed = cb;
   }
 
   private notifySessionConfirmed(): boolean {
+    if (!this.onSessionConfirmed) {
+      this.jar.clearDelta();
+      return true;
+    }
     try {
-      return this.onSessionConfirmed?.(this.session()) !== false;
+      const delta = this.jar.peekDelta();
+      const res = this.onSessionConfirmed(this.session(), delta);
+      if (res === false || res === null) return false;
+      if (res && typeof res === "object") {
+        this.cookieVersion = res.cookie_version ?? this.cookieVersion;
+        this.jar.syncFromRecords(res.cookies);
+      } else {
+        this.jar.clearDelta();
+      }
+      return true;
     } catch {
       // observer errors must not break protocol loop
       return true;
@@ -277,6 +319,7 @@ export class FeishuWebClient {
       throw new WebHttpError("credential_denied", "当前个人 Web 账号与已授权账号不一致");
     }
     if (profile.name) this.ownerName = profile.name;
+    if (profile.openId) this.ownerOpenId = profile.openId;
   }
 
   // ───────── Gateway RPCs ─────────
@@ -288,7 +331,7 @@ export class FeishuWebClient {
   ): Promise<Buffer> {
     const cid = opts.cid || randomRequestId();
     const packet = opts.packet ?? encodePacket(command, payload, cid);
-    const headers = authenticatedHeaders(this.jar, this.endpoints, {
+    const headers = authenticatedHeaders(this.jar, this.endpoints, this.endpoints.gatewayUrl, {
       "Content-Type": "application/x-protobuf",
       "X-Appid": WEB_APP_ID,
       "X-Command": String(command),
@@ -518,7 +561,8 @@ export class FeishuWebClient {
     if (input.rootId && input.rootId !== actualRoot) {
       throw new Error("原消息根话题与草稿记录不一致，拒绝发送");
     }
-    const chat = await this.readChat(input.chatId, { signal: input.signal });
+    // 发包前强制实时查询群模式（不走 10 分钟缓存），防止群模式变更后错用 thread 标志
+    const chat = await this.readChat(input.chatId, { signal: input.signal, force: true });
     const group = isGroupChat(chat.kind);
     if (!group && chat.kind !== CHAT_KIND_P2P) {
       throw new Error(`不支持的个人会话类型：${chat.kind}`);
@@ -548,7 +592,7 @@ export class FeishuWebClient {
     const res = await fetchWithJar(this.jar, {
       method: "GET",
       url,
-      headers: authenticatedHeaders(this.jar, this.endpoints),
+      headers: authenticatedHeaders(this.jar, this.endpoints, url),
       signal,
       allowInsecureHttp: this.endpoints.allowInsecureHttp,
       extraAllowedHosts: this.endpoints.extraAllowedHosts,

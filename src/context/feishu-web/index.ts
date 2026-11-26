@@ -1,5 +1,6 @@
 export {
   APP_KEY_RE,
+  authenticatedHeaders,
   beginLogin,
   decodeLoginPoll,
   DEFAULT_ENDPOINTS,
@@ -31,6 +32,7 @@ export {
   parseSetCookieHeader,
   RecordingCookieJar,
   WebLoginStore,
+  type CookieDelta,
   type CookieRecord,
   type WebLogin,
 } from "./cookies.ts";

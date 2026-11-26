@@ -14,6 +14,8 @@ import { MAX_WIRE_BYTES } from "./proto.ts";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const DEFAULT_MAX_QUEUE_BYTES = 16 * 1024 * 1024; // 16 MiB aggregate cap
+const DEFAULT_MAX_QUEUE_FRAMES = 2048;
+const DEFAULT_MAX_FRAG_FRAMES = 256;
 
 const OP_CONT = 0x0;
 const OP_TEXT = 0x1;
@@ -32,6 +34,8 @@ export interface DialWebSocketOptions {
   handshakeTimeoutMs?: number;
   maxFrameBytes?: number;
   maxQueueBytes?: number;
+  maxQueueFrames?: number;
+  maxFragFrames?: number;
   signal?: AbortSignal;
 }
 
@@ -154,6 +158,8 @@ export class BinaryWebSocket {
   private readonly socket: net.Socket;
   private readonly maxFrameBytes: number;
   private readonly maxQueueBytes: number;
+  private readonly maxQueueFrames: number;
+  private readonly maxFragFrames: number;
   private readonly rx = new ChunkReader();
   private fragOpcode: number | null = null;
   private fragChunks: Buffer[] = [];
@@ -164,10 +170,19 @@ export class BinaryWebSocket {
   private readonly waiters: Waiter[] = [];
   private closedErr: Error | null = null;
 
-  constructor(socket: net.Socket, initialHead: Buffer, maxFrameBytes = MAX_WIRE_BYTES, maxQueueBytes = DEFAULT_MAX_QUEUE_BYTES) {
+  constructor(
+    socket: net.Socket,
+    initialHead: Buffer,
+    maxFrameBytes = MAX_WIRE_BYTES,
+    maxQueueBytes = DEFAULT_MAX_QUEUE_BYTES,
+    maxQueueFrames = DEFAULT_MAX_QUEUE_FRAMES,
+    maxFragFrames = DEFAULT_MAX_FRAG_FRAMES,
+  ) {
     this.socket = socket;
     this.maxFrameBytes = maxFrameBytes;
     this.maxQueueBytes = Math.max(maxQueueBytes, 1024);
+    this.maxQueueFrames = Math.max(maxQueueFrames, 16);
+    this.maxFragFrames = Math.max(maxFragFrames, 4);
 
     socket.on("data", (chunk: Buffer) => this.onData(chunk));
     socket.on("error", (err) => this.fail(err));
@@ -181,6 +196,8 @@ export class BinaryWebSocket {
     const handshakeTimeoutMs = opts.handshakeTimeoutMs ?? 20_000;
     const maxFrameBytes = opts.maxFrameBytes ?? MAX_WIRE_BYTES;
     const maxQueueBytes = opts.maxQueueBytes ?? DEFAULT_MAX_QUEUE_BYTES;
+    const maxQueueFrames = opts.maxQueueFrames ?? DEFAULT_MAX_QUEUE_FRAMES;
+    const maxFragFrames = opts.maxFragFrames ?? DEFAULT_MAX_FRAG_FRAMES;
     const parsed = new URL(address);
     const isTls = parsed.protocol === "wss:" || parsed.protocol === "https:";
     const mod = isTls ? https : http;
@@ -233,7 +250,7 @@ export class BinaryWebSocket {
           finish(() => reject(new WebHttpError("http_error", `WebSocket 握手校验失败 (status=${res.statusCode})`, res.statusCode)));
           return;
         }
-        finish(() => resolve(new BinaryWebSocket(socket, head, maxFrameBytes, maxQueueBytes)));
+        finish(() => resolve(new BinaryWebSocket(socket, head, maxFrameBytes, maxQueueBytes, maxQueueFrames, maxFragFrames)));
       });
 
       req.on("response", (res) => {
@@ -348,6 +365,10 @@ export class BinaryWebSocket {
         this.protocolError("WebSocket 分片消息超过最大字节限制");
         return;
       }
+      if (this.fragChunks.length >= this.maxFragFrames) {
+        this.protocolError(`WebSocket 分片数量超过上限 (${this.maxFragFrames})`);
+        return;
+      }
       this.fragChunks.push(payload);
       if (fin) {
         const op = this.fragOpcode;
@@ -374,8 +395,12 @@ export class BinaryWebSocket {
       this.protocolError(`WebSocket 接收队列超过内存上限 (${this.maxQueueBytes} bytes)`);
       return;
     }
+    if (this.queue.length >= this.maxQueueFrames) {
+      this.protocolError(`WebSocket 接收队列帧数超过上限 (${this.maxQueueFrames})`);
+      return;
+    }
     this.queue.push(frame);
-    if (!this.paused && this.queuedBytes >= Math.floor(this.maxQueueBytes / 2)) {
+    if (!this.paused && (this.queuedBytes >= Math.floor(this.maxQueueBytes / 2) || this.queue.length >= Math.floor(this.maxQueueFrames / 2))) {
       this.paused = true;
       this.socket.pause();
     }
@@ -433,7 +458,7 @@ export class BinaryWebSocket {
     if (this.queue.length > 0) {
       const frame = this.queue.shift()!;
       this.queuedBytes = Math.max(0, this.queuedBytes - frame.data.length);
-      if (this.paused && this.queuedBytes <= Math.floor(this.maxQueueBytes / 4)) {
+      if (this.paused && this.queuedBytes <= Math.floor(this.maxQueueBytes / 4) && this.queue.length <= Math.floor(this.maxQueueFrames / 4)) {
         this.paused = false;
         this.socket.resume();
       }

@@ -87,12 +87,20 @@ function arr(o: any, key: string): any[] {
   return [];
 }
 
+export interface NativePollingExclusions {
+  excludedGroupNames: Set<string>;
+  excludeAllGroups: boolean;
+  excludeAllDms: boolean;
+}
+
 export class Connectors {
   app: App;
   store: ContextStore;
-  constructor(app: App, store: ContextStore) {
+  nativeExclusions?: () => Promise<NativePollingExclusions>;
+  constructor(app: App, store: ContextStore, nativeExclusions?: () => Promise<NativePollingExclusions>) {
     this.app = app;
     this.store = store;
+    this.nativeExclusions = nativeExclusions;
   }
 
   private get cfg() {
@@ -287,8 +295,28 @@ export class Connectors {
     });
   }
 
-  private denied(chatId: string, chatName: string): boolean {
-    return this.cfg.context.groups_deny.some((d) => d && (chatId === d || (chatName && chatName.includes(d))));
+  private denied(chatId: string, chatName: string, chatType = "", nativeExcl?: NativePollingExclusions, requireName = true): boolean {
+    if (chatId && this.store.isConvMutedById(chatId)) return true;
+    if (
+      this.cfg.context.groups_deny.some((raw) => {
+        const d = raw.trim();
+        if (!d) return false;
+        if (chatId === d) return true;
+        if (!d.startsWith("oc_") && !d.startsWith("pw_chat:") && !/^\d+$/.test(d) && chatName && chatName.includes(d)) return true;
+        return false;
+      })
+    ) {
+      return true;
+    }
+    if (!nativeExcl) return false;
+    const isDm = chatType === "p2p";
+    if (isDm) return nativeExcl.excludeAllDms;
+    if (nativeExcl.excludeAllGroups) return true;
+    if (nativeExcl.excludedGroupNames.size > 0) {
+      if (!chatName) return requireName; // 存在原生群排除规则且消息仍无群名时按 fail-closed 拦截；白名单预筛若尚未拉到群名则延后到单条消息入库前校验
+      if (nativeExcl.excludedGroupNames.has(norm(chatName))) return true;
+    }
+    return false;
   }
 
   private toObs(m: Raw, kind: string, me: string): Obs | undefined {
@@ -343,12 +371,19 @@ export class Connectors {
     }
     for (const [id, v] of Object.entries(spoken)) if (v.at < now - lookback) delete spoken[id];
     this.setKv("spoken_groups", JSON.stringify(spoken));
+    const nativeExcl = this.nativeExclusions ? await this.nativeExclusions() : undefined;
     const groups =
       this.cfg.context.groups === "allowlist"
-        ? Object.fromEntries(this.cfg.context.groups_allow.map((id) => [id, { name: spoken[id]?.name ?? "", at: now }]))
+        ? Object.fromEntries(
+            this.cfg.context.groups_allow
+              .map((s) => s.trim())
+              // 仅保留开放平台群 ID，防止 pw_chat:* / 纯数字原生 ID 占用轮询 max_groups 配额
+              .filter((id) => id && !id.startsWith("pw_chat:") && !/^\d+$/.test(id))
+              .map((id) => [id, { name: spoken[id]?.name ?? "", at: now }]),
+          )
         : spoken;
     const ranked = Object.entries(groups)
-      .filter(([id, v]) => !this.denied(id, v.name))
+      .filter(([id, v]) => !this.denied(id, v.name, "group", nativeExcl, false))
       .sort((a, b) => b[1].at - a[1].at)
       .slice(0, this.cfg.context.max_groups);
     for (const [chatId, v] of ranked) {
@@ -374,7 +409,7 @@ export class Connectors {
         dropped++;
         continue;
       }
-      if (this.denied(String(m.chat_id ?? ""), String(m.chat_name ?? ""))) {
+      if (this.denied(String(m.chat_id ?? ""), String(m.chat_name ?? ""), String(m.chat_type ?? ""), nativeExcl)) {
         dropped++;
         continue;
       }

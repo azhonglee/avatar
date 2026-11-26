@@ -146,7 +146,7 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
     store.clear();
     app.store.set(
       "ctx.personal_web.state",
-      JSON.stringify({ state: "needs_login", owner_id: "", owner_name: "", since: Date.now(), last_message_at: null, last_error: "已手动登出" }),
+      JSON.stringify({ state: "needs_login", owner_id: "", owner_name: "", session_id: "", since: Date.now(), last_message_at: null, last_error: "已手动登出" }),
     );
     console.log(`已清除个人 Web 登录凭据（${store.file}）。若 pa run 正在运行，将在数秒内自动断开会话且不会回写旧凭据。`);
     return;
@@ -166,7 +166,7 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
     }
     if (verify) {
       if (!login) throw new Error("尚未登录，请先运行 `pa context web-login`");
-      const client = await FeishuWebClient.connect(login, { onSessionConfirmed: (u) => store.saveIfSessionMatches(u) });
+      const client = await FeishuWebClient.connect(login, { onSessionConfirmed: (u, d) => store.saveIfSessionMatches(u, d) });
       console.log(`✅ 在线核验通过：${client.owner().name}（ID: ${client.owner().id}）`);
     }
     return;
@@ -209,9 +209,22 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
         allowUnverifiedOwner: !!values["allow-unverified-owner"],
       });
       const store = new WebLoginStore(app.cfg.dataDir);
-      store.save(login);
-      app.store.set(BOUND_OWNER_KV_KEY, login.owner_id);
-      if (login.owner_name && !app.store.get("ctx.owner_name")) app.store.set("ctx.owner_name", login.owner_name);
+      const saved = store.save(login);
+      app.store.set(BOUND_OWNER_KV_KEY, saved.owner_id);
+      // 清除此前 web-logout 或旧会话残留的 needs_login 错误状态，避免守护进程未启动时 web-status / doctor 误报过期
+      app.store.set(
+        "ctx.personal_web.state",
+        JSON.stringify({
+          state: "stopped",
+          owner_id: saved.owner_id,
+          owner_name: saved.owner_name,
+          session_id: saved.session_id ?? "",
+          since: Date.now(),
+          last_message_at: null,
+          last_error: "",
+        }),
+      );
+      if (saved.owner_name && !app.store.get("ctx.owner_name")) app.store.set("ctx.owner_name", saved.owner_name);
       console.log(`✅ 个人 Web 登录成功：${login.owner_name || "(无昵称)"}（ID: ${login.owner_id}）`);
       console.log(`凭据已以 0600 权限保存到：${store.file}`);
       if (!app.cfg.context.enabled || !app.cfg.context.personal_web.enabled) {

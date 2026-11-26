@@ -62,6 +62,7 @@ export type LoginPollStatus = "waiting" | "scanned" | "approved";
 export interface NativeProfile {
   id: string;
   name: string;
+  openId?: string;
 }
 
 const LOSSLESS_ID_KEYS = new Set(["id", "front_user_id"]);
@@ -121,6 +122,7 @@ export function authHeaders(
 export function authenticatedHeaders(
   jar: RecordingCookieJar,
   endpoints: WebEndpoints,
+  targetUrl: string,
   extra: Record<string, string> = {},
 ): Record<string, string> {
   const headers: Record<string, string> = {
@@ -133,7 +135,7 @@ export function authenticatedHeaders(
     Referer: endpoints.accountsReferer,
     ...extra,
   };
-  const csrf = jar.cookieValue(new URL(endpoints.accountsOrigin + "/"), "swp_csrf_token");
+  const csrf = jar.cookieValue(new URL(targetUrl), "swp_csrf_token");
   if (csrf) headers["x-csrf-token"] = csrf;
   return headers;
 }
@@ -146,7 +148,7 @@ export async function readNativeProfile(
   const res = await fetchWithJar(jar, {
     method: "GET",
     url: endpoints.profileUrl,
-    headers: authenticatedHeaders(jar, endpoints, { "X-App-Id": "12" }),
+    headers: authenticatedHeaders(jar, endpoints, endpoints.profileUrl, { "X-App-Id": "12" }),
     timeoutMs: opts.timeoutMs,
     signal: opts.signal,
     allowInsecureHttp: endpoints.allowInsecureHttp,
@@ -158,7 +160,7 @@ export async function readNativeProfile(
   if (res.status !== 200) {
     throw new WebHttpError("http_error", `查询个人 Web 资料失败 (HTTP ${res.status})`, res.status);
   }
-  let parsed: { code?: number; data?: { user?: { id?: unknown; name?: string } } };
+  let parsed: { code?: number; data?: { user?: { id?: unknown; name?: string; open_id?: string; openId?: string } } };
   try {
     parsed = parseJsonPreserveNativeIds<typeof parsed>(res.body.toString("utf8"));
   } catch {
@@ -169,7 +171,9 @@ export async function readNativeProfile(
   if (typeof parsed?.code !== "number" || parsed.code !== 0 || !id) {
     throw new WebHttpError("http_error", "个人 Web 资料服务暂时不可用", res.status);
   }
-  return { id, name: String(parsed.data?.user?.name ?? "") };
+  const rawOpenId = parsed.data?.user?.open_id ?? parsed.data?.user?.openId;
+  const openId = typeof rawOpenId === "string" && rawOpenId.trim() ? rawOpenId.trim() : undefined;
+  return { id, name: String(parsed.data?.user?.name ?? ""), ...(openId ? { openId } : {}) };
 }
 
 export async function loadWebMetadata(
@@ -177,11 +181,13 @@ export async function loadWebMetadata(
   endpoints: WebEndpoints,
   opts: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<{ deviceId: string; appKey: string }> {
-  const deviceId = jar.cookieValue(new URL(endpoints.accountsOrigin + "/"), "passport_web_did");
+  const messengerUrl = new URL(endpoints.messengerUrl);
+  const accountsUrl = new URL(endpoints.accountsOrigin + "/");
+  const deviceId = jar.cookieValue(messengerUrl, "passport_web_did") || jar.cookieValue(accountsUrl, "passport_web_did");
   const res = await fetchWithJar(jar, {
     method: "GET",
     url: endpoints.messengerUrl,
-    headers: authenticatedHeaders(jar, endpoints),
+    headers: authenticatedHeaders(jar, endpoints, endpoints.messengerUrl),
     timeoutMs: opts.timeoutMs,
     signal: opts.signal,
     allowInsecureHttp: endpoints.allowInsecureHttp,
@@ -195,7 +201,8 @@ export async function loadWebMetadata(
   }
   const body = res.body.toString("utf8");
   const match = body.match(APP_KEY_RE);
-  const resolvedDeviceId = deviceId || jar.cookieValue(new URL(endpoints.accountsOrigin + "/"), "passport_web_did");
+  const resolvedDeviceId =
+    deviceId || jar.cookieValue(messengerUrl, "passport_web_did") || jar.cookieValue(accountsUrl, "passport_web_did");
   if (!match?.[1] || !resolvedDeviceId) {
     throw new WebHttpError("http_error", "已登录的个人 Web 元数据暂不可用（缺少 appKey 或 passport_web_did）", res.status);
   }
@@ -361,7 +368,9 @@ export async function pollLogin(
       cookies: jar.records(),
       owner_id: profile.id,
       owner_name: profile.name,
+      ...(profile.openId ? { owner_open_id: profile.openId } : {}),
       session_id: crypto.randomUUID(),
+      cookie_version: 1,
       updated_at: new Date().toISOString(),
     };
   };

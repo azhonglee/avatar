@@ -4,7 +4,7 @@ import type { App } from "../app.ts";
 import type { CtxItemKind, CtxPriority } from "../api/types.ts";
 import { loadPrompt, runHarness } from "../harness.ts";
 import { errMsg, log, render, truncate } from "../util.ts";
-import type { ContextStore, ItemRow, KnowledgeRow, Obs, ProjectRow } from "./store.ts";
+import { obsRevision, type ContextStore, type ItemRow, type KnowledgeRow, type Obs, type ProjectRow } from "./store.ts";
 
 /**
  * 理解层：把待处理的会话观测交给模型，得到结构化的图谱更新（项目 / 事项 / 知识 / 动态 / 人 / 冲突），
@@ -389,7 +389,7 @@ export class Understander {
     this.store.markProcessed(
       fresh.flatMap((id) => {
         const o = byId.get(id);
-        return o ? [{ id, text: o.text }] : [];
+        return o ? [{ id, rev: obsRevision(o) }] : [];
       }),
     );
     // 把 Meego 待办挂到具体项目
