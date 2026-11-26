@@ -354,7 +354,7 @@ export class FeishuWebClient {
   async gateway(
     command: number,
     payload: Uint8Array | undefined,
-    opts: { cid?: string; packet?: Buffer; signal?: AbortSignal } = {},
+    opts: { cid?: string; packet?: Buffer; signal?: AbortSignal; deferCookiePersist?: boolean } = {},
   ): Promise<Buffer> {
     const cid = opts.cid || randomRequestId();
     const packet = opts.packet ?? encodePacket(command, payload, cid);
@@ -387,8 +387,17 @@ export class FeishuWebClient {
       throw new WebHttpError("http_error", `个人 Web 网关请求被拒绝 (HTTP ${res.status})`, res.status);
     }
     const unpacked = unwrapGatewayPayload(res.body);
-    if (res.cookiesUpdated || this.hasPendingCookieDelta()) this.notifySessionConfirmed();
+    if (!opts.deferCookiePersist && (res.cookiesUpdated || this.hasPendingCookieDelta())) {
+      this.notifySessionConfirmed();
+    }
     return unpacked;
+  }
+
+  /** 将此前延迟（如发回复先落库回执）的待持久化轮换 Cookie 立即刷盘，失败则抛错上报 */
+  flushPendingCookies(): void {
+    if (this.hasPendingCookieDelta()) {
+      this.notifySessionConfirmed();
+    }
   }
 
   /** Fetch one native message by its numeric message ID (command 8). */
@@ -515,9 +524,15 @@ export class FeishuWebClient {
     inThread: boolean,
     signal?: AbortSignal,
     parentId = rootId,
+    opts?: { deferCookiePersist?: boolean },
   ): Promise<WebMessage> {
     const packet = encodeReplyPacket(chatId, rootId, cid, segments, inThread, parentId);
-    const data = await this.gateway(CMD_SEND_MESSAGE, undefined, { cid, packet, signal });
+    const data = await this.gateway(CMD_SEND_MESSAGE, undefined, {
+      cid,
+      packet,
+      signal,
+      deferCookiePersist: opts?.deferCookiePersist,
+    });
     const resp = parseProto(data, MAX_WIRE_BYTES);
     const created = decodeMessage(resp.bytes(1), this.ownerId);
     if (!created.id) {
@@ -597,8 +612,13 @@ export class FeishuWebClient {
     const inThread = replyInThread(chat.kind, chat.mode);
     const threaded = group || inThread;
     hooks?.onBeforeSend?.({ rootId: actualRoot, parentId: actualParent, threaded });
-    const created = await this.sendReply(input.chatId, actualRoot, input.cid, [{ text }], inThread, input.signal, actualParent);
+    // 发包响应可能同时携带新消息 ID 与 Cookie 轮换：先让 onCreated 把 replyId 持久化为 created，
+    // 再尝试刷盘轮换后的 Cookie，确保即使 Cookie 落盘报错也不会让已发送消息滞留在 sending 态而无法回读恢复。
+    const created = await this.sendReply(input.chatId, actualRoot, input.cid, [{ text }], inThread, input.signal, actualParent, {
+      deferCookiePersist: true,
+    });
     hooks?.onCreated?.({ replyId: created.id, rootId: actualRoot, parentId: actualParent, threaded });
+    this.flushPendingCookies();
 
     return this.verifyReplyReadback({
       replyId: created.id,

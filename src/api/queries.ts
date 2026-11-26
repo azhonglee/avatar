@@ -3,6 +3,8 @@ import path from "node:path";
 import { Cron } from "croner";
 import { tryGit } from "../delivery/git.ts";
 import type { App } from "../app.ts";
+import { CommandError } from "../commands.ts";
+import { hasWorkspaceOwnerMismatch } from "../context/personal-web.ts";
 import { availableActions } from "../core-commands.ts";
 import type { Effect, WorkItem } from "../ledger.ts";
 import type { DispatchPayload } from "../workflows/dispatch.ts";
@@ -304,6 +306,16 @@ export function stepLog(app: App, stepId: number, offset: number): LogChunk | un
   const s = app.ledger.step(stepId);
   if (!s) return undefined;
   const file = path.resolve(s.log || "");
+  if (hasWorkspaceOwnerMismatch(app.store, app.cfg.owner.open_id)) {
+    const work = app.ledger.get(s.work_id);
+    const isContextStep =
+      work?.kind === "context" ||
+      s.work_id.startsWith("context:") ||
+      path.basename(file).startsWith("context-");
+    if (isContextStep) {
+      throw new CommandError("conflict", "当前工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已阻断读取上下文运行日志以防跨账号泄漏");
+    }
+  }
   // 只允许读取数据目录下的日志
   if (!s.log || !file.startsWith(path.resolve(app.cfg.dataDir) + path.sep) || !fs.existsSync(file)) {
     return { step_id: stepId, offset, next_offset: offset, text: "", eof: true, running: s.status === "running" };
@@ -323,7 +335,34 @@ export function stepLog(app: App, stepId: number, offset: number): LogChunk | un
   return { step_id: stepId, offset: start, next_offset: start + len, text: buf.toString("utf8"), eof: start + len >= size, running: s.status === "running" };
 }
 
-function healthItem(w: WorkItem): HealthItem {
+function isContextHealthWork(w: WorkItem): boolean {
+  if (w.kind === "context") return true;
+  if (w.ref.startsWith("card:ctx-") || w.ref.startsWith("ctx-draft:")) return true;
+  if (w.ref.startsWith("context:") && w.ref !== "context:pw-needs-login") return true;
+  if (w.kind === "effect") {
+    const e = w.payload as unknown as Partial<Effect>;
+    if (e.op === "pw.reply") return true;
+    if (e.op === "card.upsert" && typeof e.args?.key === "string" && e.args.key.startsWith("ctx-")) return true;
+  }
+  return false;
+}
+
+function healthItem(w: WorkItem, ownerMismatch = false): HealthItem {
+  if (ownerMismatch && isContextHealthWork(w)) {
+    return {
+      id: w.id,
+      kind: w.kind as HealthItem["kind"],
+      ref: "context:isolated",
+      state: w.state,
+      terminal: w.terminal,
+      attempts: w.attempts,
+      next_at: w.next_at,
+      error: "工作区 owner.open_id 与已绑定账号不一致，上下文已隔离",
+      summary: "上下文任务已按主人隔离",
+      updated: w.updated,
+      acknowledged: w.outcome === "acknowledged",
+    };
+  }
   const p = w.payload as Record<string, unknown>;
   const summary =
     w.kind === "effect" ? effectSummary(w.payload as unknown as Effect) : String(p.summary ?? p.name ?? p.action ?? w.ref).slice(0, 120);
@@ -344,12 +383,13 @@ function healthItem(w: WorkItem): HealthItem {
 
 export function health(app: App): Health {
   const { ledger, store, cfg } = app;
+  const ownerMismatch = hasWorkspaceOwnerMismatch(store, cfg.owner.open_id);
   const kinds = ["event", "effect", "job", "delivery"] as const;
-  const retrying = kinds.flatMap((k) => ledger.active(k)).filter((w) => w.attempts > 1 || !!w.error).map(healthItem);
+  const retrying = kinds.flatMap((k) => ledger.active(k)).filter((w) => w.attempts > 1 || !!w.error).map((w) => healthItem(w, ownerMismatch));
   const failed = ledger
     .list({ kinds: [...kinds], states: ["dead", "errored"], limit: 200 })
     .filter((w) => w.updated > Date.now() - 14 * DAY)
-    .map(healthItem);
+    .map((w) => healthItem(w, ownerMismatch));
   const hb = store.get("daemon.heartbeat");
   const [owner, at] = hb ? hb.split("|") : [null, null];
   let guard: Health["guard"] = [];

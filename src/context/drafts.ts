@@ -230,7 +230,8 @@ export class Drafter {
       if (currentBound !== ownerId) {
         throw new Error(`该草稿归属账号 (${ownerId}) 与当前工作区绑定账号 (${currentBound}) 不一致，拒绝发送`);
       }
-      // 若飞书已创建该精确草稿回复（仅缺回读确认），即使已关闭 send_replies 也放行只读回读恢复，绝不放行新发送
+      // 若飞书已创建该精确草稿回复（仅缺回读确认），即使已关闭 send_replies 或原消息后续被撤回，仍放行只读回读恢复；
+      // 但若尚未发出且目标观测已被编辑撤回（withdrawn），必须拒绝发起新的外部发送。
       const readbackRecovery = isReadbackOnlyDelivery(this.app.store, {
         draft_id: d.id,
         owner_id: ownerId,
@@ -238,6 +239,9 @@ export class Drafter {
         message_id: d.target.native_message_id,
         text: content,
       });
+      if (!readbackRecovery && obs?.meta.withdrawn === true) {
+        throw new Error("该草稿对应的原个人 Web 消息已被编辑移出触发范围或撤回，拒绝发送新回复");
+      }
       if (!this.cfg.context.personal_web.send_replies && !readbackRecovery) {
         throw new Error("该草稿目标来自个人 Web 实时消息；为避免偏离原话题，请在设置中开启 context.personal_web.send_replies 后再发送");
       }
@@ -262,6 +266,9 @@ export class Drafter {
         if (d.target.message_id) {
           if (lockedRoute && lockedRoute !== "im.reply") {
             throw new Error(`草稿已绑定发送路由 ${lockedRoute}，拒绝切换为 im.reply`);
+          }
+          if (obs?.meta.withdrawn === true) {
+            throw new Error("该草稿对应的原消息已被撤回，拒绝发送回复");
           }
           return { op: "im.reply", args: { message_id: d.target.message_id, text: content, draft_id: d.id } };
         }

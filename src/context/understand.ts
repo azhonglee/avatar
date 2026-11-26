@@ -133,6 +133,7 @@ export class Understander {
     convs: { conv: string; conv_name: string; target_obs_id?: string }[],
     maxChars = 24_000,
     activeNativeOwner?: string | null,
+    filterObs?: (conv: string, obs: Obs[]) => Obs[],
   ): { prompt: string; obs: Obs[]; fresh: string[]; convs: string[] } {
     const tz = this.cfg.owner.timezone;
     const sections: string[] = [];
@@ -141,10 +142,12 @@ export class Understander {
     const used: string[] = [];
     let size = 0;
     for (const c of convs) {
-      const list = c.target_obs_id
+      const rawList = c.target_obs_id
         ? this.store.convWindowAround(c.conv, c.target_obs_id, 60, 12, activeNativeOwner)
         : this.store.convWindow(c.conv, 60, 12, activeNativeOwner);
+      const list = filterObs ? filterObs(c.conv, rawList) : rawList;
       if (!list.length) continue;
+      if (!list.some((o) => !this.isProcessed(o.id))) continue;
       const lines = list.map((o) => {
         const isNew = !this.isProcessed(o.id);
         return `[${o.id}] ${fmt(o.time, tz)} ${o.is_me ? "【我】" : o.actor_name || o.actor_id}: ${truncate(o.text, 500)}${isNew ? " (新)" : ""}`;
@@ -223,19 +226,25 @@ export class Understander {
       .join("\n");
   }
 
-  /** 跑一批：调用模型 → 解析 → 应用前二次策略复核 → 原子写入 */
+  /** 跑一批：调用模型 → 解析 → 应用前二次策略复核 → 写事务内校验租约与整批新鲜度后原子写入 */
   async runBatch(
     workId: string,
     convs: { conv: string; conv_name: string; target_obs_id?: string }[],
     signal?: AbortSignal,
     activeNativeOwner?: string | null,
     validateBeforeApply?: (batchConvs: { conv: string; conv_name: string }[]) => Promise<Set<string>>,
+    opts?: {
+      filterObs?: (conv: string, obs: Obs[]) => Obs[];
+      claimCheck?: { convs: string[]; holder: string; procOwner: string };
+    },
   ): Promise<ApplyResult & { convs: string[]; fresh: number }> {
     this.processedCache.clear();
-    const batch = this.buildBatch(convs, 24_000, activeNativeOwner);
+    const batch = this.buildBatch(convs, 24_000, activeNativeOwner, opts?.filterObs);
     if (!batch.fresh.length) {
-      // 没有可处理的新观测（理论上不会发生）：把这些会话的待处理标掉，避免周期里反复空转
-      for (const c of batch.convs) this.store.skipConv(c);
+      // 若因当前白名单/范围过滤导致该会话无合格待处理行，不调用 skipConv，留待后续范围恢复或 @我 触发
+      if (!opts?.filterObs) {
+        for (const c of batch.convs) this.store.skipConv(c);
+      }
       return { ...emptyResult(), convs: batch.convs, fresh: 0 };
     }
     const harness = this.cfg.context.harness || this.cfg.roles.brain;
@@ -258,7 +267,10 @@ export class Understander {
       const out = parseUnderstand(r.text);
       const usedMeta = batch.convs.map((id) => ({ conv: id, conv_name: convs.find((c) => c.conv === id)?.conv_name ?? "" }));
       const disallowedConvs = validateBeforeApply ? await validateBeforeApply(usedMeta) : undefined;
-      const res = this.apply(out, batch.obs, batch.fresh, disallowedConvs);
+      const claimCheck = opts?.claimCheck
+        ? { ...opts.claimCheck, convs: batch.convs.filter((id) => opts.claimCheck!.convs.includes(id)) }
+        : undefined;
+      const res = this.apply(out, batch.obs, batch.fresh, disallowedConvs, claimCheck);
       this.app.ledger.endStep(step, "ok", `新事项 ${res.created.length}，关闭 ${res.closed.length}，知识 ${res.knowledge}`);
       return { ...res, convs: batch.convs, fresh: batch.fresh.length };
     } catch (e) {
@@ -269,12 +281,18 @@ export class Understander {
 
   /**
    * 写入模型结果（原子事务内校验）：
-   *   - 证据必须指向这批里真实存在的观测，且在提交时刻未被编辑、撤回、静音或因原生规则变更而被禁止（disallowedConvs）；
-   *   - 若某条结论同时引用了有效观测 A 与被撤回/编辑的观测 B 而整条被拒，保留有效观测 A 仍为待处理（keepPendingIds），
-   *     避免 A 被静默吞掉永不重试；
-   *   - 仅当整批 fresh 观测中仍有未过期观测时才应用结果，并在同一事务内按修订标记已处理。
+   *   - 若传入 `claimCheck`，先在同一 BEGIN IMMEDIATE 写事务内校验所有会话认领租约仍归当前执行者有效持有，失去租约则整体放弃，避免陈旧执行者覆盖继任者结果；
+   *   - 证据必须指向这批里真实存在的观测，且在提交时刻未被编辑、撤回、静音或因策略变更而被禁止（disallowedConvs）；
+   *   - 若本批中任一观测在推理期间失效/撤回/被静音（`batchPartiallyStale`），因为 `out.projects` 与 `out.people` 无逐条证据归属，
+   *     整体放弃该批模型输出且不消费其余仍有效的待处理观测，留待下轮基于干净批次重跑，杜绝被排除会话的信息渗入项目或人物图谱。
    */
-  apply(out: UnderstandOut, obs: Obs[], fresh: string[], disallowedConvs?: Set<string>): ApplyResult {
+  apply(
+    out: UnderstandOut,
+    obs: Obs[],
+    fresh: string[],
+    disallowedConvs?: Set<string>,
+    claimCheck?: { convs: string[]; holder: string; procOwner: string },
+  ): ApplyResult {
     const res = emptyResult();
     const byId = new Map(obs.map((o) => [o.id, o]));
     const auto = this.cfg.context.autonomy;
@@ -288,7 +306,19 @@ export class Understander {
     };
 
     this.store.tx(() => {
-      // 在同一 BEGIN IMMEDIATE 事务内核对本批观测当前修订、撤回状态、会话静音状态及策略复核结果
+      // 1) 在写事务内强校验会话租约所有权：被暂停超时或被他进程接管后绝不覆写图谱
+      if (claimCheck && claimCheck.convs.length > 0) {
+        const nowCheck = Date.now();
+        const stillOwned = claimCheck.convs.every((c) =>
+          this.store.isConvClaimedBy(c, claimCheck.holder, claimCheck.procOwner, nowCheck),
+        );
+        if (!stillOwned) {
+          res.rejected += out.items.length + out.knowledge.length + out.updates.length + out.projects.length + out.people.length;
+          return;
+        }
+      }
+
+      // 2) 在同一 BEGIN IMMEDIATE 事务内核对本批观测当前修订、撤回状态、会话静音状态及策略复核结果
       const stillValidIds = new Set<string>();
       const curStmt = this.store.db.prepare("SELECT conv, text, meta FROM ctx_obs WHERE id = ?");
       const mutedCache = new Map<string, boolean>();
@@ -315,10 +345,12 @@ export class Understander {
         stillValidIds.add(o.id);
       }
 
+      const batchPartiallyStale = (!!disallowedConvs && disallowedConvs.size > 0) || stillValidIds.size < obs.length;
       const validFreshIds = fresh.filter((id) => stillValidIds.has(id));
-      if (fresh.length > 0 && validFreshIds.length === 0) {
-        // 本批全部新观测在推理期间都已被编辑、撤回、静音或策略失效：整体放弃旧模型输出，绝不落库或触发提醒
-        res.rejected += out.items.length + out.knowledge.length + out.updates.length;
+      if (batchPartiallyStale || (fresh.length > 0 && validFreshIds.length === 0)) {
+        // 只要本批中任一会话/观测在推理期间被静音、撤回、编辑或策略失效，整体丢弃本批全部模型产出
+        // （含无逐条 evidence 归属的 projects / people），同时不标记其余仍有效观测为已处理，供下轮干净批次重跑。
+        res.rejected += out.items.length + out.knowledge.length + out.updates.length + out.projects.length + out.people.length;
         return;
       }
 

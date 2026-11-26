@@ -16,6 +16,7 @@ import type {
   CtxUpdateView,
 } from "../api/types.ts";
 import { defaultDraftKind } from "./drafts.ts";
+import { hasWorkspaceOwnerMismatch } from "./personal-web.ts";
 import type { ContextStore, DraftRow, ItemRow, ProjectRow } from "./store.ts";
 
 /**
@@ -270,19 +271,34 @@ export class ContextViews {
 
   status(running: boolean, personalWeb?: CtxPersonalWebStatus): CtxStatus {
     const kv = this.app.store;
+    const ownerMismatch = hasWorkspaceOwnerMismatch(kv, this.app.cfg.owner.open_id);
     const sources = ["meego", "tasks", "im", "minutes", "calendar", "docs"].map((s) => {
       const r = JSON.parse(kv.get(`ctx.source.${s}`) ?? "null") as { at?: number; count?: number; error?: string } | null;
-      return { source: s, last_pull: r?.at ?? null, last_count: r?.count ?? 0, error: r?.error ?? "" };
+      return { source: s, last_pull: r?.at ?? null, last_count: r?.count ?? 0, error: ownerMismatch ? "" : r?.error ?? "" };
     });
+    const safePersonalWeb =
+      personalWeb && ownerMismatch
+        ? {
+            enabled: personalWeb.enabled,
+            logged_in: false,
+            state: "needs_login",
+            owner_id: "",
+            owner_name: "",
+            last_message_at: null,
+            last_error: "当前工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已隔离上下文",
+          }
+        : personalWeb;
     return {
       last_cycle: Number(kv.get("ctx.last_cycle") ?? 0) || null,
-      last_error: kv.get("ctx.last_error") ?? "",
+      last_error: ownerMismatch ? "当前工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已隔离上下文" : kv.get("ctx.last_error") ?? "",
       running,
       sources,
-      pending_obs: this.store.pendingCount(),
-      totals: this.store.totals(),
+      pending_obs: ownerMismatch ? 0 : this.store.pendingCount(),
+      totals: ownerMismatch
+        ? { projects: 0, open_items: 0, knowledge: 0, people: 0 }
+        : this.store.totals(),
       understand_enabled: this.app.cfg.context.understand,
-      ...(personalWeb ? { personal_web: personalWeb } : {}),
+      ...(safePersonalWeb ? { personal_web: safePersonalWeb } : {}),
     };
   }
 

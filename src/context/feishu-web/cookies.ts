@@ -433,12 +433,14 @@ function decryptPayload(env: EncryptedEnvelope, key: Buffer): string {
 export class WebLoginStore {
   readonly file: string;
   readonly lockFile: string;
+  readonly stagedFile: string;
   private readonly lockTimeoutMs: number;
 
   constructor(dataDir: string, filename = "feishu-web.json", lockTimeoutMs = 5_000) {
     const external = process.env.PA_FEISHU_WEB_CRED_FILE?.trim();
     this.file = external ? path.resolve(external) : path.join(dataDir, filename);
     this.lockFile = `${this.file}.lock.db`;
+    this.stagedFile = `${this.file}.staged`;
     this.lockTimeoutMs = Math.max(100, Math.trunc(lockTimeoutMs));
   }
 
@@ -539,8 +541,8 @@ export class WebLoginStore {
     }
   }
 
-  private writeUnlocked(login: WebLogin, cookieVersion: number): WebLogin {
-    fs.mkdirSync(path.dirname(this.file), { recursive: true });
+  private writeTargetUnlocked(targetPath: string, login: WebLogin, cookieVersion: number): WebLogin {
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
     const key = resolveEncryptionKey();
     if (!key) {
       if (this.hasExistingEncryptedFile()) {
@@ -552,7 +554,7 @@ export class WebLoginStore {
         "保存个人 Web 凭据必须配置静态加密密钥（设置环境变量 PA_FEISHU_WEB_KEY 或通过 systemd LoadCredential 提供 CREDENTIALS_DIRECTORY/feishu-web-key），禁止明文写入磁盘",
       );
     }
-    const tmp = path.join(path.dirname(this.file), `.${path.basename(this.file)}.${process.pid}.${Date.now()}.tmp`);
+    const tmp = path.join(path.dirname(targetPath), `.${path.basename(targetPath)}.${process.pid}.${Date.now()}.tmp`);
     const payload: WebLogin = {
       owner_id: login.owner_id,
       owner_name: login.owner_name,
@@ -571,7 +573,7 @@ export class WebLoginStore {
       fs.closeSync(fd);
       fd = undefined;
       fs.chmodSync(tmp, 0o600);
-      fs.renameSync(tmp, this.file);
+      fs.renameSync(tmp, targetPath);
     } catch (e) {
       if (fd !== undefined) {
         try {
@@ -586,6 +588,10 @@ export class WebLoginStore {
     return payload;
   }
 
+  private writeUnlocked(login: WebLogin, cookieVersion: number): WebLogin {
+    return this.writeTargetUnlocked(this.file, login, cookieVersion);
+  }
+
   save(login: WebLogin): WebLogin {
     return this.withLock(() => this.writeUnlocked(login, 1));
   }
@@ -593,6 +599,62 @@ export class WebLoginStore {
   /** 在持跨进程凭据文件锁期间执行自定义校验并原子写入，用于串行化工作区绑定核验与凭据替换 */
   commitWithLock<T>(fn: (write: (login: WebLogin) => WebLogin) => T): T {
     return this.withLock(() => fn((login) => this.writeUnlocked(login, 1)));
+  }
+
+  /**
+   * 两阶段可恢复暂存提交（跨进程锁保护）：
+   *   1. `stage(login)` 将新加密凭据 fsync 到 `<file>.staged`，暂不覆盖现网 `<file>`；
+   *   2. 调用方在 SQLite 事务内写入绑定与 pending 标记并 COMMIT；
+   *   3. SQLite COMMIT 成功后调用 `commitFile()` 原子 rename `<file>.staged -> <file>`；
+   *   4. 若 SQLite 回滚则调用 `abortFile()` 清理暂存文件，旧凭据纹丝不动；
+   *   5. 若进程在 COMMIT 与 rename 之间崩溃，后续 `reconcilePendingCommit()` 会按已提交绑定自动补全 rename。
+   */
+  stageWithLock<T>(
+    fn: (stage: (login: WebLogin) => { payload: WebLogin; commitFile: () => void; abortFile: () => void }) => T,
+  ): T {
+    return this.withLock(() =>
+      fn((login) => {
+        const payload = this.writeTargetUnlocked(this.stagedFile, login, 1);
+        return {
+          payload,
+          commitFile: () => {
+            fs.renameSync(this.stagedFile, this.file);
+          },
+          abortFile: () => {
+            fs.rmSync(this.stagedFile, { force: true });
+          },
+        };
+      }),
+    );
+  }
+
+  /**
+   * 崩溃恢复协调：若 SQLite 已提交 `pendingKey` 且 `.staged` 仍存在，说明上次崩溃发生在 SQLite COMMIT 与 rename 之间，
+   * 原子补全 rename 并清除标记；若 SQLite 未提交 `pendingKey` 但残留 `.staged`，说明上次崩溃在 COMMIT 之前，安全清理孤儿暂存文件。
+   */
+  reconcilePendingCommit(
+    store: { get(k: string): string | undefined; set(k: string, v: string): void },
+    pendingKey: string,
+  ): void {
+    const hasPending = !!(store.get(pendingKey) ?? "").trim();
+    const hasStaged = fs.existsSync(this.stagedFile);
+    if (!hasPending && !hasStaged) return;
+    try {
+      this.withLock(() => {
+        const pendingNow = !!(store.get(pendingKey) ?? "").trim();
+        const stagedNow = fs.existsSync(this.stagedFile);
+        if (pendingNow) {
+          if (stagedNow) {
+            fs.renameSync(this.stagedFile, this.file);
+          }
+          store.set(pendingKey, "");
+        } else if (stagedNow) {
+          fs.rmSync(this.stagedFile, { force: true });
+        }
+      });
+    } catch {
+      // 锁暂时不可用时留待下次读取/启动继续协调
+    }
   }
 
   /**
@@ -670,6 +732,7 @@ export class WebLoginStore {
 
   clear(): void {
     this.withLock(() => {
+      fs.rmSync(this.stagedFile, { force: true });
       fs.rmSync(this.file, { force: true });
     });
   }

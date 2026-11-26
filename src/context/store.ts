@@ -320,7 +320,8 @@ export class ContextStore {
           if (curVer !== undefined && nextVer !== undefined && nextVer < curVer) continue;
           const revChanged = obsRevision({ text: String(cur.text ?? ""), meta: curMeta }) !== obsRevision(o);
           if (wasBgOnly || wasWithdrawn || revChanged) {
-            const mergedMeta: Record<string, unknown> = { ...curMeta, ...(o.meta ?? {}) };
+            const prevGen = typeof curMeta.edit_gen === "number" && Number.isFinite(curMeta.edit_gen) ? curMeta.edit_gen : 0;
+            const mergedMeta: Record<string, unknown> = { ...curMeta, ...(o.meta ?? {}), edit_gen: prevGen + 1 };
             delete mergedMeta.background_only;
             delete mergedMeta.withdrawn;
             upd.run(
@@ -412,6 +413,8 @@ export class ContextStore {
       if (!cur) return false;
       const m = j<Record<string, unknown>>(cur.meta, {});
       if (cur.processed !== 0 && m.withdrawn === true) return false;
+      const prevGen = typeof m.edit_gen === "number" && Number.isFinite(m.edit_gen) ? m.edit_gen : 0;
+      m.edit_gen = prevGen + 1;
       m.withdrawn = true;
       this.db.prepare("UPDATE ctx_obs SET processed = 1, meta = ? WHERE id = ?").run(JSON.stringify(m), id);
       return true;
@@ -577,10 +580,19 @@ export class ContextStore {
   renewConv(conv: string, holder: string, procOwner?: string, ttlMs = 120_000, now = Date.now()): boolean {
     const r = procOwner
       ? this.db
-          .prepare("UPDATE ctx_conv_claim SET expires_at = ? WHERE conv = ? AND holder = ? AND proc_owner = ?")
-          .run(now + ttlMs, conv, holder, procOwner)
-      : this.db.prepare("UPDATE ctx_conv_claim SET expires_at = ? WHERE conv = ? AND holder = ?").run(now + ttlMs, conv, holder);
+          .prepare("UPDATE ctx_conv_claim SET expires_at = ? WHERE conv = ? AND holder = ? AND proc_owner = ? AND expires_at > ?")
+          .run(now + ttlMs, conv, holder, procOwner, now)
+      : this.db
+          .prepare("UPDATE ctx_conv_claim SET expires_at = ? WHERE conv = ? AND holder = ? AND expires_at > ?")
+          .run(now + ttlMs, conv, holder, now);
     return Number(r.changes) > 0;
+  }
+
+  /** 在写事务内校验会话认领租约仍由指定执行者有效持有（未过期且未被他进程接管） */
+  isConvClaimedBy(conv: string, holder: string, procOwner: string, now = Date.now()): boolean {
+    return !!this.db
+      .prepare("SELECT 1 FROM ctx_conv_claim WHERE conv = ? AND holder = ? AND proc_owner = ? AND expires_at > ?")
+      .get(conv, holder, procOwner, now);
   }
 
   releaseConv(conv: string, holder: string, procOwner?: string): void {

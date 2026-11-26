@@ -401,6 +401,10 @@ export class Connectors {
     const now = Date.now();
     const lookback = this.cfg.context.lookback_days * DAY;
     const baseCursor = Number(this.kv("cursor.im") ?? 0) || now - lookback;
+    const hadPriorAtMe = Number(this.kv("cursor.im.at_me") ?? 0) > 0;
+    const hadPriorP2p = Number(this.kv("cursor.im.p2p") ?? 0) > 0;
+    const hadPriorMine = Number(this.kv("cursor.im.mine") ?? 0) > 0;
+    const hadPriorGroups = Number(this.kv("cursor.im.groups") ?? 0) > 0;
     const sinceAtMe = Number(this.kv("cursor.im.at_me") ?? 0) || baseCursor;
     const sinceP2p = Number(this.kv("cursor.im.p2p") ?? 0) || baseCursor;
     const sinceMine = Number(this.kv("cursor.im.mine") ?? 0) || baseCursor;
@@ -451,7 +455,8 @@ export class Connectors {
               .map((id) => [id, { name: spoken[id]?.name ?? "", at: now }]),
           )
         : spoken;
-    const ranked = nativeExcl?.groupsInconclusive
+    const scannedGroups = !nativeExcl?.groupsInconclusive;
+    const ranked = !scannedGroups
       ? []
       : Object.entries(groups)
           .filter(([id, v]) => this.classifyExclusion(id, v.name, "group", nativeExcl, false) === "allowed")
@@ -549,7 +554,7 @@ export class Connectors {
       let atMeBlocked = !!nativeExcl?.groupsInconclusive;
       let p2pBlocked = !!nativeExcl?.dmsInconclusive || !fetchedP2p;
       let mineBlocked = !!nativeExcl?.groupsInconclusive;
-      let groupsBlocked = !!nativeExcl?.groupsInconclusive;
+      let groupsBlocked = !!nativeExcl?.groupsInconclusive || !scannedGroups;
       for (const st of chatPollState.values()) st.hadInconclusiveRow = false;
 
       const needsCurrentName = this.hasNameDenyPatterns() || !!(nativeExcl && nativeExcl.confirmedGroupNames.size > 0);
@@ -640,10 +645,20 @@ export class Connectors {
             this.setKv(`cursor.chat.${chatId}`, String(now));
           }
         }
+        // 任一未扫描或受阻的流，在尚无既有游标时持久化其原始起始游标（since*），
+        // 避免新工作区下轮重算 Date.now() - lookback 而丢失首窗口开头的历史消息
         if (!atMeBlocked) this.setKv("cursor.im.at_me", String(now));
+        else if (!hadPriorAtMe) this.setKv("cursor.im.at_me", String(sinceAtMe));
+
         if (!p2pBlocked) this.setKv("cursor.im.p2p", String(now));
+        else if (!hadPriorP2p) this.setKv("cursor.im.p2p", String(sinceP2p));
+
         if (!mineBlocked) this.setKv("cursor.im.mine", String(now));
+        else if (!hadPriorMine) this.setKv("cursor.im.mine", String(sinceMine));
+
         if (!groupsBlocked) this.setKv("cursor.im.groups", String(now));
+        else if (!hadPriorGroups) this.setKv("cursor.im.groups", String(sinceGroups));
+
         if (!atMeBlocked && !p2pBlocked && !mineBlocked && !groupsBlocked) this.setKv("cursor.im", String(now));
         return { committed: true as const, count: n };
       });

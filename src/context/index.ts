@@ -57,7 +57,7 @@ export class ContextService {
     this.drafter = new Drafter(app, this.store);
     this.personalWeb = new PersonalWebBridge(app, this.store, {
       onFastTrigger: (t) => {
-        this.enqueue(`fast:${t.conv}:${t.trigger_obs_id}:${t.text_hash}`, {
+        this.enqueue(`fast:${t.conv}:${t.trigger_obs_id}:g${t.rev_gen}:${t.text_hash}`, {
           task: "fast",
           conv: t.conv,
           conv_name: t.conv_name,
@@ -164,23 +164,34 @@ export class ContextService {
           ...(this.cfg.context.sources.docs ? ["doc"] : []),
         ];
         const skippedInCycle = new Set<string>();
+        let policyRestarts = 0;
         while (budget > 0 && !signal?.aborted) {
-          if (this.isWorkspaceOwnerMismatched()) break;
+          if (this.isWorkspaceOwnerMismatched() || !this.cfg.context.understand) break;
           const activeNativeOwner = this.personalWeb.activeBoundNativeOwner();
-          // 每个模型批次前重新解析原生排除快照，避免前一批长耗时推理期间新增静音规则未生效
+          // 在解析原生排除快照与筛选候选之前捕获策略签名，确保筛选过程一旦发生静音/白名单/开关变化就重启筛选而非带着旧快照送模型
+          const selectionPolicySig = this.personalWeb.policySignature();
           const nativeExclSnapshot = await this.personalWeb.resolveNativeExclusionsForPolling();
           const targetCount = Math.min(budget, 8 * par);
           const eligible: { conv: string; conv_name: string; n: number }[] = [];
           const scanned = new Set<string>(skippedInCycle);
           const procOwner = this.app.ledger.owner;
           const claimToken = `${workId}:${procOwner}:${randomUUID().slice(0, 8)}`;
-          // 从首批选坑开始即启动续租心跳，防止大量候选的异步排除校验耗时超过 120s 租约，同时确保中途异常/中止时释放全部已占坑会话
+          const batchAbort = new AbortController();
+          const onParentAbort = () => batchAbort.abort();
+          signal?.addEventListener("abort", onParentAbort, { once: true });
+          // 从首批选坑开始即启动续租心跳，防止大量候选的异步排除校验耗时超过 120s 租约，失去任一租约时立即中止
           const claimHeartbeat = setInterval(() => {
-            for (const c of eligible) this.store.renewConv(c.conv, claimToken, procOwner);
+            for (const c of eligible) {
+              if (!this.store.renewConv(c.conv, claimToken, procOwner)) {
+                batchAbort.abort();
+                break;
+              }
+            }
           }, 30_000);
           claimHeartbeat.unref?.();
           let groups: (typeof eligible)[] = [];
           let results: PromiseSettledResult<Awaited<ReturnType<Understander["runBatch"]>>>[] = [];
+          let restartedForPolicy = false;
           try {
             // 持续翻页跳过被排除/占用的会话，直到凑满目标批次或待处理队列真正耗尽，避免后续会议/文档饿死
             while (eligible.length < targetCount && !signal?.aborted) {
@@ -197,6 +208,15 @@ export class ContextService {
                   skippedInCycle.add(c.conv);
                   continue;
                 }
+                // 按当前群范围/白名单过滤：若该群已被移出 allowlist 且窗口内无真实 @我 待处理行，不占坑也不送模型
+                const scopedPreview = this.personalWeb.filterWindowByCurrentScope(
+                  c.conv,
+                  this.store.convWindow(c.conv, 60, 12, activeNativeOwner),
+                );
+                if (!scopedPreview.some((o) => this.store.obsPending(o.id))) {
+                  skippedInCycle.add(c.conv);
+                  continue;
+                }
                 if (!this.store.claimConv(c.conv, claimToken, procOwner)) {
                   skippedInCycle.add(c.conv);
                   continue;
@@ -205,32 +225,58 @@ export class ContextService {
               }
             }
             if (signal?.aborted) throw new Error("aborted");
-            // 推理前逐个续租并核实占坑所有权仍属于当前执行者，丢弃已失联的占坑
-            const pending = eligible.filter((c) => this.store.renewConv(c.conv, claimToken, procOwner));
-            if (!pending.length) break;
-            const batchPolicySig = this.personalWeb.policySignature();
-            const validateBeforeApply = async (usedConvs: { conv: string; conv_name: string }[]): Promise<Set<string>> => {
-              const disallowed = new Set<string>();
-              if (this.isWorkspaceOwnerMismatched()) {
-                for (const c of usedConvs) disallowed.add(c.conv);
+            if (this.isWorkspaceOwnerMismatched() || !this.cfg.context.understand) break;
+            if (this.personalWeb.policySignature() !== selectionPolicySig) {
+              // 候选筛选与排除核验期间策略发生了变化：释放占坑并用新策略重新筛选
+              restartedForPolicy = true;
+            } else {
+              // 推理前逐个续租并核实占坑所有权仍属于当前执行者，丢弃已失联的占坑
+              const pending = eligible.filter((c) => this.store.renewConv(c.conv, claimToken, procOwner));
+              if (!pending.length) break;
+              const validateBeforeApply = async (usedConvs: { conv: string; conv_name: string }[]): Promise<Set<string>> => {
+                const disallowed = new Set<string>();
+                if (this.isWorkspaceOwnerMismatched() || !this.cfg.context.understand) {
+                  for (const c of usedConvs) disallowed.add(c.conv);
+                  return disallowed;
+                }
+                if (this.personalWeb.policySignature() === selectionPolicySig) return disallowed;
+                const freshExcl = await this.personalWeb.resolveNativeExclusionsForPolling();
+                for (const c of usedConvs) {
+                  const elig = await this.personalWeb.checkConvAllowedForUnderstand(c.conv, c.conv_name, freshExcl);
+                  if (elig !== "allowed") {
+                    disallowed.add(c.conv);
+                    continue;
+                  }
+                  const scopedAfter = this.personalWeb.filterWindowByCurrentScope(
+                    c.conv,
+                    this.store.convWindow(c.conv, 60, 12, activeNativeOwner),
+                  );
+                  if (!scopedAfter.some((o) => this.store.obsPending(o.id))) {
+                    disallowed.add(c.conv);
+                  }
+                }
                 return disallowed;
-              }
-              if (this.personalWeb.policySignature() === batchPolicySig) return disallowed;
-              const freshExcl = await this.personalWeb.resolveNativeExclusionsForPolling();
-              for (const c of usedConvs) {
-                const elig = await this.personalWeb.checkConvAllowedForUnderstand(c.conv, c.conv_name, freshExcl);
-                if (elig !== "allowed") disallowed.add(c.conv);
-              }
-              return disallowed;
-            };
-            groups = Array.from({ length: Math.min(par, pending.length) }, () => []);
-            pending.forEach((c, i) => groups[i % groups.length].push(c));
-            results = await Promise.allSettled(
-              groups.map((g) => this.understander.runBatch(workId, g, signal, activeNativeOwner, validateBeforeApply)),
-            );
+              };
+              groups = Array.from({ length: Math.min(par, pending.length) }, () => []);
+              pending.forEach((c, i) => groups[i % groups.length].push(c));
+              results = await Promise.allSettled(
+                groups.map((g) =>
+                  this.understander.runBatch(workId, g, batchAbort.signal, activeNativeOwner, validateBeforeApply, {
+                    filterObs: (conv, win) => this.personalWeb.filterWindowByCurrentScope(conv, win),
+                    claimCheck: { convs: g.map((x) => x.conv), holder: claimToken, procOwner },
+                  }),
+                ),
+              );
+            }
           } finally {
+            signal?.removeEventListener("abort", onParentAbort);
             clearInterval(claimHeartbeat);
             for (const c of eligible) this.store.releaseConv(c.conv, claimToken, procOwner);
+          }
+          if (restartedForPolicy) {
+            if (++policyRestarts >= 3) break;
+            skippedInCycle.clear();
+            continue;
           }
           if (signal?.aborted) throw new Error("aborted");
           let progress = 0;
@@ -345,29 +391,50 @@ export class ContextService {
     if (!this.store.claimConv(p.conv, claimToken, procOwner)) {
       return { busy: true, fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
     }
+    const batchAbort = new AbortController();
+    const onParentAbort = () => batchAbort.abort();
+    signal?.addEventListener("abort", onParentAbort, { once: true });
     const claimHeartbeat = setInterval(() => {
-      this.store.renewConv(p.conv, claimToken, procOwner);
+      if (!this.store.renewConv(p.conv, claimToken, procOwner)) {
+        batchAbort.abort();
+      }
     }, 30_000);
     claimHeartbeat.unref?.();
     const activeNativeOwner = this.personalWeb.activeBoundNativeOwner();
+    const isFastSwitchEnabled = () =>
+      !this.isWorkspaceOwnerMismatched() &&
+      this.cfg.context.understand &&
+      this.cfg.context.sources.im &&
+      this.cfg.context.personal_web.enabled &&
+      this.cfg.context.personal_web.fast_lane;
     try {
       await this.ensureOwnerName();
+      if (!isFastSwitchEnabled()) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
       const rawAnchors = p.anchors?.length ? p.anchors : p.anchor ? [p.anchor] : [];
       const selectedBefore = this.selectEligibleFastTriggers(p.conv, rawAnchors, p.trigger_obs_id, activeNativeOwner);
       if (!selectedBefore) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
       if (selectedBefore.eligibleAnchors.length) {
-        await this.personalWeb.hydrateContext(selectedBefore.eligibleAnchors, p.conv, p.conv_name, signal);
+        await this.personalWeb.hydrateContext(selectedBefore.eligibleAnchors, p.conv, p.conv_name, batchAbort.signal);
       }
+      // 补读历史结束后重新核验 understand / fast_lane / sources.im / 主人开关与排除策略（策略快照先于异步校验捕获）
+      if (!isFastSwitchEnabled()) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+      const fastPolicySig = this.personalWeb.policySignature();
       const eligAfter = await this.personalWeb.checkConvAllowedForUnderstand(p.conv, p.conv_name);
       if (eligAfter !== "allowed") return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+      if (!isFastSwitchEnabled() || this.personalWeb.policySignature() !== fastPolicySig) {
+        return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+      }
       const selectedAfter = this.selectEligibleFastTriggers(p.conv, rawAnchors, p.trigger_obs_id, activeNativeOwner);
       if (!selectedAfter) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
-      const window = this.store.convWindowAround(p.conv, selectedAfter.targetObsId, 60, 12, activeNativeOwner);
-      if (!window.length) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
-      const fastPolicySig = this.personalWeb.policySignature();
+      const window = this.personalWeb.filterWindowByCurrentScope(
+        p.conv,
+        this.store.convWindowAround(p.conv, selectedAfter.targetObsId, 60, 12, activeNativeOwner),
+      );
+      if (!window.some((o) => this.store.obsPending(o.id))) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+      if (!this.store.renewConv(p.conv, claimToken, procOwner)) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
       const validateBeforeApply = async (usedConvs: { conv: string; conv_name: string }[]): Promise<Set<string>> => {
         const disallowed = new Set<string>();
-        if (this.isWorkspaceOwnerMismatched()) {
+        if (!isFastSwitchEnabled()) {
           for (const c of usedConvs) disallowed.add(c.conv);
           return disallowed;
         }
@@ -382,9 +449,13 @@ export class ContextService {
       const r = await this.understander.runBatch(
         workId,
         [{ conv: p.conv, conv_name: p.conv_name, target_obs_id: selectedAfter.targetObsId }],
-        signal,
+        batchAbort.signal,
         activeNativeOwner,
         validateBeforeApply,
+        {
+          filterObs: (conv, win) => this.personalWeb.filterWindowByCurrentScope(conv, win),
+          claimCheck: { convs: [p.conv], holder: claimToken, procOwner },
+        },
       );
       relinkMeegoItems(this.store);
       this.store.mergeConflicts();
@@ -402,6 +473,7 @@ export class ContextService {
       }
       return { fresh: r.fresh, created: r.created.length, nudged, pre_drafted: preDrafted };
     } finally {
+      signal?.removeEventListener("abort", onParentAbort);
       clearInterval(claimHeartbeat);
       this.store.releaseConv(p.conv, claimToken, procOwner);
     }

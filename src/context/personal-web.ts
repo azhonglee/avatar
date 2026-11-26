@@ -11,6 +11,7 @@ import {
   CHAT_KIND_P2P,
   FeishuWebClient,
   GatewayError,
+  isGroupChat,
   SessionNeedsLoginError,
   USER_SENDER_TYPE,
   WebHttpError,
@@ -49,6 +50,8 @@ export interface FastTrigger {
   conv_name: string;
   trigger_obs_id: string;
   text_hash: string;
+  /** 持久化编辑代际（仅在正文/状态真实变化时递增，重复推送不递增），确保编辑撤回再恢复原文仍触发新快通道作业 */
+  rev_gen: number;
   anchor: FastAnchor;
   /** 防抖合并期间收到的所有去重锚点（覆盖同群不同话题的多次 @我） */
   anchors: FastAnchor[];
@@ -100,6 +103,7 @@ export interface PersonalWebBridgeHooks {
 const STATE_KV_KEY = "ctx.personal_web.state";
 export const BOUND_OWNER_KV_KEY = "ctx.personal_web.bound_owner_id";
 export const BOUND_WORKSPACE_OWNER_KV_KEY = "ctx.personal_web.bound_workspace_open_id";
+export const PENDING_CRED_COMMIT_KV_KEY = "ctx.personal_web.pending_cred_commit";
 export function pwSpokenGroupsKey(ownerId: string): string {
   return `ctx.pw_spoken_groups.${ownerId}`;
 }
@@ -172,13 +176,13 @@ const ACTIVE_STATES = new Set<ListenerState>(["listening", "connecting", "reconn
 const DAY_MS = 86_400_000;
 const OC_EXCLUSION_TTL_MS = 10 * 60_000;
 
-/** 优先以观测中记录的权威 chat_type 区分群聊/私聊，仅无权威类型时才谨慎回退标签前缀 */
-function classifyRecordedChatType(obs: Obs | undefined, label: string): "group" | "dm" | "unknown" {
+/** 仅依据观测中记录的权威 chat_type / kind 区分群聊与私聊；绝不凭用户可见群名前缀（如“私聊xxx”）推断私聊类型 */
+function classifyRecordedChatType(obs: Obs | undefined): "group" | "dm" | "unknown" {
   const t = String(obs?.meta.chat_type ?? "").trim().toLowerCase();
   if (t === "p2p") return "dm";
   if (t === "group" || t === "topic" || t === "topic_group") return "group";
-  const trimmed = label.trim();
-  if (trimmed.startsWith("私聊")) return "dm";
+  if (obs?.kind === "p2p") return "dm";
+  if (obs?.kind === "group") return "group";
   return "unknown";
 }
 
@@ -210,6 +214,7 @@ export class PersonalWebBridge {
     this.store = store;
     this.hooks = hooks;
     this.loginStore = new WebLoginStore(app.cfg.dataDir);
+    this.loginStore.reconcilePendingCommit(app.store, PENDING_CRED_COMMIT_KV_KEY);
     this.initialCfgStat = app.cfg.file ? statSignature(app.cfg.file) : "";
     const saved = this.loadSavedState();
     const login = this.loginStore.load();
@@ -254,7 +259,21 @@ export class PersonalWebBridge {
     const allow = [...this.cfg.context.groups_allow].map((s) => s.trim()).sort().join("|");
     const bound = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
     const boundWs = (this.app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
-    return `${this.cfg.context.sources.im ? 1 : 0};${this.cfg.context.groups};${allow};${deny};${mutes};${bound};${boundWs};${this.cfg.owner.open_id.trim()}`;
+    const pw = this.cfg.context.personal_web;
+    return [
+      this.cfg.context.sources.im ? 1 : 0,
+      this.cfg.context.understand ? 1 : 0,
+      pw.enabled ? 1 : 0,
+      pw.fast_lane ? 1 : 0,
+      this.cfg.context.groups,
+      this.cfg.context.max_groups,
+      allow,
+      deny,
+      mutes,
+      bound,
+      boundWs,
+      this.cfg.owner.open_id.trim(),
+    ].join(";");
   }
 
   private loadSavedState(): PersistedState | undefined {
@@ -286,6 +305,7 @@ export class PersonalWebBridge {
   }
 
   status(now = Date.now()): CtxPersonalWebStatus {
+    this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
     const inspected = this.loginStore.inspect();
     const login = inspected.status === "ok" ? inspected.login : undefined;
     const saved = this.loadSavedState() ?? this.state;
@@ -329,6 +349,7 @@ export class PersonalWebBridge {
   /** 启动个人 Web 长连接监听（异步后台运行，不阻塞常驻进程启动）。 */
   start(): { stop(): void } {
     if (!this.cfg.context.personal_web.enabled) return { stop: () => undefined };
+    this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
     this.stop();
     const ctrl = new AbortController();
     this.stopCtrl = ctrl;
@@ -768,7 +789,7 @@ export class PersonalWebBridge {
     for (const [nativeId, muteName] of rules) {
       const pwConv = `pw_chat:${nativeId}`;
       const latest = this.store.latestConvObs(pwConv);
-      const recordedType = classifyRecordedChatType(latest, muteName);
+      const recordedType = classifyRecordedChatType(latest);
       const rawStale = (muteName || latest?.conv_name || "").trim();
       const staleGroupName = rawStale && !/^群聊\(\d+\)$/.test(rawStale) && !rawStale.startsWith("私聊") ? rawStale : "";
 
@@ -777,10 +798,17 @@ export class PersonalWebBridge {
           const meta = await client.readChat(nativeId, { force: true });
           if (meta.kind === CHAT_KIND_P2P) {
             dmsInconclusive = true;
-          } else if (meta.name.trim()) {
-            confirmedGroupNames.add(norm(meta.name.trim()));
+          } else if (isGroupChat(meta.kind)) {
+            if (meta.name.trim()) {
+              confirmedGroupNames.add(norm(meta.name.trim()));
+            } else {
+              groupsInconclusive = true;
+            }
           } else {
+            // 未知或未识别的原生会话类型：不能仅凭非空名称当作群聊，必须对群与私聊双路按 inconclusive 暂缓
+            if (meta.name.trim()) confirmedGroupNames.add(norm(meta.name.trim()));
             groupsInconclusive = true;
+            dmsInconclusive = true;
           }
           continue;
         } catch {
@@ -827,7 +855,7 @@ export class PersonalWebBridge {
       const chatId = conv.slice("pw_chat:".length);
       if (this.store.isConvMutedById(conv) || this.store.isConvMutedById(chatId)) return "excluded";
       const latest = this.store.latestConvObs(conv);
-      const recordedType = classifyRecordedChatType(latest, convName);
+      const recordedType = classifyRecordedChatType(latest);
       const kind: "group" | "dm" = recordedType === "dm" ? "dm" : "group";
       const client = this.client;
       let chatName = "";
@@ -866,7 +894,7 @@ export class PersonalWebBridge {
     if (this.store.isConvMutedById(conv)) return "excluded";
     const latest = this.store.latestConvObs(conv);
     let effectiveName = (convName || latest?.conv_name || "").trim();
-    let recordedType = classifyRecordedChatType(latest, effectiveName);
+    let recordedType = classifyRecordedChatType(latest);
     const nameRules = this.nameDenyPatterns();
     for (const raw of this.cfg.context.groups_deny) {
       const d = raw.trim();
@@ -951,6 +979,42 @@ export class PersonalWebBridge {
       .sort((a, b) => b[1].at - a[1].at)
       .slice(0, this.cfg.context.max_groups);
     return ranked.some(([k]) => k === pwConv || k === chatId);
+  }
+
+  /**
+   * 按当前生效的群白名单/范围策略过滤进入模型提示词的观测窗口：
+   *   - 私聊（p2p）与非 IM 会话原样放行；
+   *   - `pw_chat:*` 群：按当前 `isGroupInScope`（allowlist / spoken）判断；
+   *   - `oc_*` 群：在 `groups === "allowlist"` 模式下按当前 `groups_allow` 判断；
+   *   - 若群当前已不在允许范围内（例如消息入库后用户将其移出 groups_allow），
+   *     剔除所有普通群消息与普通背景，仅保留真实有效的 `@我` 观测（`kind === "at_me"` 且未撤回）。
+   */
+  filterWindowByCurrentScope(conv: string, window: Obs[]): Obs[] {
+    if (!window.length) return window;
+    if (!conv.startsWith("pw_chat:") && !conv.startsWith("oc_")) return window;
+    const isDm = window.some((o) => String(o.meta.chat_type ?? "").trim().toLowerCase() === "p2p" || o.kind === "p2p");
+    if (isDm) return window;
+
+    let inScope = true;
+    if (conv.startsWith("pw_chat:")) {
+      const ownerId = this.activeBoundNativeOwner();
+      if (!ownerId) return [];
+      inScope = this.isGroupInScope(conv.slice("pw_chat:".length), conv, ownerId);
+    } else if (conv.startsWith("oc_") && this.cfg.context.groups === "allowlist") {
+      const openAllow = [
+        ...new Set(
+          this.cfg.context.groups_allow
+            .map((s) => s.trim())
+            .filter((s) => s && !s.startsWith("pw_chat:") && !/^\d+$/.test(s))
+            .filter((s) => !this.isDirectlyDenied(s, "")),
+        ),
+      ].slice(0, this.cfg.context.max_groups);
+      inScope = openAllow.includes(conv);
+    }
+    if (inScope) return window;
+    return window.filter(
+      (o) => o.kind === "at_me" && o.meta.at_me !== false && o.meta.is_mention_me !== false && o.meta.withdrawn !== true,
+    );
   }
 
   // ───────── 实时消息入库与快通道调度 ─────────
@@ -1072,21 +1136,29 @@ export class PersonalWebBridge {
     });
     if (excluded) return;
 
-    // 5) 落库前最终核验会话代际、中止信号与当前采集策略（防止异步查询期间被关闭 sources.im、静音或收窄白名单后仍写入）
-    if (signal?.aborted) {
-      throw new WebHttpError("aborted", "会话已中止，放弃提交推送观测");
-    }
-    if (capturedSessionId) {
-      const diskNow = this.loginStore.load();
-      if (!diskNow || diskNow.owner_id !== ownerId || (diskNow.session_id && diskNow.session_id !== capturedSessionId)) {
-        throw new WebHttpError("aborted", "个人 Web 会话已登出或变更，放弃提交推送观测");
+    // 5) 落库前最终核验会话代际、中止信号与当前采集策略：
+    //    如果异步排除查询期间策略变化，先重跑排除校验，并在最后一次 await 结束后再做一次无 await 的同步提交前终检，
+    //    彻底杜绝「登出/静音/关闭 sources.im 发生在最后一次 await 期间仍把消息写入数据库」的竞态。
+    const checkFinalIngestSync = (): boolean => {
+      if (signal?.aborted) {
+        throw new WebHttpError("aborted", "会话已中止，放弃提交推送观测");
       }
-      this.validateBoundOwner(diskNow);
-    }
-    if (!this.cfg.context.sources.im) return;
-    if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(effectiveMsg.conversationId)) return;
-    if (this.isDirectlyDenied(pwConv, chatName || convName)) return;
+      if (capturedSessionId) {
+        const diskNow = this.loginStore.load();
+        if (!diskNow || diskNow.owner_id !== ownerId || (diskNow.session_id && diskNow.session_id !== capturedSessionId)) {
+          throw new WebHttpError("aborted", "个人 Web 会话已登出或变更，放弃提交推送观测");
+        }
+        this.validateBoundOwner(diskNow);
+      }
+      if (!this.cfg.context.sources.im || !this.cfg.context.personal_web.enabled) return false;
+      if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(effectiveMsg.conversationId)) return false;
+      if (this.isDirectlyDenied(pwConv, chatName || convName)) return false;
+      return true;
+    };
+
+    if (!checkFinalIngestSync()) return;
     if (this.openChatExclusionsKey() !== ocExclBefore) {
+      const ocExclRetry = this.openChatExclusionsKey();
       const excludedNow = await this.evaluateChatExclusion({
         chatId: effectiveMsg.conversationId,
         pwConv,
@@ -1098,6 +1170,8 @@ export class PersonalWebBridge {
         signal,
       });
       if (excludedNow) return;
+      if (!checkFinalIngestSync()) return;
+      if (this.openChatExclusionsKey() !== ocExclRetry) return;
     }
 
     if (effectiveMsg.conversationKind === "group" && isMe && this.cfg.context.groups !== "allowlist") {
@@ -1152,6 +1226,9 @@ export class PersonalWebBridge {
     if (!shouldFastLane) return;
 
     const revHash = createHash("sha256").update(obsRevision(obs)).digest("hex").slice(0, 12);
+    const storedObs = this.store.obs(obs.id);
+    const revGen =
+      typeof storedObs?.meta.edit_gen === "number" && Number.isFinite(storedObs.meta.edit_gen) ? storedObs.meta.edit_gen : 0;
     const anchor: FastAnchor = {
       id: effectiveMsg.id,
       conversationId: effectiveMsg.conversationId,
@@ -1166,6 +1243,7 @@ export class PersonalWebBridge {
       conv_name: convName,
       trigger_obs_id: obs.id,
       text_hash: revHash,
+      rev_gen: revGen,
       anchor,
       anchors: [anchor],
     });
@@ -1268,7 +1346,7 @@ export class PersonalWebBridge {
     };
     if (!sessionStillValid()) return 0;
 
-    const isDm = classifyRecordedChatType(triggerObs, convName) === "dm";
+    const isDm = classifyRecordedChatType(triggerObs) === "dm";
     let chatName = "";
     if (!isDm) {
       try {
@@ -1330,14 +1408,19 @@ export class PersonalWebBridge {
         }
       }
       if (!collected.size) return 0;
-      // 落库前重新核验会话代际与全部采集策略（防止 readContext 在途期间被静音、收窄白名单或关闭 sources.im 后仍持久化背景）
-      if (signal?.aborted) return 0;
-      if (!sessionStillValid()) return 0;
-      if (!this.cfg.context.sources.im) return 0;
-      if (this.store.isConvMutedById(conv) || this.store.isConvMutedById(primary.conversationId)) return 0;
-      if (this.isDirectlyDenied(conv, chatName || convName)) return 0;
-      if (!isDm && !this.isGroupInScope(primary.conversationId, conv, clientOwnerId)) return 0;
+      // 落库前重新核验会话代际与全部采集策略（含最后一次异步复核之后的无 await 同步终检）
+      const checkHydrateFinalSync = (): boolean => {
+        if (signal?.aborted) return false;
+        if (!sessionStillValid()) return false;
+        if (!this.cfg.context.sources.im || !this.cfg.context.personal_web.enabled) return false;
+        if (this.store.isConvMutedById(conv) || this.store.isConvMutedById(primary.conversationId)) return false;
+        if (this.isDirectlyDenied(conv, chatName || convName)) return false;
+        if (!isDm && !this.isGroupInScope(primary.conversationId, conv, clientOwnerId)) return false;
+        return true;
+      };
+      if (!checkHydrateFinalSync()) return 0;
       if (this.openChatExclusionsKey() !== ocExclBefore) {
+        const ocExclRetry = this.openChatExclusionsKey();
         try {
           const excludedNow = await this.evaluateChatExclusion({
             chatId: primary.conversationId,
@@ -1353,6 +1436,8 @@ export class PersonalWebBridge {
         } catch {
           return 0;
         }
+        if (!checkHydrateFinalSync()) return 0;
+        if (this.openChatExclusionsKey() !== ocExclRetry) return 0;
       }
       const ownerName = this.app.store.get("ctx.owner_name") || clientOwnerName || "我";
       const bg: Obs[] = [...collected.values()].map((m) => {
@@ -1508,6 +1593,7 @@ export class PersonalWebBridge {
     text: string;
     cid: string;
   }): Promise<VerifiedReplyResult> {
+    this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
     const normalizedText = args.text.replace(/\r\n/g, "\n").trim();
     const textHash = createHash("sha256").update(normalizedText).digest("hex");
     const prev = this.loadDelivery(args.cid);
@@ -1799,9 +1885,13 @@ export async function verifyWorkspaceOwnerBinding(
 }
 
 /**
- * 在跨进程凭据文件锁 + SQLite BEGIN IMMEDIATE 写事务双重串行化保护下提交登录与工作区绑定：
- *   - 再次核验当前工作区绑定、旧账号/无归属观测及中止信号（避免两路并发首次登录互覆或换号窗口内落入旧观测）；
- *   - 同步写入加密凭据、绑定键与初始状态，任一步失败则原子回滚 SQLite，不产生凭据与绑定割裂。
+ * 在跨进程凭据文件锁 + SQLite BEGIN IMMEDIATE 写事务双重串行化保护下采用两阶段暂存提交登录与工作区绑定：
+ *   1. 先协调恢复可能残留的上次未完成暂存提交（reconcilePendingCommit）；
+ *   2. 再次核验当前工作区绑定、旧账号/无归属观测及中止信号；
+ *   3. 先将新加密凭据 fsync 到 `<file>.staged`（不覆盖旧凭据），再在 SQLite 事务内写入新绑定与 pending 标记并 COMMIT；
+ *      - 若 SQLite COMMIT 失败或回滚，直接删除 `.staged`，旧凭据与旧绑定完全一致；
+ *      - SQLite COMMIT 成功后立即原子 rename `.staged -> <file>` 并清除 pending 标记；
+ *      - 若在 COMMIT 与 rename 之间崩溃，后续启动/读取由 reconcilePendingCommit 自动补全 rename，彻底杜绝新凭据配旧绑定。
  */
 export function commitWorkspaceLogin(
   app: App,
@@ -1809,10 +1899,13 @@ export function commitWorkspaceLogin(
   opts: { forceSwitch?: boolean; allowUnverifiedOwner?: boolean; signal?: AbortSignal } = {},
 ): WebLogin {
   const loginStore = new WebLoginStore(app.cfg.dataDir);
-  return loginStore.commitWithLock((write) => {
+  loginStore.reconcilePendingCommit(app.store, PENDING_CRED_COMMIT_KV_KEY);
+  return loginStore.stageWithLock((stage) => {
     if (opts.signal?.aborted) {
       throw new Error("扫码登录已取消");
     }
+    let staged: { payload: WebLogin; commitFile: () => void; abortFile: () => void } | undefined;
+    let sqliteCommitted = false;
     app.store.db.exec("BEGIN IMMEDIATE");
     try {
       const boundId = (app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim() || loginStore.load()?.owner_id || "";
@@ -1846,8 +1939,13 @@ export function commitWorkspaceLogin(
         throw new Error("扫码登录已取消");
       }
 
-      const saved = write(login);
+      staged = stage(login);
+      const saved = staged.payload;
       saveWorkspaceBinding(app.store, saved.owner_id, configuredOpenId);
+      app.store.set(
+        PENDING_CRED_COMMIT_KV_KEY,
+        JSON.stringify({ owner_id: saved.owner_id, session_id: saved.session_id ?? "", at: Date.now() }),
+      );
       app.store.set(
         STATE_KV_KEY,
         JSON.stringify({
@@ -1864,12 +1962,27 @@ export function commitWorkspaceLogin(
         app.store.set("ctx.owner_name", saved.owner_name);
       }
       app.store.db.exec("COMMIT");
+      sqliteCommitted = true;
+
+      staged.commitFile();
+      try {
+        app.store.set(PENDING_CRED_COMMIT_KV_KEY, "");
+      } catch {
+        // 凭据文件已切换完成；下次 reconcilePendingCommit 会自动清除冗余标记
+      }
       return saved;
     } catch (err) {
-      try {
-        app.store.db.exec("ROLLBACK");
-      } catch {
-        // ignore
+      if (!sqliteCommitted) {
+        try {
+          app.store.db.exec("ROLLBACK");
+        } catch {
+          // ignore
+        }
+        try {
+          staged?.abortFile();
+        } catch {
+          // ignore
+        }
       }
       throw err;
     }
