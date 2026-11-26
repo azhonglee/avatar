@@ -267,7 +267,44 @@ export class WebLoginStore {
     return this.load()?.session_id;
   }
 
-  save(login: WebLogin): WebLogin {
+  private withLock<T>(fn: () => T): T {
+    fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    const lockFile = `${this.file}.lock`;
+    const deadline = Date.now() + 5_000;
+    let lockFd: number | undefined;
+    while (lockFd === undefined) {
+      try {
+        lockFd = fs.openSync(lockFile, "wx", 0o600);
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code !== "EEXIST") throw e;
+        try {
+          const st = fs.statSync(lockFile);
+          if (Date.now() - st.mtimeMs > 30_000) {
+            fs.rmSync(lockFile, { force: true });
+            continue;
+          }
+        } catch {
+          continue;
+        }
+        if (Date.now() >= deadline) throw new Error(`等待个人 Web 凭据文件锁超时：${lockFile}`);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
+      }
+    }
+    try {
+      fs.writeFileSync(lockFd, `${process.pid}\n`, "utf8");
+      return fn();
+    } finally {
+      try {
+        fs.closeSync(lockFd);
+      } catch {
+        // ignore close failure
+      }
+      fs.rmSync(lockFile, { force: true });
+    }
+  }
+
+  private writeUnlocked(login: WebLogin): WebLogin {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     const tmp = path.join(path.dirname(this.file), `.${path.basename(this.file)}.${process.pid}.${Date.now()}.tmp`);
     const payload: WebLogin = {
@@ -277,38 +314,52 @@ export class WebLoginStore {
       cookies: login.cookies,
       updated_at: new Date().toISOString(),
     };
-    const fd = fs.openSync(tmp, "w", 0o600);
+    let fd: number | undefined;
     try {
+      fd = fs.openSync(tmp, "w", 0o600);
       fs.writeFileSync(fd, JSON.stringify(payload, null, 2) + "\n", "utf8");
       fs.fsyncSync(fd);
-    } finally {
       fs.closeSync(fd);
-    }
-    try {
+      fd = undefined;
       fs.chmodSync(tmp, 0o600);
       fs.renameSync(tmp, this.file);
     } catch (e) {
+      if (fd !== undefined) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // ignore close failure
+        }
+      }
       fs.rmSync(tmp, { force: true });
       throw e;
     }
     return payload;
   }
 
+  save(login: WebLogin): WebLogin {
+    return this.withLock(() => this.writeUnlocked(login));
+  }
+
   /**
-   * 仅当磁盘上的凭据文件仍然存在且属于同一会话代际（session_id + owner_id）时才写回轮换后的 Cookie。
+   * 跨进程加锁核验：仅当磁盘上的凭据文件仍然存在且属于同一会话代际（session_id + owner_id）时才写回轮换后的 Cookie。
    * 若已被 `web-logout` 清除或已被新一次 `web-login` 覆盖，返回 false 且绝不覆写。
    */
   saveIfSessionMatches(login: WebLogin): boolean {
-    const current = this.load();
-    if (!current) return false;
-    if (current.owner_id !== login.owner_id) return false;
-    if (current.session_id && login.session_id && current.session_id !== login.session_id) return false;
-    if (current.session_id && !login.session_id) return false;
-    this.save({ ...login, session_id: current.session_id ?? login.session_id });
-    return true;
+    return this.withLock(() => {
+      const current = this.load();
+      if (!current) return false;
+      if (current.owner_id !== login.owner_id) return false;
+      if (current.session_id && login.session_id && current.session_id !== login.session_id) return false;
+      if (current.session_id && !login.session_id) return false;
+      this.writeUnlocked({ ...login, session_id: current.session_id ?? login.session_id });
+      return true;
+    });
   }
 
   clear(): void {
-    fs.rmSync(this.file, { force: true });
+    this.withLock(() => {
+      fs.rmSync(this.file, { force: true });
+    });
   }
 }

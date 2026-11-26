@@ -166,6 +166,8 @@ class SessionRetryPolicy {
       }
       return { state: "reverifying", waitMs: this.denialRetryMs, giveUp: false };
     }
+    // 非鉴权类错误中断「连续」鉴权拒绝计数，避免偶发 401 + 多次网络抖动误判为登出
+    this.denials = 0;
     const waitMs = this.delayMs;
     this.delayMs = Math.min(this.delayMs * 2, this.ceilingMs);
     return { state: "reconnecting", waitMs, giveUp: false };

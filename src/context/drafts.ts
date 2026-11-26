@@ -4,6 +4,7 @@ import type { CtxDraftKind } from "../api/types.ts";
 import type { Effect } from "../ledger.ts";
 import { loadPrompt, runHarness } from "../harness.ts";
 import { render, truncate } from "../util.ts";
+import { BOUND_OWNER_KV_KEY } from "./personal-web.ts";
 import type { ContextStore, DraftRow, ItemRow, Obs } from "./store.ts";
 
 /**
@@ -47,64 +48,59 @@ export class Drafter {
     const any = fromOther ?? this.store.lastEvidenceObs("item", it.id, (o) => o.source === "im");
     if (!any) throw new Error("找不到这个事项对应的飞书会话，没法起草消息");
     if (kind === "reply" && fromOther) {
-      const openMsgId = String(fromOther.meta.open_message_id ?? "");
-      const openChatId = String(fromOther.meta.open_chat_id ?? "") || this.store.convAlias(fromOther.conv)?.open_conv || "";
-      if (fromOther.meta.transport === "personal_web" && !openMsgId) {
+      if (fromOther.meta.transport === "personal_web") {
         if (fromOther.meta.native_message_id && fromOther.meta.native_chat_id) {
+          const nativeOwnerId = String(fromOther.meta.native_owner_id ?? this.app.store.get(BOUND_OWNER_KV_KEY) ?? "");
           return {
             target: {
               transport: "personal_web",
               obs_id: fromOther.id,
+              native_owner_id: nativeOwnerId,
               native_message_id: String(fromOther.meta.native_message_id),
               native_chat_id: String(fromOther.meta.native_chat_id),
               native_root_id: String(fromOther.meta.native_root_id ?? fromOther.meta.native_message_id),
-              ...(openChatId ? { chat_id: openChatId } : {}),
               url: fromOther.url,
             },
             label: `回复 ${fromOther.actor_name || "对方"}（${fromOther.conv_name} · 个人 Web）`,
             conv: fromOther,
           };
         }
-        if (openChatId) {
-          return {
-            target: { obs_id: fromOther.id, chat_id: openChatId, url: fromOther.url },
-            label: `回复 ${fromOther.actor_name || "对方"}（${fromOther.conv_name}）`,
-            conv: fromOther,
-          };
-        }
-        throw new Error("该消息缺少可回复的消息标识");
+        throw new Error("该个人 Web 消息缺少可回复的原消息标识");
       }
+      const openMsgId = String(fromOther.meta.message_id ?? fromOther.id.replace(/^im:/, ""));
+      if (!openMsgId) throw new Error("该消息缺少可回复的消息标识");
       return {
         target: {
           obs_id: fromOther.id,
-          message_id: openMsgId || String(fromOther.meta.message_id ?? fromOther.id.replace(/^im:/, "")),
-          chat_id: openChatId || fromOther.conv,
+          message_id: openMsgId,
+          chat_id: fromOther.conv,
           url: fromOther.url,
         },
         label: `回复 ${fromOther.actor_name || "对方"}（${fromOther.conv_name}）`,
         conv: fromOther,
       };
     }
-    const openChatId = String(any.meta.open_chat_id ?? "") || this.store.convAlias(any.conv)?.open_conv || "";
-    if (any.meta.transport === "personal_web" && !openChatId) {
+    if (any.meta.transport === "personal_web") {
       if (any.meta.native_message_id && any.meta.native_chat_id) {
+        const nativeOwnerId = String(any.meta.native_owner_id ?? this.app.store.get(BOUND_OWNER_KV_KEY) ?? "");
         return {
           target: {
             transport: "personal_web",
             obs_id: any.id,
+            native_owner_id: nativeOwnerId,
             native_message_id: String(any.meta.native_message_id),
             native_chat_id: String(any.meta.native_chat_id),
             native_root_id: String(any.meta.native_root_id ?? any.meta.native_message_id),
             url: any.url,
           },
-          label: `${kind === "followup" ? "跟进" : "发到"} ${any.conv_name}（个人 Web）`,
+          label: `${kind === "followup" ? "跟进" : "回复"} ${any.conv_name}（个人 Web）`,
           conv: any,
         };
       }
-      throw new Error("该会话缺少可发送的会话标识");
+      throw new Error("该个人 Web 会话缺少可发送的消息标识");
     }
     return {
-      target: { obs_id: any.id, chat_id: openChatId || any.conv, url: any.url },
+      target: { obs_id: any.id, chat_id: any.conv, url: any.url },
       label: `${kind === "followup" ? "跟进" : "发到"} ${any.conv_name}${it.counterpart ? `（${it.counterpart}）` : ""}`,
       conv: any,
     };
@@ -142,7 +138,7 @@ export class Drafter {
           .join("\n")
       : "（无）";
     const task = {
-      reply: `回复 ${target.message_id ? "对方最近的这条消息" : "对方"}，就「${it.title}」给出答复或进展。`,
+      reply: `回复 ${target.message_id || target.native_message_id ? "对方最近的这条消息" : "对方"}，就「${it.title}」给出答复或进展。`,
       followup: `礼貌地跟进「${it.title}」，询问对方（${it.counterpart || "相关同事"}）的进展或预计时间。`,
       meego_comment: `为 Meego 工作项写一条进展评论：说明「${it.title}」当前的实际进展、下一步和预计时间。`,
     }[k];
@@ -190,52 +186,70 @@ export class Drafter {
     return this.store.addDraft({ item_id: "", project_id: "", kind: "weekly_report", target: { title: `周报 ${date}` }, target_label: `我的文档库 · 周报 ${date}`, content });
   }
 
-  /** 确认草稿：变成对外动作（outbox）；确认时再根据最新观测决定走开放平台还是个人 Web 协议 */
+  /** 确认草稿：变成对外动作（outbox）；严格沿用草稿原始传输通道与路由，绝不把话题回复降级为群顶层消息，绝不跨账号发送 */
   effectFor(d: DraftRow, content: string): Effect {
     const obs = d.target.obs_id ? this.store.obs(d.target.obs_id) : undefined;
-    const enrichedMsgId = String(obs?.meta.open_message_id ?? "");
-    const enrichedChatId = String(obs?.meta.open_chat_id ?? "") || (obs ? this.store.convAlias(obs.conv)?.open_conv ?? "" : "");
+    const lockedRoute = d.target.delivery_route || "";
+
+    const buildPwReply = (): Effect => {
+      if (lockedRoute && lockedRoute !== "pw.reply") {
+        throw new Error(`草稿已绑定发送路由 ${lockedRoute}，拒绝切换为 pw.reply`);
+      }
+      if (!this.cfg.context.personal_web.send_replies) {
+        throw new Error("该草稿目标来自个人 Web 实时消息；为避免偏离原话题，请在设置中开启 context.personal_web.send_replies 后再发送");
+      }
+      if (!d.target.native_chat_id || !d.target.native_message_id) {
+        throw new Error("该个人 Web 草稿缺少原会话或原消息 ID，无法发送");
+      }
+      const ownerId = d.target.native_owner_id || String(obs?.meta.native_owner_id ?? "") || this.app.store.get(BOUND_OWNER_KV_KEY) || "";
+      if (!ownerId) {
+        throw new Error("该个人 Web 草稿缺少绑定账号 ID，拒绝发送");
+      }
+      const currentBound = this.app.store.get(BOUND_OWNER_KV_KEY);
+      if (currentBound && currentBound !== ownerId) {
+        throw new Error(`该草稿归属账号 (${ownerId}) 与当前工作区绑定账号 (${currentBound}) 不一致，拒绝发送`);
+      }
+      return {
+        op: "pw.reply",
+        args: {
+          owner_id: ownerId,
+          chat_id: d.target.native_chat_id,
+          message_id: d.target.native_message_id,
+          root_id: d.target.native_root_id,
+          text: content,
+          draft_id: d.id,
+        },
+      };
+    };
 
     switch (d.kind) {
       case "reply": {
-        const openMsg = d.target.message_id || enrichedMsgId;
-        if (openMsg) return { op: "im.reply", args: { message_id: openMsg, text: content, draft_id: d.id } };
-        if (d.target.transport === "personal_web" && d.target.native_chat_id && d.target.native_message_id) {
-          if (this.cfg.context.personal_web.send_replies) {
-            return {
-              op: "pw.reply",
-              args: {
-                chat_id: d.target.native_chat_id,
-                message_id: d.target.native_message_id,
-                root_id: d.target.native_root_id,
-                text: content,
-                draft_id: d.id,
-              },
-            };
-          }
-          const openChat = d.target.chat_id || enrichedChatId;
-          if (openChat) return { op: "im.send", args: { chat_id: openChat, text: content, draft_id: d.id } };
-          throw new Error("该草稿目标来自个人 Web 实时消息，尚未补齐开放平台消息 ID；可在设置中开启 context.personal_web.send_replies 或等下一轮飞书采集后再发送");
+        if (lockedRoute === "pw.reply" || d.target.transport === "personal_web") {
+          return buildPwReply();
         }
-        return { op: "im.send", args: { chat_id: d.target.chat_id || enrichedChatId, text: content, draft_id: d.id } };
+        if (d.target.message_id) {
+          if (lockedRoute && lockedRoute !== "im.reply") {
+            throw new Error(`草稿已绑定发送路由 ${lockedRoute}，拒绝切换为 im.reply`);
+          }
+          return { op: "im.reply", args: { message_id: d.target.message_id, text: content, draft_id: d.id } };
+        }
+        if (lockedRoute === "im.reply") {
+          throw new Error("该草稿已绑定按原消息回复（im.reply），但缺少 message_id，拒绝降级为顶层消息");
+        }
+        if (!d.target.chat_id) {
+          throw new Error("该回复草稿缺少目标会话 ID");
+        }
+        return { op: "im.send", args: { chat_id: d.target.chat_id, text: content, draft_id: d.id } };
       }
       case "followup": {
-        const openChat = d.target.chat_id || enrichedChatId;
-        if (openChat) return { op: "im.send", args: { chat_id: openChat, text: content, draft_id: d.id } };
-        if (d.target.transport === "personal_web" && d.target.native_chat_id && d.target.native_message_id) {
-          if (this.cfg.context.personal_web.send_replies) {
-            return {
-              op: "pw.reply",
-              args: {
-                chat_id: d.target.native_chat_id,
-                message_id: d.target.native_message_id,
-                root_id: d.target.native_root_id,
-                text: content,
-                draft_id: d.id,
-              },
-            };
-          }
-          throw new Error("该跟进草稿来自个人 Web 实时会话，尚未补齐开放平台会话 ID；可开启 context.personal_web.send_replies 或等下一轮飞书采集后再发送");
+        if (lockedRoute === "pw.reply" || d.target.transport === "personal_web") {
+          return buildPwReply();
+        }
+        if (lockedRoute && lockedRoute !== "im.send") {
+          throw new Error(`草稿已绑定发送路由 ${lockedRoute}，拒绝切换为 im.send`);
+        }
+        if (!d.target.chat_id) {
+          throw new Error("该跟进草稿缺少目标会话 ID");
         }
         return { op: "im.send", args: { chat_id: d.target.chat_id, text: content, draft_id: d.id } };
       }

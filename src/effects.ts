@@ -21,9 +21,9 @@ export interface EffectHooks {
    */
   gate?: (kind: NotifyKind | undefined, e: Effect) => number | false | undefined;
   /**
-   * 个人 Web 协议回复执行器（由工作上下文模块注册，只在用户确认草稿后触发，带发送前核验与独立回读确认）。
+   * 个人 Web 协议回复执行器（由工作上下文模块注册，只在用户确认草稿后触发，绑定确认账号并带发送前核验与独立回读确认）。
    */
-  pwReply?: (args: { chat_id: string; message_id: string; root_id?: string; text: string; cid: string }) => Promise<void>;
+  pwReply?: (args: { owner_id: string; chat_id: string; message_id: string; root_id?: string; text: string; cid: string }) => Promise<void>;
 }
 
 export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: Lark, store: Store, hooks: EffectHooks = {}): Handler<Effect> {
@@ -76,10 +76,11 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
           if (!hooks.pwReply) throw new Error("个人 Web 回复未注册");
           const normText = e.args.text.replace(/\r\n/g, "\n").trim();
           const revKey = e.args.draft_id
-            ? `draft:${e.args.draft_id}:${e.args.chat_id}:${e.args.message_id}:${normText}`
+            ? `draft:${e.args.draft_id}:${e.args.owner_id}:${e.args.chat_id}:${e.args.message_id}:${normText}`
             : `effect:${item.id}`;
           const cid = createHash("sha256").update(`avatar-pw\0${revKey}`).digest("hex").slice(0, 32);
           await hooks.pwReply({
+            owner_id: e.args.owner_id,
             chat_id: e.args.chat_id,
             message_id: e.args.message_id,
             root_id: e.args.root_id,

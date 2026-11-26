@@ -56,8 +56,8 @@ export type Effect =
   | { op: "im.reply"; args: { message_id: string; text: string; draft_id?: string } }
   /** 以你本人身份在会话里发一条消息（只在你确认草稿后产生） */
   | { op: "im.send"; args: { chat_id: string; text: string; draft_id?: string } }
-  /** 以你本人身份经个人 Web 协议回复（带发送前核验与独立回读确认；只在你确认草稿后产生） */
-  | { op: "pw.reply"; args: { chat_id: string; message_id: string; root_id?: string; text: string; draft_id?: string } }
+  /** 以你本人身份经个人 Web 协议回复（绑定原确认账号，带发送前核验与独立回读确认；只在你确认草稿后产生） */
+  | { op: "pw.reply"; args: { owner_id: string; chat_id: string; message_id: string; root_id?: string; text: string; draft_id?: string } }
   /** 以你本人身份给 Meego 工作项写评论（只在你确认草稿后产生） */
   | { op: "meego.comment"; args: { project_key: string; work_item_id: string; content: string; draft_id?: string } }
   /** 以你本人身份在「我的文档库」里新建文档（周报草稿确认后） */

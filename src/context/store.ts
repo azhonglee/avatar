@@ -200,12 +200,9 @@ export class ContextStore {
         id TEXT PRIMARY KEY, source TEXT NOT NULL, kind TEXT NOT NULL, conv TEXT NOT NULL DEFAULT '', conv_name TEXT NOT NULL DEFAULT '',
         actor_id TEXT NOT NULL DEFAULT '', actor_name TEXT NOT NULL DEFAULT '', is_me INTEGER NOT NULL DEFAULT 0, time INTEGER NOT NULL,
         text TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', meta TEXT NOT NULL DEFAULT '{}',
-        ingested INTEGER NOT NULL, processed INTEGER NOT NULL DEFAULT 0, alt_id TEXT NOT NULL DEFAULT '');
+        ingested INTEGER NOT NULL, processed INTEGER NOT NULL DEFAULT 0);
       CREATE INDEX IF NOT EXISTS ctx_obs_pending ON ctx_obs (processed, conv, time);
       CREATE INDEX IF NOT EXISTS ctx_obs_conv ON ctx_obs (conv, time);
-      CREATE INDEX IF NOT EXISTS ctx_obs_im_time ON ctx_obs (source, is_me, time);
-      CREATE TABLE IF NOT EXISTS ctx_conv_alias (
-        pw_conv TEXT PRIMARY KEY, open_conv TEXT NOT NULL UNIQUE, conv_name TEXT NOT NULL DEFAULT '', updated INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS ctx_project (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, aliases TEXT NOT NULL DEFAULT '[]', refs TEXT NOT NULL DEFAULT '[]',
         description TEXT NOT NULL DEFAULT '', my_role TEXT NOT NULL DEFAULT '', stage TEXT NOT NULL DEFAULT '',
@@ -247,10 +244,6 @@ export class ContextStore {
     // 迁移：子项目
     const cols = new Set((db.prepare("PRAGMA table_info(ctx_project)").all() as { name: string }[]).map((c) => c.name));
     if (!cols.has("parent_id")) db.exec("ALTER TABLE ctx_project ADD COLUMN parent_id TEXT NOT NULL DEFAULT ''");
-    // 迁移：观测跨通道备用 ID（pw:* ↔ im:* 1 对 1 绑定，编辑更新直接按 alt_id 定位）
-    const obsCols = new Set((db.prepare("PRAGMA table_info(ctx_obs)").all() as { name: string }[]).map((c) => c.name));
-    if (!obsCols.has("alt_id")) db.exec("ALTER TABLE ctx_obs ADD COLUMN alt_id TEXT NOT NULL DEFAULT ''");
-    db.exec("CREATE INDEX IF NOT EXISTS ctx_obs_alt_id ON ctx_obs (alt_id) WHERE alt_id != ''");
   }
 
   private txDepth = 0;
@@ -271,217 +264,70 @@ export class ContextStore {
     }
   }
 
-  // ───────── 会话别名（pw_chat:* ↔ oc_* 1 对 1 绑定） ─────────
-
-  private static isGenericConvName(name: string): boolean {
-    const t = name.trim();
-    return !t || t === "群聊" || t === "私聊" || /^群聊\(/.test(t) || /^私聊：\d+$/.test(t);
-  }
-
-  convAlias(conv: string): { pw_conv: string; open_conv: string; conv_name: string } | undefined {
-    if (!conv) return undefined;
-    const r = this.db
-      .prepare("SELECT pw_conv, open_conv, conv_name FROM ctx_conv_alias WHERE pw_conv = ? OR open_conv = ? LIMIT 1")
-      .get(conv, conv) as { pw_conv: string; open_conv: string; conv_name: string } | undefined;
-    return r;
-  }
-
-  /** 按精确非泛化群名反查已记录的开放平台会话（用于首次关联前或静音/排除校验） */
-  findOpenConvsByName(convName: string): string[] {
-    if (ContextStore.isGenericConvName(convName)) return [];
-    const target = norm(convName);
-    const rows = this.db
-      .prepare("SELECT DISTINCT conv, conv_name FROM ctx_obs WHERE source = 'im' AND conv NOT LIKE 'pw_chat:%' AND conv != '' AND conv_name != ''")
-      .all() as { conv: string; conv_name: string }[];
-    return rows.filter((r) => norm(r.conv_name) === target).map((r) => r.conv);
-  }
-
-  /** 建立或更新 1 对 1 会话别名；若任一端已绑定到其他会话则拒绝覆盖并返回 false。 */
-  linkConvAlias(pwConv: string, openConv: string, convName = ""): boolean {
-    if (!pwConv.startsWith("pw_chat:") || !openConv || openConv.startsWith("pw_chat:")) return false;
-    const byPw = this.db.prepare("SELECT open_conv, conv_name FROM ctx_conv_alias WHERE pw_conv = ?").get(pwConv) as { open_conv: string; conv_name: string } | undefined;
-    if (byPw && byPw.open_conv !== openConv) return false;
-    const byOpen = this.db.prepare("SELECT pw_conv FROM ctx_conv_alias WHERE open_conv = ?").get(openConv) as { pw_conv: string } | undefined;
-    if (byOpen && byOpen.pw_conv !== pwConv) return false;
-    const finalName = !ContextStore.isGenericConvName(convName) ? convName : (byPw?.conv_name ?? "");
-    this.db
-      .prepare("INSERT OR REPLACE INTO ctx_conv_alias (pw_conv, open_conv, conv_name, updated) VALUES (?, ?, ?, ?)")
-      .run(pwConv, openConv, finalName, Date.now());
-    return true;
-  }
-
-  /** 返回同一会话的所有等价键（[conv] 或 [pw_conv, open_conv]） */
-  convGroup(conv: string): string[] {
-    const a = this.convAlias(conv);
-    return a ? [a.pw_conv, a.open_conv] : [conv];
-  }
-
-  /** 规范会话键：已绑定别名时优先使用 open_conv，保证锁、待处理列表和背景窗口合并到同一会话 */
-  canonicalConv(conv: string): string {
-    return this.convAlias(conv)?.open_conv ?? conv;
-  }
-
   // ───────── 观测 ─────────
 
   /**
-   * 幂等写入观测：
-   *   1. 按主 ID 或备用 ID（alt_id）直接定位：支持跨通道消息的后续编辑，以及把历史背景行（background_only）在首次真实投递时提升为待处理。
-   *   2. 跨通道 1 对 1 去重（pw:* ↔ im:*）：必须满足已验证会话匹配（已有别名 / 同非泛化群名 / 无冲突且唯一长文本 ≥12 字）、同 chat_type、
-   *      同 is_me、±15 秒且目标行尚未绑定 alt_id；存在歧义（多于 1 条候选）时绝不合并，防止回复目标串群。
+   * 幂等写入观测（严格按通道原生主键 ID 索引查找，绝不做跨通道启发式猜群或合并）：
+   *   - 同 ID 已存在且曾仅作为历史背景写入（meta.background_only = true）时，首次真实投递将其提升为待处理；
+   *   - 同 ID 已存在且正文变化（消息被编辑）时，更新正文并重新标为待处理。
    * 返回新增或重新变为待处理的数量。
    */
   addObs(list: Obs[]): number {
     const now = Date.now();
-    const findExisting = this.db.prepare(
-      "SELECT id, alt_id, kind, conv, conv_name, actor_id, actor_name, text, url, meta, processed FROM ctx_obs WHERE id = ? OR alt_id = ? LIMIT 1",
-    );
-    const nearIm = this.db.prepare(
-      `SELECT id, alt_id, conv, conv_name, actor_id, actor_name, text, url, meta, processed FROM ctx_obs
-       WHERE source = 'im' AND is_me = ? AND alt_id = '' AND time BETWEEN ? AND ? AND id LIKE ? LIMIT 50`,
-    );
-    const updRow = this.db.prepare(
-      "UPDATE ctx_obs SET kind = ?, conv_name = ?, actor_name = ?, text = ?, url = ?, meta = ?, alt_id = ?, processed = ? WHERE id = ?",
-    );
+    const get = this.db.prepare("SELECT kind, conv_name, actor_name, text, url, meta, processed FROM ctx_obs WHERE id = ?");
     const ins = this.db.prepare(
-      `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed, alt_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '')`,
+      `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
     );
+    const upd = this.db.prepare("UPDATE ctx_obs SET kind = ?, conv_name = ?, actor_name = ?, text = ?, url = ?, meta = ?, processed = 0 WHERE id = ?");
     let n = 0;
-
-    const mergeMeta = (base: Record<string, unknown>, incoming: Obs, isIncomingLark: boolean, clearBg: boolean): Record<string, unknown> => {
-      const merged: Record<string, unknown> = { ...base, ...(incoming.meta ?? {}) };
-      if (isIncomingLark) {
-        merged.open_message_id = String(incoming.meta.message_id ?? incoming.id.replace(/^im:/, ""));
-        merged.open_chat_id = incoming.conv;
-        merged.open_actor_id = incoming.actor_id;
-        // 保留已有的个人 Web 原生字段
-        for (const k of ["transport", "native_message_id", "native_chat_id", "native_root_id", "native_parent_id", "position", "at_me", "mentions"]) {
-          if (base[k] !== undefined) merged[k] = base[k];
-        }
-      } else if (incoming.id.startsWith("pw:")) {
-        merged.native_message_id = String(incoming.meta.native_message_id ?? incoming.id.replace(/^pw:/, ""));
-        merged.native_chat_id = String(incoming.meta.native_chat_id ?? "");
-        merged.native_root_id = String(incoming.meta.native_root_id ?? "");
-        for (const k of ["message_id", "open_message_id", "open_chat_id", "open_actor_id"]) {
-          if (base[k] !== undefined) merged[k] = base[k];
-        }
-      }
-      if (clearBg) delete merged.background_only;
-      return merged;
-    };
-
-    const pickBetterConv = (curName: string, incName: string, preferInc: boolean) =>
-      preferInc && incName && ContextStore.isGenericConvName(curName) ? incName : curName || incName;
-    const pickBetterActor = (curActor: string, incActor: string, preferInc: boolean) =>
-      preferInc && incActor && (!curActor || /^\d+$/.test(curActor)) ? incActor : curActor || incActor;
-
     this.tx(() => {
       for (const o of list) {
         if (!o.id || !o.time) continue;
-        const cur = findExisting.get(o.id, o.id) as Row | undefined;
-        if (cur) {
+        const cur = get.get(o.id) as Row | undefined;
+        if (!cur) {
+          ins.run(o.id, o.source, o.kind, o.conv, o.conv_name, o.actor_id, o.actor_name, o.is_me ? 1 : 0, o.time, o.text, o.url, JSON.stringify(o.meta ?? {}), now);
+          n++;
+        } else {
           const curMeta = j<Record<string, unknown>>(cur.meta, {});
-          const isIncomingLark = o.id.startsWith("im:");
           const wasBgOnly = curMeta.background_only === true;
           const textChanged = String(cur.text ?? "") !== o.text;
-          const nextProcessed = wasBgOnly || textChanged ? 0 : Number(cur.processed ?? 0);
-          const mergedMeta = mergeMeta(curMeta, o, isIncomingLark, wasBgOnly);
-          const nextKind = wasBgOnly ? o.kind : String(cur.kind ?? o.kind);
-          const nextConvName = pickBetterConv(String(cur.conv_name ?? ""), o.conv_name, isIncomingLark || wasBgOnly);
-          const nextActorName = pickBetterActor(String(cur.actor_name ?? ""), o.actor_name, isIncomingLark || wasBgOnly);
-          const nextUrl = String(cur.url ?? "") || o.url;
-          updRow.run(nextKind, nextConvName, nextActorName, o.text, nextUrl, JSON.stringify(mergedMeta), String(cur.alt_id ?? ""), nextProcessed, String(cur.id));
-          if (wasBgOnly || textChanged) n++;
-          continue;
-        }
-
-        // 跨通道 1 对 1 匹配（pw:* ↔ im:*）
-        if (o.source === "im" && (o.id.startsWith("im:") || o.id.startsWith("pw:"))) {
-          const nt = norm(o.text);
-          if (nt.length >= 2) {
-            const isIncomingLark = o.id.startsWith("im:");
-            const otherPrefix = isIncomingLark ? "pw:%" : "im:%";
-            const incChatType = String(o.meta.chat_type ?? "");
-            const cands = nearIm.all(o.is_me ? 1 : 0, o.time - 15_000, o.time + 15_000, otherPrefix) as Row[];
-            const textMatches = cands.filter((c) => {
-              if (norm(String(c.text ?? "")) !== nt) return false;
-              const cm = j<Record<string, unknown>>(c.meta, {});
-              const cChatType = String(cm.chat_type ?? "");
-              if (incChatType && cChatType && (incChatType === "p2p") !== (cChatType === "p2p")) return false;
-              return true;
-            });
-
-            const proven = textMatches.filter((c) => {
-              const pwConv = isIncomingLark ? String(c.conv ?? "") : o.conv;
-              const openConv = isIncomingLark ? o.conv : String(c.conv ?? "");
-              const byPw = this.convAlias(pwConv);
-              const byOpen = this.convAlias(openConv);
-              // 已绑定且指向同一会话：直接通过
-              if (byPw && byPw.open_conv === openConv) return true;
-              // 任一端已绑定到别的会话：绝不串群合并
-              if (byPw && byPw.open_conv !== openConv) return false;
-              if (byOpen && byOpen.pw_conv !== pwConv) return false;
-              // 群聊且两边都有非泛化群名且一致：可证明是同一个群
-              const cName = String(c.conv_name ?? "");
-              if (incChatType !== "p2p" && !ContextStore.isGenericConvName(cName) && !ContextStore.isGenericConvName(o.conv_name)) {
-                return norm(cName) === norm(o.conv_name);
-              }
-              // 尚未建立别名（例如私聊或群名缺失）：仅在全局 ±15s 唯一命中且正文足够特异（≥12 归一字符）时允许匹配
-              return textMatches.length === 1 && nt.length >= 12;
-            });
-
-            if (proven.length === 1) {
-              const hit = proven[0];
-              const pwConv = isIncomingLark ? String(hit.conv ?? "") : o.conv;
-              const openConv = isIncomingLark ? o.conv : String(hit.conv ?? "");
-              const bestName = pickBetterConv(String(hit.conv_name ?? ""), o.conv_name, isIncomingLark);
-              if (this.linkConvAlias(pwConv, openConv, bestName)) {
-                const hitMeta = j<Record<string, unknown>>(hit.meta, {});
-                const wasBgOnly = hitMeta.background_only === true;
-                const mergedMeta = mergeMeta(hitMeta, o, isIncomingLark, wasBgOnly);
-                const bestActor = pickBetterActor(String(hit.actor_name ?? ""), o.actor_name, isIncomingLark);
-                const bestUrl = String(hit.url ?? "") || o.url;
-                const nextProcessed = wasBgOnly ? 0 : Number(hit.processed ?? 0);
-                const nextKind = wasBgOnly ? o.kind : String(hit.kind ?? o.kind);
-                updRow.run(nextKind, bestName, bestActor, String(hit.text ?? ""), bestUrl, JSON.stringify(mergedMeta), o.id, nextProcessed, String(hit.id));
-                if (wasBgOnly) n++;
-                continue;
-              }
-            }
+          if (wasBgOnly || textChanged) {
+            const mergedMeta: Record<string, unknown> = { ...curMeta, ...(o.meta ?? {}) };
+            delete mergedMeta.background_only;
+            upd.run(
+              wasBgOnly ? o.kind : String(cur.kind ?? o.kind),
+              o.conv_name || String(cur.conv_name ?? ""),
+              o.actor_name || String(cur.actor_name ?? ""),
+              o.text,
+              o.url || String(cur.url ?? ""),
+              JSON.stringify(mergedMeta),
+              o.id,
+            );
+            n++;
           }
         }
-
-        ins.run(o.id, o.source, o.kind, o.conv, o.conv_name, o.actor_id, o.actor_name, o.is_me ? 1 : 0, o.time, o.text, o.url, JSON.stringify(o.meta ?? {}), now);
-        n++;
       }
     });
     return n;
   }
 
   /**
-   * 写入历史背景观测（只插未出现过的记录，标记 processed = 1 且 meta.background_only = true）。
-   * 后续若该消息经推送或轮询真实投递，addObs 会将其从背景态提升为 processed = 0 进入理解。
+   * 写入历史背景观测（仅插入未出现过的 ID，标为 processed = 1 且 meta.background_only = true）。
+   * 后续若该消息经真实推送或轮询到达，addObs 会将其提升为待处理。
    */
   addBackgroundObs(list: Obs[]): number {
     const now = Date.now();
-    const get = this.db.prepare("SELECT 1 FROM ctx_obs WHERE id = ? OR alt_id = ? LIMIT 1");
+    const get = this.db.prepare("SELECT 1 FROM ctx_obs WHERE id = ?");
     const ins = this.db.prepare(
-      `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed, alt_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, '')`,
+      `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
     );
     let n = 0;
     this.tx(() => {
       for (const o of list) {
         if (!o.id || !o.time) continue;
-        if (get.get(o.id, o.id)) continue;
-        // 仅在同一已验证会话（含别名）内做背景去重，避免跨群误跳过
-        const nt = norm(o.text);
-        if (o.source === "im" && nt.length >= 2) {
-          const keys = this.convGroup(o.conv);
-          const q = `SELECT text FROM ctx_obs WHERE source = 'im' AND is_me = ? AND conv IN (${keys.map(() => "?").join(",")}) AND time BETWEEN ? AND ? LIMIT 30`;
-          const cands = this.db.prepare(q).all(o.is_me ? 1 : 0, ...keys, o.time - 15_000, o.time + 15_000) as { text: string }[];
-          if (cands.some((c) => norm(c.text) === nt)) continue;
-        }
+        if (get.get(o.id)) continue;
         const meta = { ...(o.meta ?? {}), background_only: true };
         ins.run(o.id, o.source, o.kind, o.conv, o.conv_name, o.actor_id, o.actor_name, o.is_me ? 1 : 0, o.time, o.text, o.url, JSON.stringify(meta), now);
         n++;
@@ -491,39 +337,25 @@ export class ContextStore {
   }
 
   obs(id: string): Obs | undefined {
-    const r = this.db.prepare("SELECT * FROM ctx_obs WHERE id = ? OR alt_id = ? LIMIT 1").get(id, id) as Row | undefined;
+    const r = this.db.prepare("SELECT * FROM ctx_obs WHERE id = ?").get(id) as Row | undefined;
     return r ? this.toObs(r) : undefined;
+  }
+
+  obsPending(id: string): boolean {
+    const r = this.db.prepare("SELECT processed FROM ctx_obs WHERE id = ?").get(id) as { processed: number } | undefined;
+    return r !== undefined && r.processed === 0;
   }
 
   private toObs(r: Row): Obs {
     return { ...(r as unknown as Obs), is_me: !!r.is_me, meta: j(r.meta, {}) };
   }
 
-  /** 待理解的会话（按最早未处理观测排序），已绑定别名的会话合并计数，排除静音会话 */
+  /** 待理解的会话（按最早未处理观测排序），严格按会话 ID 排除静音会话 */
   pendingConvs(limit: number, sources: string[] = ["im", "minutes", "doc"]): { conv: string; conv_name: string; n: number }[] {
     const q = `SELECT conv, MAX(conv_name) AS conv_name, COUNT(*) AS n, MIN(time) AS t FROM ctx_obs
-               WHERE processed = 0 AND source IN (${sources.map(() => "?").join(",")})
-               GROUP BY conv ORDER BY t`;
-    const rows = this.db.prepare(q).all(...sources) as { conv: string; conv_name: string; n: number; t: number }[];
-    const merged = new Map<string, { conv: string; conv_name: string; n: number; t: number }>();
-    for (const r of rows) {
-      if (this.isConvMuted(r.conv, r.conv_name)) continue;
-      const key = this.canonicalConv(r.conv);
-      const cur = merged.get(key);
-      if (!cur) {
-        merged.set(key, { conv: key, conv_name: r.conv_name, n: r.n, t: r.t });
-      } else {
-        cur.n += r.n;
-        cur.t = Math.min(cur.t, r.t);
-        if (ContextStore.isGenericConvName(cur.conv_name) && !ContextStore.isGenericConvName(r.conv_name)) {
-          cur.conv_name = r.conv_name;
-        }
-      }
-    }
-    return [...merged.values()]
-      .sort((a, b) => a.t - b.t)
-      .slice(0, limit)
-      .map(({ conv, conv_name, n }) => ({ conv, conv_name, n }));
+               WHERE processed = 0 AND source IN (${sources.map(() => "?").join(",")}) AND conv NOT IN (SELECT conv FROM ctx_mute_conv)
+               GROUP BY conv ORDER BY t LIMIT ?`;
+    return this.db.prepare(q).all(...sources, limit) as { conv: string; conv_name: string; n: number }[];
   }
 
   pendingCount(): number {
@@ -531,100 +363,104 @@ export class ContextStore {
   }
 
   /**
-   * 理解窗口：这个会话（含别名）最早的一批待处理观测（按时间正序，最多 maxFresh 条）+ 它们之前的若干条已处理观测作为背景。
+   * 理解窗口：这个会话最早的一批待处理观测（按时间正序，最多 maxFresh 条）+ 它们之前的若干条已处理观测作为背景。
    * 从最早的待处理开始，保证大群 / 停机后积压的消息分几批都能处理到，不会因为只取最近 N 条而永远卡住。
    */
   convWindow(conv: string, maxFresh = 60, context = 12): Obs[] {
-    const keys = this.convGroup(conv);
-    const ph = keys.map(() => "?").join(",");
-    const fresh = this.db.prepare(`SELECT * FROM ctx_obs WHERE conv IN (${ph}) AND processed = 0 ORDER BY time ASC, id ASC LIMIT ?`).all(...keys, maxFresh) as Row[];
+    const fresh = this.db.prepare("SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 ORDER BY time ASC, id ASC LIMIT ?").all(conv, maxFresh) as Row[];
     if (!fresh.length) return [];
     const t0 = Number(fresh[0].time);
-    const before = this.db.prepare(`SELECT * FROM ctx_obs WHERE conv IN (${ph}) AND processed = 1 AND time <= ? ORDER BY time DESC, id DESC LIMIT ?`).all(...keys, t0, context) as Row[];
+    const before = this.db.prepare("SELECT * FROM ctx_obs WHERE conv = ? AND processed = 1 AND time <= ? ORDER BY time DESC, id DESC LIMIT ?").all(conv, t0, context) as Row[];
     return [...before.reverse(), ...fresh].map((r) => this.toObs(r));
   }
 
   /**
-   * 快通道理解窗口：保证包含触发消息（targetObsId）及其后防抖期内的新消息（最多 maxFresh 条），
-   * 并在其前附带最多 context 条历史背景；更早的积压消息仍保持 processed = 0 留给常规周期消化。
+   * 快通道理解窗口：
+   *   - 若触发消息（targetObsId）已被常规周期或前序作业处理完，直接返回空数组，避免陈旧快通道作业空耗模型处理无关积压；
+   *   - 否则保证包含触发消息及其后防抖期内的新消息（最多 maxFresh 条），附带前序背景，并显式补齐其话题根消息与引用父消息锚点。
    */
   convWindowAround(conv: string, targetObsId: string, maxFresh = 60, context = 12): Obs[] {
-    const keys = this.convGroup(conv);
-    const ph = keys.map(() => "?").join(",");
-    const target = this.db.prepare("SELECT * FROM ctx_obs WHERE (id = ? OR alt_id = ?) AND processed = 0 LIMIT 1").get(targetObsId, targetObsId) as Row | undefined;
-    if (!target) return this.convWindow(conv, maxFresh, context);
+    const target = this.db.prepare("SELECT * FROM ctx_obs WHERE id = ? AND conv = ? AND processed = 0").get(targetObsId, conv) as Row | undefined;
+    if (!target) return [];
     const targetTime = Number(target.time);
     const after = this.db
-      .prepare(`SELECT * FROM ctx_obs WHERE conv IN (${ph}) AND processed = 0 AND time >= ? ORDER BY time ASC, id ASC LIMIT ?`)
-      .all(...keys, targetTime, maxFresh) as Row[];
+      .prepare("SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 AND time >= ? ORDER BY time ASC, id ASC LIMIT ?")
+      .all(conv, targetTime, maxFresh) as Row[];
     const hasTarget = after.some((r) => String(r.id) === String(target.id));
     let fresh = hasTarget ? after : [target, ...after.slice(0, Math.max(0, maxFresh - 1))];
     const rem = maxFresh - fresh.length;
     if (rem > 0) {
       const seen = new Set(fresh.map((r) => String(r.id)));
       const earlierPending = this.db
-        .prepare(`SELECT * FROM ctx_obs WHERE conv IN (${ph}) AND processed = 0 AND time <= ? ORDER BY time DESC, id DESC LIMIT ?`)
-        .all(...keys, targetTime, rem + seen.size) as Row[];
+        .prepare("SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 AND time <= ? ORDER BY time DESC, id DESC LIMIT ?")
+        .all(conv, targetTime, rem + seen.size) as Row[];
       const extra = earlierPending.filter((r) => !seen.has(String(r.id))).slice(0, rem).reverse();
       fresh = [...extra, ...fresh];
     }
     fresh.sort((a, b) => Number(a.time) - Number(b.time) || String(a.id).localeCompare(String(b.id)));
-    const freshIds = new Set(fresh.map((r) => String(r.id)));
+    const includedIds = new Set(fresh.map((r) => String(r.id)));
     const t0 = Number(fresh[0].time);
     const before = (
       this.db
-        .prepare(`SELECT * FROM ctx_obs WHERE conv IN (${ph}) AND time <= ? ORDER BY time DESC, id DESC LIMIT ?`)
-        .all(...keys, t0, context + freshIds.size) as Row[]
+        .prepare("SELECT * FROM ctx_obs WHERE conv = ? AND time <= ? ORDER BY time DESC, id DESC LIMIT ?")
+        .all(conv, t0, context + includedIds.size) as Row[]
     )
-      .filter((r) => !freshIds.has(String(r.id)))
+      .filter((r) => !includedIds.has(String(r.id)))
       .slice(0, context)
       .reverse();
-    return [...before, ...fresh].map((r) => this.toObs(r));
+    before.forEach((r) => includedIds.add(String(r.id)));
+
+    // 显式补齐话题根消息与被引用父消息锚点（即使早于最近 context 条也能被模型看到）
+    const targetMeta = j<Record<string, unknown>>(target.meta, {});
+    const anchors: Row[] = [];
+    for (const rawId of [String(targetMeta.native_root_id ?? ""), String(targetMeta.native_parent_id ?? "")]) {
+      if (!rawId) continue;
+      const anchorObsId = `pw:${rawId}`;
+      if (includedIds.has(anchorObsId)) continue;
+      const row = this.db.prepare("SELECT * FROM ctx_obs WHERE id = ? AND conv = ?").get(anchorObsId, conv) as Row | undefined;
+      if (row) {
+        anchors.push(row);
+        includedIds.add(String(row.id));
+      }
+    }
+    anchors.sort((a, b) => Number(a.time) - Number(b.time) || String(a.id).localeCompare(String(b.id)));
+    return [...anchors, ...before, ...fresh].map((r) => this.toObs(r));
   }
 
   convObs(conv: string, since: number, limit = 80): Obs[] {
-    const keys = this.convGroup(conv);
-    const ph = keys.map(() => "?").join(",");
-    const rows = this.db.prepare(`SELECT * FROM ctx_obs WHERE conv IN (${ph}) AND time >= ? ORDER BY time DESC LIMIT ?`).all(...keys, since, limit) as Row[];
+    const rows = this.db.prepare("SELECT * FROM ctx_obs WHERE conv = ? AND time >= ? ORDER BY time DESC LIMIT ?").all(conv, since, limit) as Row[];
     return rows.map((r) => this.toObs(r)).reverse();
   }
 
-  markProcessed(ids: string[]): void {
-    const get = this.db.prepare("SELECT meta FROM ctx_obs WHERE id = ?");
-    const upd = this.db.prepare("UPDATE ctx_obs SET processed = 1, meta = ? WHERE id = ?");
+  /**
+   * 标记观测为已处理；传入 `{ id, text }` 时仅当当前正文与送给模型的正文一致才标记，
+   * 防止模型推理期间到达的消息编辑被旧批次静默吞掉。
+   */
+  markProcessed(entries: (string | { id: string; text: string })[]): void {
+    const get = this.db.prepare("SELECT text, meta FROM ctx_obs WHERE id = ?");
+    const upd = this.db.prepare("UPDATE ctx_obs SET processed = 1, meta = ? WHERE id = ? AND text = ?");
     this.tx(() => {
-      for (const id of ids) {
-        const cur = get.get(id) as { meta: string } | undefined;
+      for (const entry of entries) {
+        const id = typeof entry === "string" ? entry : entry.id;
+        const expectedText = typeof entry === "string" ? undefined : entry.text;
+        const cur = get.get(id) as { text: string; meta: string } | undefined;
         if (!cur) continue;
+        if (expectedText !== undefined && cur.text !== expectedText) continue;
         const m = j<Record<string, unknown>>(cur.meta, {});
         if (m.background_only) delete m.background_only;
-        upd.run(JSON.stringify(m), id);
+        upd.run(JSON.stringify(m), id, cur.text);
       }
     });
   }
 
   muteConv(conv: string, name: string, muted: boolean): void {
-    const keys = this.convGroup(conv);
-    const now = Date.now();
-    this.tx(() => {
-      if (muted) {
-        for (const k of keys) {
-          this.db.prepare("INSERT OR REPLACE INTO ctx_mute_conv (conv, name, at) VALUES (?, ?, ?)").run(k, name, now);
-          this.db.prepare("UPDATE ctx_obs SET processed = 1 WHERE conv = ?").run(k);
-        }
-      } else {
-        for (const k of keys) this.db.prepare("DELETE FROM ctx_mute_conv WHERE conv = ?").run(k);
-      }
-    });
+    if (muted) this.db.prepare("INSERT OR REPLACE INTO ctx_mute_conv (conv, name, at) VALUES (?, ?, ?)").run(conv, name, Date.now());
+    else this.db.prepare("DELETE FROM ctx_mute_conv WHERE conv = ?").run(conv);
+    if (muted) this.db.prepare("UPDATE ctx_obs SET processed = 1 WHERE conv = ?").run(conv);
   }
 
-  isConvMuted(conv: string, chatName = ""): boolean {
-    const keys = new Set(this.convGroup(conv));
-    for (const m of this.mutedConvs()) {
-      if (keys.has(m.conv)) return true;
-      if (chatName && !ContextStore.isGenericConvName(chatName) && m.name && norm(m.name) === norm(chatName)) return true;
-    }
-    return false;
+  isConvMutedById(conv: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM ctx_mute_conv WHERE conv = ?").get(conv);
   }
 
   mutedConvs(): { conv: string; name: string }[] {
@@ -1079,11 +915,9 @@ export class ContextStore {
     });
   }
 
-  /** 某会话（含别名）所有待处理观测标为已处理（理解反复失败时跳过） */
+  /** 某会话所有待处理观测标为已处理（理解反复失败时跳过） */
   skipConv(conv: string): number {
-    const keys = this.convGroup(conv);
-    const ph = keys.map(() => "?").join(",");
-    return Number(this.db.prepare(`UPDATE ctx_obs SET processed = 1 WHERE conv IN (${ph}) AND processed = 0`).run(...keys).changes);
+    return Number(this.db.prepare("UPDATE ctx_obs SET processed = 1 WHERE conv = ? AND processed = 0").run(conv).changes);
   }
 
   /** 今天（since 之后）关闭的事项 */

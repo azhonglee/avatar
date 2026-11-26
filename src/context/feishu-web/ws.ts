@@ -69,11 +69,92 @@ function buildClientFrame(opcode: number, payload: Uint8Array): Buffer {
   return out;
 }
 
+/** O(N) chunked byte accumulator avoiding O(N^2) buffer recopying across fragmented TCP reads. */
+class ChunkReader {
+  private readonly chunks: Buffer[] = [];
+  private headOffset = 0;
+  private total = 0;
+
+  get length(): number {
+    return this.total;
+  }
+
+  push(chunk: Buffer): void {
+    if (chunk.length === 0) return;
+    this.chunks.push(chunk);
+    this.total += chunk.length;
+  }
+
+  byteAt(idx: number): number {
+    let rem = idx + this.headOffset;
+    for (let i = 0; i < this.chunks.length; i++) {
+      const c = this.chunks[i];
+      if (rem < c.length) return c[rem];
+      rem -= c.length;
+    }
+    throw new RangeError("ChunkReader out of bounds");
+  }
+
+  peekBytes(offset: number, len: number): Buffer {
+    const out = Buffer.allocUnsafe(len);
+    let rem = offset + this.headOffset;
+    let written = 0;
+    for (let i = 0; i < this.chunks.length && written < len; i++) {
+      const c = this.chunks[i];
+      if (rem >= c.length) {
+        rem -= c.length;
+        continue;
+      }
+      const take = Math.min(len - written, c.length - rem);
+      c.copy(out, written, rem, rem + take);
+      written += take;
+      rem = 0;
+    }
+    return out;
+  }
+
+  skip(n: number): void {
+    let rem = n;
+    this.total -= n;
+    while (rem > 0 && this.chunks.length > 0) {
+      const avail = this.chunks[0].length - this.headOffset;
+      if (rem < avail) {
+        this.headOffset += rem;
+        return;
+      }
+      rem -= avail;
+      this.chunks.shift();
+      this.headOffset = 0;
+    }
+  }
+
+  take(n: number): Buffer {
+    if (n === 0) return Buffer.alloc(0);
+    const out = Buffer.allocUnsafe(n);
+    let written = 0;
+    this.total -= n;
+    while (written < n && this.chunks.length > 0) {
+      const c = this.chunks[0];
+      const avail = c.length - this.headOffset;
+      const take = Math.min(n - written, avail);
+      c.copy(out, written, this.headOffset, this.headOffset + take);
+      written += take;
+      if (take === avail) {
+        this.chunks.shift();
+        this.headOffset = 0;
+      } else {
+        this.headOffset += take;
+      }
+    }
+    return out;
+  }
+}
+
 export class BinaryWebSocket {
   private readonly socket: net.Socket;
   private readonly maxFrameBytes: number;
   private readonly maxQueueBytes: number;
-  private buf: Buffer = Buffer.alloc(0);
+  private readonly rx = new ChunkReader();
   private fragOpcode: number | null = null;
   private fragChunks: Buffer[] = [];
   private fragBytes = 0;
@@ -175,11 +256,11 @@ export class BinaryWebSocket {
 
   private onData(chunk: Buffer): void {
     if (this.closedErr) return;
-    this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
+    this.rx.push(chunk);
 
-    while (this.buf.length >= 2 && !this.closedErr) {
-      const b0 = this.buf[0];
-      const b1 = this.buf[1];
+    while (this.rx.length >= 2 && !this.closedErr) {
+      const b0 = this.rx.byteAt(0);
+      const b1 = this.rx.byteAt(1);
       const fin = (b0 & 0x80) !== 0;
       const rsv = b0 & 0x70;
       const opcode = b0 & 0x0f;
@@ -193,12 +274,12 @@ export class BinaryWebSocket {
       }
 
       if (len === 126) {
-        if (this.buf.length < 4) return;
-        len = this.buf.readUInt16BE(2);
+        if (this.rx.length < 4) return;
+        len = this.rx.peekBytes(2, 2).readUInt16BE(0);
         offset = 4;
       } else if (len === 127) {
-        if (this.buf.length < 10) return;
-        const bigLen = this.buf.readBigUInt64BE(2);
+        if (this.rx.length < 10) return;
+        const bigLen = this.rx.peekBytes(2, 8).readBigUInt64BE(0);
         if (bigLen > BigInt(this.maxFrameBytes)) {
           this.protocolError("WebSocket 帧超过最大字节限制");
           return;
@@ -213,14 +294,14 @@ export class BinaryWebSocket {
       }
 
       const maskLen = masked ? 4 : 0;
-      if (this.buf.length < offset + maskLen + len) return;
+      if (this.rx.length < offset + maskLen + len) return;
 
-      let payload = Buffer.from(this.buf.subarray(offset + maskLen, offset + maskLen + len));
-      if (masked) {
-        const mask = this.buf.subarray(offset, offset + 4);
+      this.rx.skip(offset);
+      const mask = masked ? this.rx.take(4) : undefined;
+      const payload = this.rx.take(len);
+      if (mask) {
         for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
       }
-      this.buf = this.buf.subarray(offset + maskLen + len);
 
       this.handleFrame(fin, opcode, payload);
     }

@@ -44,10 +44,30 @@ if (role === "lark") {
   logCall(writes.includes(key) || key === "im +messages-send" ? { input: stdin() } : {});
   if ((fx.fail ?? []).includes(argv[0])) fail(`${argv[0]} 故障`);
   if (key === "auth status") {
-    process.stdout.write(JSON.stringify({ identities: { user: { openId: "ou_owner", userName: fx.user_name ?? "张三" } } }) + "\n");
+    if (fx.auth_fail) fail("auth status 故障");
+    const user = {
+      ...(fx.user_open_id !== null ? { openId: fx.user_open_id ?? "ou_owner" } : {}),
+      ...(fx.user_name !== null ? { userName: fx.user_name ?? "张三" } : {}),
+    };
+    process.stdout.write(JSON.stringify({ identities: { user } }) + "\n");
     process.exit(0);
   }
   switch (key) {
+    case "im chats": {
+      if (argv[2] === "get") {
+        if (fx.chat_meta_fail) fail("im chats get 故障");
+        let chatId = "";
+        try {
+          chatId = JSON.parse(flag("--params") ?? "{}").chat_id ?? "";
+        } catch {
+          chatId = "";
+        }
+        const meta = (fx.chat_meta ?? {})[chatId];
+        if (!meta) fail(`chat not found: ${chatId}`);
+        ok(meta);
+      }
+      fail(`桩未实现：${argv.slice(0, 3).join(" ")}`);
+    }
     case "im +messages-search":
       if (argv.includes("--is-at-me")) ok({ messages: fx.at_me ?? [] });
       if (flag("--chat-type") === "p2p") ok({ messages: fx.p2p ?? [] });

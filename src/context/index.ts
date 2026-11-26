@@ -58,7 +58,7 @@ export class ContextService {
     this.drafter = new Drafter(app, this.store);
     this.personalWeb = new PersonalWebBridge(app, this.store, {
       onFastTrigger: (t) => {
-        this.enqueue(`fast:${t.conv}:${t.trigger_obs_id}`, {
+        this.enqueue(`fast:${t.conv}:${t.trigger_obs_id}:${t.text_hash}`, {
           task: "fast",
           conv: t.conv,
           conv_name: t.conv_name,
@@ -145,10 +145,10 @@ export class ContextService {
         while (budget > 0 && !signal?.aborted) {
           const pending = this.store
             .pendingConvs(Math.min(budget, 8 * par) + this.activeConvs.size)
-            .filter((c) => !this.activeConvs.has(this.store.canonicalConv(c.conv)))
+            .filter((c) => !this.activeConvs.has(c.conv))
             .slice(0, Math.min(budget, 8 * par));
           if (!pending.length) break;
-          const claimed = pending.map((c) => this.store.canonicalConv(c.conv));
+          const claimed = pending.map((c) => c.conv);
           claimed.forEach((k) => this.activeConvs.add(k));
           const groups: (typeof pending)[] = Array.from({ length: Math.min(par, pending.length) }, () => []);
           pending.forEach((c, i) => groups[i % groups.length].push(c));
@@ -223,8 +223,9 @@ export class ContextService {
     p: { conv: string; conv_name: string; trigger_obs_id: string; anchor?: FastAnchor },
     signal?: AbortSignal,
   ): Promise<{ busy?: boolean; fresh: number; created: number; nudged: number; pre_drafted: number }> {
-    if (!this.cfg.context.understand) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
-    const claimKey = this.store.canonicalConv(p.conv);
+    if (!this.cfg.context.understand || !this.cfg.context.sources.im) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+    if (this.store.isConvMutedById(p.conv)) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+    const claimKey = p.conv;
     if (this.activeConvs.has(claimKey)) return { busy: true, fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
     this.activeConvs.add(claimKey);
     try {
@@ -232,6 +233,7 @@ export class ContextService {
       if (p.anchor) {
         await this.personalWeb.hydrateContext(p.anchor, p.conv, p.conv_name, signal);
       }
+      if (this.store.isConvMutedById(p.conv)) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
       const window = this.store.convWindowAround(p.conv, p.trigger_obs_id);
       if (!window.length) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
       const r = await this.understander.runBatch(
@@ -246,12 +248,13 @@ export class ContextService {
       const nudged = this.nudge(r.created);
       this.autonomy(r.created);
 
-      // 可选：为高优先级「别人在等你」自动预起草回复草稿（只起草，绝不自动发送）
+      // 可选：为高优先级「别人在等你」自动预起草回复草稿（只起草，绝不自动发送；跳过静音/隐藏项目）
       let preDrafted = 0;
       if (this.cfg.context.personal_web.pre_draft) {
         for (const c of r.created) {
           const it = this.store.item(c.id);
           if (!it || it.status !== "open" || it.kind !== "ask_me" || it.priority !== "high") continue;
+          if (this.store.hidden(this.store.project(it.project_id))) continue;
           if (it.meta.needs_review || it.feedback === "unimportant" || !this.draftable(it)) continue;
           if (this.enqueue(`draft:${it.id}:reply:fast`, { task: "draft", item_id: it.id, kind: "reply" })) preDrafted++;
         }
@@ -794,6 +797,13 @@ export function registerContext(app: App): ContextService | undefined {
       if (!svc.store.casDraft(d.id, ["proposed", "failed"], "approved", content)) {
         throw new CommandError("conflict", d.status === "sent" ? "已经发送过了" : d.status === "discarded" ? "草稿已丢弃" : "正在发送中");
       }
+      svc.store.setDraft(d.id, {
+        target: {
+          ...d.target,
+          delivery_route: effect.op,
+          ...(effect.op === "pw.reply" ? { native_owner_id: effect.args.owner_id } : {}),
+        },
+      });
       ledger.emit(`ctx-draft:${d.id}`, [effect], `ctx-draft-${d.id}-${Date.now()}`);
       return ok(d.kind === "weekly_report" ? "正在新建文档" : "正在以你的身份发送", d.id);
     },
