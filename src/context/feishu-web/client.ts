@@ -981,8 +981,9 @@ export class FeishuWebClient {
     try {
       push = parseProto(payload, MAX_WIRE_BYTES);
     } catch (err) {
-      onWarn?.(`推送载荷解析失败：${err instanceof Error ? err.message : String(err)}`);
-      return false;
+      // 整包解析失败重试也不会成功，记录后照常 ACK；不 ACK 只留给真正的落库失败
+      onWarn?.(`推送载荷解析失败（已跳过并 ACK）：${err instanceof Error ? err.message : String(err)}`);
+      return true;
     }
 
     let rejected = false;

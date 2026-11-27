@@ -134,7 +134,7 @@ context:
   sources: { meego: true, im: true, minutes: true, calendar: true, tasks: true, docs: true }
   groups: spoken              # spoken：@我、私聊和我发言过的群；allowlist：只看 groups_allow 里的群
   groups_allow: []
-  groups_deny: []             # 永远不读的会话（chat_id 或群名关键字）
+  groups_deny: []             # 永远不读的会话（chat_id 或群名关键字）；个人 Web 通道还可写 pw_chat:<原生会话ID>，oc_ ID 按 lark-cli 记下的群名对应
   max_groups: 40
   bot_allow: [Meego, 项目管理, Codebase, 云文档, 审批, 智能纪要, MLOps, Bits]   # 保留哪些机器人的通知，其余当噪音
   legacy_days: 180            # Meego / 飞书任务超过这么久没动静视为历史遗留（自动静音）

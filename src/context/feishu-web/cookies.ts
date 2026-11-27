@@ -394,18 +394,48 @@ export class WebLoginStore {
    * 防止 `pa context web-logout` 或重新登录后被运行中的常驻进程回写旧凭据。
    */
   saveIfSessionMatches(login: WebLogin): WebLogin | null {
-    const current = this.load();
-    if (!current) return null;
-    if (current.owner_id !== login.owner_id) return null;
-    if (current.session_id && current.session_id !== login.session_id) return null;
-    return this.save({
-      ...login,
-      owner_open_id: login.owner_open_id || current.owner_open_id,
-      session_id: current.session_id ?? login.session_id,
+    // 与 clear() 共用文件锁：检查与写回之间不能插入 web-logout，否则会把已登出的凭据写回磁盘
+    return this.withLock(() => {
+      const current = this.load();
+      if (!current) return null;
+      if (current.owner_id !== login.owner_id) return null;
+      if (current.session_id && current.session_id !== login.session_id) return null;
+      return this.save({
+        ...login,
+        owner_open_id: login.owner_open_id || current.owner_open_id,
+        session_id: current.session_id ?? login.session_id,
+      });
     });
   }
 
   clear(): void {
-    fs.rmSync(this.file, { force: true });
+    this.withLock(() => fs.rmSync(this.file, { force: true }));
+  }
+
+  /** 跨进程互斥（O_EXCL 锁文件）；持有超过 10 秒的锁视为进程崩溃遗留，直接清除 */
+  private withLock<T>(fn: () => T): T {
+    const lock = `${this.file}.lock`;
+    fs.mkdirSync(path.dirname(lock), { recursive: true });
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      try {
+        fs.closeSync(fs.openSync(lock, "wx", 0o600));
+        break;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+        try {
+          if (Date.now() - fs.statSync(lock).mtimeMs > 10_000) fs.rmSync(lock, { force: true });
+        } catch {
+          // 锁刚被释放，重试即可
+        }
+        if (Date.now() > deadline) throw new Error(`等待个人 Web 凭据文件锁超时：${lock}`);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      }
+    }
+    try {
+      return fn();
+    } finally {
+      fs.rmSync(lock, { force: true });
+    }
   }
 }

@@ -3,6 +3,7 @@ import type { CtxPersonalWebStatus } from "../api/types.ts";
 import { errMsg, log } from "../util.ts";
 import {
   FeishuWebClient,
+  GatewayError,
   isUsableWebMessage,
   SessionNeedsLoginError,
   USER_SENDER_TYPE,
@@ -14,7 +15,7 @@ import {
   type WebLogin,
   type WebMessage,
 } from "./feishu-web/index.ts";
-import type { ContextStore, Obs } from "./store.ts";
+import { isRealConvName, type ContextStore, type Obs } from "./store.ts";
 
 /**
  * 个人 Web 协议桥接层：把 FeishuWebClient 的实时推送接入 Working Context。
@@ -55,7 +56,8 @@ interface PersistedState {
 }
 
 interface DeliveryRecord {
-  status: "created" | "verified";
+  /** sending：已开始发包但结果未知（可能已送达），不得自动重发 */
+  status: "sending" | "created" | "verified";
   replyId: string;
   chatId: string;
   rootId: string;
@@ -77,8 +79,12 @@ export interface PersonalWebBridgeHooks {
 /** 核验个人 Web 登录账号与当前工作区的绑定关系（防误登他人账号覆盖工作区上下文）。 */
 export function verifyLoginForWorkspace(app: App, login: WebLogin, opts: { forceSwitch?: boolean } = {}): void {
   const cfgOpenId = app.cfg.owner.open_id.trim();
+  // open_id 按应用区分：网页端拿到的 open_id 属于飞书网页应用，与 lark-cli 自建应用下的值天然不同，只能作提示，不能据此拒绝
   if (cfgOpenId && login.owner_open_id && login.owner_open_id !== cfgOpenId) {
-    throw new Error(`扫码登录的飞书账号 (${login.owner_open_id}) 与 config.yaml 中的 owner.open_id (${cfgOpenId}) 不一致`);
+    log("warn", "个人 Web 资料返回的 open_id 与 config.yaml 的 owner.open_id 不同（open_id 按应用区分，可能属正常）", {
+      web_open_id: login.owner_open_id,
+      owner_open_id: cfgOpenId,
+    });
   }
   const bound = (app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
   if (bound && bound !== login.owner_id && !opts.forceSwitch) {
@@ -351,16 +357,41 @@ export class PersonalWebBridge {
     });
   }
 
-  isDeniedChat(chatId: string, chatName: string): boolean {
-    if (
-      this.cfg.context.groups_deny.some(
-        (d) => d && (chatId === d || `pw_chat:${chatId}` === d || (chatName && chatName.includes(d))),
-      )
-    ) {
-      return true;
+  /** 同一会话在两个通道下的 ID：原生 ID、pw_chat: 前缀形式，以及跨通道匹配记下的开放平台 oc_ ID */
+  private chatIds(chatId: string): Set<string> {
+    const open = this.store.pwAlias("chat", chatId);
+    return new Set([chatId, `pw_chat:${chatId}`, ...(open ? [open] : [])]);
+  }
+
+  /** lark-cli 通道记下的 oc_ 群 ID → 群名，用来把按 oc_ ID 写的规则对上个人 Web 会话 */
+  private openGroupName(openChatId: string): string {
+    try {
+      const spoken = JSON.parse(this.app.store.get("ctx.spoken_groups") ?? "{}") as Record<string, { name?: string }>;
+      return String(spoken[openChatId]?.name ?? "");
+    } catch {
+      return "";
     }
+  }
+
+  /** 规则项 r 是否指向这个会话：ID 相等，或群名包含关键字，或 r 是 oc_ ID 且其已知群名与会话名一致 */
+  private ruleMatches(r: string, ids: Set<string>, chatName: string): boolean {
+    if (!r) return false;
+    if (ids.has(r)) return true;
+    if (!chatName) return false;
+    if (chatName.includes(r)) return true;
+    return r.startsWith("oc_") && this.openGroupName(r) === chatName;
+  }
+
+  isDeniedChat(chatId: string, chatName: string): boolean {
+    const ids = this.chatIds(chatId);
+    if (this.cfg.context.groups_deny.some((d) => this.ruleMatches(d, ids, chatName))) return true;
     const muted = this.store.mutedConvs();
-    return muted.some((m) => m.conv === `pw_chat:${chatId}` || (chatName && m.name === chatName));
+    return muted.some((m) => ids.has(m.conv) || (!!chatName && m.name === chatName));
+  }
+
+  /** 是否存在要靠会话名才能判定的排除或静音规则（查不到会话名时据此决定是否放行） */
+  private hasNameBasedExclusions(): boolean {
+    return this.cfg.context.groups_deny.some(Boolean) || this.store.mutedConvs().length > 0;
   }
 
   private loadSpokenGroups(): Set<string> {
@@ -384,8 +415,8 @@ export class PersonalWebBridge {
 
   private isGroupInScope(chatId: string, chatName: string, isAtMe: boolean): boolean {
     if (isAtMe) return true;
-    const allow = this.cfg.context.groups_allow;
-    const inAllow = allow.some((a) => a && (chatId === a || `pw_chat:${chatId}` === a || (chatName && chatName.includes(a))));
+    const ids = this.chatIds(chatId);
+    const inAllow = this.cfg.context.groups_allow.some((a) => this.ruleMatches(a, ids, chatName));
     if (this.cfg.context.groups === "allowlist") return inAllow;
     return inAllow || this.loadSpokenGroups().has(chatId);
   }
@@ -410,13 +441,16 @@ export class PersonalWebBridge {
 
     if (!isHuman && !this.botAllowed(text)) return;
 
+    // 群和私聊都查会话名（私聊的会话名即对方姓名），排除/静音规则和姓名展示都要用
     let chatName = "";
-    if (msg.conversationKind === "group" && client) {
+    if (client && msg.conversationKind) {
       try {
-        const meta = await client.readChat(msg.conversationId, { signal });
-        chatName = meta.name;
-      } catch {
-        // best effort
+        chatName = (await client.readChat(msg.conversationId, { signal })).name.trim();
+      } catch (err) {
+        // 查不到名称时无法判断是否命中按名称的排除/静音规则：抛出以不 ACK，等重投后再判断，绝不按“未命中”放行
+        if (this.hasNameBasedExclusions()) {
+          throw new Error(`查询会话名称失败，无法核对排除规则，暂不处理该消息：${errMsg(err)}`);
+        }
       }
     }
     if (this.isDeniedChat(msg.conversationId, chatName)) return;
@@ -428,8 +462,9 @@ export class PersonalWebBridge {
     }
 
     const conv = `pw_chat:${msg.conversationId}`;
+    const actorName = isMe ? ownerName : this.actorDisplayName(msg.actorId, msg.conversationKind, chatName);
     const convName =
-      chatName || (msg.conversationKind === "dm" ? `私聊：${isMe ? "本人" : msg.actorId}` : `群聊(${msg.conversationId.slice(-6)})`);
+      chatName || (msg.conversationKind === "dm" ? `私聊：${isMe ? "本人" : actorName}` : `群聊(${msg.conversationId.slice(-6)})`);
     const kind = !isHuman ? "bot" : isMe ? "mine" : isAtMe ? "at_me" : msg.conversationKind === "dm" ? "p2p" : "group";
 
     const obs: Obs = {
@@ -439,7 +474,7 @@ export class PersonalWebBridge {
       conv,
       conv_name: convName,
       actor_id: msg.actorId,
-      actor_name: isMe ? ownerName : msg.actorId,
+      actor_name: actorName,
       is_me: isMe,
       time: msg.createdAtMs || Date.now(),
       text: text.slice(0, 2000),
@@ -491,6 +526,11 @@ export class PersonalWebBridge {
     this.scheduleFastLane(trigger);
   }
 
+  /** 对方姓名：跨通道匹配记下的姓名；私聊里对方发的消息用会话名（即对方姓名）；都没有才退回原生 ID */
+  private actorDisplayName(actorId: string, kind: WebMessage["conversationKind"], chatName: string): string {
+    return this.store.pwAlias("actor", actorId) || (kind === "dm" && isRealConvName(chatName) ? chatName : actorId);
+  }
+
   private scheduleFastLane(trigger: FastTrigger): void {
     const prev = this.debounceTimers.get(trigger.conv);
     if (prev) clearTimeout(prev);
@@ -528,7 +568,7 @@ export class PersonalWebBridge {
             conv,
             conv_name: convName,
             actor_id: m.actorId,
-            actor_name: isMe ? ownerName : m.actorId,
+            actor_name: isMe ? ownerName : this.actorDisplayName(m.actorId, m.conversationKind, convName),
             is_me: isMe,
             time: m.createdAtMs || Date.now(),
             text: m.text.trim().slice(0, 2000),
@@ -592,7 +632,12 @@ export class PersonalWebBridge {
       };
     }
 
-    if (!this.cfg.context.personal_web.send_replies) {
+    if (prev?.status === "sending") {
+      throw new Error("上次个人 Web 发送结果不明确（对方可能已经收到），为避免重复发送已停止自动重试；请先在飞书核实");
+    }
+    // 已发出只差回读核验的回复不需要发送权限，关掉 send_replies 后仍可完成确认
+    const readbackOnly = prev?.status === "created" && !!prev.replyId;
+    if (!readbackOnly && !this.cfg.context.personal_web.send_replies) {
       throw new Error("未开启个人 Web 回复（需在配置中设置 context.personal_web.send_replies: true）");
     }
 
@@ -608,7 +653,7 @@ export class PersonalWebBridge {
     }
 
     // 上次已成功发包但回读中断：直接走回读核验，绝不二次发包
-    if (prev?.status === "created" && prev.replyId) {
+    if (readbackOnly && prev) {
       const res = await client.verifyReplyReadback({
         replyId: prev.replyId,
         chatId: prev.chatId,
@@ -622,33 +667,46 @@ export class PersonalWebBridge {
       return res;
     }
 
-    const res = await client.sendVerifiedReply(
-      {
-        chatId: args.chat_id,
-        messageId: args.message_id,
-        rootId: args.root_id,
-        text: args.text,
-        cid: args.cid,
-      },
-      {
-        onBeforeSend: ({ chat }) => {
-          if (this.isDeniedChat(args.chat_id, chat.name)) {
-            throw new Error(`目标会话「${chat.name || args.chat_id}」已被排除或静音，拒绝发送个人 Web 回复`);
-          }
+    let entered = false;
+    let created = false;
+    let res: VerifiedReplyResult;
+    try {
+      res = await client.sendVerifiedReply(
+        {
+          chatId: args.chat_id,
+          messageId: args.message_id,
+          rootId: args.root_id,
+          text: args.text,
+          cid: args.cid,
         },
-        onCreated: ({ replyId, rootId, parentId, threaded }) => {
-          this.saveDelivery(args.cid, {
-            status: "created",
-            replyId,
-            chatId: args.chat_id,
-            rootId,
-            parentId,
-            threaded,
-            updatedAt: Date.now(),
-          });
+        {
+          onBeforeSend: ({ chat, rootId, parentId, threaded }) => {
+            if (this.isDeniedChat(args.chat_id, chat.name)) {
+              throw new Error(`目标会话「${chat.name || args.chat_id}」已被排除或静音，拒绝发送个人 Web 回复`);
+            }
+            // 发包前先记 sending：之后若结果不明（超时、断线、进程被杀），重试会停在这里而不是再发一次
+            this.saveDelivery(args.cid, { status: "sending", replyId: "", chatId: args.chat_id, rootId, parentId, threaded, updatedAt: Date.now() });
+            entered = true;
+          },
+          onCreated: ({ replyId, rootId, parentId, threaded }) => {
+            created = true;
+            this.saveDelivery(args.cid, {
+              status: "created",
+              replyId,
+              chatId: args.chat_id,
+              rootId,
+              parentId,
+              threaded,
+              updatedAt: Date.now(),
+            });
+          },
         },
-      },
-    );
+      );
+    } catch (err) {
+      // 只有服务端明确拒绝（未创建消息）才撤销 sending 允许重试；结果不明时保留 sending
+      if (entered && !created && isDefinitiveNonCreationError(err)) this.app.store.set(`${DELIVERY_KV_PREFIX}${args.cid}`, "");
+      throw err;
+    }
     this.saveDelivery(args.cid, {
       status: "verified",
       replyId: res.replyId,
@@ -661,6 +719,13 @@ export class PersonalWebBridge {
     });
     return res;
   }
+}
+
+/** 请求被服务端明确拒绝（因此确定没有创建消息）的错误；超时、断线、5xx、空载荷都不算 */
+function isDefinitiveNonCreationError(err: unknown): boolean {
+  if (err instanceof WebHttpError && err.status !== undefined) return [400, 401, 403, 404].includes(err.status);
+  if (err instanceof GatewayError) return !err.emptyPayload && typeof err.status === "number" && err.status !== 0;
+  return false;
 }
 
 function waitAbortable(ms: number, signal: AbortSignal): Promise<void> {

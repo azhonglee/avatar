@@ -194,12 +194,79 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
           meta: { message_id: "om_grp_9001", chat_type: "group" },
         },
       ]);
-      assert.equal(n2, 0, "matching lark-cli message enriches existing pw:* obs");
-      const enriched = svc.store.obs("pw:9001")!;
-      assert.equal(enriched.conv_name, "核心架构群");
+      assert.equal(n2, 0, "matching lark-cli message is deduplicated against the existing pw:* obs");
+      // pw:9001 只有占位会话名（弱匹配）：只去重，不回填开放平台 ID 和名称
+      const weak = svc.store.obs("pw:9001")!;
+      assert.equal(weak.conv_name, "群聊(c1)");
+      assert.equal(weak.meta.open_message_id, undefined);
+
+      // 双方都有真实群名且一致（强匹配）：回填开放平台 ID 与姓名，并记下原生 ID 的对应关系
+      svc.store.addObs([
+        {
+          id: "pw:9002",
+          source: "im",
+          kind: "group",
+          conv: "pw_chat:c2",
+          conv_name: "核心架构群",
+          actor_id: "8888",
+          actor_name: "8888",
+          is_me: false,
+          time: now + 3000,
+          text: "收到",
+          url: "",
+          meta: { transport: "personal_web", native_message_id: "9002", native_chat_id: "c2", native_root_id: "9002", chat_type: "group" },
+        },
+      ]);
+      const n3 = svc.store.addObs([
+        {
+          id: "im:om_grp_9002",
+          source: "im",
+          kind: "group",
+          conv: "oc_grp_1",
+          conv_name: "核心架构群",
+          actor_id: "ou_zs",
+          actor_name: "张三",
+          is_me: false,
+          time: now + 3500,
+          text: "收到",
+          url: "https://feishu.cn/grp",
+          meta: { message_id: "om_grp_9002", chat_type: "group" },
+        },
+      ]);
+      assert.equal(n3, 0);
+      const enriched = svc.store.obs("pw:9002")!;
       assert.equal(enriched.actor_name, "张三");
-      assert.equal(enriched.meta.open_message_id, "om_grp_9001");
+      assert.equal(enriched.meta.open_message_id, "om_grp_9002");
       assert.equal(enriched.meta.open_chat_id, "oc_grp_1");
+      assert.equal(svc.store.pwAlias("chat", "c2"), "oc_grp_1");
+      assert.equal(svc.store.pwAlias("actor", "8888"), "张三");
+
+      // 另一个群里同一句短话：会话名不同，不得合并或回填
+      const n4 = svc.store.addObs([
+        {
+          id: "im:om_other_grp",
+          source: "im",
+          kind: "group",
+          conv: "oc_grp_2",
+          conv_name: "运营周会群",
+          actor_id: "ou_ls",
+          actor_name: "李四",
+          is_me: false,
+          time: now + 4000,
+          text: "收到",
+          url: "",
+          meta: { message_id: "om_other_grp", chat_type: "group" },
+        },
+      ]);
+      assert.equal(n4, 1, "same short text from a different chat must be stored separately");
+      assert.equal(svc.store.obs("pw:9002")!.meta.open_message_id, "om_grp_9002");
+
+      // 按 oc_ ID 配置的排除在个人 Web 通道同样生效（借助跨通道记下的对应关系）
+      app.cfg.context.groups_deny = ["oc_grp_1"];
+      assert.equal(svc.personalWeb.isDeniedChat("c2", ""), true);
+      app.cfg.context.groups_deny = [];
+      svc.store.muteConv("oc_grp_1", "核心架构群", true);
+      assert.equal(svc.personalWeb.isDeniedChat("c2", ""), true, "mute recorded under the oc_ ID applies to the native chat");
     } finally {
       app.store.db.close();
       fs.rmSync(dir, { recursive: true, force: true });
@@ -270,16 +337,14 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
     process.env.PA_FEISHU_WEB_KEY = "bridge-test-key";
     const app = makeApp(dir);
     try {
-      // Mismatched open_id rejected
-      assert.throws(
-        () =>
-          verifyLoginForWorkspace(app, {
-            owner_id: "1001",
-            owner_name: "Other",
-            owner_open_id: "ou_someone_else",
-            cookies: [],
-          }),
-        /不一致/,
+      // open_id 按应用区分，网页端的 open_id 与 owner.open_id 不同不能据此拒绝（只告警）
+      assert.doesNotThrow(() =>
+        verifyLoginForWorkspace(app, {
+          owner_id: "1001",
+          owner_name: "Other",
+          owner_open_id: "ou_someone_else",
+          cookies: [],
+        }),
       );
 
       // Matching open_id accepted and bound
@@ -323,6 +388,16 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
       });
       assert.equal(res.verified, true);
       assert.equal(res.replyId, "rep-1");
+
+      // 上次发包结果不明（sending）：拒绝自动重发，也不触网
+      app.store.set(
+        "ctx.pw_delivery.cid-uncertain",
+        JSON.stringify({ status: "sending", replyId: "", chatId: "chat-1", rootId: "root-1", parentId: "root-1", threaded: true, updatedAt: Date.now() }),
+      );
+      await assert.rejects(
+        svc.personalWeb.sendVerifiedReply({ chat_id: "chat-1", message_id: "root-1", text: "重复投递测试", cid: "cid-uncertain" }),
+        /结果不明确/,
+      );
     } finally {
       app.store.db.close();
       if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;

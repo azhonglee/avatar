@@ -74,7 +74,10 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
           break;
         case "pw.reply": {
           if (!hooks.pwReply) throw new Error("个人 Web 回复未注册");
-          const cid = createHash("sha256").update(`avatar-pw\0${item.id}`).digest("hex").slice(0, 32);
+          // 按草稿 + 正文生成 cid：同一草稿再次确认（新的 effect id）也命中同一条投递记录，不会重复发送；改了正文才算新回复
+          const textHash = createHash("sha256").update(e.args.text.replace(/\r\n/g, "\n").trim()).digest("hex");
+          const key = e.args.draft_id ? `draft:${e.args.draft_id}:${textHash}` : item.id;
+          const cid = createHash("sha256").update(`avatar-pw\0${key}`).digest("hex").slice(0, 32);
           await hooks.pwReply({
             chat_id: e.args.chat_id,
             message_id: e.args.message_id,

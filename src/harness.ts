@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { ROOT, type Config } from "./config.ts";
 import type { Profile } from "./guard.ts";
-import { runProcess } from "./util.ts";
+import { runProcess, scrubPersonalWebEnv } from "./util.ts";
 
 export interface HarnessRun {
   harness: string;
@@ -45,13 +45,7 @@ export interface HarnessResult {
   aborted: boolean;
 }
 
-/** 从子 harness 环境中移除个人 Web 凭据相关变量，避免被子进程默认继承。 */
-export function scrubPersonalWebEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const out: NodeJS.ProcessEnv = { ...base };
-  delete out.PA_FEISHU_WEB_KEY;
-  delete out.PA_FEISHU_WEB_CRED_FILE;
-  return out;
-}
+export { scrubPersonalWebEnv } from "./util.ts";
 
 /** 通过 acpx（ACP）以无头方式调用任一 harness 跑一次性任务，返回最终回复文本。 */
 export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessResult> {

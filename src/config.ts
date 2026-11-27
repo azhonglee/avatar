@@ -215,7 +215,7 @@ const Schema = z.object({
       /** 群消息范围：spoken = @我、私聊和我发言过的群；allowlist = 只看 groups_allow 里的群（加上 @我、私聊） */
       groups: z.enum(["spoken", "allowlist"]).default("spoken"),
       groups_allow: z.array(z.string()).default([]),
-      /** 永远不读的会话（chat_id 或群名关键字） */
+      /** 永远不读的会话（chat_id 或群名关键字；个人 Web 通道还可写 pw_chat:<原生会话ID>） */
       groups_deny: z.array(z.string()).default([]),
       max_groups: z.number().int().min(1).max(200).default(40),
       /** 保留哪些机器人的通知（名字或内容匹配任一正则即保留；其余机器人消息当噪音丢弃） */

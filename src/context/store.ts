@@ -146,6 +146,29 @@ export function norm(s: string): string {
     .trim();
 }
 
+/** 会话名未知时（只有占位名），正文至少这么长才认为是同一条消息 */
+const WEAK_MERGE_MIN_CHARS = 8;
+
+/** 占位会话名（个人 Web 未查到名称时的“群聊(…)”/“私聊：…”，或 lark-cli 缺 chat_name 时的“群聊”/“私聊”）不能证明是同一会话 */
+export function isRealConvName(s: string): boolean {
+  return !!s && !/^(群聊|私聊)($|\(|：)/.test(s);
+}
+
+/** 个人 Web 拿不到姓名时 actor_name 是原生数字 ID，不能用来比对 */
+export function isRealActorName(s: string): boolean {
+  return !!s && !/^\d+$/.test(s);
+}
+
+/** 跨通道判断两条观测是否同一条消息：会话名或发送人明确不同 → none；双方都有真实会话名且一致 → strong；否则 weak。 */
+function crossMatch(a: Row, b: Pick<Obs, "conv_name" | "actor_name">): "strong" | "weak" | "none" {
+  const aConv = String(a.conv_name ?? "");
+  const aActor = String(a.actor_name ?? "");
+  const convKnown = isRealConvName(aConv) && isRealConvName(b.conv_name);
+  if (convKnown && aConv !== b.conv_name) return "none";
+  if (isRealActorName(aActor) && isRealActorName(b.actor_name) && aActor !== b.actor_name) return "none";
+  return convKnown ? "strong" : "weak";
+}
+
 function grams(s: string): Set<string> {
   const n = norm(s);
   const g = new Set<string>();
@@ -240,6 +263,7 @@ export class ContextStore {
         target TEXT NOT NULL DEFAULT '{}', target_label TEXT NOT NULL DEFAULT '', content TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'proposed', error TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL, updated INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS ctx_mute_conv (conv TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS ctx_pw_alias (kind TEXT NOT NULL, native_id TEXT NOT NULL, value TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (kind, native_id));
     `);
     // 迁移：子项目
     const cols = new Set((db.prepare("PRAGMA table_info(ctx_project)").all() as { name: string }[]).map((c) => c.name));
@@ -297,15 +321,28 @@ export class ContextStore {
               const otherPrefix = o.id.startsWith("im:") ? "pw:%" : "im:%";
               const inChatType = String(o.meta.chat_type ?? "");
               const cands = nearIm.all(o.is_me ? 1 : 0, o.time - 15_000, o.time + 15_000, otherPrefix) as Row[];
+              let strong = false;
               const hit = cands.find((c) => {
                 if (norm(String(c.text ?? "")) !== nt) return false;
                 const cMeta = j<Record<string, unknown>>(c.meta, {});
                 const cChatType = String(cMeta.chat_type ?? "");
-                return !inChatType || !cChatType || inChatType === cChatType;
+                if (inChatType && cChatType && inChatType !== cChatType) return false;
+                const m = crossMatch(c, o);
+                if (m === "none" || (m === "weak" && nt.length < WEAK_MERGE_MIN_CHARS)) return false;
+                strong = m === "strong";
+                return true;
               });
+              // 弱匹配（会话名未知）只丢弃重复观测，不回填任何 ID 或名称，防止把另一个会话的开放平台 ID 写到这条消息上
+              if (hit && !strong) continue;
               if (hit) {
                 const hitMeta = j<Record<string, unknown>>(hit.meta, {});
                 const isIncomingLark = o.id.startsWith("im:");
+                const nativeChat = String(isIncomingLark ? (hitMeta.native_chat_id ?? "") : (o.meta.native_chat_id ?? ""));
+                const openChat = isIncomingLark ? o.conv : String(hit.conv ?? "");
+                if (nativeChat && openChat.startsWith("oc_")) this.setPwAlias("chat", nativeChat, openChat);
+                const nativeActor = isIncomingLark ? String(hit.actor_id ?? "") : o.actor_id;
+                const larkActorName = isIncomingLark ? o.actor_name : String(hit.actor_name ?? "");
+                if (!o.is_me && nativeActor && isRealActorName(larkActorName)) this.setPwAlias("actor", nativeActor, larkActorName);
                 const mergedMeta = isIncomingLark
                   ? {
                       ...hitMeta,
@@ -349,7 +386,7 @@ export class ContextStore {
     const now = Date.now();
     const get = this.db.prepare("SELECT 1 FROM ctx_obs WHERE id = ?");
     const nearIm = this.db.prepare(
-      `SELECT text FROM ctx_obs WHERE source = 'im' AND is_me = ? AND time BETWEEN ? AND ? LIMIT 30`,
+      `SELECT text, conv_name, actor_name FROM ctx_obs WHERE source = 'im' AND is_me = ? AND time BETWEEN ? AND ? LIMIT 30`,
     );
     const ins = this.db.prepare(
       `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed)
@@ -362,8 +399,13 @@ export class ContextStore {
         if (get.get(o.id)) continue;
         const nt = norm(o.text);
         if (o.source === "im" && nt.length >= 2) {
-          const cands = nearIm.all(o.is_me ? 1 : 0, o.time - 15_000, o.time + 15_000) as { text: string }[];
-          if (cands.some((c) => norm(c.text) === nt)) continue;
+          const cands = nearIm.all(o.is_me ? 1 : 0, o.time - 15_000, o.time + 15_000) as Row[];
+          const dup = cands.some((c) => {
+            if (norm(String(c.text ?? "")) !== nt) return false;
+            const m = crossMatch(c, o);
+            return m === "strong" || (m === "weak" && nt.length >= WEAK_MERGE_MIN_CHARS);
+          });
+          if (dup) continue;
         }
         ins.run(o.id, o.source, o.kind, o.conv, o.conv_name, o.actor_id, o.actor_name, o.is_me ? 1 : 0, o.time, o.text, o.url, JSON.stringify(o.meta ?? {}), now);
         n++;
@@ -430,6 +472,16 @@ export class ContextStore {
 
   mutedConvs(): { conv: string; name: string }[] {
     return this.db.prepare("SELECT conv, name FROM ctx_mute_conv").all() as { conv: string; name: string }[];
+  }
+
+  /** 个人 Web 原生 ID 与开放平台的对应（chat：原生会话 ID → oc_；actor：原生用户 ID → 姓名），来自跨通道强匹配 */
+  setPwAlias(kind: "chat" | "actor", nativeId: string, value: string): void {
+    this.db.prepare("INSERT OR REPLACE INTO ctx_pw_alias (kind, native_id, value, at) VALUES (?, ?, ?, ?)").run(kind, nativeId, value, Date.now());
+  }
+
+  pwAlias(kind: "chat" | "actor", nativeId: string): string {
+    const r = this.db.prepare("SELECT value FROM ctx_pw_alias WHERE kind = ? AND native_id = ?").get(kind, nativeId) as { value: string } | undefined;
+    return r?.value ?? "";
   }
 
   // ───────── 项目 ─────────
