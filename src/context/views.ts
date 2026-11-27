@@ -17,7 +17,7 @@ import type {
 } from "../api/types.ts";
 import { defaultDraftKind } from "./drafts.ts";
 import { hasWorkspaceOwnerMismatch } from "./personal-web.ts";
-import { obsRevision, type ContextStore, type DraftRow, type ItemRow, type ProjectRow } from "./store.ts";
+import { obsRevisionToken, type ContextStore, type DraftRow, type ItemRow, type ProjectRow } from "./store.ts";
 
 /**
  * 排序与视图：确定性规则给事项打分（并说明原因），组装今天页、项目页等视图。
@@ -171,7 +171,7 @@ export class ContextViews {
       const cl = c.claims[i];
       const obs = cl.obs_id ? this.store.obs(cl.obs_id) : undefined;
       if (obs?.meta.withdrawn === true) continue;
-      if (obs && cl.obs_rev && obsRevision(obs) !== cl.obs_rev) continue;
+      if (obs && cl.obs_rev && obsRevisionToken(obs) !== cl.obs_rev) continue;
       claims.push({
         index: i,
         ...(cl.obs_rev ? { obs_rev: cl.obs_rev } : {}),

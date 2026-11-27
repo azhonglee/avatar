@@ -97,7 +97,7 @@ import {
   saveWorkspaceBinding,
   verifyWorkspaceOwnerBinding,
 } from "../src/context/personal-web.ts";
-import { ContextStore, obsRevision, type Obs } from "../src/context/store.ts";
+import { ContextStore, obsRevision, obsRevisionToken, type Obs } from "../src/context/store.ts";
 import {
   branchUsesGitLfs,
   classifyGitRemoteTransport,
@@ -111,6 +111,7 @@ import {
   parseRemote,
   parseScpGitUrl,
   pushBranch,
+  redactGitUrls,
   remoteDefaultBranch,
   resolveAuthorizedSshAuthSock,
   resolveExternalLfsStorageGitOpts,
@@ -2992,7 +2993,9 @@ test("Codex 第四轮回归：凭据加密与 harness 隔离、工作区主人�
     });
     const mHandle = mismatchBridge.start();
     await waitUntil(() => mismatchBridge.status().state === "needs_login");
-    assert.match(mismatchBridge.status().last_error, /已绑定的工作区主人 \(ou_owner_a\) 不一致/);
+    assert.match(mismatchBridge.status().last_error, /owner\.open_id.*不一致/);
+    assert.ok(!mismatchBridge.status().last_error.includes("ou_owner_a"), "跨主人冲突状态绝不得向新主人泄露旧主人 open_id");
+    assert.equal(mismatchBridge.status().last_message_at, null, "跨主人冲突状态绝不得泄露旧主人 last_message_at");
     mHandle.stop();
     app.cfg.owner.open_id = "ou_owner_a";
 
@@ -25164,6 +25167,45 @@ test("第三十一轮 Codex Review 缺陷回归：未入选群须显式@我、CL
           },
           content: "明天同步结果",
         });
+        const sentCalls: string[][] = [];
+        const liveMgetMap = new Map<string, Record<string, unknown>>([
+          [
+            "om_r31_reply_src",
+            {
+              message_id: "om_r31_reply_src",
+              chat_id: "oc_r31_unselected_g",
+              chat_name: "外部群",
+              chat_type: "group",
+              content: "@测试主人 帮我看看",
+              mentions: [{ id: "ou_r31_owner_A" }],
+            },
+          ],
+          [
+            "om_r31_send_src",
+            {
+              message_id: "om_r31_send_src",
+              chat_id: "oc_r31_unselected_g",
+              chat_name: "外部群",
+              chat_type: "group",
+              content: "@测试主人 明天确认",
+              mentions: [{ id: "ou_r31_owner_A" }],
+            },
+          ],
+        ]);
+        const fakeLark = app.lark as unknown as {
+          authStatus: () => Promise<unknown>;
+          run: (argv: string[]) => Promise<unknown>;
+        };
+        fakeLark.authStatus = async () => ({ identity: "user", user: { open_id: "ou_r31_owner_A" } });
+        fakeLark.run = async (argv: string[]) => {
+          if (argv[0] === "im" && argv[1] === "+messages-mget") {
+            const ids = (argv[argv.indexOf("--message-ids") + 1] ?? "").split(",").filter(Boolean);
+            return { messages: ids.map((id) => liveMgetMap.get(id)).filter(Boolean) };
+          }
+          sentCalls.push(argv);
+          return {};
+        };
+
         await app.commands.exec("context.draft_approve", { id: dReply.id }, { source: "card", actor: "owner" });
         await app.commands.exec("context.draft_approve", { id: dSend.id }, { source: "card", actor: "owner" });
 
@@ -25190,16 +25232,6 @@ test("第三十一轮 Codex Review 缺陷回归：未入选群须显式@我、CL
           },
         ]);
 
-        const sentCalls: string[][] = [];
-        const fakeLark = app.lark as unknown as {
-          authStatus: () => Promise<unknown>;
-          run: (argv: string[]) => Promise<unknown>;
-        };
-        fakeLark.authStatus = async () => ({ identity: "user", user: { open_id: "ou_r31_owner_A" } });
-        fakeLark.run = async (argv: string[]) => {
-          sentCalls.push(argv);
-          return {};
-        };
         const effHandler = (app.engine as unknown as { handlers: Map<string, { run: (it: unknown, ctx: unknown) => Promise<void> }> }).handlers.get("effect");
         assert.ok(effHandler, "effect handler 应已注册");
         const dummyCtx = { attempt: 1, signal: new AbortController().signal };
@@ -25322,7 +25354,7 @@ test("第三十一轮 Codex Review 缺陷回归：未入选群须显式@我、CL
           "源消息已编辑时携带旧 obs_rev 必须拒绝",
         );
 
-        // 重理解再次 addConflict：同 obs_id 原地替换新说法与新 obs_rev
+        // 重理解再次 addConflict：新修订追加到新索引（保留旧索引 0 失效），旧卡片无论是否携带 obs_rev 都无法误命中新说法
         ctxSvc.store.addConflict({
           project_id: "",
           topic: "评审时间",
@@ -25331,18 +25363,25 @@ test("第三十一轮 Codex Review 缺陷回归：未入选群须显式@我、CL
         });
         const refreshedView = ctxSvc.views.conflictView(ctxSvc.store.conflict(cf.id)!);
         assert.equal(refreshedView.claims.length, 2);
-        assert.equal(refreshedView.claims[0].claim, "周一评审");
-        const newRev1 = refreshedView.claims[0].obs_rev;
-        assert.ok(newRev1 && newRev1 !== oldRev1, "重理解后 obs_rev 必须更新");
+        const newClaim = refreshedView.claims.find((c) => c.claim === "周一评审")!;
+        assert.ok(newClaim, "视图应展示重理解后的新说法");
+        assert.equal(newClaim.index, 2, "新修订说法必须追加至新索引而非覆写旧索引 0");
+        const newRev1 = newClaim.obs_rev;
+        assert.ok(newRev1 && newRev1 !== oldRev1 && /^[0-9a-f]{32}$/.test(newRev1), "obs_rev 应为紧凑 32 位十六进制摘要");
 
         await assert.rejects(
-          () => app.commands.exec("context.conflict_resolve", { id: cf.id, choice: 0, obs_rev: oldRev1 }, { source: "card", actor: "owner" }),
+          () => app.commands.exec("context.conflict_resolve", { id: cf.id, choice: 0 }, { source: "card", actor: "owner" }),
           /编辑|失效/,
-          "重理解原地替换后，旧卡片发回的旧 obs_rev 仍必须被拒绝",
+          "重理解后，不带 obs_rev 的旧卡片点击 choice=0 仍必须被拒绝",
+        );
+        await assert.rejects(
+          () => app.commands.exec("context.conflict_resolve", { id: cf.id, choice: newClaim.index, obs_rev: oldRev1 }, { source: "card", actor: "owner" }),
+          /编辑|失效/,
+          "携带旧 obs_rev 提交新索引仍必须被拒绝",
         );
         const okRes = await app.commands.exec(
           "context.conflict_resolve",
-          { id: cf.id, choice: refreshedView.claims[0].index, obs_rev: newRev1 },
+          { id: cf.id, choice: newClaim.index, obs_rev: newRev1 },
           { source: "card", actor: "owner" },
         );
         assert.equal(okRes.ok, true);
@@ -25734,6 +25773,659 @@ test("第三十一轮 Codex Review 缺陷回归：未入选群须显式@我、CL
         assert.equal(profileCount, 1, "账号不一致绝不得重试");
       } finally {
         await new Promise<void>((resolve) => srv.close(() => resolve()));
+      }
+    }
+  } finally {
+    if (prevPwKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevPwKey;
+    if (prevCredEnv === undefined) delete process.env.PA_FEISHU_WEB_CRED_FILE;
+    else process.env.PA_FEISHU_WEB_CRED_FILE = prevCredEnv;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("子 Agent 联合审查 15 项缺陷回归：pw.reply遵守sources.im、CLI草稿fail-closed与远端实时回读、纯CLI跨主隔离、冲突紧凑摘要与追加索引、mget缺mentions沿用正向实证、spoken越界mine不入库、status防泄露、parseRemote脱敏查询串与@密码、交付瞬态报错脱敏、括号查询串脱敏、Git跨仓insteadOf与易失盘、文件软链bindMount保路径、Settings热改ABA回滚、Dispatcher步骤防泄漏与unshare后置软链顺序", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-subreview-"));
+  const prevPwKey = process.env.PA_FEISHU_WEB_KEY;
+  const prevCredEnv = process.env.PA_FEISHU_WEB_CRED_FILE;
+  delete process.env.PA_FEISHU_WEB_CRED_FILE;
+  process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
+
+  const makeCfg = (
+    dataDir: string,
+    opts: {
+      ownerOpenId?: string;
+      ctxEnabled?: boolean;
+      imEnabled?: boolean;
+      pwEnabled?: boolean;
+      sendReplies?: boolean;
+      groups?: "spoken" | "allowlist";
+      groupsAllow?: string[];
+      groupsDeny?: string[];
+      maxGroups?: number;
+    } = {},
+  ) => ({
+    data_dir: dataDir,
+    owner: { open_id: opts.ownerOpenId ?? "ou_sr_owner_A", name: "审查主人", timezone: "Asia/Shanghai" },
+    roles: { brain: "stub", reviewer: "stub" },
+    harnesses: { stub: { type: "codex-exec", cmd: "/nonexistent/pa-sr-stub-bin" } },
+    dispatch: { default_harness: "stub" },
+    lark: { enabled: true },
+    server: { enabled: false },
+    cards: { enabled: false },
+    context: {
+      enabled: opts.ctxEnabled ?? true,
+      groups: opts.groups ?? "allowlist",
+      groups_allow: opts.groupsAllow ?? ["已入选群"],
+      groups_deny: opts.groupsDeny ?? [],
+      max_groups: opts.maxGroups ?? 5,
+      sources: { meego: false, tasks: false, im: opts.imEnabled ?? true, minutes: false, calendar: false, docs: false },
+      personal_web: {
+        enabled: opts.pwEnabled ?? false,
+        pre_draft: false,
+        send_replies: opts.sendReplies ?? false,
+      },
+    },
+    bins: { lark_cli: path.join(STUBS, "lark-cli.mjs") },
+  });
+
+  const makeApp = (sub: string, opts: Parameters<typeof makeCfg>[1] = {}) => {
+    const dataDir = path.join(dir, `${sub}-data`);
+    fs.mkdirSync(dataDir, { recursive: true });
+    const cfgFile = path.join(dir, `${sub}-config.yaml`);
+    fs.writeFileSync(cfgFile, JSON.stringify(makeCfg(dataDir, opts), null, 2), "utf8");
+    return { app: createApp(loadConfig(cfgFile)), cfgFile, dataDir };
+  };
+
+  try {
+    // 1) [SR-A1 P1] pw.reply 在 context.sources.im: false 时必须在审批与投递两端均被阻断
+    {
+      const { app, cfgFile, dataDir } = makeApp("sr-a1-pw-im-off", {
+        pwEnabled: true,
+        sendReplies: true,
+        imEnabled: true,
+      });
+      try {
+        const ctxSvc = registerContext(app)!;
+        saveWorkspaceBinding(app.store, "7701", "ou_sr_owner_A");
+        ctxSvc.store.addObs([
+          {
+            id: "pw:sr_a1_msg",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:9001",
+            conv_name: "私聊：甲",
+            actor_id: "2",
+            actor_name: "甲",
+            is_me: false,
+            time: Date.now(),
+            text: "请回复我一下",
+            url: "",
+            meta: { transport: "personal_web", native_owner_id: "7701", native_chat_id: "9001", native_message_id: "sr_a1_msg" },
+          },
+        ]);
+        const { item } = ctxSvc.store.upsertItem({ title: "回复甲", kind: "ask_me", source: "im" });
+        const draft = ctxSvc.store.addDraft({
+          item_id: item.id,
+          project_id: "",
+          kind: "reply",
+          target_label: "私聊：甲",
+          target: {
+            transport: "personal_web",
+            obs_id: "pw:sr_a1_msg",
+            native_owner_id: "7701",
+            native_chat_id: "9001",
+            native_message_id: "sr_a1_msg",
+          },
+          content: "好的收到",
+        });
+
+        // 外部磁盘关闭 sources.im: false -> 审批 pw.reply 必须立刻拒绝
+        fs.writeFileSync(
+          cfgFile,
+          JSON.stringify(makeCfg(dataDir, { pwEnabled: true, sendReplies: true, imEnabled: false }), null, 2),
+          "utf8",
+        );
+        await assert.rejects(
+          () => app.commands.exec("context.draft_approve", { id: draft.id }, { source: "web", actor: "owner" }),
+          /IM 采集|sources\.im/,
+          "关闭 context.sources.im 后审批 pw.reply 必须拒绝",
+        );
+        // 投递侧 sendVerifiedReply 同样拒绝
+        await assert.rejects(
+          () =>
+            ctxSvc.personalWeb.sendVerifiedReply({
+              owner_id: "7701",
+              chat_id: "9001",
+              message_id: "sr_a1_msg",
+              text: "好的收到",
+              cid: "cid-sr-a1",
+            }),
+          /IM 采集|sources\.im/,
+          "关闭 context.sources.im 后投递 pw.reply 必须拒绝",
+        );
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 2) [SR-A2 P1] context.enabled: false 时 effectHandler 对 im.reply/im.send 必须 fail-closed；verifyCliDraftTargetForDelivery 实时回读 mget 拦截撤回/去@与范围外 chat_id
+    {
+      // 2a) context.enabled: false（未注册 verifyCliDraftDelivery）
+      const { app } = makeApp("sr-a2-disabled", { ctxEnabled: false });
+      try {
+        const fakeLark = app.lark as unknown as {
+          authStatus: () => Promise<unknown>;
+          run: (argv: string[]) => Promise<unknown>;
+        };
+        const sent: string[][] = [];
+        fakeLark.authStatus = async () => ({ identity: "user", user: { open_id: "ou_sr_owner_A" } });
+        fakeLark.run = async (argv: string[]) => {
+          sent.push(argv);
+          return {};
+        };
+        app.ledger.enqueue({
+          id: "fx:sr-a2-reply",
+          kind: "effect",
+          ref: "ctx-draft:drf_disabled",
+          payload: { op: "im.reply", args: { message_id: "om_x", text: "不应发出" } },
+        });
+        app.ledger.enqueue({
+          id: "fx:sr-a2-send",
+          kind: "effect",
+          ref: "ctx-draft:drf_disabled2",
+          payload: { op: "im.send", args: { chat_id: "oc_x", text: "不应发出" } },
+        });
+        const effHandler = (
+          app.engine as unknown as { handlers: Map<string, { run: (it: unknown, ctx: unknown) => Promise<void> }> }
+        ).handlers.get("effect")!;
+        const dummyCtx = { attempt: 1, signal: new AbortController().signal };
+        await assert.rejects(() => effHandler.run(app.ledger.get("fx:sr-a2-reply")!, dummyCtx), /fail-closed|未启用/);
+        await assert.rejects(() => effHandler.run(app.ledger.get("fx:sr-a2-send")!, dummyCtx), /fail-closed|未启用/);
+        assert.equal(sent.length, 0, "context.enabled=false 时绝不得调用 lark-cli 发消息");
+      } finally {
+        app.store.db.close();
+      }
+
+      // 2b) 远端实时回读发现未入选群原消息已删 @me（即便本地 SQLite 仍陈旧为 live @me）& chat_id-only 群越界
+      const { app: app2 } = makeApp("sr-a2-live-mget", { groups: "allowlist", groupsAllow: ["白名单群"] });
+      try {
+        const ctxSvc = registerContext(app2)!;
+        ctxSvc.store.addObs([
+          {
+            id: "im:om_sr_a2_stale",
+            source: "im",
+            kind: "at_me",
+            conv: "oc_sr_a2_unselected",
+            conv_name: "范围外群",
+            actor_id: "ou_other",
+            actor_name: "同事",
+            is_me: false,
+            time: Date.now(),
+            text: "@审查主人 帮我看下",
+            url: "",
+            meta: { message_id: "om_sr_a2_stale", chat_type: "group", mentions: [{ id: "ou_sr_owner_A" }] },
+          },
+        ]);
+        const { item } = ctxSvc.store.upsertItem({ title: "范围外群回复", kind: "ask_me", source: "im" });
+        const draft = ctxSvc.store.addDraft({
+          item_id: item.id,
+          project_id: "",
+          kind: "reply",
+          target_label: "范围外群",
+          target: { chat_id: "oc_sr_a2_unselected", message_id: "om_sr_a2_stale", obs_id: "im:om_sr_a2_stale" },
+          content: "好的",
+        });
+        const fakeLark = app2.lark as unknown as {
+          authStatus: () => Promise<unknown>;
+          run: (argv: string[]) => Promise<unknown>;
+        };
+        fakeLark.authStatus = async () => ({ identity: "user", user: { open_id: "ou_sr_owner_A" } });
+        fakeLark.run = async (argv: string[]) => {
+          if (argv[0] === "im" && argv[1] === "+messages-mget") {
+            return {
+              messages: [
+                {
+                  message_id: "om_sr_a2_stale",
+                  chat_id: "oc_sr_a2_unselected",
+                  chat_name: "范围外群",
+                  chat_type: "group",
+                  content: "已编辑去掉艾特",
+                  mentions: [],
+                },
+              ],
+            };
+          }
+          return {};
+        };
+        await assert.rejects(
+          () => ctxSvc.verifyCliDraftTargetForDelivery(draft.id, "oc_sr_a2_unselected", "om_sr_a2_stale"),
+          /不再 @本人|移出/,
+          "远端实时回读发现范围外群已去 @me 时必须拒发并撤回本地陈旧观测",
+        );
+        assert.equal(ctxSvc.store.obs("im:om_sr_a2_stale")?.meta.withdrawn, true, "远端确认去@后应顺带撤回本地陈旧观测");
+
+        // chat_id-only 草稿目标群不在白名单内 -> 必须拒绝
+        const chatOnlyDraft = ctxSvc.store.addDraft({
+          item_id: item.id,
+          project_id: "",
+          kind: "followup",
+          target_label: "未入选群",
+          target: { chat_id: "oc_sr_a2_unselected" },
+          content: "跟进一下",
+        });
+        await assert.rejects(
+          () => ctxSvc.verifyCliDraftTargetForDelivery(chatOnlyDraft.id, "oc_sr_a2_unselected"),
+          /移出当前允许的群范围/,
+          "仅含 chat_id 的群草稿若群不在白名单内必须拒绝",
+        );
+      } finally {
+        app2.store.db.close();
+      }
+    }
+
+    // 3) [SR-A3 P1 + SR-A7 P2] 纯 CLI 工作区（仅 owner.open_id，无个人 Web 绑定）换主人时必须触发隔离，且 PersonalWebBridge.status() 零泄露
+    {
+      const { app } = makeApp("sr-a3-cli-owner", { ownerOpenId: "ou_sr_owner_B", pwEnabled: true });
+      try {
+        app.store.set("owner.open_id", "ou_sr_owner_A");
+        app.store.set("ctx.pw.state", JSON.stringify({ state: "listening", owner_id: "7701", owner_name: "旧主人", session_id: "s1", since: 1, last_message_at: 1700000000999, last_error: "旧主人敏感报错 ou_sr_owner_A" }));
+        assert.equal(hasWorkspaceOwnerMismatch(app.store, "ou_sr_owner_B"), true, "纯 CLI 工作区仅凭 owner.open_id 变更也必须触发主人隔离");
+        const ctxSvc = registerContext(app)!;
+        const pwSt = ctxSvc.personalWeb.status();
+        assert.equal(pwSt.logged_in, false);
+        assert.equal(pwSt.last_message_at, null, "PersonalWebBridge.status() 在主人冲突时绝不得泄露旧主人 last_message_at");
+        assert.ok(!pwSt.last_error.includes("ou_sr_owner_A"), "PersonalWebBridge.status() 绝不得泄露旧主人 open_id 或旧报错");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 4) [SR-A4 P2] obsRevisionToken 为 32 位十六进制摘要（不含原文与 NUL），mergeConflicts 与 addConflict 不覆写旧索引
+    {
+      const { app } = makeApp("sr-a4-conflict-token");
+      try {
+        const ctxSvc = registerContext(app)!;
+        const longText = "超长机密正文".repeat(120);
+        ctxSvc.store.addObs([
+          {
+            id: "pw:sr_a4_1",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:a4",
+            conv_name: "私聊",
+            actor_id: "2",
+            actor_name: "甲",
+            is_me: false,
+            time: 100,
+            text: longText,
+            url: "",
+            meta: { at_me: true, mentions: [{ id: "7701", start: 0, end: 2 }], edit_version: 1 },
+          },
+        ]);
+        const obs1 = ctxSvc.store.obs("pw:sr_a4_1")!;
+        const tok1 = obsRevisionToken(obs1);
+        assert.match(tok1, /^[0-9a-f]{32}$/, "obsRevisionToken 应为紧凑 32 位十六进制摘要");
+        assert.ok(!tok1.includes("\0") && !tok1.includes("超长机密正文"));
+
+        const c1 = ctxSvc.store.addConflict({
+          project_id: "",
+          topic: "方案选择",
+          claims: [{ claim: "方案一", quote: "超长", obs_id: "pw:sr_a4_1", time: 100 }],
+        });
+        ctxSvc.store.addObs([
+          {
+            id: "pw:sr_a4_1",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:a4",
+            conv_name: "私聊",
+            actor_id: "2",
+            actor_name: "甲",
+            is_me: false,
+            time: 100,
+            text: "已修改为方案二",
+            url: "",
+            meta: { at_me: true, mentions: [{ id: "7701", start: 0, end: 2 }], edit_version: 2 },
+          },
+        ]);
+        const c2 = ctxSvc.store.addConflict({
+          project_id: "",
+          topic: "方案选择",
+          claims: [{ claim: "方案二", quote: "已修改为方案二", obs_id: "pw:sr_a4_1", time: 100 }],
+        });
+        assert.equal(c2.id, c1.id);
+        assert.equal(ctxSvc.store.conflict(c1.id)!.claims.length, 2, "新修订说法应追加至索引 1，保留失效的索引 0");
+        await assert.rejects(
+          () => app.commands.exec("context.conflict_resolve", { id: c1.id, choice: 0 }, { source: "card", actor: "owner" }),
+          /编辑|失效/,
+          "不带 obs_rev 的旧卡片点击 choice=0 仍必须被拒绝",
+        );
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 5) [SR-A5 P2] 未入选群已撤回复活经 +messages-mget 确认正文一致但 mget 省略 mentions 时，沿用匹配候选的显式 mentions 成功复活
+    {
+      const { app } = makeApp("sr-a5-mget-omit-mentions");
+      try {
+        const ctxSvc = registerContext(app)!;
+        const now = Date.now();
+        ctxSvc.store.addObs([
+          {
+            id: "im:om_sr_a5",
+            source: "im",
+            kind: "at_me",
+            conv: "oc_sr_a5_ext",
+            conv_name: "外部群",
+            actor_id: "ou_other",
+            actor_name: "同事",
+            is_me: false,
+            time: now - 10_000,
+            text: "@审查主人 旧文",
+            url: "",
+            meta: { message_id: "om_sr_a5", chat_type: "group", poll_observed_at: now - 10_000 },
+          },
+        ]);
+        ctxSvc.store.retirePendingObs("im:om_sr_a5", { pollObservedAt: now - 5_000 });
+        const fakeLark = app.lark as unknown as {
+          authStatus: () => Promise<unknown>;
+          run: (argv: string[]) => Promise<unknown>;
+        };
+        fakeLark.authStatus = async () => ({ identity: "user", user: { open_id: "ou_sr_owner_A" } });
+        fakeLark.run = async (argv: string[]) => {
+          if (argv[0] === "im" && argv[1] === "+messages-search" && argv.includes("--is-at-me")) {
+            return {
+              messages: [
+                {
+                  message_id: "om_sr_a5",
+                  chat_id: "oc_sr_a5_ext",
+                  chat_name: "外部群",
+                  chat_type: "group",
+                  sender: { id: "ou_other", name: "同事" },
+                  content: "@审查主人 恢复艾特请看",
+                  mentions: [{ id: "ou_sr_owner_A", name: "审查主人" }],
+                  create_time: String(now - 10_000),
+                },
+              ],
+              has_more: false,
+            };
+          }
+          if (argv[0] === "im" && argv[1] === "+messages-mget") {
+            return {
+              messages: [
+                {
+                  message_id: "om_sr_a5",
+                  chat_id: "oc_sr_a5_ext",
+                  chat_name: "外部群",
+                  chat_type: "group",
+                  sender: { id: "ou_other", name: "同事" },
+                  content: "@审查主人 恢复艾特请看",
+                  // 故意省略 mentions，验证沿用匹配候选的显式正向 mentions
+                  create_time: String(now - 10_000),
+                },
+              ],
+            };
+          }
+          return { messages: [], items: [], has_more: false };
+        };
+        await ctxSvc.connectors.pullIm(0, "ou_sr_owner_A");
+        const revived = ctxSvc.store.obs("im:om_sr_a5");
+        assert.ok(revived && revived.meta.withdrawn !== true, "mget 确认正文一致时应沿用正向 mentions 复活观测而非误丢");
+        assert.equal(revived?.text, "@审查主人 恢复艾特请看");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 6) [SR-A6 P2] spoken 模式下超出 max_groups 的本人历史发言（mine）不得入库 ctx_obs
+    {
+      const { app } = makeApp("sr-a6-spoken-mine", { groups: "spoken", maxGroups: 1 });
+      try {
+        const ctxSvc = registerContext(app)!;
+        const now = Date.now();
+        const fakeLark = app.lark as unknown as {
+          authStatus: () => Promise<unknown>;
+          run: (argv: string[]) => Promise<unknown>;
+        };
+        fakeLark.authStatus = async () => ({ identity: "user", user: { open_id: "ou_sr_owner_A" } });
+        fakeLark.run = async (argv: string[]) => {
+          if (argv[0] === "im" && argv[1] === "+messages-search" && argv.includes("--sender")) {
+            return {
+              messages: [
+                {
+                  message_id: "om_sr_a6_old",
+                  chat_id: "oc_sr_a6_old",
+                  chat_name: "旧群",
+                  chat_type: "group",
+                  sender: { id: "ou_sr_owner_A", name: "审查主人" },
+                  content: "我在旧群说过一句话",
+                  create_time: String(now - 60_000),
+                },
+                {
+                  message_id: "om_sr_a6_new",
+                  chat_id: "oc_sr_a6_new",
+                  chat_name: "新群",
+                  chat_type: "group",
+                  sender: { id: "ou_sr_owner_A", name: "审查主人" },
+                  content: "我在新群刚刚说过话",
+                  create_time: String(now - 1_000),
+                },
+              ],
+              has_more: false,
+            };
+          }
+          return { messages: [], items: [], has_more: false };
+        };
+        await ctxSvc.connectors.pullIm(0, "ou_sr_owner_A");
+        assert.equal(ctxSvc.store.obs("im:om_sr_a6_old"), undefined, "spoken 模式超出 max_groups 的旧群 mine 消息不得入库 ctx_obs");
+        assert.ok(ctxSvc.store.obs("im:om_sr_a6_new"), "入选的新群 mine 消息应正常入库");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 7 & 8 & 9) [SR-B1 + SR-B3 + SR-B2 P1] parseRemote 剥离 query/fragment 并支持密码内 @；redactGitUrls/maskUrl 正确处理查询串内括号；交付瞬态错误脱敏
+    {
+      assert.deepEqual(
+        parseRemote("https://gitlab.example.com/org/repo.git?private_token=SR_B1_SECRET#frag"),
+        { host: "gitlab.example.com", path: "org/repo" },
+        "parseRemote 必须剥离 ?query 与 #fragment，绝不能把令牌带入 remote.path",
+      );
+      assert.deepEqual(
+        parseRemote("https://alice:p@ss@github.com/org/repo.git"),
+        { host: "github.com", path: "org/repo" },
+        "parseRemote 必须支持密码内含 @ 的 URL",
+      );
+      assert.deepEqual(
+        parseRemote("git@gitlab.example.com:org/sub/repo.git?tok=secret"),
+        { host: "gitlab.example.com", path: "org/sub/repo" },
+      );
+
+      const s3Err = 'Get "https://s3.example.com/oid?response-content-disposition=attachment%3Bfilename%3Ddoc(1).pdf&X-Amz-Signature=SR_B3_SIG&X-Amz-Security-Token=SR_B3_TOK": EOF';
+      const maskedS3 = maskUrl(s3Err);
+      assert.ok(maskedS3.includes('Get "https://s3.example.com/oid?***": EOF'), `查询串内配对括号不得提前截断脱敏：${maskedS3}`);
+      assert.ok(!maskedS3.includes("SR_B3_SIG") && !maskedS3.includes("SR_B3_TOK"));
+
+      const wrappedParen = redactGitUrls("failed (https://host.example/p?token=SR_B3_WRAP) done");
+      assert.equal(wrappedParen, "failed (https://host.example/p?***) done", "外围未配对右括号应保留");
+    }
+
+    // 10) [SR-B4 P1] stageSanitizedGitConfig 阻断同用户名不同令牌的 url.*.insteadOf 跨仓泄露，并把 [lfs "...@"] 与 ?query 纳入易失盘强制校验
+    {
+      const entries = [
+        { key: "url.https://oauth2:glpat-ADMIN-SECRET@gitlab.example.com/.insteadof", value: "admin-gl:" },
+        { key: "url.https://oauth2:glpat-LOWPRIV@gitlab.example.com/.insteadof", value: "low-gl:" },
+      ];
+      const outNoPass = sanitizeGitConfigEntries(entries, {
+        allowedRemoteUrls: ["https://oauth2@gitlab.example.com/team/app.git"],
+      });
+      assert.ok(!outNoPass.includes("glpat-ADMIN-SECRET"), "无密码远端绝不得继承同用户名 oauth2 的 ADMIN 令牌 insteadOf");
+      assert.ok(!outNoPass.includes("glpat-LOWPRIV"));
+
+      const outLowPass = sanitizeGitConfigEntries(entries, {
+        allowedRemoteUrls: ["https://oauth2:glpat-LOWPRIV@gitlab.example.com/team/app.git"],
+      });
+      assert.ok(!outLowPass.includes("glpat-ADMIN-SECRET"), "低权限密码远端绝不得继承同用户名高权限令牌 insteadOf");
+      assert.ok(outLowPass.includes("glpat-LOWPRIV"), "密码与主机完全一致的目标 insteadOf 规则应正常保留");
+
+      // [lfs "https://u:SECRET@host/repo.git"] 与 ?token= 查询串在无 tmpfs 时必须拒绝落盘
+      const diskOnly = path.join(dir, "sr-b4-disk-only");
+      const gitHome = path.join(dir, "sr-b4-git-home");
+      fs.mkdirSync(diskOnly, { recursive: true });
+      fs.mkdirSync(gitHome, { recursive: true });
+      const lfsCredCfg = path.join(gitHome, ".gitconfig");
+      fs.writeFileSync(
+        lfsCredCfg,
+        '[lfs "https://u:LFS_SECRET@lfs.example.com/org/repo.git"]\n\tlocksverify = true\n',
+        { mode: 0o600 },
+      );
+      assert.throws(
+        () =>
+          stageSanitizedGitConfig(
+            { HOME: gitHome, GIT_CONFIG_GLOBAL: lfsCredCfg },
+            undefined,
+            { allowedRemoteUrls: ["https://u:LFS_SECRET@lfs.example.com/org/repo.git"], tmpfsCandidates: [diskOnly] },
+          ),
+        /易失内存|tmpfs|落盘/,
+        "含凭据的 [lfs \"https://u:SECRET@...\"] 配置在无易失 tmpfs 时必须拒绝落盘",
+      );
+
+      const queryCredCfg = path.join(gitHome, ".gitconfig.query");
+      fs.writeFileSync(
+        queryCredCfg,
+        '[remote "origin"]\n\turl = https://git.example.com/org/repo.git?token=QUERY_SECRET\n',
+        { mode: 0o600 },
+      );
+      assert.throws(
+        () =>
+          stageSanitizedGitConfig(
+            { HOME: gitHome, GIT_CONFIG_GLOBAL: queryCredCfg },
+            undefined,
+            {
+              allowedRemoteUrls: ["https://git.example.com/org/repo.git?token=QUERY_SECRET"],
+              allowedRemoteNames: ["origin"],
+              tmpfsCandidates: [diskOnly],
+            },
+          ),
+        /易失内存|tmpfs|落盘/,
+        "含 ?token= 查询串的 Git 配置在无易失 tmpfs 时必须拒绝落盘",
+      );
+    }
+
+    // 11) [SR-B5 P2 + SR-B8 P2] wrapCredentialIsolatedCommand 保留文件级软链 extraBindMounts 的逻辑叶路径（不解引用回源路径）
+    {
+      const symBase = path.join(dir, "sr-b5-sym");
+      const dataTargetDir = path.join(symBase, "..data");
+      const saDir = path.join(symBase, "sa");
+      fs.mkdirSync(dataTargetDir, { recursive: true });
+      fs.mkdirSync(saDir, { recursive: true });
+      const realToken = path.join(dataTargetDir, "token");
+      fs.writeFileSync(realToken, "irsa-jwt-token", { mode: 0o600 });
+      const symlinkToken = path.join(saDir, "token");
+      fs.symlinkSync(realToken, symlinkToken);
+
+      const isoDataDir = path.join(dir, "sr-b5-data");
+      const isoCwd = path.join(dir, "sr-b5-cwd");
+      fs.mkdirSync(isoDataDir, { recursive: true });
+      fs.mkdirSync(isoCwd, { recursive: true });
+
+      const wrapped = wrapCredentialIsolatedCommand("/bin/true", [], process.env, {
+        cwd: isoCwd,
+        dataDir: isoDataDir,
+        extraBindMounts: [{ src: realToken, dest: symlinkToken, mode: "ro" }],
+      });
+      if (wrapped.isolated) {
+        const expectedDest = path.join(fs.realpathSync(saDir), "token");
+        const joinedArgs = wrapped.args.join(" ");
+        assert.ok(
+          joinedArgs.includes(expectedDest),
+          `extraBindMounts 文件软链必须保留叶路径 ${expectedDest}，而非解引用为 ${fs.realpathSync(realToken)}`,
+        );
+      }
+    }
+
+    // 12) [SR-B6 P2] SettingsService.put() 热修改后磁盘被回滚回 raw1（ABA），syncDiskPrivacyConfig 不得误命中缓存跳过重载
+    {
+      const { app, cfgFile, dataDir } = makeApp("sr-b6-aba", { groupsDeny: ["绝密群"], sendReplies: false });
+      try {
+        const raw1 = fs.readFileSync(cfgFile, "utf8");
+        const ctxSvc = registerContext(app)!;
+        const settings = new SettingsService(app);
+        const putRes = await settings.put({ context: { groups_deny: [], personal_web: { send_replies: true } } });
+        assert.equal(putRes.ok, true);
+        assert.deepEqual(app.cfg.context.groups_deny, []);
+        assert.equal(app.cfg.context.personal_web.send_replies, true);
+
+        // 运维从 config.yaml.bak 还原磁盘为 raw1（与启动时完全相同的内容）
+        fs.writeFileSync(cfgFile, raw1, "utf8");
+        assert.equal(ctxSvc.personalWeb.syncDiskPrivacyConfig({ throwOnError: false }), true);
+        assert.deepEqual(app.cfg.context.groups_deny, ["绝密群"], "ABA 回滚磁盘后 syncDiskPrivacyConfig 必须重新载入 groups_deny");
+        assert.equal(app.cfg.context.personal_web.send_replies, false, "ABA 回滚磁盘后 syncDiskPrivacyConfig 必须重新载入 send_replies=false");
+        void dataDir;
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 13) [SR-B7 P2] Dispatcher.execute() 与 Dispatcher.runReview() 遇到 runHarness 抛错时必须闭合账本 step 为 failed，绝不永久停在 running
+    {
+      const { app } = makeApp("sr-b7-steps");
+      try {
+        const wtDir = path.join(dir, "sr-b7-wt");
+        fs.mkdirSync(wtDir, { recursive: true });
+        // 损坏的 .git 软链可触发 runHarness 准备阶段直接抛错（在启动子进程之前）
+        fs.symlinkSync(path.join(dir, "no-such-git"), path.join(wtDir, ".git"));
+        const workId = "dispatch:sr_b7_1:1";
+        app.ledger.enqueue({
+          id: workId,
+          kind: "dispatch",
+          ref: "sr_b7_1",
+          payload: {
+            guid: "sr_b7_1",
+            summary: "step leak test",
+            description: "desc",
+            cwd: wtDir,
+            branch: "",
+            base: "",
+            harness: "stub",
+            reviewer: "stub",
+            round: 1,
+            report: "done",
+          },
+        });
+        const workItem = app.ledger.get(workId)!;
+        const ctx = { attempt: 1, signal: new AbortController().signal };
+
+        // execute() 抛错后 step 必须为 failed
+        await assert.rejects(
+          () =>
+            (
+              app.dispatcher as unknown as {
+                execute: (it: typeof workItem, c: typeof ctx) => Promise<unknown>;
+              }
+            ).execute(workItem, ctx),
+        );
+        const execSteps = app.ledger.steps(workId);
+        assert.equal(execSteps.length, 1);
+        assert.equal(execSteps[0].status, "failed", "execute() 抛错后账本步骤必须闭合为 failed");
+
+        // runReview() 抛错后返回 status: "error" 且每轮尝试的 step 均闭合为 failed
+        const revCheck = await (
+          app.dispatcher as unknown as {
+            runReview: (it: typeof workItem, c: typeof ctx) => Promise<{ status: string; detail: string }>;
+          }
+        ).runReview(workItem, ctx);
+        assert.equal(revCheck.status, "error", "runReview() 准备阶段抛错应返回 error 结果");
+        const allSteps = app.ledger.steps(workId);
+        assert.ok(allSteps.length >= 2);
+        assert.ok(
+          allSteps.every((s) => s.status === "failed"),
+          `execute 与 runReview 的所有失败步骤均须闭合为 failed，实际：${allSteps.map((s) => s.status).join(",")}`,
+        );
+      } finally {
+        app.store.db.close();
       }
     }
   } finally {

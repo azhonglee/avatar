@@ -3,7 +3,7 @@ import fs from "node:fs";
 import YAML from "yaml";
 import type { App } from "../app.ts";
 import type { CtxPersonalWebStatus } from "../api/types.ts";
-import { ConfigSchema } from "../config.ts";
+import { ConfigSchema, getConfigMutationGen } from "../config.ts";
 import { extractOwnerOpenId } from "../lark.ts";
 import type { Store } from "../store.ts";
 import { deepFind, errMsg, log } from "../util.ts";
@@ -395,10 +395,16 @@ export function saveWorkspaceBinding(store: Store, nativeOwnerId: string, worksp
  * 即必须阻断旧主人派生的视图（今天/项目/事项/草稿）与全部通知/卡片投递，防止旧主人的私聊摘要泄漏给新主人。
  */
 export function hasWorkspaceOwnerMismatch(store: Store, cfgOwnerOpenId: string): boolean {
+  const cfgOwner = cfgOwnerOpenId.trim();
   const boundNative = (store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
   const boundWs = (store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
-  if (!boundNative && !boundWs) return false;
-  return boundWs !== cfgOwnerOpenId.trim();
+  if (boundNative || boundWs) {
+    if (boundWs !== cfgOwner) return true;
+  }
+  // 纯 CLI 轮询工作区未绑定个人 Web 时，也必须检测 pa init 写入的 owner.open_id 与当前配置主人不一致，防止旧主人数据跨号泄露
+  const prevOwner = (store.get("owner.open_id") ?? "").trim();
+  if (prevOwner && prevOwner !== cfgOwner) return true;
+  return false;
 }
 
 /** 统一计算 pw.reply 幂等键（CID）与规范化正文哈希，供 effects / drafts / personal-web 共用（DRY） */
@@ -497,6 +503,7 @@ export class PersonalWebBridge {
   private readonly pwGroupNameCache = new Map<string, string>();
   private readonly hadInitialCfgFile: boolean;
   private lastSyncedCfgRaw: string | undefined;
+  private lastSyncedCfgGen = 0;
   private diskPolicyError = "";
   private diskOwnerOpenId: string | undefined;
   private diskPersonalWebVeto = false;
@@ -514,6 +521,7 @@ export class PersonalWebBridge {
     // 仅缓存 loadConfig() 实际解析并应用过的磁盘原始字节（绝不把未解析的新文件直接标为已同步）；
     // 若 loadConfig() 与构造桥接之间磁盘已被外部修改，首次 syncDiskPrivacyConfig() 会立刻检测到差异并应用最新策略。
     this.lastSyncedCfgRaw = app.cfg.loadedRaw;
+    this.lastSyncedCfgGen = getConfigMutationGen(app.cfg);
     const saved = this.loadSavedState();
     const login = this.loginStore.load();
     this.state = saved ?? {
@@ -556,7 +564,8 @@ export class PersonalWebBridge {
       if (opts?.throwOnError) throw new Error(this.diskPolicyError);
       return false;
     }
-    if (disk.raw === this.lastSyncedCfgRaw) {
+    const curCfgGen = getConfigMutationGen(this.cfg);
+    if (disk.raw === this.lastSyncedCfgRaw && curCfgGen === this.lastSyncedCfgGen) {
       if (this.diskPolicyError) {
         if (opts?.throwOnError) throw new Error(this.diskPolicyError);
         return false;
@@ -619,10 +628,12 @@ export class PersonalWebBridge {
 
       this.diskPolicyError = "";
       this.lastSyncedCfgRaw = disk.raw;
+      this.lastSyncedCfgGen = curCfgGen;
       return true;
     } catch (err) {
       this.diskPolicyError = `无法核验磁盘隐私配置 (${cfgFile})：${errMsg(err)}`;
       this.lastSyncedCfgRaw = disk.raw;
+      this.lastSyncedCfgGen = curCfgGen;
       if (opts?.throwOnError) throw new Error(this.diskPolicyError);
       return false;
     }
@@ -825,6 +836,18 @@ export class PersonalWebBridge {
       (!!saved.session_id || !!saved.owner_id);
     const loggedIn = (loginAuthorized && !currentSessionRejected) || daemonHealthyWithoutLocalCred;
 
+    if (ownerMismatch) {
+      return {
+        enabled,
+        logged_in: false,
+        state: enabled ? "needs_login" : "idle",
+        owner_id: "",
+        owner_name: "",
+        last_message_at: null,
+        last_error: enabled ? "当前工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已隔离上下文" : "",
+      };
+    }
+
     let state: string = staleSavedSession ? "stopped" : saved.state;
     let lastError = staleSavedSession ? "" : saved.last_error;
     if (!enabled) {
@@ -848,7 +871,7 @@ export class PersonalWebBridge {
       state,
       owner_id: (loggedIn && loginAuthorized ? login?.owner_id : "") || (loggedIn ? saved.owner_id : ""),
       owner_name: (loggedIn && loginAuthorized ? login?.owner_name : "") || (loggedIn ? saved.owner_name : ""),
-      last_message_at: saved.last_message_at,
+      last_message_at: loggedIn ? saved.last_message_at : null,
       last_error: lastError,
     };
   }
@@ -2600,6 +2623,9 @@ export class PersonalWebBridge {
     maxGroups: number;
     lookbackDays: number;
   } {
+    if (!this.cfg.context.sources.im) {
+      throw new Error("已关闭 IM 采集（context.sources.im: false），已中止个人 Web 回复发送");
+    }
     if (!this.cfg.context.personal_web.send_replies) {
       throw new Error("未开启个人 Web 回复（需在配置中设置 context.personal_web.send_replies: true）");
     }
@@ -2612,6 +2638,9 @@ export class PersonalWebBridge {
       this.syncDiskPrivacyConfig({ throwOnError: true });
       if (this.isWorkspaceOwnerMismatched()) {
         throw new Error("检测到配置文件 owner.open_id 已变更或与已绑定主人不一致，已中止发送");
+      }
+      if (!this.cfg.context.sources.im) {
+        throw new Error("检测到配置文件已关闭 IM 采集（context.sources.im: false），已中止发送");
       }
       if (!this.cfg.context.personal_web.send_replies) {
         throw new Error("检测到配置文件已关闭 context.personal_web.send_replies，已中止发送");

@@ -127,10 +127,11 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
           break;
         // ── 以下只会在你确认草稿 / 开启对应自主动作后产生，均以你本人身份执行 ──
         case "im.reply": {
-          const draftId = e.args.draft_id || (item.ref.startsWith("ctx-draft:") ? item.ref.slice("ctx-draft:".length) : undefined);
-          if (draftId && hooks.verifyCliDraftDelivery) {
-            await hooks.verifyCliDraftDelivery({ draft_id: draftId, message_id: e.args.message_id });
+          if (!cfg.context.enabled || !cfg.context.sources.im || !hooks.verifyCliDraftDelivery) {
+            throw new Error("工作上下文或 IM 采集未启用，拒绝投递 CLI 会话回复（fail-closed）");
           }
+          const draftId = e.args.draft_id || (item.ref.startsWith("ctx-draft:") ? item.ref.slice("ctx-draft:".length) : undefined);
+          await hooks.verifyCliDraftDelivery({ draft_id: draftId, message_id: e.args.message_id });
           await lark.run(["im", "+messages-reply", "--message-id", e.args.message_id, "--text", "-", "--idempotency-key", item.id.slice(0, 50)], {
             as: "user",
             input: e.args.text,
@@ -138,10 +139,11 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
           break;
         }
         case "im.send": {
-          const draftId = e.args.draft_id || (item.ref.startsWith("ctx-draft:") ? item.ref.slice("ctx-draft:".length) : undefined);
-          if (draftId && hooks.verifyCliDraftDelivery) {
-            await hooks.verifyCliDraftDelivery({ draft_id: draftId, chat_id: e.args.chat_id });
+          if (!cfg.context.enabled || !cfg.context.sources.im || !hooks.verifyCliDraftDelivery) {
+            throw new Error("工作上下文或 IM 采集未启用，拒绝投递 CLI 会话消息（fail-closed）");
           }
+          const draftId = e.args.draft_id || (item.ref.startsWith("ctx-draft:") ? item.ref.slice("ctx-draft:".length) : undefined);
+          await hooks.verifyCliDraftDelivery({ draft_id: draftId, chat_id: e.args.chat_id });
           await lark.run(["im", "+messages-send", "--chat-id", e.args.chat_id, "--text", "-", "--idempotency-key", item.id.slice(0, 50)], {
             as: "user",
             input: e.args.text,

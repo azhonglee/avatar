@@ -12,10 +12,10 @@ import { detectIsolatedCodexKeyringConflict } from "../harness.ts";
 import type { Effect, NotifyKind } from "../ledger.ts";
 import { deepFind, errMsg, log, truncate } from "../util.ts";
 import { draftCard, eveningCard, itemCard, KIND_LABEL, morningCard, type CtxRenderCtx } from "./cards.ts";
-import { Connectors, relinkMeegoItems } from "./connectors.ts";
+import { Connectors, relinkMeegoItems, textOf } from "./connectors.ts";
 import { defaultDraftKind, Drafter, DraftTargetIneligibleError, DraftTargetUncertainError } from "./drafts.ts";
 import { PersonalWebBridge, type FastAnchor } from "./personal-web.ts";
-import { ContextStore, obsRevision, type ItemRow } from "./store.ts";
+import { ContextStore, obsRevision, obsRevisionToken, type ItemRow } from "./store.ts";
 import { splitProject, Understander, UnderstandParseError, type SplitResult } from "./understand.ts";
 import { ContextViews, startOfDay } from "./views.ts";
 
@@ -130,38 +130,131 @@ export class ContextService {
    *   - 若草稿绑定了源观测 `target.obs_id`，核验源观测存在、未被撤回、会话未被静音/排除且仍在当前群范围或仍保留 @本人；
    *   - 若草稿仅含 `chat_id`，核验目标会话未被静音或排除。
    */
-  async verifyCliDraftTargetForDelivery(draftId: string, fallbackChatId?: string): Promise<void> {
+  /**
+   * 审批与投递基于草稿的 CLI 会话消息（`im.reply` / `im.send`）前实时核验：
+   *   - 同步磁盘隐私策略、核验工作区主人未切换且 `context.enabled` 与 `context.sources.im` 均开启；
+   *   - 若绑定源观测或源消息 ID，除校验本地未撤回与会话允许外，还经 `im +messages-mget` 实时回读飞书远端确认原消息未撤回/删除且在范围外群仍显式 @本人；
+   *   - 若仅含 `chat_id`，同时校验会话未静音/排除且群聊仍在当前允许群范围内；
+   *   - 所有异步校验完成后再次同步复检磁盘隐私配置、主人绑定、IM 开关、源观测撤回与会话静音，防止异步等待期间策略变更竞态。
+   */
+  async verifyCliDraftTargetForDelivery(
+    draftId: string,
+    fallbackChatId?: string,
+    fallbackMessageId?: string,
+  ): Promise<void> {
     this.personalWeb.syncDiskPrivacyConfig({ throwOnError: true });
     this.assertWorkspaceOwnerMatches();
-    if (!this.cfg.context.sources.im) {
-      throw new Error("IM 采集已关闭，拒绝投递基于会话消息起草的草稿");
+    if (!this.cfg.context.enabled || !this.cfg.context.sources.im) {
+      throw new Error("工作上下文或 IM 采集已关闭，拒绝投递基于会话消息起草的草稿");
     }
     const d = draftId ? this.store.draft(draftId) : undefined;
     if (draftId && !d) {
       throw new Error("草稿记录不存在，拒绝发送");
     }
-    if (d?.target.obs_id) {
-      const obs = this.store.obs(d.target.obs_id);
-      if (!obs || obs.meta.withdrawn === true) {
-        throw new Error("该草稿对应的原消息已被撤回或移除，拒绝发送");
-      }
-      const convDecision = await this.personalWeb.checkConvAllowedForUnderstand(obs.conv, obs.conv_name);
+    const obsId = d?.target.obs_id || (fallbackMessageId ? `im:${fallbackMessageId}` : "");
+    const obs = obsId ? this.store.obs(obsId) : undefined;
+    if (d?.target.obs_id && (!obs || obs.meta.withdrawn === true)) {
+      throw new Error("该草稿对应的原消息已被撤回或移除，拒绝发送");
+    }
+    if (!d?.target.obs_id && obs?.meta.withdrawn === true) {
+      throw new Error("该回复目标对应的原消息已被撤回，拒绝发送");
+    }
+    const targetConv = obs?.conv || d?.target.chat_id || fallbackChatId || "";
+    if (targetConv) {
+      const convDecision = await this.personalWeb.checkConvAllowedForUnderstand(targetConv, obs?.conv_name ?? "");
       if (convDecision !== "allowed") {
-        throw new Error("该草稿对应的会话已被静音、排除或暂时无法确认排除状态，拒绝发送");
+        throw new Error("该草稿目标会话已被静音、排除或暂时无法确认排除状态，拒绝发送");
       }
-      const nativeExcl = await this.personalWeb.resolveNativeExclusionsForPolling();
+    }
+    const nativeExcl = await this.personalWeb.resolveNativeExclusionsForPolling();
+    if (obs) {
       const kept = this.personalWeb.filterWindowByCurrentScope(obs.conv, [obs], nativeExcl);
       if (!kept.length) {
         throw new Error("该草稿对应的原消息已移出当前允许的群范围或已移除 @本人，拒绝发送");
       }
-      return;
     }
-    const chatId = d?.target.chat_id || fallbackChatId || "";
-    if (chatId) {
-      const convDecision = await this.personalWeb.checkConvAllowedForUnderstand(chatId, "");
-      if (convDecision !== "allowed") {
-        throw new Error("该草稿目标会话已被静音、排除或暂时无法确认排除状态，拒绝发送");
+
+    const liveMessageId =
+      d?.target.message_id ||
+      fallbackMessageId ||
+      (obs?.id.startsWith("im:") ? String(obs.meta.message_id ?? obs.id.slice(3)) : "");
+    if (liveMessageId) {
+      let data: Record<string, unknown>;
+      try {
+        data = (await this.app.lark.run(
+          ["im", "+messages-mget", "--message-ids", liveMessageId, "--no-reactions"],
+          { as: "user" },
+        )) as Record<string, unknown>;
+      } catch (err) {
+        throw new Error(`发送前实时回读原消息失败，按安全原则中止发送：${errMsg(err)}`);
       }
+      const list = Array.isArray(data?.messages)
+        ? (data.messages as Record<string, unknown>[])
+        : Array.isArray(data?.items)
+          ? (data.items as Record<string, unknown>[])
+          : [];
+      const fresh = list.find((m) => String(m.message_id ?? m.id ?? "") === liveMessageId);
+      const freshText = fresh ? textOf(fresh.content ?? fresh.text ?? "") : "";
+      if (!fresh || fresh.deleted === true || fresh.is_deleted === true || !freshText) {
+        if (obs) this.store.retirePendingObs(obs.id);
+        throw new Error("发送前实时核验发现原消息已被撤回、删除或不可读，已中止发送");
+      }
+      const liveChatId = String(fresh.chat_id ?? "") || targetConv;
+      const liveChatType = String(fresh.chat_type ?? obs?.meta.chat_type ?? "").trim().toLowerCase();
+      if (liveChatId && liveChatId !== targetConv) {
+        const liveConvDecision = await this.personalWeb.checkConvAllowedForUnderstand(
+          liveChatId,
+          String(fresh.chat_name ?? obs?.conv_name ?? ""),
+        );
+        if (liveConvDecision !== "allowed") {
+          throw new Error("发送前实时核验发现目标会话已被静音、排除或暂时无法确认排除状态，已中止发送");
+        }
+      }
+      const isDm =
+        liveChatType === "p2p" || obs?.kind === "p2p" || (!!liveChatId && this.store.isDmConv(liveChatId));
+      if (!isDm && liveChatId.startsWith("oc_")) {
+        const inScope = this.personalWeb.isGroupConvInCurrentScope(liveChatId, nativeExcl);
+        if (!inScope) {
+          const me = this.cfg.owner.open_id.trim();
+          if (this.connectors.explicitMentionsMe(fresh, me) !== true) {
+            if (obs) this.store.retirePendingObs(obs.id);
+            throw new Error("发送前实时核验发现范围外群原消息已不再 @本人（可能已被编辑移除 @mention），已中止发送");
+          }
+        }
+      }
+    } else {
+      if (!targetConv) {
+        throw new Error("草稿缺少目标会话 ID，拒绝发送");
+      }
+      const isDm = this.store.isDmConv(targetConv);
+      if (!isDm && targetConv.startsWith("oc_") && !this.personalWeb.isGroupConvInCurrentScope(targetConv, nativeExcl)) {
+        throw new Error("该草稿目标群已移出当前允许的群范围，拒绝发送");
+      }
+    }
+
+    // 所有异步回读完成后再次同步核验磁盘策略、主人一致、IM 开关、源观测未撤回与会话未静音
+    this.personalWeb.syncDiskPrivacyConfig({ throwOnError: true });
+    this.assertWorkspaceOwnerMatches();
+    if (!this.cfg.context.enabled || !this.cfg.context.sources.im) {
+      throw new Error("工作上下文或 IM 采集在核验期间已关闭，拒绝发送");
+    }
+    if (obsId) {
+      const latestObs = this.store.obs(obsId);
+      if ((d?.target.obs_id && !latestObs) || latestObs?.meta.withdrawn === true) {
+        throw new Error("核验期间检测到原消息已被撤回或移除，拒绝发送");
+      }
+      if (latestObs) {
+        if (this.store.isConvMutedById(latestObs.conv)) {
+          throw new Error("核验期间检测到目标会话已被静音，拒绝发送");
+        }
+        const postKept = this.personalWeb.filterWindowByCurrentScope(latestObs.conv, [latestObs], nativeExcl);
+        if (!postKept.length) {
+          throw new Error("核验期间检测到原消息已移出当前允许范围，拒绝发送");
+        }
+      }
+    }
+    if (targetConv && this.store.isConvMutedById(targetConv)) {
+      throw new Error("核验期间检测到目标会话已被静音，拒绝发送");
     }
   }
 
@@ -1205,8 +1298,8 @@ export function registerContext(app: App): ContextService | undefined {
   app.effectHooks.shouldDeferPwReply = (cid, isDaemon) =>
     svc.personalWeb.shouldDeferReplyToCredentialedConsumer(cid, isDaemon);
   app.effectHooks.isContextOwnerMismatched = () => svc.isWorkspaceOwnerMismatched();
-  app.effectHooks.verifyCliDraftDelivery = async ({ draft_id, chat_id }) => {
-    await svc.verifyCliDraftTargetForDelivery(draft_id ?? "", chat_id);
+  app.effectHooks.verifyCliDraftDelivery = async ({ draft_id, chat_id, message_id }) => {
+    await svc.verifyCliDraftTargetForDelivery(draft_id ?? "", chat_id, message_id);
   };
   bus.on("effect.settled", (e) => {
     if (e.ref.startsWith("ctx-draft:")) svc.syncDraft(e.ref.slice("ctx-draft:".length));
@@ -1420,7 +1513,7 @@ export function registerContext(app: App): ContextService | undefined {
         if (srcObs?.meta.withdrawn === true) {
           throw new CommandError("conflict", "该说法对应的原消息已被撤回，无法以此为准，请刷新后重新选择或手写结论");
         }
-        const curRev = srcObs ? obsRevision(srcObs) : "";
+        const curRev = srcObs ? obsRevisionToken(srcObs) : "";
         if (
           (srcObs && chosen.obs_rev && curRev !== chosen.obs_rev) ||
           (a.obs_rev && chosen.obs_rev && a.obs_rev !== chosen.obs_rev) ||
@@ -1470,20 +1563,26 @@ export function registerContext(app: App): ContextService | undefined {
       svc.assertWorkspaceOwnerMatches();
       const d = svc.store.draft(a.id);
       if (!d) throw new CommandError("not_found", "没有这份草稿");
+      if (d.status !== "proposed" && d.status !== "failed") {
+        throw new CommandError("conflict", d.status === "sent" ? "已经发送过了" : d.status === "discarded" ? "草稿已丢弃" : "正在发送中");
+      }
       const content = a.content?.trim() || d.content;
       if (!content.trim()) throw new CommandError("invalid", "内容不能为空");
       let effect: Effect;
       try {
+        svc.personalWeb.syncDiskPrivacyConfig({ throwOnError: true });
+        svc.assertWorkspaceOwnerMatches();
         effect = svc.drafter.effectFor(d, content);
         if (effect.op === "im.reply" || effect.op === "im.send") {
-          await svc.verifyCliDraftTargetForDelivery(d.id, d.target.chat_id);
+          await svc.verifyCliDraftTargetForDelivery(d.id, d.target.chat_id, d.target.message_id);
         }
       } catch (e) {
         if (e instanceof CommandError) throw e;
         throw new CommandError("invalid", errMsg(e));
       }
       if (!svc.store.casDraft(d.id, ["proposed", "failed"], "approved", content)) {
-        throw new CommandError("conflict", d.status === "sent" ? "已经发送过了" : d.status === "discarded" ? "草稿已丢弃" : "正在发送中");
+        const latestStatus = svc.store.draft(d.id)?.status;
+        throw new CommandError("conflict", latestStatus === "sent" ? "已经发送过了" : latestStatus === "discarded" ? "草稿已丢弃" : "正在发送中");
       }
       svc.store.setDraft(d.id, {
         target: {

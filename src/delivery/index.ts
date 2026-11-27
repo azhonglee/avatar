@@ -22,6 +22,7 @@ import {
   isClean,
   parseRemote,
   pushBranch,
+  redactGitUrls,
   remoteDefaultBranch,
   remoteUrl,
   removeStaleWorktreeAdminRecord,
@@ -76,9 +77,7 @@ export function resolveProvider(cfg: Config, spec: RepoSpec): { name: string; cf
 
 /** 去掉文本里 URL 的内嵌账号密码（userinfo@）与查询串（?token=... 等凭据），防止凭据进入账本、日志或飞书任务评论。 */
 export function maskUrl(text: string): string {
-  return text
-    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s?#]+@/gi, "$1***@")
-    .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s"'`<>?#]+)\?[^\s"'`<>#)]+/gi, "$1?***");
+  return redactGitUrls(text);
 }
 
 function isPermanent(e: unknown): boolean {
@@ -402,8 +401,8 @@ export function registerDelivery(app: App): void {
             throw new DeliveryError(`未知的交付动作：${String((p as { action?: unknown }).action)}`);
         }
       } catch (e) {
-        if (!isPermanent(e)) throw e; // 网络等暂时性错误：交给引擎退避重试
         const msg = maskUrl(errMsg(e));
+        if (!isPermanent(e)) throw new Error(msg); // 网络等暂时性错误：先脱敏再交给引擎退避重试，防止 work.error / 日志泄露凭据 URL
         ledger.transition(item, { state: "errored", terminal: true, outcome: "errored", error: msg, payload: { ...p, message: msg } }, say(p.guid, `❌ ${ACTION_TEXT[p.action] ?? "交付"}失败：${msg}`));
         log("warn", "交付失败", { work: item.id, action: p.action, err: msg });
       }

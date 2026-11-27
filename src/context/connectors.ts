@@ -654,7 +654,7 @@ export class Connectors {
     return "allowed";
   }
 
-  private explicitMentionsMe(m: Raw, me: string): boolean | undefined {
+  explicitMentionsMe(m: Raw, me: string): boolean | undefined {
     const mentions = m.mentions;
     if (!Array.isArray(mentions)) return undefined;
     return mentions.some((x: unknown) => {
@@ -1046,7 +1046,7 @@ export class Connectors {
         verifyFailed?: boolean;
         deleted?: boolean;
         authoritativeLive?: boolean;
-        candidates: { text: string; kind: string; atMe: boolean }[];
+        candidates: { text: string; kind: string; atMe: boolean; explicitAtMe?: boolean; mentions?: unknown[] }[];
       }
     >();
     for (const row of raws) {
@@ -1056,6 +1056,8 @@ export class Connectors {
       const rowTimeMs = parseEditTimeMs(row.m, this.cfg.owner.timezone);
       const rowText = textOf(row.m.content ?? row.m.text ?? "");
       const rowDeleted = row.m.deleted === true || row.m.is_deleted === true;
+      const rowExplicitAtMe = rowMentionsMe(row.m);
+      const rowMentions = Array.isArray(row.m.mentions) ? row.m.mentions : undefined;
       const rowAtMe = rowEffectiveAtMe(row.m, row.kind);
       const rowEffKind = rowAtMe ? "at_me" : fallbackKindWithoutAtMe(row.m, row.kind);
       const existing = mergedById.get(id);
@@ -1069,11 +1071,11 @@ export class Connectors {
           streams: new Set([row.stream]),
           fallbackGroupName: row.fallbackGroupName ?? "",
           needsVerify: false,
-          candidates: [{ text: rowText, kind: rowEffKind, atMe: rowAtMe }],
+          candidates: [{ text: rowText, kind: rowEffKind, atMe: rowAtMe, explicitAtMe: rowExplicitAtMe, mentions: rowMentions }],
         });
       } else {
         existing.streams.add(row.stream);
-        existing.candidates.push({ text: rowText, kind: rowEffKind, atMe: rowAtMe });
+        existing.candidates.push({ text: rowText, kind: rowEffKind, atMe: rowAtMe, explicitAtMe: rowExplicitAtMe, mentions: rowMentions });
         const cmp = compareRowRevisions(
           { editCounter: rowCounter, editTimeMs: rowTimeMs },
           { editCounter: existing.editCounter, editTimeMs: existing.editTimeMs },
@@ -1205,13 +1207,15 @@ export class Connectors {
         const senderId = String(sender.id ?? sender.open_id ?? fresh.sender_id ?? entry.m.sender_id ?? "");
         const explicitAtMe = rowMentionsMe(fresh);
         let nextKind: string;
+        let carriedMentions: unknown[] | undefined;
         if (explicitAtMe === true) {
           nextKind = "at_me";
         } else if (explicitAtMe === false) {
           nextKind = mergedChatType.toLowerCase() === "p2p" ? "p2p" : senderId === me ? "mine" : "group";
         } else {
           // 若 +messages-mget 未返回 mentions 字段，仅当全部与权威正文一致的候选对是否 @我 达成一致时才推断 kind；
-          // 若候选正文相同却在 @我 归类上冲突，按未决处理并保留游标待下次重试，绝不偏袒先到的 --is-at-me 流
+          // 若候选正文相同却在 @我 归类上冲突，按未决处理并保留游标待下次重试，绝不偏袒先到的 --is-at-me 流；
+          // 若匹配候选一致且均携带当前正文的显式正向 mentions，沿用该 mentions 供后续未入选群正向校验，避免合法恢复的 @我 被误丢并推进游标
           const matchingCands = entry.candidates.filter((c) => c.text === freshText);
           if (matchingCands.length > 0) {
             const atMeValues = new Set(matchingCands.map((c) => c.atMe));
@@ -1221,11 +1225,17 @@ export class Connectors {
             }
             const matched = matchingCands[0];
             nextKind = matched.atMe ? "at_me" : matched.kind;
+            if (nextKind === "at_me" && matchingCands.every((c) => c.explicitAtMe === true && Array.isArray(c.mentions))) {
+              carriedMentions = matched.mentions;
+            }
           } else {
             nextKind = mergedChatType.toLowerCase() === "p2p" ? "p2p" : senderId === me ? "mine" : "group";
           }
         }
         const liveMerged = mergeNewerImRow(entry.m, fresh, hadPriorMentions && nextKind !== "at_me");
+        if (carriedMentions && !Array.isArray(liveMerged.mentions)) {
+          liveMerged.mentions = carriedMentions;
+        }
         delete liveMerged.deleted;
         delete liveMerged.is_deleted;
         entry.m = liveMerged;
@@ -1435,14 +1445,11 @@ export class Connectors {
           }
           continue;
         }
-        // 范围外群的非 @我 消息（含曾命中 --is-at-me 搜索但正文已被编辑移除 @我，或 lark-cli 省略 mentions 缺少当前正文显式 @本人 实证的白名单外/排位外群消息）不入库，
+        // 范围外群的非 @我 消息（含 spoken 模式下超出 max_groups 的本人历史发言、曾命中 --is-at-me 搜索但正文已被编辑移除 @我，
+        // 或 lark-cli 省略 mentions 缺少当前正文显式 @本人 实证的白名单外/排位外群消息）不入库，
         // 并按修订水位撤回该 ID 此前可能入库的 @我 待处理记录
         const hasPositiveCurrentMention = this.explicitMentionsMe(m, me) === true;
-        const isUnselectedGroup =
-          !isP2pFinal &&
-          chatId.startsWith("oc_") &&
-          !rankedSet.has(chatId) &&
-          (this.cfg.context.groups === "allowlist" || entry.kind !== "mine");
+        const isUnselectedGroup = !isP2pFinal && chatId.startsWith("oc_") && !rankedSet.has(chatId);
         const outOfScopeGroup =
           isUnselectedGroup && (entry.kind !== "at_me" || !hasPositiveCurrentMention);
         if (outOfScopeGroup) {

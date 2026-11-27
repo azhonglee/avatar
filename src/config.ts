@@ -355,6 +355,18 @@ export function repoSpec(cfg: Config, ref: string): RepoSpec {
 /** 配置的 zod schema（设置服务用它校验写入）。 */
 export const ConfigSchema = Schema;
 
+const CONFIG_MUTATION_GEN = Symbol("pa.configMutationGen");
+
+export function markConfigMutated(cfg: Config): void {
+  const rec = cfg as unknown as Record<symbol, number | undefined>;
+  rec[CONFIG_MUTATION_GEN] = (rec[CONFIG_MUTATION_GEN] ?? 0) + 1;
+}
+
+export function getConfigMutationGen(cfg: Config): number {
+  const rec = cfg as unknown as Record<symbol, number | undefined>;
+  return rec[CONFIG_MUTATION_GEN] ?? 0;
+}
+
 export function loadConfig(file = process.env.PA_CONFIG ?? path.join(ROOT, "config.yaml")): Config {
   if (!fs.existsSync(file)) {
     throw new Error(`找不到配置文件 ${file}。先执行：cp config.example.yaml config.yaml 并按需修改`);

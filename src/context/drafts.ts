@@ -533,6 +533,12 @@ export class Drafter {
       if (!readbackRecovery && obs?.meta.withdrawn === true) {
         throw new Error("该草稿对应的原个人 Web 消息已被编辑移出触发范围或撤回，拒绝发送新回复");
       }
+      if (!readbackRecovery && !this.cfg.context.sources.im) {
+        throw new Error("已关闭 IM 采集（context.sources.im: false），拒绝发送个人 Web 回复");
+      }
+      if (!readbackRecovery && this.isConvSyncBlocked(`pw_chat:${d.target.native_chat_id}`)) {
+        throw new Error("该草稿对应的个人 Web 会话已被静音或排除，拒绝发送新回复");
+      }
       if (!this.cfg.context.personal_web.send_replies && !readbackRecovery) {
         throw new Error("该草稿目标来自个人 Web 实时消息；为避免偏离原话题，请在设置中开启 context.personal_web.send_replies 后再发送");
       }

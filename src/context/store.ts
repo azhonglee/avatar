@@ -20,6 +20,15 @@ export function obsRevision(o: { text: string; meta?: Record<string, unknown> })
 }
 
 /**
+ * 计算紧凑、安全的观测修订令牌（32 位 SHA-256 十六进制摘要，含内容/@mention 与 edit_gen），
+ * 用于冲突卡片回调与前端按钮绑定，避免把 2000 字原文或 NUL 字节塞进飞书卡片回调载荷。
+ */
+export function obsRevisionToken(o: { text: string; meta?: Record<string, unknown> }): string {
+  const editGen = typeof o.meta?.edit_gen === "number" && Number.isFinite(o.meta.edit_gen) ? o.meta.edit_gen : 0;
+  return createHash("sha256").update(`${obsRevision(o)}\0g=${editGen}`).digest("hex").slice(0, 32);
+}
+
+/**
  * 工作图谱存储：观测（原始信号）→ 项目 / 事项 / 知识 / 动态 / 人 / 冲突 / 草稿，每条事实挂证据。
  * 和账本共用一个 SQLite 文件。所有写入都是幂等的：观测按来源 ID 去重，事项按强标识（Meego 节点、飞书任务）去重。
  */
@@ -1172,7 +1181,7 @@ export class ContextStore {
     const stampedClaims: ConflictRow["claims"] = c.claims.map((cl) => {
       if (cl.obs_rev) return cl;
       const obs = cl.obs_id ? this.obs(cl.obs_id) : undefined;
-      return obs ? { ...cl, obs_rev: obsRevision(obs) } : cl;
+      return obs ? { ...cl, obs_rev: obsRevisionToken(obs) } : cl;
     });
     const normalizedInput = { ...c, claims: stampedClaims };
     const byRef = c.ref ? this.conflicts("open").find((x) => x.id === c.ref) : undefined;
@@ -1180,10 +1189,11 @@ export class ContextStore {
     if (open) {
       const claims = [...open.claims];
       for (const cl of stampedClaims) {
-        const idx = claims.findIndex((x) => x.obs_id === cl.obs_id);
-        if (idx >= 0) {
-          // 同一观测经编辑重理解后再次写入冲突时，原地替换旧修订说法，避免旧说法残留为可选裁决项
-          claims[idx] = cl;
+        // 仅当 obs_id 与 obs_rev 完全一致时去重；若源消息被编辑后产出新 obs_rev，追加新索引而非原地覆盖旧索引，
+        // 从而旧卡片（即便未带 obs_rev）点击旧 choice 仍命中已失效的旧 obs_rev 并被拒绝
+        const sameRevIdx = claims.findIndex((x) => x.obs_id === cl.obs_id && (x.obs_rev ?? "") === (cl.obs_rev ?? ""));
+        if (sameRevIdx >= 0) {
+          claims[sameRevIdx] = cl;
         } else {
           claims.push(cl);
         }
@@ -1216,13 +1226,8 @@ export class ContextStore {
         const dup = open[k];
         if (gone.has(dup.id) || !sameConflict(keep, dup)) continue;
         for (const cl of dup.claims) {
-          const existingIdx = keep.claims.findIndex((x) => x.obs_id === cl.obs_id);
-          if (existingIdx >= 0) {
-            const obs = cl.obs_id ? this.obs(cl.obs_id) : undefined;
-            if (obs && cl.obs_rev && obsRevision(obs) === cl.obs_rev) {
-              keep.claims[existingIdx] = cl;
-            }
-          } else {
+          const sameRev = keep.claims.some((x) => x.obs_id === cl.obs_id && (x.obs_rev ?? "") === (cl.obs_rev ?? ""));
+          if (!sameRev) {
             keep.claims.push(cl);
           }
         }

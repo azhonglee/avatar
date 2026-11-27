@@ -75,6 +75,23 @@ if (role === "lark") {
       ok({ messages: [] });
     case "im +chat-messages-list":
       ok({ messages: (fx.chats ?? {})[flag("--chat-id")] ?? [] });
+    case "im +messages-mget": {
+      const ids = new Set((flag("--message-ids") ?? "").split(",").map((s) => s.trim()).filter(Boolean));
+      const pool = Array.isArray(fx.mget)
+        ? fx.mget
+        : [
+            ...(fx.at_me ?? []),
+            ...(fx.p2p ?? []),
+            ...(fx.mine ?? []),
+            ...Object.values(fx.chats ?? {}).flat(),
+          ];
+      const byId = new Map();
+      for (const m of pool) {
+        const mid = String(m.message_id ?? m.id ?? "");
+        if (mid && ids.has(mid)) byId.set(mid, m);
+      }
+      ok({ messages: [...byId.values()] });
+    }
     case "task +get-my-tasks":
       ok({ items: fx.tasks ?? [] });
     case "minutes +search":

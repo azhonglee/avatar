@@ -7,12 +7,14 @@ import { repoSpec, type Config } from "../config.ts";
 import {
   commitAll,
   ensureGitLfsObjectsForCheckout,
+  git,
+  redactGitUrls,
   removeStaleWorktreeAdminRecord,
   resolveExternalLfsStorageGitOpts,
   tryGit,
 } from "../delivery/git.ts";
 import { comment, move } from "../effects.ts";
-import { checkpoint, type Ctx, type Handler } from "../engine.ts";
+import { Aborted, checkpoint, type Ctx, type Handler } from "../engine.ts";
 import {
   applySanitizedGitConfigEnv,
   applySanitizedNpmrcEnv,
@@ -25,7 +27,7 @@ import {
   stageSanitizedNpmrc,
   wrapCredentialIsolatedCommand,
 } from "../harness.ts";
-import type { Effect, Ledger, WorkItem } from "../ledger.ts";
+import { LeaseLost, type Effect, type Ledger, type WorkItem } from "../ledger.ts";
 import type { Store } from "../store.ts";
 import { errMsg, log, render, runProcess, truncate } from "../util.ts";
 
@@ -331,14 +333,15 @@ export class Dispatcher {
       run: (item, ctx) => this.advance(item, ctx),
       onExhausted: (item, err) => {
         const p = item.payload;
+        const safeErr = redactGitUrls(err);
         const effects: Effect[] = [];
         if (p.guid) {
           effects.push(
-            comment(p.guid, truncate(`❌ 执行失败（${stateText(item.state)}阶段已达尝试上限 ${this.cfg.dispatch.max_attempts} 次，含进程中断）：${err}\n日志：${this.logDir(p.guid)}`, COMMENT_MAX)),
+            comment(p.guid, truncate(`❌ 执行失败（${stateText(item.state)}阶段已达尝试上限 ${this.cfg.dispatch.max_attempts} 次，含进程中断）：${safeErr}\n日志：${this.logDir(p.guid)}`, COMMENT_MAX)),
             move(p.guid, "attention"),
           );
         }
-        return { patch: { state: "errored", outcome: "errored", reason: "errored" }, effects };
+        return { patch: { state: "errored", outcome: "errored", reason: "errored", error: safeErr }, effects };
       },
     };
   }
@@ -458,33 +461,43 @@ export class Dispatcher {
     }
     const logFile = path.join(this.logDir(p.guid), `worker-${round}-${ctx.attempt}.log`);
     const step = this.ledger.startStep({ work_id: it.id, name: `worker#${round}`, harness: p.harness, log: logFile });
-    const r = await runHarness(this.cfg, {
-      harness: p.harness,
-      prompt: render(loadPrompt("worker.md"), {
-        summary: p.summary.replace(/^\s*\[[\w-]+\]\s*/, ""),
-        description: p.description,
+    let stepClosed = false;
+    try {
+      const r = await runHarness(this.cfg, {
+        harness: p.harness,
+        prompt: render(loadPrompt("worker.md"), {
+          summary: p.summary.replace(/^\s*\[[\w-]+\]\s*/, ""),
+          description: p.description,
+          cwd: p.cwd,
+          feedback: p.feedback || "（无）",
+        }),
         cwd: p.cwd,
-        feedback: p.feedback || "（无）",
-      }),
-      cwd: p.cwd,
-      tools: "write",
-      lark: "none",
-      timeoutSec: this.cfg.dispatch.timeout_sec,
-      logFile,
-      signal: ctx.signal,
-      onSpawn: (pid) => this.ledger.setStepPid(step, pid),
-      stepId: step,
-      ...repoGuard,
-    });
-    const report = r.text || "（无输出）";
-    if (!r.ok) {
-      this.ledger.endStep(step, "failed", r.aborted ? "中止" : truncate(report, 500));
-      checkpoint(ctx);
-      throw new Error(`${p.harness} 执行失败（exit ${r.exitCode}${r.timedOut ? "，超时" : ""}）：${truncate(report, 800)}`);
+        tools: "write",
+        lark: "none",
+        timeoutSec: this.cfg.dispatch.timeout_sec,
+        logFile,
+        signal: ctx.signal,
+        onSpawn: (pid) => this.ledger.setStepPid(step, pid),
+        stepId: step,
+        ...repoGuard,
+      });
+      const report = r.text || "（无输出）";
+      if (!r.ok) {
+        this.ledger.endStep(step, "failed", r.aborted ? "中止" : truncate(report, 500));
+        stepClosed = true;
+        checkpoint(ctx);
+        throw new Error(`${p.harness} 执行失败（exit ${r.exitCode}${r.timedOut ? "，超时" : ""}）：${truncate(report, 800)}`);
+      }
+      if (p.base) await autoCommit(p.cwd, `pa: 第 ${round} 轮（${p.harness}）`, { cfg: this.cfg, ...repoGuard });
+      this.ledger.endStep(step, "ok", truncate(report, 500));
+      stepClosed = true;
+      return this.ledger.transition(it, { state: "verifying", payload: { ...p, report } });
+    } catch (err) {
+      if (!stepClosed) {
+        this.ledger.endStep(step, "failed", truncate(redactGitUrls(errMsg(err)), 500));
+      }
+      throw err;
     }
-    if (p.base) await autoCommit(p.cwd, `pa: 第 ${round} 轮（${p.harness}）`, { cfg: this.cfg, ...repoGuard });
-    this.ledger.endStep(step, "ok", truncate(report, 500));
-    return this.ledger.transition(it, { state: "verifying", payload: { ...p, report } });
   }
 
   /** verifying：确定性校验 → LLM 审查 → 验收关卡决定下一步。 */
@@ -597,33 +610,48 @@ export class Dispatcher {
       checkpoint(ctx);
       const logFile = path.join(this.logDir(p.guid), `review-${p.round}-${ctx.attempt}-${i + 1}.log`);
       const step = this.ledger.startStep({ work_id: it.id, name: `review#${p.round}`, harness: p.reviewer, log: logFile });
-      const rv = await runHarness(this.cfg, {
-        harness: p.reviewer,
-        prompt: render(loadPrompt("review.md"), {
-          summary: p.summary,
-          description: p.description,
-          report: truncate(p.report, 8000),
-          diff: diff ? truncate(diff, 30000) : "（非代码任务，无 diff）",
-        }),
-        cwd: p.cwd,
-        tools: "read",
-        lark: "none",
-        timeoutSec: this.cfg.acceptance.review_timeout_sec,
-        logFile,
-        signal: ctx.signal,
-        onSpawn: (pid) => this.ledger.setStepPid(step, pid),
-        stepId: step,
-        ...repoGuard,
-      });
-      checkpoint(ctx);
-      const parsed = rv.text ? parseReview(rv.text) : undefined;
-      if (parsed) {
-        this.ledger.endStep(step, "ok", parsed.verdict);
-        return { kind: "review", name, status: parsed.verdict === "approve" ? "pass" : "fail", detail: formatReview(parsed) };
+      let stepClosed = false;
+      try {
+        const rv = await runHarness(this.cfg, {
+          harness: p.reviewer,
+          prompt: render(loadPrompt("review.md"), {
+            summary: p.summary,
+            description: p.description,
+            report: truncate(p.report, 8000),
+            diff: diff ? truncate(diff, 30000) : "（非代码任务，无 diff）",
+          }),
+          cwd: p.cwd,
+          tools: "read",
+          lark: "none",
+          timeoutSec: this.cfg.acceptance.review_timeout_sec,
+          logFile,
+          signal: ctx.signal,
+          onSpawn: (pid) => this.ledger.setStepPid(step, pid),
+          stepId: step,
+          ...repoGuard,
+        });
+        checkpoint(ctx);
+        const parsed = rv.text ? parseReview(rv.text) : undefined;
+        if (parsed) {
+          this.ledger.endStep(step, "ok", parsed.verdict);
+          stepClosed = true;
+          return { kind: "review", name, status: parsed.verdict === "approve" ? "pass" : "fail", detail: formatReview(parsed) };
+        }
+        lastErr = rv.text ? `结论无法解析：${truncate(rv.text, 300)}` : `无输出（exit ${rv.exitCode}${rv.timedOut ? "，超时" : ""}）`;
+        this.ledger.endStep(step, "failed", lastErr);
+        stepClosed = true;
+        log("warn", "审查器故障", { task: p.summary, try: i + 1, err: lastErr });
+      } catch (err) {
+        const msg = truncate(redactGitUrls(errMsg(err)), 300);
+        if (!stepClosed) {
+          this.ledger.endStep(step, "failed", ctx.signal.aborted ? "中止" : msg);
+        }
+        if (err instanceof Aborted || err instanceof LeaseLost || ctx.signal.aborted) {
+          throw err;
+        }
+        lastErr = `审查器准备/启动失败：${msg}`;
+        log("warn", "审查器故障", { task: p.summary, try: i + 1, err: lastErr });
       }
-      lastErr = rv.text ? `结论无法解析：${truncate(rv.text, 300)}` : `无输出（exit ${rv.exitCode}${rv.timedOut ? "，超时" : ""}）`;
-      this.ledger.endStep(step, "failed", lastErr);
-      log("warn", "审查器故障", { task: p.summary, try: i + 1, err: lastErr });
     }
     return { kind: "review", name, status: "error", detail: lastErr };
   }
@@ -829,12 +857,6 @@ function statusText(s: CheckResult["status"]): string {
 export function formatReview(r: Review): string {
   const issues = r.issues.map((i, n) => `${n + 1}. [${i.severity || "-"}] ${i.location ? `${i.location}：` : ""}${i.problem}${i.suggestion ? `（建议：${i.suggestion}）` : ""}`);
   return [r.summary, ...issues].filter(Boolean).join("\n") || (r.verdict === "approve" ? "没有发现问题" : "需修改");
-}
-
-async function git(cwd: string, args: string[], opts?: import("../delivery/git.ts").GitRunOpts): Promise<string> {
-  const r = await tryGit(cwd, args, opts);
-  if (r.code !== 0) throw new Error(`git ${args.join(" ")} 失败：${r.stderr.trim()}`);
-  return r.stdout;
 }
 
 /** 有改动就提交（含新文件）；没有改动什么都不做（复用交付层签名感知提交逻辑）。 */

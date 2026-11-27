@@ -5,7 +5,7 @@ import YAML, { isMap, type Document } from "yaml";
 import { z } from "zod";
 import type { App } from "./app.ts";
 import type { SettingsUpdateResult, SettingsView } from "./api/types.ts";
-import { ConfigSchema } from "./config.ts";
+import { ConfigSchema, markConfigMutated } from "./config.ts";
 import { parseHHMM } from "./notify-prefs.ts";
 import { errMsg, log } from "./util.ts";
 
@@ -350,6 +350,7 @@ export class SettingsService {
       if (isObj(src) && isObj(cfg[k])) syncInPlace(cfg[k] as Obj, src, [k]);
       else if (src !== undefined && isHotPath([k])) cfg[k] = structuredClone(src);
     }
+    markConfigMutated(this.app.cfg);
   }
 
   private audit(args: Record<string, unknown>, ok: boolean, message: string): void {

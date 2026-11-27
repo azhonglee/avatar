@@ -702,9 +702,36 @@ function isSafeGitConfigKey(rawKey: string): boolean {
 
 function isSafeGitConfigValue(rawValue: string): boolean {
   if (/[\r\n\0]/.test(rawValue)) return false;
-  if (/:\/\/[^/\s@]+@/.test(rawValue)) return false;
+  if (/:\/\/[^/\s@?#]+@/.test(rawValue)) return false;
+  if (/[a-z][a-z0-9+.-]*:\/\/[^\s"'<>?#]+\?/i.test(rawValue)) return false;
   if (/\b(?:authorization\s*:|bearer\s+\S|basic\s+[A-Za-z0-9+/=]{8,})/i.test(rawValue)) return false;
   return true;
+}
+
+/** 含凭据的 url.*.insteadOf 精确前缀匹配：除协议/主机/端口/路径外，还强制用户名、密码与查询串精确一致，杜绝同用户名不同令牌跨仓库泄露 */
+function credentialUrlPrefixMatchesExact(sectionPattern: string, targetRaw: string): boolean {
+  const pat = sectionPattern.trim();
+  const tgt = targetRaw.trim();
+  if (!pat || !tgt) return false;
+  if (tgt.startsWith(pat)) return true;
+  let patUrl: URL;
+  let tgtUrl: URL;
+  try {
+    patUrl = new URL(pat);
+    tgtUrl = new URL(tgt);
+  } catch {
+    return false;
+  }
+  if (patUrl.protocol !== tgtUrl.protocol) return false;
+  if (patUrl.hostname.toLowerCase() !== tgtUrl.hostname.toLowerCase()) return false;
+  const defPort = (p: string) => (p === "https:" ? "443" : p === "http:" ? "80" : "");
+  if ((patUrl.port || defPort(patUrl.protocol)) !== (tgtUrl.port || defPort(tgtUrl.protocol))) return false;
+  if (patUrl.username !== tgtUrl.username || patUrl.password !== tgtUrl.password) return false;
+  if (patUrl.search && patUrl.search !== tgtUrl.search) return false;
+  const patPath = patUrl.pathname.replace(/\/+$/, "");
+  if (!patPath) return true;
+  const tgtPath = tgtUrl.pathname.replace(/\/+$/, "");
+  return tgtPath === patPath || tgtPath.startsWith(`${patPath}/`);
 }
 
 function escapeGitConfigValue(val: string): string {
@@ -774,9 +801,9 @@ function isAllowedRemoteGitConfigEntry(
     return allowedRemoteUrls.some((u) => gitUrlPrefixMatchesTarget(subsection, u));
   }
   if (section === "url" && (varName === "insteadof" || varName === "pushinsteadof")) {
-    // 无内嵌凭据的 URL 重写规则或明确指向当前已授权目标 URL 的重写规则才允许保留
+    // 无内嵌凭据的 URL 重写规则直接放行；含内嵌凭据/查询串的规则必须精确匹配当前目标 URL 的用户名、密码与查询串，绝不跨仓泄露同用户名其他令牌
     if (isSafeGitConfigValue(subsection) && isSafeGitConfigValue(value)) return true;
-    return allowedRemoteUrls.some((u) => gitUrlPrefixMatchesTarget(subsection, u) || u.startsWith(subsection));
+    return allowedRemoteUrls.some((u) => credentialUrlPrefixMatchesExact(subsection, u));
   }
   return false;
 }
@@ -1258,10 +1285,13 @@ function resolveValidatedGitAuxMount(
 function sanitizedGitConfigContainsCredentials(sanitized: string): boolean {
   if (/^\s*extraheader\s*=/im.test(sanitized)) return true;
   if (/^\s*password\s*=/im.test(sanitized)) return true;
-  if (/^\s*(?:insteadof|pushinsteadof|url|pushurl|lfsurl|lfspushurl|proxy)\s*=.*:\/\/[^/\s@"'\\]+@/im.test(sanitized)) {
+  if (/^\s*(?:insteadof|pushinsteadof|url|pushurl|lfsurl|lfspushurl|proxy)\s*=.*:\/\/[^/\s@"'\\?#]+@/im.test(sanitized)) {
     return true;
   }
-  if (/^\[(?:url|http)\s+"[^"]*:\/\/[^/\s@"\\]+@[^"]*"\]/im.test(sanitized)) {
+  if (/^\[[^\]]*:\/\/[^/\s@"\\?#]+@[^\]]*\]/im.test(sanitized)) {
+    return true;
+  }
+  if (/[a-z][a-z0-9+.-]*:\/\/[^\s"'<>?#]+\?/i.test(sanitized)) {
     return true;
   }
   return false;
@@ -4818,8 +4848,8 @@ const UNSHARE_ISOLATION_SCRIPT = [
   'ORIG_PATH="${PATH-}"',
   'HAS_ORIG_PATH="${PATH+1}"',
   `export PATH="${TRUSTED_BOOTSTRAP_PATH}"`,
-  'UNSHARE_BIN="$1"; PIVOT_ROOT="$2"; SETPRIV="$3"; ORIG_UID="$4"; ORIG_GID="$5"; DD="$6"; CWD="$7"; SYS_COUNT="$8"; SYM_COUNT="$9"; TM_COUNT="${10}"; PRE_COUNT="${11}"; POST_COUNT="${12}"; EXTRA_COUNT="${13}"; M_COUNT="${14}"',
-  "shift 14",
+  'UNSHARE_BIN="$1"; PIVOT_ROOT="$2"; SETPRIV="$3"; ORIG_UID="$4"; ORIG_GID="$5"; DD="$6"; CWD="$7"; SYS_COUNT="$8"; PRE_SYM_COUNT="$9"; TM_COUNT="${10}"; PRE_COUNT="${11}"; POST_COUNT="${12}"; EXTRA_COUNT="${13}"; POST_SYM_COUNT="${14}"; M_COUNT="${15}"',
+  "shift 15",
   "mount -n --make-rprivate /",
   "S=",
   'TMP_STAGE=""',
@@ -4868,9 +4898,9 @@ const UNSHARE_ISOLATION_SCRIPT = [
   '  mount -n -o remount,ro,bind "$mp"',
   'done < "$S/save/ro-mounts"',
   `awk -v prefix="$S/newroot" '${MOUNTINFO_UNESCAPE_AWK}\n{ mp = unescape($5); if (index(mp, prefix "/") == 1) { subp = substr(mp, length(prefix) + 1); if (is_virt(subp)) next; opts = "," $6 ","; if (index(opts, ",ro,") == 0) { print "unshare read-only verification failed: " mp > "/dev/stderr"; exit 1 } } }' /proc/self/mountinfo`,
-  // 0b) 重建必要的只读目录符号链接（如 /bin -> usr/bin、/home/<user> -> /data00/home/<user>），自身不暴露未挂载路径
+  // 0b) 重建位于 tmpfs 遮蔽层之外的只读目录符号链接（如 /bin -> usr/bin、/home/<user> -> /data00/home/<user>），自身不暴露未挂载路径
   "i=0",
-  'while [ "$i" -lt "$SYM_COUNT" ]; do',
+  'while [ "$i" -lt "$PRE_SYM_COUNT" ]; do',
   '  target="$1"; dest="$2"; shift 2',
   '  mkdir -p "$(dirname "$S/newroot$dest")"',
   '  [ -e "$S/newroot$dest" ] || [ -L "$S/newroot$dest" ] || ln -s "$target" "$S/newroot$dest"',
@@ -4914,6 +4944,14 @@ const UNSHARE_ISOLATION_SCRIPT = [
   '  if [ -d "$src" ]; then [ -d "$S/newroot$dest" ] || mkdir -p "$S/newroot$dest"; else [ -e "$S/newroot$dest" ] || { mkdir -p "$(dirname "$S/newroot$dest")"; : > "$S/newroot$dest"; }; fi',
   '  mount -n --bind "$src" "$S/newroot$dest"',
   '  if [ "$mode" = "ro" ]; then mount -n -o remount,ro,bind "$S/newroot$dest"; else mount -n -o remount,rw,bind "$S/newroot$dest"; fi',
+  "  i=$((i + 1))",
+  "done",
+  // 第四阶段b：在 tmpfs（runtimeMaskDirs / dataDir / /tmp）与异路径绑定就绪后重建后置符号链接（与 bwrap 顺序一致），避免被 tmpfs 抹除
+  "i=0",
+  'while [ "$i" -lt "$POST_SYM_COUNT" ]; do',
+  '  target="$1"; dest="$2"; shift 2',
+  '  mkdir -p "$(dirname "$S/newroot$dest")"',
+  '  [ -e "$S/newroot$dest" ] || [ -L "$S/newroot$dest" ] || ln -s "$target" "$S/newroot$dest"',
   "  i=$((i + 1))",
   "done",
   'if [ -n "$DD" ]; then',
@@ -5357,9 +5395,27 @@ export function wrapCredentialIsolatedCommand(
     if (!fs.existsSync(rawEntry.src)) continue;
     const realSrc = safeRealpath(rawEntry.src);
     if (isForbiddenDaemonTarget(realSrc)) continue;
-    const realDest = resolveMountDestRealpath(rawEntry.dest);
-    if (!realDest || realDest === "/") continue;
-    if (resolvedDataDir && (realDest === resolvedDataDir || isPathInsideOrEqual(realDest, resolvedDataDir))) {
+    let srcIsFile = false;
+    try {
+      srcIsFile = fs.statSync(realSrc).isFile();
+    } catch {
+      continue;
+    }
+    const absDest = path.resolve(rawEntry.dest);
+    const derefDest = resolveMountDestRealpath(absDest);
+    // 文件级异路径挂载（如软链 AWS web_identity_token_file / ca_bundle / dotfiles .npmrc/.gitconfig）仅解析父目录软链，
+    // 保留叶节点配置路径以防解引用回到真实目标导致沙箱内按配置路径打开 ENOENT，同时对逻辑路径与解引用目标均执行 dataDir 安全边界核验
+    const realDest = srcIsFile
+      ? path.join(resolveMountDestRealpath(path.dirname(absDest)), path.basename(absDest))
+      : derefDest;
+    if (!realDest || realDest === "/" || !derefDest || derefDest === "/") continue;
+    if (
+      resolvedDataDir &&
+      (realDest === resolvedDataDir ||
+        isPathInsideOrEqual(realDest, resolvedDataDir) ||
+        derefDest === resolvedDataDir ||
+        isPathInsideOrEqual(derefDest, resolvedDataDir))
+    ) {
       continue;
     }
     if (seenExtraBindDests.has(realDest)) continue;
@@ -5428,7 +5484,6 @@ export function wrapCredentialIsolatedCommand(
   const postTmpfsSymlinks = [...dirSymlinks.filter((s) => isInsideTmpfsMask(s.dest)), ...fileSymlinks].sort(
     (a, b) => a.dest.length - b.dest.length || a.dest.localeCompare(b.dest),
   );
-  const allSymlinks = [...preTmpfsDirSymlinks, ...postTmpfsSymlinks];
 
   const rawMasks: string[] = [...(opts?.maskFiles ?? [])];
   if (hasCredKeyFile) {
@@ -5562,18 +5617,20 @@ export function wrapCredentialIsolatedCommand(
       resolvedDataDir,
       resolvedCwd,
       String(systemRoAll.length),
-      String(allSymlinks.length),
+      String(preTmpfsDirSymlinks.length),
       String(runtimeMaskDirs.length),
       String(preMounts.length),
       String(postMounts.length),
       String(extraBindMounts.length),
+      String(postTmpfsSymlinks.length),
       String(maskFiles.length),
       ...systemRoAll,
-      ...flattenSyms(allSymlinks),
+      ...flattenSyms(preTmpfsDirSymlinks),
       ...runtimeMaskDirs,
       ...flatten(preMounts),
       ...flatten(postMounts),
       ...flattenExtra(extraBindMounts),
+      ...flattenSyms(postTmpfsSymlinks),
       ...maskFiles,
       cmd,
       ...args,

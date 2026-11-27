@@ -23,10 +23,26 @@ import {
 } from "../harness.ts";
 import { errMsg, killGroup, runProcess, type ProcResult } from "../util.ts";
 
-function redactGitUrls(text: string): string {
+/** 去掉文本里 URL 的内嵌账号密码（含密码中的 `@`）与查询串（?token=... 等，保留外围未配对右括号而不被查询串内部 `)` 截断）。 */
+export function redactGitUrls(text: string): string {
   return text
     .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s?#]+@/gi, "$1***@")
-    .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s"'`<>?#]+)\?[^\s"'`<>#)]+/gi, "$1?***");
+    .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s"'`<>?#]+)\?([^\s"'`<>#]+)/gi, (_m, base: string, query: string) => {
+      let opens = 0;
+      let closes = 0;
+      for (const ch of query) {
+        if (ch === "(") opens++;
+        else if (ch === ")") closes++;
+      }
+      let trailing = "";
+      let q = query;
+      while (closes > opens && q.endsWith(")")) {
+        trailing = `)${trailing}`;
+        q = q.slice(0, -1);
+        closes--;
+      }
+      return `${base}?***${trailing}`;
+    });
 }
 
 function killChildGroup(child: { pid?: number; kill: (sig?: NodeJS.Signals) => boolean }): void {
@@ -2443,16 +2459,16 @@ export interface RemoteRef {
  */
 export function parseRemote(url: string): RemoteRef | undefined {
   const u = url.trim();
-  const clean = (p: string) => p.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/, "");
-  const m = u.match(/^(?:https?|ssh|git):\/\/(?:[^@/]+@)?([^/:]+)(?::\d+)?\/(.+)$/i);
+  const clean = (p: string) => p.replace(/[?#][\s\S]*$/, "").replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/, "");
+  const m = u.match(/^(?:https?|ssh|git):\/\/(?:[^/\s?#]+@)?([^/:?#]+)(?::\d+)?\/(.+)$/i);
   if (m) {
-    const path = clean(m[2]);
-    return path.includes("/") ? { host: m[1].toLowerCase(), path } : undefined;
+    const repoPath = clean(m[2]);
+    return repoPath.includes("/") ? { host: m[1].toLowerCase(), path: repoPath } : undefined;
   }
   const scp = parseScpGitUrl(u);
   if (scp) {
-    const path = clean(scp.path);
-    return path.includes("/") ? { host: scp.host, path } : undefined;
+    const repoPath = clean(scp.path);
+    return repoPath.includes("/") ? { host: scp.host, path: repoPath } : undefined;
   }
   return undefined;
 }
