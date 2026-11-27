@@ -256,7 +256,7 @@ export class Drafter {
     return boundNative;
   }
 
-  async forItem(itemId: string, kind?: CtxDraftKind): Promise<DraftRow> {
+  async forItem(itemId: string, kind?: CtxDraftKind, opts?: { beforeInfer?: () => boolean }): Promise<DraftRow> {
     const it = this.store.item(itemId);
     if (!it) throw new Error(`没有这个事项：${itemId}`);
     const k = kind ?? defaultDraftKind(it);
@@ -357,6 +357,10 @@ export class Drafter {
       conversation: convText,
       format: k === "meego_comment" ? "3~6 行，可用「进展 / 下一步 / 风险」分行。" : "1~4 句话，不超过 200 字。",
     });
+    // 紧贴模型调用前同步复检自动预起草资格（防止在异步解析目标与会话期间被关闭 pre_draft、静音项目或关闭事项）
+    if (opts?.beforeInfer && !opts.beforeInfer()) {
+      throw new DraftTargetIneligibleError("自动预起草资格在推理前已失效，已跳过起草");
+    }
     const content = await this.llm(prompt, k);
     return this.store.addDraft({ item_id: it.id, project_id: it.project_id, kind: k, target, target_label: label, content });
   }

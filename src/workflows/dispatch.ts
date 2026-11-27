@@ -404,13 +404,25 @@ export class Dispatcher {
     ]);
   }
 
+  /** 从派单描述解析受信任仓库根目录（无 repo: 时返回 undefined，并禁止挂载任意外部 .git） */
+  private trustedRepoOpts(p: Pick<DispatchPayload, "description" | "base">): {
+    trustedRepoRoot?: string;
+    disableGitWorktreeMounts?: boolean;
+  } {
+    if (!p.base) return { disableGitWorktreeMounts: true };
+    const ref = parseRepo({ description: p.description ?? "" });
+    if (!ref) return { disableGitWorktreeMounts: true };
+    return { trustedRepoRoot: repoSpec(this.cfg, ref).path };
+  }
+
   /** executing：在本轮检查点上运行 worker；成功则提交本轮改动，进入 verifying。 */
   private async execute(it: Item, ctx: Ctx): Promise<Item> {
     let p = it.payload;
     const round = String(p.round);
+    const repoGuard = this.trustedRepoOpts(p);
     if (p.base) {
       const cp = p.checkpoints[round];
-      const gitOpts = { cfg: this.cfg };
+      const gitOpts = { cfg: this.cfg, ...repoGuard };
       if (cp) {
         // 重入（崩溃 / 失败重试）：丢弃上次没跑完的半成品，回到本轮起点
         await git(p.cwd, ["reset", "--hard", cp], gitOpts);
@@ -440,6 +452,7 @@ export class Dispatcher {
       signal: ctx.signal,
       onSpawn: (pid) => this.ledger.setStepPid(step, pid),
       stepId: step,
+      ...repoGuard,
     });
     const report = r.text || "（无输出）";
     if (!r.ok) {
@@ -447,7 +460,7 @@ export class Dispatcher {
       checkpoint(ctx);
       throw new Error(`${p.harness} 执行失败（exit ${r.exitCode}${r.timedOut ? "，超时" : ""}）：${truncate(report, 800)}`);
     }
-    if (p.base) await autoCommit(p.cwd, `pa: 第 ${round} 轮（${p.harness}）`, { cfg: this.cfg });
+    if (p.base) await autoCommit(p.cwd, `pa: 第 ${round} 轮（${p.harness}）`, { cfg: this.cfg, ...repoGuard });
     this.ledger.endStep(step, "ok", truncate(report, 500));
     return this.ledger.transition(it, { state: "verifying", payload: { ...p, report } });
   }
@@ -470,7 +483,7 @@ export class Dispatcher {
       const feedback = checks.filter((c) => c.status === "fail").map((c) => `### ${c.name}\n${c.detail}`).join("\n\n");
       return this.ledger.transition(it, { state: "executing", payload: { ...p, history, round: p.round + 1, feedback } }, effects);
     }
-    const stat = p.base ? await gitDiffStat(p.cwd, p.base, { cfg: this.cfg, readOnly: true }) : "";
+    const stat = p.base ? await gitDiffStat(p.cwd, p.base, { cfg: this.cfg, readOnly: true, ...this.trustedRepoOpts(p) }) : "";
     const tail = [truncate(p.report, 1800), stat ? `\n变更：\n${stat}` : "", p.branch ? `分支：${p.branch}（worktree：${p.cwd}）` : ""].filter(Boolean).join("\n");
     const final = { ...p, history };
     if (d.next === "accept") {
@@ -502,6 +515,7 @@ export class Dispatcher {
         buildWorkspaceIsolation(this.cfg, {
           mode: "verify",
           cwd: p.cwd,
+          ...this.trustedRepoOpts(p),
           extraReadOnlyPaths: baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : [],
         }),
       );
@@ -533,7 +547,8 @@ export class Dispatcher {
   private async runReview(it: Item, ctx: Ctx): Promise<CheckResult> {
     const p = it.payload;
     const name = `${p.reviewer} 审查`;
-    const diff = p.base ? await gitDiff(p.cwd, p.base, { cfg: this.cfg, readOnly: true }) : "";
+    const repoGuard = this.trustedRepoOpts(p);
+    const diff = p.base ? await gitDiff(p.cwd, p.base, { cfg: this.cfg, readOnly: true, ...repoGuard }) : "";
     let lastErr = "";
     for (let i = 0; i <= this.cfg.acceptance.review_retries; i++) {
       checkpoint(ctx);
@@ -555,6 +570,7 @@ export class Dispatcher {
         signal: ctx.signal,
         onSpawn: (pid) => this.ledger.setStepPid(step, pid),
         stepId: step,
+        ...repoGuard,
       });
       checkpoint(ctx);
       const parsed = rv.text ? parseReview(rv.text) : undefined;
@@ -585,12 +601,12 @@ export class Dispatcher {
     if (!fs.existsSync(cwd)) {
       const wtParent = path.join(this.cfg.dataDir, "worktrees");
       fs.mkdirSync(wtParent, { recursive: true });
-      const head = await git(spec.path, ["rev-parse", "HEAD"], { cfg: this.cfg, readOnly: true });
-      const hasBranch = (await tryGit(spec.path, ["rev-parse", "--verify", "--quiet", branch], { cfg: this.cfg, readOnly: true })).code === 0;
+      const head = await git(spec.path, ["rev-parse", "HEAD"], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path });
+      const hasBranch = (await tryGit(spec.path, ["rev-parse", "--verify", "--quiet", branch], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path })).code === 0;
       await git(
         spec.path,
         hasBranch ? ["worktree", "add", cwd, branch] : ["worktree", "add", "-b", branch, cwd],
-        { cfg: this.cfg, extraWritablePaths: [wtParent] },
+        { cfg: this.cfg, trustedRepoRoot: spec.path, extraWritablePaths: [wtParent] },
       );
       if (!this.store.get(baseKey)) this.store.set(baseKey, head.trim());
     }

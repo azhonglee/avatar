@@ -39,6 +39,7 @@ export class Board {
   /** 幂等：找到同名清单/分组就复用，找不到才创建。 */
   async init(): Promise<void> {
     let tasklist = this.store.get("board.tasklist");
+    const cfgOwner = this.cfg.owner.open_id.trim();
     if (!tasklist) {
       const found = await this.lark.run(["task", "+tasklist-search", "--query", this.cfg.board.name], { as: "user" });
       tasklist = findItems(found, "guid").find((t) => t.name === this.cfg.board.name)?.guid as string | undefined;
@@ -49,6 +50,12 @@ export class Board {
         log("info", "已创建任务清单", { name: this.cfg.board.name, guid: tasklist });
       }
       this.store.set("board.tasklist", tasklist);
+      if (cfgOwner) this.store.set("board.owner_open_id", cfgOwner);
+    } else if (cfgOwner && !this.store.get("board.owner_open_id")) {
+      const recordedOwner = (this.store.get("owner.open_id") ?? "").trim();
+      if (!recordedOwner || recordedOwner === cfgOwner) {
+        this.store.set("board.owner_open_id", cfgOwner);
+      }
     }
     const listed = await this.lark.run(
       ["task", "sections", "list", "--params", JSON.stringify({ resource_type: "tasklist", resource_id: tasklist, page_size: 50 })],

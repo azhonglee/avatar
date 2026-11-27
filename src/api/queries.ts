@@ -5,10 +5,11 @@ import { Cron } from "croner";
 import { tryGit } from "../delivery/git.ts";
 import type { App } from "../app.ts";
 import { CommandError } from "../commands.ts";
+import { repoSpec } from "../config.ts";
 import { hasWorkspaceOwnerMismatch } from "../context/personal-web.ts";
 import { availableActions } from "../core-commands.ts";
 import type { Effect, WorkItem } from "../ledger.ts";
-import type { DispatchPayload } from "../workflows/dispatch.ts";
+import { parseRepo, type DispatchPayload } from "../workflows/dispatch.ts";
 import type {
   AuditView,
   DeliveryStatus,
@@ -147,12 +148,14 @@ export function overview(app: App): Overview {
   const today = recent.filter((w) => w.created >= dayStart);
   const count = (s: string) => today.filter((w) => w.state === s).length;
   const h = health(app);
+  // 已按旧主人隔离的失败项对当前主人不可操作，不计入当前主人的待处理失败计数或健康异常状态（原主人的确认状态保持不变）
+  const actionableFailures = h.failed.filter((f) => !f.acknowledged && !f.isolated);
   return {
     attention: {
       needs_human: needs.filter((s) => !(s.delivery === "discarded")),
       to_review: review,
       candidates: app.ext.candidates?.pendingCount() ?? 0,
-      failures: h.failed.filter((f) => !f.acknowledged).length,
+      failures: actionableFailures.length,
     },
     running,
     today: {
@@ -164,10 +167,10 @@ export function overview(app: App): Overview {
       budget_usd: cfg.budget.daily_usd,
     },
     health: {
-      ok: !!h.daemon.last_heartbeat && Date.now() - h.daemon.last_heartbeat < 60_000 && h.failed.every((f) => f.acknowledged),
+      ok: !!h.daemon.last_heartbeat && Date.now() - h.daemon.last_heartbeat < 60_000 && actionableFailures.length === 0,
       pending_events: ledger.active("event").length,
       pending_effects: ledger.active("effect").length,
-      dead: h.failed.filter((f) => !f.acknowledged).length,
+      dead: actionableFailures.length,
       daemon_owner: h.daemon.owner,
     },
   };
@@ -352,26 +355,43 @@ export function isWorkBlockedByOwner(
 }
 
 export function listDispatches(app: App, f: { filter?: DispatchFilter; q?: string; limit?: number }): DispatchSummary[] {
-  const items = app.ledger.list<DispatchPayload>({ kinds: ["dispatch"], limit: Math.min(f.limit ?? 200, 500) });
+  const maxItems = Math.min(Math.max(0, f.limit ?? 200), 500);
+  if (maxItems === 0) return [];
   const q = f.q?.trim().toLowerCase();
-  return items
-    .filter((w) => !isContextDerivedDispatchBlocked(app, w.id))
-    .filter((w) => {
+  const pageSize = Math.min(Math.max(maxItems * 2, 50), 500);
+  const matched: WorkItem<DispatchPayload>[] = [];
+  let before: number | undefined;
+  for (;;) {
+    const page = app.ledger.list<DispatchPayload>({ kinds: ["dispatch"], limit: pageSize, before });
+    if (!page.length) break;
+    for (const w of page) {
+      if (isContextDerivedDispatchBlocked(app, w.id)) continue;
+      let matchesFilter = true;
       switch (f.filter ?? "all") {
         case "active":
-          return !w.terminal;
+          matchesFilter = !w.terminal;
+          break;
         case "attention":
-          return ATTENTION.includes(w.state as DispatchState);
+          matchesFilter = ATTENTION.includes(w.state as DispatchState);
+          break;
         case "review":
-          return REVIEW.includes(w.state as DispatchState);
+          matchesFilter = REVIEW.includes(w.state as DispatchState);
+          break;
         case "done":
-          return w.terminal;
+          matchesFilter = w.terminal;
+          break;
         default:
-          return true;
+          matchesFilter = true;
       }
-    })
-    .filter((w) => !q || `${w.payload.summary ?? ""} ${w.ref} ${w.id}`.toLowerCase().includes(q))
-    .map((w) => summarize(app, w));
+      if (!matchesFilter) continue;
+      if (q && !`${w.payload.summary ?? ""} ${w.ref} ${w.id}`.toLowerCase().includes(q)) continue;
+      matched.push(w);
+      if (matched.length >= maxItems) break;
+    }
+    if (matched.length >= maxItems || page.length < pageSize) break;
+    before = page[page.length - 1].seq;
+  }
+  return matched.map((w) => summarize(app, w));
 }
 
 function stepView(s: ReturnType<App["ledger"]["steps"]>[number]): StepView {
@@ -419,28 +439,50 @@ function effectSummary(e: Effect): string {
 }
 
 export function auditViews(app: App, target?: string, limit = 50): AuditView[] {
+  const maxItems = Math.max(0, limit);
+  if (maxItems === 0) return [];
   const curOwner = app.cfg.owner.open_id.trim();
   const ownerMismatch = hasWorkspaceOwnerMismatch(app.store, curOwner);
-  return app.ledger
-    .auditLog(limit, target)
-    .filter((a) => {
-      if (ownerMismatch && a.command.startsWith("context.")) return false;
-      if (a.target && isWorkBlockedByOwner(app, a.target)) return false;
+  const pageSize = Math.min(Math.max(maxItems * 2, 50), 500);
+  const out: AuditView[] = [];
+  let before: number | undefined;
+  for (;;) {
+    const page = app.ledger.auditLog(pageSize, target, before);
+    if (!page.length) break;
+    for (const a of page) {
+      if (ownerMismatch && a.command.startsWith("context.")) continue;
+      if (a.target && isWorkBlockedByOwner(app, a.target)) continue;
       // 嵌套委派命令（如 context.item_delegate 调用 dispatch.create 失败时无派单 ID）通过 args.__context_owner 保留主人归属隔离
+      let blockedByOrigin = false;
       if (a.args) {
         try {
           const parsed = JSON.parse(a.args) as { __context_owner?: unknown };
           if (typeof parsed.__context_owner === "string") {
             const origin = parsed.__context_owner.trim();
-            if ((origin && origin !== curOwner) || ownerMismatch) return false;
+            if ((origin && origin !== curOwner) || ownerMismatch) blockedByOrigin = true;
           }
         } catch {
           // ignore malformed args json
         }
       }
-      return true;
-    })
-    .map((a) => ({ id: a.id, at: a.at, source: a.source, command: a.command, target: a.target, ok: !!a.ok, message: a.message }));
+      if (blockedByOrigin) continue;
+      out.push({ id: a.id, at: a.at, source: a.source, command: a.command, target: a.target, ok: !!a.ok, message: a.message });
+      if (out.length >= maxItems) break;
+    }
+    if (out.length >= maxItems || page.length < pageSize) break;
+    before = page[page.length - 1].id;
+  }
+  return out;
+}
+
+function dispatchRepoGuard(app: App, p: Pick<DispatchPayload, "description" | "base">): {
+  trustedRepoRoot?: string;
+  disableGitWorktreeMounts?: boolean;
+} {
+  if (!p.base) return { disableGitWorktreeMounts: true };
+  const ref = parseRepo({ description: p.description ?? "" });
+  if (!ref) return { disableGitWorktreeMounts: true };
+  return { trustedRepoRoot: repoSpec(app.cfg, ref).path };
 }
 
 export async function dispatchDetail(app: App, id: string): Promise<DispatchDetail | undefined> {
@@ -454,7 +496,7 @@ export async function dispatchDetail(app: App, id: string): Promise<DispatchDeta
   const latest = app.ledger.latest("dispatch", w.ref);
   let diffStat = "";
   if (p.base && p.cwd && fs.existsSync(p.cwd)) {
-    diffStat = (await tryGit(p.cwd, ["diff", "--stat", p.base], { cfg: app.cfg, readOnly: true })).stdout.trim();
+    diffStat = (await tryGit(p.cwd, ["diff", "--stat", p.base], { cfg: app.cfg, readOnly: true, ...dispatchRepoGuard(app, p) })).stdout.trim();
   }
   return {
     ...s,
@@ -494,11 +536,12 @@ export async function dispatchDiff(app: App, id: string): Promise<DiffView | und
   if (!w || w.kind !== "dispatch") return undefined;
   const p = w.payload;
   if (!p.base || !p.cwd || !fs.existsSync(p.cwd)) return { base: p.base ?? "", head: "", stat: "", patch: "", truncated: false };
+  const gitOpts = { cfg: app.cfg, readOnly: true, ...dispatchRepoGuard(app, p) };
   // 与基线比较（含尚未提交的已跟踪文件改动）；只读，不改动索引
   const [head, stat, patch] = await Promise.all([
-    tryGit(p.cwd, ["rev-parse", "HEAD"], { cfg: app.cfg, readOnly: true }),
-    tryGit(p.cwd, ["diff", "--stat", p.base], { cfg: app.cfg, readOnly: true }),
-    tryGit(p.cwd, ["diff", "--no-color", p.base], { cfg: app.cfg, readOnly: true }),
+    tryGit(p.cwd, ["rev-parse", "HEAD"], gitOpts),
+    tryGit(p.cwd, ["diff", "--stat", p.base], gitOpts),
+    tryGit(p.cwd, ["diff", "--no-color", p.base], gitOpts),
   ]);
   return {
     base: p.base,

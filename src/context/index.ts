@@ -250,42 +250,61 @@ export class ContextService {
               // 推理前逐个续租并核实占坑所有权仍属于当前执行者，丢弃已失联的占坑
               const pending = eligible.filter((c) => this.store.renewConv(c.conv, claimToken, procOwner));
               if (!pending.length) break;
-              const validateBeforeApply = async (
-                usedConvs: { conv: string; conv_name: string }[],
-                batchObs: import("./store.ts").Obs[],
-              ): Promise<Set<string>> => {
-                const disallowed = new Set<string>();
-                if (this.isWorkspaceOwnerMismatched() || !this.cfg.context.understand) {
-                  for (const c of usedConvs) disallowed.add(c.conv);
-                  return disallowed;
-                }
-                if (this.personalWeb.policySignature() === selectionPolicySig) return disallowed;
-                const freshExcl = await this.personalWeb.resolveNativeExclusionsForPolling();
-                for (const c of usedConvs) {
-                  const elig = await this.personalWeb.checkConvAllowedForUnderstand(c.conv, c.conv_name, freshExcl);
-                  if (elig !== "allowed") {
-                    disallowed.add(c.conv);
-                    continue;
-                  }
-                  // 逐条复核实际送入模型的精确观测行：只要其中任一行在新策略下不再允许（例如混合了普通消息和 @我的群被移出白名单），整体放弃本批
-                  const sentRows = batchObs.filter((o) => o.conv === c.conv);
-                  const stillAllowed = this.personalWeb.filterWindowByCurrentScope(c.conv, sentRows, freshExcl);
-                  if (stillAllowed.length < sentRows.length) {
-                    disallowed.add(c.conv);
-                  }
-                }
-                return disallowed;
-              };
               groups = Array.from({ length: Math.min(par, pending.length) }, () => []);
               pending.forEach((c, i) => groups[i % groups.length].push(c));
               results = await Promise.allSettled(
-                groups.map((g) =>
-                  this.understander.runBatch(workId, g, batchAbort.signal, activeNativeOwner, validateBeforeApply, {
+                groups.map((g) => {
+                  // 每个并发批次独立记录刚核验过的策略快照版本，并在写事务提交边界再次同步核对
+                  let verifiedPolicySig = selectionPolicySig;
+                  const validateBeforeApply = async (
+                    usedConvs: { conv: string; conv_name: string }[],
+                    batchObs: import("./store.ts").Obs[],
+                  ): Promise<Set<string>> => {
+                    const disallowed = new Set<string>();
+                    if (this.isWorkspaceOwnerMismatched() || !this.cfg.context.understand) {
+                      verifiedPolicySig = "";
+                      for (const c of usedConvs) disallowed.add(c.conv);
+                      return disallowed;
+                    }
+                    if (this.personalWeb.policySignature() === selectionPolicySig) {
+                      verifiedPolicySig = selectionPolicySig;
+                      return disallowed;
+                    }
+                    const sigBeforeValidate = this.personalWeb.policySignature();
+                    const freshExcl = await this.personalWeb.resolveNativeExclusionsForPolling();
+                    for (const c of usedConvs) {
+                      const elig = await this.personalWeb.checkConvAllowedForUnderstand(c.conv, c.conv_name, freshExcl);
+                      if (elig !== "allowed") {
+                        disallowed.add(c.conv);
+                        continue;
+                      }
+                      // 逐条复核实际送入模型的精确观测行：只要其中任一行在新策略下不再允许（例如混合了普通消息和 @我的群被移出白名单），整体放弃本批
+                      const sentRows = batchObs.filter((o) => o.conv === c.conv);
+                      const stillAllowed = this.personalWeb.filterWindowByCurrentScope(c.conv, sentRows, freshExcl);
+                      if (stillAllowed.length < sentRows.length) {
+                        disallowed.add(c.conv);
+                      }
+                    }
+                    if (this.personalWeb.policySignature() !== sigBeforeValidate) {
+                      // 异步复核期间发生第二次策略漂移：标记整批失效并令 commitGuard 拒绝提交
+                      verifiedPolicySig = "";
+                      for (const c of usedConvs) disallowed.add(c.conv);
+                      return disallowed;
+                    }
+                    verifiedPolicySig = sigBeforeValidate;
+                    return disallowed;
+                  };
+                  return this.understander.runBatch(workId, g, batchAbort.signal, activeNativeOwner, validateBeforeApply, {
                     filterObs: (conv, win) => this.personalWeb.filterWindowByCurrentScope(conv, win, nativeExclSnapshot),
                     isMentionsOnly: (conv) => this.personalWeb.isConvMentionsOnly(conv, nativeExclSnapshot),
                     claimCheck: { convs: g.map((x) => x.conv), holder: claimToken, procOwner },
-                  }),
-                ),
+                    commitGuard: () =>
+                      !this.isWorkspaceOwnerMismatched() &&
+                      this.cfg.context.understand &&
+                      !!verifiedPolicySig &&
+                      this.personalWeb.policySignature() === verifiedPolicySig,
+                  });
+                }),
               );
               // 在仍持有会话占坑租约期间处理连续解析失败跳过：仅标记本批实际送入模型的精确观测及修订，绝不波及同群未送入模型的普通消息
               results.forEach((res, gi) => {
@@ -472,16 +491,22 @@ export class ContextService {
       );
       if (!window.some((o) => this.store.obsPending(o.id))) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
       if (!this.store.renewConv(p.conv, claimToken, procOwner)) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+      let verifiedFastPolicySig = fastPolicySig;
       const validateBeforeApply = async (
         usedConvs: { conv: string; conv_name: string }[],
         batchObs: import("./store.ts").Obs[],
       ): Promise<Set<string>> => {
         const disallowed = new Set<string>();
         if (!isFastSwitchEnabled() || signal?.aborted) {
+          verifiedFastPolicySig = "";
           for (const c of usedConvs) disallowed.add(c.conv);
           return disallowed;
         }
-        if (this.personalWeb.policySignature() === fastPolicySig) return disallowed;
+        if (this.personalWeb.policySignature() === fastPolicySig) {
+          verifiedFastPolicySig = fastPolicySig;
+          return disallowed;
+        }
+        const sigBeforeValidate = this.personalWeb.policySignature();
         const freshExcl = await this.personalWeb.resolveNativeExclusionsForPolling();
         for (const c of usedConvs) {
           const elig = await this.personalWeb.checkConvAllowedForUnderstand(c.conv, c.conv_name, freshExcl);
@@ -495,6 +520,12 @@ export class ContextService {
             disallowed.add(c.conv);
           }
         }
+        if (this.personalWeb.policySignature() !== sigBeforeValidate) {
+          verifiedFastPolicySig = "";
+          for (const c of usedConvs) disallowed.add(c.conv);
+          return disallowed;
+        }
+        verifiedFastPolicySig = sigBeforeValidate;
         return disallowed;
       };
       const r = await this.understander.runBatch(
@@ -507,6 +538,10 @@ export class ContextService {
           filterObs: (conv, win) => this.personalWeb.filterWindowByCurrentScope(conv, win, fastNativeExcl),
           isMentionsOnly: (conv) => this.personalWeb.isConvMentionsOnly(conv, fastNativeExcl),
           claimCheck: { convs: [p.conv], holder: claimToken, procOwner },
+          commitGuard: () =>
+            isFastSwitchEnabled() &&
+            !!verifiedFastPolicySig &&
+            this.personalWeb.policySignature() === verifiedFastPolicySig,
         },
       );
       if (signal?.aborted) throw new Error("aborted");
@@ -754,7 +789,16 @@ export class ContextService {
             }
           }
           try {
-            const d = await this.drafter.forItem(p.item_id, p.kind);
+            const d = await this.drafter.forItem(
+              p.item_id,
+              p.kind,
+              p.auto
+                ? {
+                    beforeInfer: () =>
+                      !this.isWorkspaceOwnerMismatched() && this.canAutoPreDraft(this.store.item(p.item_id)),
+                  }
+                : undefined,
+            );
             this.app.ledger.transition(item, { state: "done", terminal: true, payload: { ...p, draft_id: d.id } as never });
             this.renderDraft(d.id);
           } catch (err) {

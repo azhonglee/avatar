@@ -313,6 +313,7 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
           buildWorkspaceIsolation(cfg, {
             mode: "git-ro",
             cwd: spec.path,
+            trustedRepoRoot: spec.path,
             extraReadOnlyPaths: baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : [],
           }),
         );

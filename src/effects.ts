@@ -41,7 +41,28 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
     kind: "effect",
     concurrency: 1,
     maxAttempts: cfg.engine.effect_attempts,
-    claimOpts: () => (shouldReservePwReply() ? { excludeEffectOps: ["pw.reply"] } : undefined),
+    claimOpts: () => {
+      if (!shouldReservePwReply()) return undefined;
+      // 保留仍需凭据执行的 pw.reply 给持钥常驻进程，但对已完成 verified 回读的回复允许无密钥消费者直接幂等收尾
+      const verifiedIds: string[] = [];
+      if (hooks.pwReply) {
+        for (const w of ledger.active<Effect>("effect")) {
+          if (w.payload.op !== "pw.reply") continue;
+          const { cid } = computePwReplyCid({
+            draft_id: w.payload.args.draft_id,
+            effect_id: w.id,
+            owner_id: w.payload.args.owner_id,
+            chat_id: w.payload.args.chat_id,
+            message_id: w.payload.args.message_id,
+            text: w.payload.args.text,
+          });
+          if (!shouldReservePwReply(cid)) verifiedIds.push(w.id);
+        }
+      }
+      return verifiedIds.length
+        ? { excludeEffectOps: ["pw.reply"], allowEffectIds: verifiedIds }
+        : { excludeEffectOps: ["pw.reply"] };
+    },
     async run(item) {
       const e = item.payload;
       // 若工作区 owner.open_id 与已绑定的个人 Web 主人不一致，严禁向新主人投递旧主人的上下文卡片、提醒、草稿或自主任务

@@ -93,8 +93,9 @@ export function HealthPage() {
       <PageHeader title="健康" subtitle="失败与重试中的工作、常驻进程状态、命令守卫的拦截记录" />
       <QueryView q={q}>
         {(h) => {
-          const open = h.failed.filter((f) => !f.acknowledged);
-          const acked = h.failed.filter((f) => f.acknowledged);
+          const open = h.failed.filter((f) => !f.acknowledged && !f.isolated);
+          const acked = h.failed.filter((f) => f.acknowledged && !f.isolated);
+          const isolated = h.failed.filter((f) => !!f.isolated);
           return (
             <div className="grid-overview">
               <div className="col-main">
@@ -112,6 +113,15 @@ export function HealthPage() {
                     <Collapsible summary={`已忽略 ${acked.length} 项`}>
                       <ul className="hlist">
                         {acked.map((it) => (
+                          <FailedItem key={it.id} it={it} />
+                        ))}
+                      </ul>
+                    </Collapsible>
+                  )}
+                  {isolated.length > 0 && (
+                    <Collapsible summary={`已按旧主人隔离 ${isolated.length} 项`}>
+                      <ul className="hlist">
+                        {isolated.map((it) => (
                           <FailedItem key={it.id} it={it} />
                         ))}
                       </ul>

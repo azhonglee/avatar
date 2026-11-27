@@ -65,29 +65,137 @@ function resolvePivotRootBin(): string | undefined {
   }
 }
 
-/** 探测 worktree 对应的 .git 目录与主仓 commondir，便于仅暴露必要 git 元数据而不开放主仓工作区或 dataDir */
-export function detectGitWorktreeDirs(dir: string): { gitDir?: string; commonDir?: string } {
-  const dotGit = path.join(dir, ".git");
+function resolveExpectedGitCommonDir(repoRoot: string): string {
+  const realRoot = safeRealpath(repoRoot);
+  const dotGit = path.join(realRoot, ".git");
   try {
     const st = fs.lstatSync(dotGit);
-    if (!st.isFile()) return {};
-    const content = fs.readFileSync(dotGit, "utf8");
-    const m = content.match(/^gitdir:\s*(.+)$/m);
-    if (!m) return {};
-    const rawGitDir = m[1].trim();
-    const gitDir = safeRealpath(path.isAbsolute(rawGitDir) ? rawGitDir : path.resolve(dir, rawGitDir));
-    let commonDir: string | undefined;
-    const commonFile = path.join(gitDir, "commondir");
-    if (fs.existsSync(commonFile)) {
-      const rawCommon = fs.readFileSync(commonFile, "utf8").trim();
-      if (rawCommon) {
-        commonDir = safeRealpath(path.isAbsolute(rawCommon) ? rawCommon : path.resolve(gitDir, rawCommon));
+    if (st.isDirectory()) return safeRealpath(dotGit);
+    if (st.isFile()) {
+      const m = fs.readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+)$/m);
+      if (m) {
+        const gd = safeRealpath(path.isAbsolute(m[1].trim()) ? m[1].trim() : path.resolve(realRoot, m[1].trim()));
+        const cf = path.join(gd, "commondir");
+        if (fs.existsSync(cf) && fs.lstatSync(cf).isFile()) {
+          const rawC = fs.readFileSync(cf, "utf8").trim();
+          if (rawC) return safeRealpath(path.isAbsolute(rawC) ? rawC : path.resolve(gd, rawC));
+        }
+        return gd;
       }
     }
-    return { gitDir, commonDir };
+  } catch {
+    // 裸仓库直接以 repoRoot 为 commonDir
+  }
+  return realRoot;
+}
+
+function isGenuineGitCommonDir(dir: string): boolean {
+  try {
+    return (
+      fs.statSync(dir).isDirectory() &&
+      fs.lstatSync(path.join(dir, "HEAD")).isFile() &&
+      fs.statSync(path.join(dir, "objects")).isDirectory() &&
+      fs.statSync(path.join(dir, "refs")).isDirectory()
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 探测并严格校验 worktree 对应的 .git 管理目录与主仓 commondir：
+ *   - 绝不盲信可写 worktree 内的 `.git` / `commondir` 指向任意宿主机路径；
+ *   - 拒绝符号链接 `.git` / `commondir` / `gitdir`，要求 `<gitDir>/gitdir` 反向指向当前 `<dir>/.git`，
+ *     要求 `gitDir` 严格位于 `<commonDir>/worktrees/` 下且 `commonDir` 为合法 Git 仓库目录且不在 `dataDir` 内；
+ *   - 提供 `trustedRepoRoot` 时，进一步要求 `commonDir` 与受信任仓库的真实 `.git` 目录完全一致，不一致直接抛错拒绝挂载。
+ */
+export function detectGitWorktreeDirs(
+  dir: string,
+  opts?: { trustedRepoRoot?: string; dataDir?: string },
+): { gitDir?: string; commonDir?: string } {
+  const realDir = safeRealpath(dir);
+  const dotGit = path.join(realDir, ".git");
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(dotGit);
   } catch {
     return {};
   }
+  if (st.isSymbolicLink()) {
+    throw new Error(`检测到符号链接 .git，已按安全策略拒绝挂载：${realDir}`);
+  }
+  if (!st.isFile()) return {};
+
+  const reject = (reason: string): never => {
+    throw new Error(`worktree .git 元数据校验失败（${reason}），已按安全策略拒绝挂载：${realDir}`);
+  };
+
+  let content: string;
+  try {
+    content = fs.readFileSync(dotGit, "utf8");
+  } catch {
+    return reject("无法读取 .git 文件");
+  }
+  const m = content.match(/^gitdir:\s*(.+)$/m);
+  if (!m) return reject(".git 文件缺少 gitdir 声明");
+  const rawGitDir = m[1].trim();
+  const absGitDir = path.isAbsolute(rawGitDir) ? rawGitDir : path.resolve(realDir, rawGitDir);
+  let gitDir: string;
+  try {
+    if (!fs.statSync(absGitDir).isDirectory()) return reject("gitdir 目标不是目录");
+    gitDir = fs.realpathSync(absGitDir);
+  } catch {
+    return reject("gitdir 目标不存在或不可访问");
+  }
+
+  const commonFile = path.join(gitDir, "commondir");
+  const backFile = path.join(gitDir, "gitdir");
+  let commonDir: string;
+  try {
+    if (!fs.lstatSync(commonFile).isFile()) return reject("缺少合法 commondir 文件");
+    const rawCommon = fs.readFileSync(commonFile, "utf8").trim();
+    if (!rawCommon) return reject("commondir 为空");
+    const absCommon = path.isAbsolute(rawCommon) ? rawCommon : path.resolve(gitDir, rawCommon);
+    if (!fs.statSync(absCommon).isDirectory()) return reject("commondir 目标不是目录");
+    commonDir = fs.realpathSync(absCommon);
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("worktree .git 元数据校验失败")) throw err;
+    return reject("无法读取或解析 commondir");
+  }
+
+  // 双向绑定校核：<gitDir>/gitdir 必须反向指回本 checkout 的 .git
+  try {
+    if (!fs.lstatSync(backFile).isFile()) return reject("缺少合法反向 gitdir 指针");
+    const rawBack = fs.readFileSync(backFile, "utf8").trim();
+    if (!rawBack) return reject("反向 gitdir 指针为空");
+    const absBack = path.isAbsolute(rawBack) ? rawBack : path.resolve(gitDir, rawBack);
+    const backTarget = path.join(safeRealpath(path.dirname(absBack)), path.basename(absBack));
+    if (backTarget !== dotGit) return reject("反向 gitdir 指针与当前 worktree 不一致");
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("worktree .git 元数据校验失败")) throw err;
+    return reject("无法校验反向 gitdir 指针");
+  }
+
+  const worktreesRoot = path.join(commonDir, "worktrees");
+  if (!isPathInsideOrEqual(gitDir, worktreesRoot) || gitDir === worktreesRoot) {
+    return reject("gitDir 不在 commondir/worktrees 目录下");
+  }
+  if (!isGenuineGitCommonDir(commonDir)) {
+    return reject("commondir 不是合法的 Git 仓库目录");
+  }
+  if (opts?.dataDir) {
+    const resolvedDataDir = safeRealpath(opts.dataDir);
+    if (isPathInsideOrEqual(gitDir, resolvedDataDir) || isPathInsideOrEqual(commonDir, resolvedDataDir)) {
+      return reject("Git 元数据目录不得落入 dataDir 私有目录内");
+    }
+  }
+  if (opts?.trustedRepoRoot) {
+    const expectedCommon = resolveExpectedGitCommonDir(opts.trustedRepoRoot);
+    if (commonDir !== expectedCommon) {
+      return reject(`commondir (${commonDir}) 不属于受信任仓库 (${expectedCommon})`);
+    }
+  }
+  return { gitDir, commonDir };
 }
 
 function hasStateDbSensitiveState(dataDir: string, includeContextObs = false): boolean {
@@ -96,12 +204,15 @@ function hasStateDbSensitiveState(dataDir: string, includeContextObs = false): b
   let db: DatabaseSync | undefined;
   try {
     db = new DatabaseSync(dbPath, { readOnly: true });
-    const hasPwKv = db
-      .prepare(
-        "SELECT 1 FROM kv WHERE (k LIKE 'ctx.personal_web.%' AND v != '') OR (k = 'daemon.holds_web_key' AND v = '1') LIMIT 1",
-      )
-      .get();
-    if (hasPwKv) return true;
+    const hasKvTbl = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kv' LIMIT 1").get();
+    if (hasKvTbl) {
+      const hasPwKv = db
+        .prepare(
+          "SELECT 1 FROM kv WHERE (k LIKE 'ctx.personal_web.%' AND v != '') OR (k = 'daemon.holds_web_key' AND v = '1') LIMIT 1",
+        )
+        .get();
+      if (hasPwKv) return true;
+    }
     if (includeContextObs) {
       const hasObsTbl = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ctx_obs' LIMIT 1").get();
       if (hasObsTbl) {
@@ -110,8 +221,10 @@ function hasStateDbSensitiveState(dataDir: string, includeContextObs = false): b
       }
     }
     return false;
-  } catch {
-    return false;
+  } catch (err) {
+    // 仅在数据库文件并发消失时返回 false；锁冲突、权限不足或损坏等意外检查失败一律按 fail-closed 要求隔离
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT" || !fs.existsSync(dbPath)) return false;
+    return true;
   } finally {
     try {
       db?.close();
@@ -124,7 +237,8 @@ function hasStateDbSensitiveState(dataDir: string, includeContextObs = false): b
 /**
  * 按工作区配置、本地敏感状态与当前进程凭据综合判断是否必须启用内核级 PID + 挂载命名空间隔离：
  *   - 不再仅依赖当前 shell 的环境变量：即便交互式 shell（如 `pa dispatch`）未持有服务密钥，
- *     只要工作区启用了个人 Web、存在加密凭据文件，或 `state.db` 含个人 Web 绑定/常驻持钥标记（以及对仓库 worker/verify 检查私有上下文观测），均强制隔离。
+ *     只要工作区启用了个人 Web、存在加密凭据文件，或 `state.db` 含个人 Web 绑定/常驻持钥标记（以及对仓库能力进程检查私有上下文观测），均强制隔离；
+ *   - 若 `state.db` 存在但检查发生锁冲突/权限/损坏等异常，按 fail-closed 要求隔离。
  */
 export function workspaceRequiresIsolation(
   cfgOrDataDir: Pick<Config, "dataDir" | "context"> | string | undefined,
@@ -145,15 +259,26 @@ export function workspaceRequiresIsolation(
   return hasStateDbSensitiveState(dataDir, opts?.includeContextObs);
 }
 
-export type WorkspaceIsolationMode = "verify" | "worker-write" | "worker-ro" | "codex-exec" | "git-rw" | "git-ro";
+export type WorkspaceIsolationMode =
+  | "llm-none"
+  | "verify"
+  | "worker-write"
+  | "worker-ro"
+  | "codex-exec"
+  | "git-rw"
+  | "git-ro";
 
-/** 根据工作区配置与子进程角色生成最小权限文件系统挂载视图（始终排除 dataDir 私有状态） */
+/** 根据工作区配置与子进程角色生成最小权限文件系统挂载视图（始终排除 dataDir 私有状态，不开放宿主机共享代理配置目录写权限） */
 export function buildWorkspaceIsolation(
   cfg: Pick<Config, "dataDir" | "context"> | undefined,
   opts: {
     mode: WorkspaceIsolationMode;
     cwd?: string;
     cmdPath?: string;
+    /** 受信任的派单仓库根目录：存在时严格校核 worktree `.git` / `commondir` 归属该仓库 */
+    trustedRepoRoot?: string;
+    /** 显式禁止挂载任何外部 worktree `.git` 目录（用于非 Git 派单的空工作区） */
+    disableGitWorktreeMounts?: boolean;
     allowGuardLog?: boolean;
     extraWritablePaths?: string[];
     extraReadOnlyPaths?: string[];
@@ -161,15 +286,21 @@ export function buildWorkspaceIsolation(
   rawEnv: NodeJS.ProcessEnv = process.env,
 ): IsolationOptions {
   const dataDir = cfg?.dataDir;
-  const includeContextObs = opts.mode === "verify" || opts.mode === "worker-write" || opts.mode === "worker-ro";
+  // 纯无工具推理（llm-none）在未启用个人 Web 时不因轮询 ctx_obs 强制要求 Linux 命名空间，保持 macOS/受限主机兼容；
+  // 所有具备仓库访问能力的进程（verify / worker / codex-exec 审查 / git-rw / git-ro）均对 ctx_obs 启用隔离。
+  const includeContextObs = opts.mode !== "llm-none";
   const requireIsolation = workspaceRequiresIsolation(cfg, rawEnv, { includeContextObs });
   const writablePaths: string[] = [];
   const readOnlyPaths: string[] = [];
   const resolvedCwd = opts.cwd ? safeRealpath(opts.cwd) : undefined;
-  const resolvedDataDir = dataDir ? safeRealpath(dataDir) : undefined;
-  const wt = resolvedCwd ? detectGitWorktreeDirs(resolvedCwd) : {};
+  const shouldInspectGit = opts.mode !== "llm-none" && !opts.disableGitWorktreeMounts && !!resolvedCwd;
+  const wt = shouldInspectGit
+    ? detectGitWorktreeDirs(resolvedCwd!, { trustedRepoRoot: opts.trustedRepoRoot, dataDir })
+    : {};
 
-  if (opts.mode === "verify") {
+  if (opts.mode === "llm-none") {
+    if (resolvedCwd) readOnlyPaths.push(resolvedCwd);
+  } else if (opts.mode === "verify") {
     if (resolvedCwd) writablePaths.push(resolvedCwd);
     if (wt.gitDir) writablePaths.push(wt.gitDir);
     if (wt.commonDir && wt.commonDir !== wt.gitDir) readOnlyPaths.push(wt.commonDir);
@@ -177,12 +308,10 @@ export function buildWorkspaceIsolation(
     if (resolvedCwd) writablePaths.push(resolvedCwd);
     if (wt.commonDir) writablePaths.push(wt.commonDir);
     else if (wt.gitDir) writablePaths.push(wt.gitDir);
-  } else if (opts.mode === "worker-ro") {
-    if (resolvedCwd) writablePaths.push(resolvedCwd);
+  } else if (opts.mode === "worker-ro" || opts.mode === "codex-exec") {
+    if (resolvedCwd) readOnlyPaths.push(resolvedCwd);
     if (wt.commonDir) readOnlyPaths.push(wt.commonDir);
     if (wt.gitDir && wt.gitDir !== wt.commonDir) readOnlyPaths.push(wt.gitDir);
-  } else if (opts.mode === "codex-exec") {
-    if (resolvedCwd) writablePaths.push(resolvedCwd);
   } else if (opts.mode === "git-rw") {
     if (resolvedCwd) writablePaths.push(resolvedCwd);
     if (wt.commonDir) writablePaths.push(wt.commonDir);
@@ -191,20 +320,6 @@ export function buildWorkspaceIsolation(
     if (resolvedCwd) readOnlyPaths.push(resolvedCwd);
     if (wt.commonDir) readOnlyPaths.push(wt.commonDir);
     if (wt.gitDir && wt.gitDir !== wt.commonDir) readOnlyPaths.push(wt.gitDir);
-  }
-
-  // 允许真实代理 CLI（acpx / claude / codex / doubao）在非 tools=none 模式下访问其自身状态目录（绝不放行 dataDir）
-  if (opts.mode === "worker-write" || opts.mode === "worker-ro") {
-    const home = rawEnv.HOME?.trim() || os.homedir();
-    for (const sub of [".claude", ".codex", ".acpx", ".doubao"]) {
-      const dir = path.join(home, sub);
-      if (fs.existsSync(dir)) {
-        const real = safeRealpath(dir);
-        if (!resolvedDataDir || !isPathInsideOrEqual(real, resolvedDataDir)) {
-          writablePaths.push(real);
-        }
-      }
-    }
   }
 
   // 当需要 lark 守卫审计日志时，仅单独挂载 guard.log 单文件（绝不暴露 dataDir 或 state.db）
@@ -222,7 +337,9 @@ export function buildWorkspaceIsolation(
   if (opts.cmdPath) {
     try {
       const resolvedCmd = path.isAbsolute(opts.cmdPath) ? safeRealpath(opts.cmdPath) : safeRealpath(resolveBin(opts.cmdPath));
-      if (isPathInsideOrEqual(resolvedCmd, "/tmp")) readOnlyPaths.push(resolvedCmd);
+      if (isPathInsideOrEqual(resolvedCmd, "/tmp") || isPathInsideOrEqual(resolvedCmd, "/dev/shm")) {
+        readOnlyPaths.push(resolvedCmd);
+      }
     } catch {
       // ignore unresolved cmd
     }
@@ -305,9 +422,30 @@ export function hasCredentialMountIsolation(): boolean {
   return probeMountMaskBackend().kind !== "none";
 }
 
+const MOUNTINFO_UNESCAPE_AWK = [
+  "function unescape(s, out, i, c, oct) {",
+  '  out = ""',
+  "  for (i = 1; i <= length(s); i++) {",
+  "    c = substr(s, i, 1)",
+  '    if (c == "\\\\" && i + 3 <= length(s)) {',
+  "      oct = substr(s, i + 1, 3)",
+  '      if (oct == "040") { out = out " "; i += 3; continue }',
+  '      if (oct == "011") { out = out "\\t"; i += 3; continue }',
+  '      if (oct == "134") { out = out "\\\\"; i += 3; continue }',
+  '      if (oct == "012") { exit 42 }',
+  "    }",
+  "    out = out c",
+  "  }",
+  "  return out",
+  "}",
+  "function is_virt(subp) {",
+  '  return (subp == "/proc" || subp == "/dev" || subp == "/sys" || index(subp, "/proc/") == 1 || index(subp, "/dev/") == 1 || index(subp, "/sys/") == 1)',
+  "}",
+].join("\n");
+
 const UNSHARE_ISOLATION_SCRIPT = [
   "set -e",
-  'PIVOT_ROOT="$1"; SETPRIV="$2"; DD="$3"; CWD="$4"; W_COUNT="$5"; R_COUNT="$6"; M_COUNT="$7"',
+  'PIVOT_ROOT="$1"; SETPRIV="$2"; DD="$3"; CWD="$4"; PRE_COUNT="$5"; POST_COUNT="$6"; M_COUNT="$7"',
   "shift 7",
   "mount -n --make-rprivate /",
   "S=",
@@ -329,19 +467,21 @@ const UNSHARE_ISOLATION_SCRIPT = [
   'mkdir -p "$S/newroot" "$S/save"',
   'mount -n --rbind / "$S/newroot"',
   "i=0",
-  'while [ "$i" -lt "$W_COUNT" ]; do',
-  '  p="$1"; shift',
-  '  printf "%sx" "$p" > "$S/save/w$i.path"',
-  '  if [ -d "$p" ]; then mkdir -p "$S/save/w$i"; else : > "$S/save/w$i"; fi',
-  '  mount -n --bind "$p" "$S/save/w$i"',
+  'while [ "$i" -lt "$PRE_COUNT" ]; do',
+  '  mode="$1"; p="$2"; shift 2',
+  '  printf "%sx" "$mode" > "$S/save/pre$i.mode"',
+  '  printf "%sx" "$p" > "$S/save/pre$i.path"',
+  '  if [ -d "$p" ]; then mkdir -p "$S/save/pre$i"; else : > "$S/save/pre$i"; fi',
+  '  mount -n --bind "$p" "$S/save/pre$i"',
   "  i=$((i + 1))",
   "done",
   "i=0",
-  'while [ "$i" -lt "$R_COUNT" ]; do',
-  '  p="$1"; shift',
-  '  printf "%sx" "$p" > "$S/save/r$i.path"',
-  '  if [ -d "$p" ]; then mkdir -p "$S/save/r$i"; else : > "$S/save/r$i"; fi',
-  '  mount -n --bind "$p" "$S/save/r$i"',
+  'while [ "$i" -lt "$POST_COUNT" ]; do',
+  '  mode="$1"; p="$2"; shift 2',
+  '  printf "%sx" "$mode" > "$S/save/post$i.mode"',
+  '  printf "%sx" "$p" > "$S/save/post$i.path"',
+  '  if [ -d "$p" ]; then mkdir -p "$S/save/post$i"; else : > "$S/save/post$i"; fi',
+  '  mount -n --bind "$p" "$S/save/post$i"',
   "  i=$((i + 1))",
   "done",
   "i=0",
@@ -350,32 +490,43 @@ const UNSHARE_ISOLATION_SCRIPT = [
   '  printf "%sx" "$p" > "$S/save/m$i.path"',
   "  i=$((i + 1))",
   "done",
-  'awk -v prefix="$S/newroot" \'{ mp = $5; if (mp == prefix || index(mp, prefix "/") == 1) { subp = substr(mp, length(prefix) + 1); if (subp != "/proc" && subp != "/dev" && index(subp, "/proc/") != 1 && index(subp, "/dev/") != 1 && index(subp, "/sys") != 1) print mp } }\' /proc/self/mountinfo | while IFS= read -r mp; do',
-  '  mount -n -o remount,ro,bind "$mp" 2>/dev/null || true',
-  "done",
+  // 解码 /proc/self/mountinfo 八进制转义（空格 \040 / 制表符 \011 / 反斜杠 \134），将全部非虚拟挂载强制重新挂载为只读；
+  // 任一 remount 失败或复查发现仍存在可写非虚拟挂载点时，立即以非零退出中止子进程启动（fail-closed）。
+  `awk -v prefix="$S/newroot" '${MOUNTINFO_UNESCAPE_AWK}\n{ mp = unescape($5); if (mp == prefix || index(mp, prefix "/") == 1) { subp = substr(mp, length(prefix) + 1); if (is_virt(subp)) next; opts = "," $6 ","; if (index(opts, ",ro,") > 0) next; print mp } }' /proc/self/mountinfo > "$S/save/ro-mounts"`,
+  'while IFS= read -r mp; do',
+  '  [ -n "$mp" ] || continue',
+  '  mount -n -o remount,ro,bind "$mp"',
+  'done < "$S/save/ro-mounts"',
+  `awk -v prefix="$S/newroot" '${MOUNTINFO_UNESCAPE_AWK}\n{ mp = unescape($5); if (mp == prefix || index(mp, prefix "/") == 1) { subp = substr(mp, length(prefix) + 1); if (is_virt(subp)) next; opts = "," $6 ","; if (index(opts, ",ro,") == 0) { print "unshare read-only verification failed: " mp > "/dev/stderr"; exit 1 } } }' /proc/self/mountinfo`,
   'mount -n -t tmpfs tmpfs "$S/newroot/tmp"',
+  'if [ -d "$S/newroot/dev/shm" ]; then mount -n -t tmpfs tmpfs "$S/newroot/dev/shm"; fi',
+  // 第一阶段：挂载位于 dataDir 之外（含可能包含 dataDir 的祖先目录）的允许路径
+  "i=0",
+  'while [ "$i" -lt "$PRE_COUNT" ]; do',
+  '  mode=$(cat "$S/save/pre$i.mode"); mode=${mode%x}',
+  '  p=$(cat "$S/save/pre$i.path"); p=${p%x}',
+  '  if [ -d "$S/save/pre$i" ]; then [ -d "$S/newroot$p" ] || mkdir -p "$S/newroot$p"; else [ -e "$S/newroot$p" ] || { mkdir -p "$(dirname "$S/newroot$p")"; : > "$S/newroot$p"; }; fi',
+  '  mount -n --move "$S/save/pre$i" "$S/newroot$p"',
+  '  if [ "$mode" = "ro" ]; then mount -n -o remount,ro,bind "$S/newroot$p"; else mount -n -o remount,rw,bind "$S/newroot$p"; fi',
+  "  i=$((i + 1))",
+  "done",
+  // 第二阶段：在所有祖先挂载之后覆盖空 tmpfs 遮蔽整个 dataDir，确保 state.db / feishu-web.json / logs / runs 绝不重现
   'if [ -n "$DD" ]; then',
-  '  mkdir -p "$S/newroot$DD" 2>/dev/null || true',
+  '  [ -d "$S/newroot$DD" ] || mkdir -p "$S/newroot$DD"',
   '  mount -n -t tmpfs tmpfs "$S/newroot$DD"',
   "fi",
+  // 第三阶段：在空 dataDir tmpfs 之上仅恢复显式允许的子路径（如当前派单 worktree 或 guard.log）
   "i=0",
-  'while [ "$i" -lt "$R_COUNT" ]; do',
-  '  p=$(cat "$S/save/r$i.path"); p=${p%x}',
-  '  if [ -d "$S/save/r$i" ]; then mkdir -p "$S/newroot$p"; else mkdir -p "$(dirname "$S/newroot$p")"; : > "$S/newroot$p"; fi',
-  '  mount -n --move "$S/save/r$i" "$S/newroot$p"',
-  '  mount -n -o remount,ro,bind "$S/newroot$p" 2>/dev/null || true',
-  "  i=$((i + 1))",
-  "done",
-  "i=0",
-  'while [ "$i" -lt "$W_COUNT" ]; do',
-  '  p=$(cat "$S/save/w$i.path"); p=${p%x}',
-  '  if [ -d "$S/save/w$i" ]; then mkdir -p "$S/newroot$p"; else mkdir -p "$(dirname "$S/newroot$p")"; : > "$S/newroot$p"; fi',
-  '  mount -n --move "$S/save/w$i" "$S/newroot$p"',
-  '  mount -n -o remount,rw,bind "$S/newroot$p" 2>/dev/null || true',
+  'while [ "$i" -lt "$POST_COUNT" ]; do',
+  '  mode=$(cat "$S/save/post$i.mode"); mode=${mode%x}',
+  '  p=$(cat "$S/save/post$i.path"); p=${p%x}',
+  '  if [ -d "$S/save/post$i" ]; then [ -d "$S/newroot$p" ] || mkdir -p "$S/newroot$p"; else [ -e "$S/newroot$p" ] || { mkdir -p "$(dirname "$S/newroot$p")"; : > "$S/newroot$p"; }; fi',
+  '  mount -n --move "$S/save/post$i" "$S/newroot$p"',
+  '  if [ "$mode" = "ro" ]; then mount -n -o remount,ro,bind "$S/newroot$p"; else mount -n -o remount,rw,bind "$S/newroot$p"; fi',
   "  i=$((i + 1))",
   "done",
   'if [ -n "$DD" ]; then',
-  '  mount -n -o remount,ro,bind "$S/newroot$DD" 2>/dev/null || true',
+  '  mount -n -o remount,ro,bind "$S/newroot$DD"',
   "fi",
   "i=0",
   'while [ "$i" -lt "$M_COUNT" ]; do',
@@ -396,11 +547,12 @@ const UNSHARE_ISOLATION_SCRIPT = [
 /**
  * 为模型执行器、仓库校验命令、git 子进程等同 UID 不可信子进程提供内核级进程与最小权限文件系统隔离：
  *   - 只要当前进程持有密钥，或工作区启用了个人 Web / 存有私有状态（即使交互式 shell 本身未持有密钥），均强制激活隔离；
- *   - 优先用 `bwrap --ro-bind / / --dev /dev --unshare-pid --proc /proc --tmpfs /tmp [--tmpfs <dataDir>]` 构建只读根视图，
- *     将整个 `dataDir`（含 `state.db`、outbox、`feishu-web.json`、`runs/`、`logs/`）彻底隐藏在空 tmpfs 后，
- *     仅显式绑定允许的工作树/scratch 路径，并用 `/dev/null` 遮罩外部密钥与凭据文件；
- *   - 回退用 `unshare --user --map-root-user --mount --pid --fork --mount-proc` + `pivot_root` 构建等价只读根与 tmpfs 边界，
- *     再以 `setpriv --bounding-set -all ... --no-new-privs` 永久剥离全部 capabilities；
+ *   - 优先用 `bwrap --ro-bind / / --dev /dev --unshare-pid --proc /proc --tmpfs /tmp` 构建只读根视图，
+ *     先挂载 dataDir 之外的路径（含任何祖先路径），再用空 `--tmpfs <dataDir>` 重新彻底遮蔽 `dataDir`
+ *     （隐藏 `state.db`、outbox、`feishu-web.json`、`runs/`、`logs/`），随后仅在其上恢复显式允许的 worktree / `guard.log`，
+ *     并用 `/dev/null` 遮罩外部密钥与凭据文件；
+ *   - 回退用 `unshare --user --map-root-user --mount --pid --fork --mount-proc` + `pivot_root` 构建完全等价边界，
+ *     解码 `/proc/self/mountinfo` 并在任一只读重挂无法验证时 fail-closed 中止，再以 `setpriv` 永久剥离全部 capabilities；
  *   - 宿主机不支持时按 fail-closed 拒绝启动子进程。
  */
 export function wrapCredentialIsolatedCommand(
@@ -424,12 +576,21 @@ export function wrapCredentialIsolatedCommand(
   const resolvedDataDir = opts?.dataDir && fs.existsSync(opts.dataDir) ? safeRealpath(opts.dataDir) : "";
   const resolvedCwd = opts?.cwd && fs.existsSync(opts.cwd) ? safeRealpath(opts.cwd) : "";
 
-  // 绝不允许把 dataDir 根目录或其核心敏感文件放进 writable/readOnly 列表
+  // 绝不允许把 dataDir 根目录或其核心敏感文件/运行日志目录放进 writable/readOnly 列表
   const isForbiddenDaemonTarget = (p: string): boolean => {
     if (!resolvedDataDir) return false;
     if (p === resolvedDataDir) return true;
-    for (const sensitive of ["state.db", "state.db-wal", "state.db-shm", "feishu-web.json", "feishu-web.json.staged", "feishu-web.json.lock.db"]) {
-      if (p === path.join(resolvedDataDir, sensitive)) return true;
+    for (const sensitive of [
+      "state.db",
+      "state.db-wal",
+      "state.db-shm",
+      "feishu-web.json",
+      "feishu-web.json.staged",
+      "feishu-web.json.lock.db",
+      "runs",
+    ]) {
+      const target = path.join(resolvedDataDir, sensitive);
+      if (p === target || (sensitive === "runs" && isPathInsideOrEqual(p, target))) return true;
     }
     return false;
   };
@@ -450,11 +611,27 @@ export function wrapCredentialIsolatedCommand(
   const rawReadOnly = [...(opts?.readOnlyPaths ?? [])];
   if (hasCredKeyFile && credDir && fs.existsSync(credDir)) {
     const resolvedCredDir = safeRealpath(credDir);
-    if (isPathInsideOrEqual(resolvedCredDir, "/tmp")) {
+    if (isPathInsideOrEqual(resolvedCredDir, "/tmp") || isPathInsideOrEqual(resolvedCredDir, "/dev/shm")) {
       rawReadOnly.push(resolvedCredDir);
     }
   }
   const readOnlyPaths = dedupeSorted(rawReadOnly).filter((p) => !writableSet.has(p));
+
+  type MountEntry = { mode: "ro" | "rw"; path: string };
+  const allMounts: MountEntry[] = [
+    ...readOnlyPaths.map((p): MountEntry => ({ mode: "ro", path: p })),
+    ...writablePaths.map((p): MountEntry => ({ mode: "rw", path: p })),
+  ];
+  // 按是否位于 dataDir 内部拆分为两阶段挂载（每阶段按路径长度升序，确保更深层子路径覆盖父路径）：
+  //   1) preMounts：dataDir 之外的路径（含可能包含 dataDir 的仓库祖先目录），先挂载；
+  //   2) tmpfs(dataDir)：在 preMounts 之后覆盖空 tmpfs，确保 dataDir 始终被遮蔽；
+  //   3) postMounts：严格位于 dataDir 内部且显式放行的子路径（如当前派单 worktree 或 guard.log），最后恢复。
+  const isStrictlyInsideDataDir = (p: string): boolean =>
+    !!resolvedDataDir && p !== resolvedDataDir && isPathInsideOrEqual(p, resolvedDataDir);
+  const sortEntries = (list: MountEntry[]): MountEntry[] =>
+    list.sort((a, b) => a.path.length - b.path.length || a.path.localeCompare(b.path));
+  const preMounts = sortEntries(allMounts.filter((m) => !isStrictlyInsideDataDir(m.path)));
+  const postMounts = sortEntries(allMounts.filter((m) => isStrictlyInsideDataDir(m.path)));
 
   const rawMasks: string[] = [...(opts?.maskFiles ?? [])];
   if (hasCredKeyFile) {
@@ -465,12 +642,17 @@ export function wrapCredentialIsolatedCommand(
       if (fs.existsSync(f)) rawMasks.push(path.resolve(f), safeRealpath(f));
     }
   }
-  const isReExposed = (p: string): boolean =>
-    writablePaths.some((w) => isPathInsideOrEqual(p, w)) || readOnlyPaths.some((r) => isPathInsideOrEqual(p, r));
+  const isReExposedBy = (p: string, mounts: MountEntry[]): boolean =>
+    mounts.some((m) => isPathInsideOrEqual(p, m.path));
   const maskFiles = [...new Set(rawMasks.map((m) => safeRealpath(m)).filter((m) => fs.existsSync(m)))].filter((m) => {
-    // 已被 /tmp 或 dataDir 空 tmpfs 隐藏且未被任何显式挂载重新暴露的敏感文件无需额外创建挂载点
-    if (isPathInsideOrEqual(m, "/tmp") && !isReExposed(m)) return false;
-    if (resolvedDataDir && isPathInsideOrEqual(m, resolvedDataDir) && !isReExposed(m)) return false;
+    // 位于 dataDir 内的文件已被空 tmpfs 遮蔽，仅当被 postMounts 重新暴露时才需额外 /dev/null 遮罩
+    if (resolvedDataDir && isPathInsideOrEqual(m, resolvedDataDir)) {
+      return isReExposedBy(m, postMounts);
+    }
+    // 位于 /tmp 或 /dev/shm 内的文件已被空 tmpfs 隐藏，仅当被 preMounts 重新暴露时才需额外 /dev/null 遮罩
+    if (isPathInsideOrEqual(m, "/tmp") || isPathInsideOrEqual(m, "/dev/shm")) {
+      return isReExposedBy(m, preMounts);
+    }
     return true;
   });
 
@@ -489,14 +671,14 @@ export function wrapCredentialIsolatedCommand(
       "--tmpfs",
       "/tmp",
     ];
+    for (const m of preMounts) {
+      bwrapArgs.push(m.mode === "ro" ? "--ro-bind" : "--bind", m.path, m.path);
+    }
     if (resolvedDataDir) {
       bwrapArgs.push("--tmpfs", resolvedDataDir);
     }
-    for (const ro of readOnlyPaths) {
-      bwrapArgs.push("--ro-bind", ro, ro);
-    }
-    for (const rw of writablePaths) {
-      bwrapArgs.push("--bind", rw, rw);
+    for (const m of postMounts) {
+      bwrapArgs.push(m.mode === "ro" ? "--ro-bind" : "--bind", m.path, m.path);
     }
     for (const mf of maskFiles) {
       bwrapArgs.push("--bind", "/dev/null", mf);
@@ -510,6 +692,7 @@ export function wrapCredentialIsolatedCommand(
     if (!backend.setprivBin || !backend.pivotRootBin) {
       throw new Error("unshare 回退缺少 setpriv 或 pivot_root，无法构建只读根挂载视图并永久剥离权限，已按安全策略拒绝执行");
     }
+    const flatten = (list: MountEntry[]): string[] => list.flatMap((m) => [m.mode, m.path]);
     const unshareArgs = [
       "--user",
       "--map-root-user",
@@ -526,11 +709,11 @@ export function wrapCredentialIsolatedCommand(
       backend.setprivBin,
       resolvedDataDir,
       resolvedCwd,
-      String(writablePaths.length),
-      String(readOnlyPaths.length),
+      String(preMounts.length),
+      String(postMounts.length),
       String(maskFiles.length),
-      ...writablePaths,
-      ...readOnlyPaths,
+      ...flatten(preMounts),
+      ...flatten(postMounts),
       ...maskFiles,
       cmd,
       ...args,
@@ -1297,6 +1480,10 @@ export interface HarnessRun {
   onSpawn?: (pgid: number) => void;
   /** 对应的步骤 id（用量记录用） */
   stepId?: number;
+  /** 受信任的派单仓库根目录（用于校核 worktree .git / commondir 归属，防 worker 篡改元数据） */
+  trustedRepoRoot?: string;
+  /** 非 Git 派单的空工作区：禁止探测或挂载外部 worktree .git 目录 */
+  disableGitWorktreeMounts?: boolean;
 }
 
 /**
@@ -1339,6 +1526,22 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
   const started = new Date().toISOString();
   let r: Awaited<ReturnType<typeof runProcess>>;
   try {
+    const mode: WorkspaceIsolationMode =
+      run.tools === "write" ? "worker-write" : run.tools === "read" ? "worker-ro" : "llm-none";
+    const wrapped = wrapCredentialIsolatedCommand(
+      cfg.bins.acpx,
+      args,
+      process.env,
+      buildWorkspaceIsolation(cfg, {
+        mode,
+        cwd: run.cwd,
+        cmdPath: cfg.bins.acpx,
+        trustedRepoRoot: run.trustedRepoRoot,
+        disableGitWorktreeMounts: run.disableGitWorktreeMounts,
+        allowGuardLog: run.lark !== "none",
+        extraReadOnlyPaths: baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : [],
+      }),
+    );
     const env: NodeJS.ProcessEnv = {
       ...mergeHarnessEnv(baseEnv.env, h.env),
       PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${process.env.PATH ?? ""}`,
@@ -1346,19 +1549,14 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       PA_OWNER_OPEN_ID: cfg.owner.open_id,
       PA_LARK_REAL: realLark,
       PA_GUARD_LOG: path.join(cfg.dataDir, "logs", "guard.log"),
+      ...(wrapped.isolated
+        ? {
+            TMPDIR: "/tmp",
+            XDG_CACHE_HOME: "/tmp/.pa-cache",
+            XDG_STATE_HOME: "/tmp/.pa-state",
+          }
+        : {}),
     };
-    const wrapped = wrapCredentialIsolatedCommand(
-      cfg.bins.acpx,
-      args,
-      process.env,
-      buildWorkspaceIsolation(cfg, {
-        mode: run.tools === "write" ? "worker-write" : "worker-ro",
-        cwd: run.cwd,
-        cmdPath: cfg.bins.acpx,
-        allowGuardLog: run.lark !== "none",
-        extraReadOnlyPaths: baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : [],
-      }),
-    );
     r = await runProcess(wrapped.cmd, wrapped.args, {
       cwd: run.cwd,
       env,
@@ -1427,10 +1625,14 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   // tools === "none"（处理不可信聊天文本的理解/起草）：在 dataDir 之外的空临时目录运行并彻底关闭 shell/执行工具与磁盘全读权限，
   // 避免模型经文件系统越界读取 dataDir 下的会话凭据或状态库。
   const isolatedTmp = run.tools === "none" ? fs.mkdtempSync(path.join(os.tmpdir(), "pa-codex-none-")) : undefined;
+  // tools === "read"（仓库审查）：把最终回复临时文件放进独立 scratch 目录，避免给只读审查进程开放仓库目录写权限。
+  const readOutDir = run.tools === "read" ? safeRealpath(fs.mkdtempSync(path.join(os.tmpdir(), "pa-codex-out-"))) : undefined;
   const execCwd = isolatedTmp ?? run.cwd;
   if (!isolatedTmp) fs.mkdirSync(execCwd, { recursive: true });
-  const outFile = path.join(execCwd, `.codex-last-${process.pid}-${Date.now()}.txt`);
-  // -o 用相对 cwd 的文件名：codex 0.169 在部分路径（如经符号链接的家目录）下打开绝对路径会报 "Not a directory"
+  const outFile = readOutDir
+    ? path.join(readOutDir, "last.txt")
+    : path.join(execCwd, `.codex-last-${process.pid}-${Date.now()}.txt`);
+  const outArg = readOutDir ? outFile : path.basename(outFile);
   const baseEnv = prepareHarnessEnv();
   const started = new Date().toISOString();
   let r: Awaited<ReturnType<typeof runProcess>>;
@@ -1438,7 +1640,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   let args: string[] = [];
   try {
     let finalEnv = mergeHarnessEnv(baseEnv.env, h.env);
-    args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--ephemeral", "--color", "never", "-o", path.basename(outFile)];
+    args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--ephemeral", "--color", "never", "-o", outArg];
     let extraToPass = h.extraArgs;
     if (run.tools === "none") {
       // 彻底隔离用户配置（包括 ~/.codex/config.toml 中配置的任意 MCP Server / 插件 / 钩子）与执行规则，
@@ -1475,17 +1677,32 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       ...(codexHome && fs.existsSync(codexHome) ? [codexHome] : []),
       ...(baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : []),
     ];
+    const extraRw = [
+      ...(isolatedTmp ? [isolatedTmp] : []),
+      ...(readOutDir ? [readOutDir] : []),
+    ];
     const wrapped = wrapCredentialIsolatedCommand(
       cmd,
       args,
       process.env,
       buildWorkspaceIsolation(cfg, {
-        mode: "codex-exec",
+        mode: run.tools === "none" ? "llm-none" : "codex-exec",
         cwd: execCwd,
         cmdPath: cmd,
+        trustedRepoRoot: run.trustedRepoRoot,
+        disableGitWorktreeMounts: run.disableGitWorktreeMounts,
+        extraWritablePaths: extraRw,
         extraReadOnlyPaths: extraRo,
       }),
     );
+    if (wrapped.isolated) {
+      finalEnv = {
+        ...finalEnv,
+        TMPDIR: "/tmp",
+        XDG_CACHE_HOME: "/tmp/.pa-cache",
+        XDG_STATE_HOME: "/tmp/.pa-state",
+      };
+    }
     r = await runProcess(wrapped.cmd, wrapped.args, {
       cwd: execCwd,
       env: finalEnv,
@@ -1504,6 +1721,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   } finally {
     baseEnv.cleanup();
     if (isolatedTmp) fs.rmSync(isolatedTmp, { recursive: true, force: true });
+    if (readOutDir) fs.rmSync(readOutDir, { recursive: true, force: true });
   }
   fs.writeFileSync(
     run.logFile,
@@ -1549,6 +1767,22 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   const baseEnv = prepareHarnessEnv();
   let r: Awaited<ReturnType<typeof runProcess>>;
   try {
+    const mode: WorkspaceIsolationMode =
+      run.tools === "write" ? "worker-write" : run.tools === "read" ? "worker-ro" : "llm-none";
+    const wrapped = wrapCredentialIsolatedCommand(
+      cmd,
+      args,
+      process.env,
+      buildWorkspaceIsolation(cfg, {
+        mode,
+        cwd: run.cwd,
+        cmdPath: cmd,
+        trustedRepoRoot: run.trustedRepoRoot,
+        disableGitWorktreeMounts: run.disableGitWorktreeMounts,
+        allowGuardLog: run.lark !== "none",
+        extraReadOnlyPaths: baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : [],
+      }),
+    );
     const env: NodeJS.ProcessEnv = {
       ...mergeHarnessEnv(baseEnv.env, h.env),
       DOUBAO_CLI_NO_UPDATE_CHECK: "1",
@@ -1557,19 +1791,14 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       PA_OWNER_OPEN_ID: cfg.owner.open_id,
       PA_LARK_REAL: realLark,
       PA_GUARD_LOG: path.join(cfg.dataDir, "logs", "guard.log"),
+      ...(wrapped.isolated
+        ? {
+            TMPDIR: "/tmp",
+            XDG_CACHE_HOME: "/tmp/.pa-cache",
+            XDG_STATE_HOME: "/tmp/.pa-state",
+          }
+        : {}),
     };
-    const wrapped = wrapCredentialIsolatedCommand(
-      cmd,
-      args,
-      process.env,
-      buildWorkspaceIsolation(cfg, {
-        mode: run.tools === "write" ? "worker-write" : "worker-ro",
-        cwd: run.cwd,
-        cmdPath: cmd,
-        allowGuardLog: run.lark !== "none",
-        extraReadOnlyPaths: baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : [],
-      }),
-    );
     r = await runProcess(wrapped.cmd, wrapped.args, {
       cwd: run.cwd,
       env,

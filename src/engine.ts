@@ -25,8 +25,8 @@ export interface Handler<P = Record<string, unknown>> {
    * 至多一次的工作（agent 作业、自由对话）设为 false：重启后按“中断”处理，不悄悄重跑。
    */
   refundOnStop?: boolean;
-  /** 可选：领取前的附加过滤（例如非持钥交互式 CLI 跳过 pw.reply，避免消耗重试次数） */
-  claimOpts?: () => { excludeEffectOps?: string[] } | undefined;
+  /** 可选：领取前的附加过滤（例如非持钥交互式 CLI 跳过未完结的 pw.reply，避免消耗重试次数，同时允许已完成回读的回执本地收尾） */
+  claimOpts?: () => { excludeEffectOps?: string[]; allowEffectIds?: string[] } | undefined;
   /** 重试耗尽：给出终态和需要投递的副作用（通知、评论、移卡片）。 */
   onExhausted(item: WorkItem<P>, lastError: string): { patch: Patch<P>; effects?: Effect[] };
 }

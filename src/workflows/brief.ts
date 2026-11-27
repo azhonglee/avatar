@@ -2,10 +2,48 @@ import { isContextDerivedDispatchBlocked, isContextOwnedTaskBlocked } from "../a
 import type { Board, BoardTask } from "../board.ts";
 import { toBoardTask } from "../board.ts";
 import type { Config } from "../config.ts";
-import type { Lark } from "../lark.ts";
+import { extractOwnerOpenId, type Lark } from "../lark.ts";
 import type { Ledger } from "../ledger.ts";
 import type { Store } from "../store.ts";
-import { findItems } from "../util.ts";
+import { errMsg, findItems } from "../util.ts";
+
+/**
+ * 核验当前晨报/晚报的数据来源归属与配置中的目标接收者（owner.open_id）完全一致：
+ *   1. 若本地持久化看板（board.tasklist）已绑定其他主人，拒绝复用旧主人看板生成新主人概览；
+ *   2. 实时核验 lark-cli 当前登录用户 open_id 与 cfg.owner.open_id 一致，防止仅改配置换主人但 lark-cli 仍登录旧账号，
+ *      从而把旧账号的个人逾期任务打上新主人标签发给新主人。
+ */
+export async function assertBriefDataOwner(cfg: Config, lark: Lark, store: Store): Promise<string> {
+  const expectedOwner = cfg.owner.open_id.trim();
+  if (!expectedOwner) {
+    throw new Error("未配置 owner.open_id，无法确认晨报/晚报数据归属，请先运行 pa init");
+  }
+  const hasBoard = !!store.get("board.tasklist");
+  if (hasBoard) {
+    const boardOwner = (store.get("board.owner_open_id") || store.get("owner.open_id") || "").trim();
+    if (!boardOwner || boardOwner !== expectedOwner) {
+      throw new Error(
+        `本地持久化看板归属账号 (${boardOwner || "未知"}) 与当前配置 owner.open_id (${expectedOwner}) 不一致，拒绝生成概览以防跨账号泄漏；请切回原主人或使用全新的 data_dir 并重新运行 pa init`,
+      );
+    }
+  }
+  let status: Record<string, unknown>;
+  try {
+    status = await lark.authStatus();
+  } catch (err) {
+    throw new Error(`无法核验当前 lark-cli 登录用户身份，已按安全策略中止生成概览：${errMsg(err)}`);
+  }
+  const authedOpenId = extractOwnerOpenId(status).trim();
+  if (!authedOpenId || !authedOpenId.startsWith("ou_")) {
+    throw new Error("无法从 lark-cli auth status 解析当前登录用户的 open_id，已按安全策略中止生成概览");
+  }
+  if (authedOpenId !== expectedOwner) {
+    throw new Error(
+      `当前 lark-cli 登录用户 (${authedOpenId}) 与配置 owner.open_id (${expectedOwner}) 不一致，拒绝生成概览以防将他人任务发送给错误主人`,
+    );
+  }
+  return expectedOwner;
+}
 
 /**
  * 晨报 / 晚报：纯数据汇总，不调用模型——便宜、稳定、可预期。
@@ -19,6 +57,7 @@ export async function buildBrief(
   board: Board,
   mode: "morning" | "evening",
 ): Promise<string> {
+  await assertBriefDataOwner(cfg, lark, store);
   const now = Date.now();
   const tz = cfg.owner.timezone;
   const dayEnd = endOfLocalDay(now, tz);

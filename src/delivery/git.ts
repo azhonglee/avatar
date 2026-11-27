@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Config } from "../config.ts";
 import {
   buildWorkspaceIsolation,
@@ -30,6 +32,10 @@ export interface GitRunOpts {
   timeoutMs?: number;
   cfg?: Pick<Config, "dataDir" | "context">;
   readOnly?: boolean;
+  /** 受信任的派单仓库根目录（用于严格校核 worktree `.git` / `commondir`，防止 worker 篡改元数据） */
+  trustedRepoRoot?: string;
+  /** 显式禁止挂载任何外部 worktree `.git` 目录 */
+  disableGitWorktreeMounts?: boolean;
   extraWritablePaths?: string[];
   extraReadOnlyPaths?: string[];
 }
@@ -43,11 +49,15 @@ function buildGitIsolation(cwd: string, opts: GitRunOpts | undefined, filteredCr
     return buildWorkspaceIsolation(opts.cfg, {
       mode: opts.readOnly ? "git-ro" : "git-rw",
       cwd,
+      trustedRepoRoot: opts.trustedRepoRoot,
+      disableGitWorktreeMounts: opts.disableGitWorktreeMounts,
       extraWritablePaths: opts.extraWritablePaths,
       extraReadOnlyPaths: extraRo,
     });
   }
-  const wt = detectGitWorktreeDirs(cwd);
+  const wt = opts?.disableGitWorktreeMounts
+    ? {}
+    : detectGitWorktreeDirs(cwd, { trustedRepoRoot: opts?.trustedRepoRoot });
   const wtTargets = [wt.commonDir, wt.gitDir].filter((p): p is string => !!p);
   return {
     cwd,
@@ -174,6 +184,8 @@ const LFS_SPEC_HEADERS = [
 const LFS_SPEC_HEADER_BUFS = LFS_SPEC_HEADERS.map((h) => Buffer.from(h, "utf8"));
 const LFS_POINTER_MIN_BYTES = 80;
 const LFS_POINTER_MAX_BYTES = 1024;
+const LFS_MAX_INT64 = 9223372036854775807n;
+const UTF8_FATAL = new TextDecoder("utf-8", { fatal: true });
 const LFS_META_CHUNK_SIZE = 1024;
 const LFS_BATCH_CHUNK_SIZE = 256;
 
@@ -231,26 +243,77 @@ async function tryGitBuffer(
   }
 }
 
-/** 从合规的 Git LFS 指针文本中提取 sha256 OID（支持标准 spec/v1 与历史 hawser spec/v1；非法文本返回 undefined）。 */
-export function extractGitLfsPointerOid(content: string): string | undefined {
-  if (!content || Buffer.byteLength(content, "utf8") > LFS_POINTER_MAX_BYTES) return undefined;
-  const lines = content.replace(/\r\n/g, "\n").split("\n").filter((l) => l.length > 0);
+/**
+ * 严格按 Git LFS 官方指针语法（git-lfs/lfs/pointer.go `DecodeKV`）校验指针文件并提取 sha256 OID：
+ *   - 支持标准 spec/v1 与历史 hawser spec/v1；
+ *   - 拒绝空字节、非法 UTF-8、UTF-8 BOM、超过 1024 字节、未知键值行（如 `not a pointer`）、重复 `oid`/`version`、
+ *     冲突的 `ext-<idx>-<name>`、非 `int64` 范围 `size` 或 `size` 未位于最后一行。
+ */
+export function extractGitLfsPointerOid(content: string | Buffer): string | undefined {
+  let text: string;
+  if (Buffer.isBuffer(content)) {
+    if (content.length === 0 || content.length > LFS_POINTER_MAX_BYTES || content.includes(0)) return undefined;
+    try {
+      text = UTF8_FATAL.decode(content);
+    } catch {
+      return undefined;
+    }
+  } else {
+    if (!content || Buffer.byteLength(content, "utf8") > LFS_POINTER_MAX_BYTES || content.includes("\0")) return undefined;
+    text = content;
+  }
+  // 仅剥离首尾 ASCII 空白（保留 \ufeff BOM 以拒绝带 BOM 的非法指针，与 Go bytes.TrimSpace 一致）
+  const trimmed = text.replace(/^[ \t\r\n\f\v]+|[ \t\r\n\f\v]+$/g, "");
+  if (!trimmed) return undefined;
+  const lines = trimmed
+    .split("\n")
+    .map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l))
+    .filter((l) => l.length > 0);
   if (lines.length < 3) return undefined;
   if (!LFS_SPEC_HEADERS.includes(lines[0] as (typeof LFS_SPEC_HEADERS)[number])) return undefined;
-  let oid: string | undefined;
-  let hasSize = false;
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i];
-    const oidMatch = line.match(/^oid sha256:([0-9a-f]{64})$/);
-    if (oidMatch) oid = oidMatch[1];
-    else if (/^size \d+$/.test(line)) hasSize = true;
-    else if (!/^[a-z0-9._-]+ \S/.test(line)) return undefined;
+
+  const lastLine = lines[lines.length - 1];
+  const sizeMatch = lastLine.match(/^size \+?(\d+)$/);
+  if (!sizeMatch) return undefined;
+  try {
+    const sizeVal = BigInt(sizeMatch[1]);
+    if (sizeVal < 0n || sizeVal > LFS_MAX_INT64) return undefined;
+  } catch {
+    return undefined;
   }
-  return oid && hasSize ? oid : undefined;
+
+  let oid: string | undefined;
+  const extByIdx = new Map<number, string>();
+  for (let i = 1; i < lines.length - 1; i++) {
+    const line = lines[i];
+    const parts = line.split(" ");
+    if (parts.length !== 2) return undefined;
+    const [key, val] = parts;
+    if (!key || !val || /\s/.test(key) || /\s/.test(val)) return undefined;
+    if (key === "oid") {
+      if (oid !== undefined) return undefined;
+      const oidMatch = val.match(/^sha256:([0-9a-f]{64})$/);
+      if (!oidMatch) return undefined;
+      oid = oidMatch[1];
+    } else if (key.startsWith("ext-")) {
+      const extMatch = key.match(/^ext-(\d+)-(.+)$/);
+      if (!extMatch) return undefined;
+      const idx = Number(extMatch[1]);
+      const name = extMatch[2];
+      if (!Number.isSafeInteger(idx) || idx < 0 || !name) return undefined;
+      if (!/^sha256:[0-9a-f]{64}$/.test(val)) return undefined;
+      const prevName = extByIdx.get(idx);
+      if (prevName !== undefined && prevName !== name) return undefined;
+      extByIdx.set(idx, name);
+    } else {
+      return undefined;
+    }
+  }
+  return oid;
 }
 
-/** 严格校验一段文本是否是合规的 Git LFS 指针文件（支持标准 spec/v1 与历史 hawser spec/v1，防止源代码字面量误判）。 */
-export function isGitLfsPointerBlob(content: string): boolean {
+/** 严格校验一段文本或二进制块是否是合规的 Git LFS 指针文件（与 `git lfs pointer --check --stdin` 语法一致）。 */
+export function isGitLfsPointerBlob(content: string | Buffer): boolean {
   return extractGitLfsPointerOid(content) !== undefined;
 }
 
@@ -271,7 +334,7 @@ function collectBatchBufferLfsOids(buf: Buffer, out: Set<string>, stopOnFirst: b
     const blobBuf = buf.subarray(offset, offset + size);
     offset += size + 1; // 跳过对象后的 '\n'
     if (LFS_SPEC_HEADER_BUFS.some((h) => blobBuf.includes(h))) {
-      const oid = extractGitLfsPointerOid(blobBuf.toString("utf8"));
+      const oid = extractGitLfsPointerOid(blobBuf);
       if (oid) {
         out.add(oid);
         found = true;
@@ -280,6 +343,34 @@ function collectBatchBufferLfsOids(buf: Buffer, out: Set<string>, stopOnFirst: b
     }
   }
   return found;
+}
+
+/** 将本地远端路径（含 `file://` URL 与相对 `cwd` 的路径）解析为真实宿主机路径，供沙箱显式挂载；非本地远端返回 undefined。 */
+export function resolveLocalGitRemoteDir(cwd: string, rawUrl: string): string | undefined {
+  const u = rawUrl.trim();
+  if (!u) return undefined;
+  let candidate: string | undefined;
+  if (/^file:\/\//i.test(u)) {
+    try {
+      candidate = fileURLToPath(u);
+    } catch {
+      return undefined;
+    }
+  } else if (/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) {
+    return undefined;
+  } else if (/^(?:[^@/]+@)?[^/:]+:(?!\/)/.test(u) && !/^[a-z]:\\/i.test(u)) {
+    const resolved = path.resolve(cwd, u);
+    if (!fs.existsSync(resolved)) return undefined;
+    candidate = resolved;
+  } else {
+    candidate = path.resolve(cwd, u);
+  }
+  try {
+    if (candidate && fs.existsSync(candidate)) return fs.realpathSync(candidate);
+  } catch {
+    // ignore
+  }
+  return undefined;
 }
 
 async function scanOutgoingGitLfs(
@@ -343,8 +434,8 @@ async function scanOutgoingGitLfs(
     }
   }
 
-  const revArgs = ["rev-list", "--objects", targetRev, ...(validRemoteCommits.length ? ["--not", ...validRemoteCommits] : [])];
-  const revList = await tryGit(cwd, revArgs, roOpts);
+  const revInput = [targetRev, ...validRemoteCommits.map((sha) => `^${sha}`)].join("\n") + "\n";
+  const revList = await tryGit(cwd, ["rev-list", "--objects", "--stdin"], { ...roOpts, input: revInput });
   if (revList.code !== 0) {
     throw new Error(`git rev-list 扫描提交 ${branchOrCommit} 待推送对象失败：${(revList.stderr || revList.stdout).trim()}`);
   }
@@ -444,33 +535,33 @@ export async function pushBranch(
     ? [...new Set(pushUrlRes.stdout.split("\n").map((s) => s.trim()).filter(Boolean))]
     : [];
   const effectivePushUrls = pushUrls.length > 0 ? pushUrls : [remote];
-  const localRemoteDirs = effectivePushUrls.filter((u) => {
-    try {
-      return !/^[a-z][a-z0-9+.-]*:\/\//i.test(u) && fs.existsSync(u);
-    } catch {
-      return false;
-    }
-  });
+  const localDirByUrl = new Map<string, string>();
+  for (const u of effectivePushUrls) {
+    const resolved = resolveLocalGitRemoteDir(cwd, u);
+    if (resolved) localDirByUrl.set(u, resolved);
+  }
+  const localRemoteDirs = [...new Set(localDirByUrl.values())];
 
   for (const pushUrl of effectivePushUrls) {
-    const isLocalDir = localRemoteDirs.includes(pushUrl);
+    const localDir = localDirByUrl.get(pushUrl);
+    // 尽量用 ls-remote 缩小扫描范围；若远端是仅允许 receive-pack（禁止 upload-pack）的 push-only 端点，
+    // 不在此处中止，而是保守按远端无已知引用扫描全量待推对象（非 LFS 仓库可直接进入 git push）。
     const lsRemote = await tryGit(cwd, ["ls-remote", pushUrl], {
       ...opts,
       readOnly: true,
-      extraReadOnlyPaths: [...(opts?.extraReadOnlyPaths ?? []), ...(isLocalDir ? [pushUrl] : [])],
+      extraReadOnlyPaths: [...(opts?.extraReadOnlyPaths ?? []), ...(localDir ? [localDir] : [])],
     });
-    if (lsRemote.code !== 0) {
-      return { ok: false, rejected: false, message: `无法读取推送目标 ${pushUrl} 引用列表：${(lsRemote.stderr || lsRemote.stdout).trim()}` };
-    }
     let remoteSha = ZERO_OID;
     const knownRemoteShas: string[] = [];
-    for (const line of lsRemote.stdout.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const [sha, ref] = trimmed.split(/\s+/);
-      if (!sha || !ref) continue;
-      if (ref === localRef) remoteSha = sha;
-      if (!ref.endsWith("^{}")) knownRemoteShas.push(sha);
+    if (lsRemote.code === 0) {
+      for (const line of lsRemote.stdout.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const [sha, ref] = trimmed.split(/\s+/);
+        if (!sha || !ref) continue;
+        if (ref === localRef) remoteSha = sha;
+        if (!ref.endsWith("^{}")) knownRemoteShas.push(sha);
+      }
     }
 
     let scan: { hasLfsAttr: boolean; oids: string[] };
@@ -484,42 +575,45 @@ export async function pushBranch(
       };
     }
 
-    if (scan.oids.length > 0) {
-      // 单推送目标时传 remote 名（自动遵从 remote.<name>.pushurl 与 lfsurl）；多推送目标时直接传规范化 pushUrl（本地路径转 file://）
-      const lfsTarget =
-        effectivePushUrls.length === 1 ? remote : isLocalDir ? `file://${pushUrl.startsWith("/") ? pushUrl : `${cwd}/${pushUrl}`}` : pushUrl;
-      for (let i = 0; i < scan.oids.length; i += LFS_UPLOAD_OID_CHUNK) {
-        const oidChunk = scan.oids.slice(i, i + LFS_UPLOAD_OID_CHUNK);
-        const lfs = await tryGit(cwd, ["lfs", "push", "--object-id", lfsTarget, ...oidChunk], {
-          ...opts,
-          extraWritablePaths: [...(opts?.extraWritablePaths ?? []), ...(isLocalDir ? [pushUrl] : [])],
-        });
-        if (lfs.code !== 0) {
-          const lfsOut = `${lfs.stdout}\n${lfs.stderr}`.trim();
-          const missingLfs = /not a git command|git-lfs.*not found|No such file/i.test(lfsOut);
-          return {
-            ok: false,
-            rejected: missingLfs,
-            message: `检测到分支 ${branch}（含待推送提交历史）涉及 Git LFS 对象，但上传 LFS 对象到 ${pushUrl} 失败（已禁用仓库 hooks 以保障安全；请确认本机已安装 git-lfs 并具备远端推送权限）：${lfsOut.slice(-600)}`,
-          };
-        }
-      }
-    } else if (scan.hasLfsAttr) {
-      const lfsArgs = ["lfs", "pre-push", remote, pushUrl];
-      const stdinLine = `${localRef} ${localSha} ${localRef} ${remoteSha}\n`;
-      const lfs = await tryGit(cwd, lfsArgs, {
+    if (scan.hasLfsAttr || scan.oids.length > 0) {
+      const lfsWritePaths = [...(opts?.extraWritablePaths ?? []), ...(localDir ? [localDir] : [])];
+      // 1) 始终先运行受信任、感知路径的 `git lfs pre-push`，保留客户端 LFS 文件锁校验（lfs.locksverify）
+      const prePush = await tryGit(cwd, ["lfs", "pre-push", remote, pushUrl], {
         ...opts,
-        input: stdinLine,
-        extraWritablePaths: [...(opts?.extraWritablePaths ?? []), ...(isLocalDir ? [pushUrl] : [])],
+        input: `${localRef} ${localSha} ${localRef} ${remoteSha}\n`,
+        extraWritablePaths: lfsWritePaths,
       });
-      if (lfs.code !== 0) {
-        const lfsOut = `${lfs.stdout}\n${lfs.stderr}`.trim();
+      if (prePush.code !== 0) {
+        const lfsOut = `${prePush.stdout}\n${prePush.stderr}`.trim();
         const missingLfs = /not a git command|git-lfs.*not found|No such file/i.test(lfsOut);
+        const lockRejected = /locked|lock verification/i.test(lfsOut);
         return {
           ok: false,
-          rejected: missingLfs,
-          message: `检测到分支 ${branch}（含待推送提交历史）涉及 Git LFS 对象，但上传 LFS 对象到 ${pushUrl} 失败（已禁用仓库 hooks 以保障安全；请确认本机已安装 git-lfs 并具备远端推送权限）：${lfsOut.slice(-600)}`,
+          rejected: missingLfs || lockRejected,
+          message: `检测到分支 ${branch}（含待推送提交历史）涉及 Git LFS 对象，但 LFS 预推校验/上传到 ${pushUrl} 失败（已禁用仓库 hooks 以保障安全；请确认本机已安装 git-lfs、未命中他人文件锁且具备远端推送权限）：${lfsOut.slice(-600)}`,
         };
+      }
+
+      // 2) 当待推送提交含 LFS 指针时，继续按精确缺失 OID 显式上传（解决 split-pushurl 下 pre-push 误按 fetch 缓存跳过对象的问题）
+      if (scan.oids.length > 0) {
+        const lfsTarget =
+          effectivePushUrls.length === 1 ? remote : localDir ? pathToFileURL(localDir).href : pushUrl;
+        for (let i = 0; i < scan.oids.length; i += LFS_UPLOAD_OID_CHUNK) {
+          const oidChunk = scan.oids.slice(i, i + LFS_UPLOAD_OID_CHUNK);
+          const lfs = await tryGit(cwd, ["lfs", "push", "--object-id", lfsTarget, ...oidChunk], {
+            ...opts,
+            extraWritablePaths: lfsWritePaths,
+          });
+          if (lfs.code !== 0) {
+            const lfsOut = `${lfs.stdout}\n${lfs.stderr}`.trim();
+            const missingLfs = /not a git command|git-lfs.*not found|No such file/i.test(lfsOut);
+            return {
+              ok: false,
+              rejected: missingLfs,
+              message: `检测到分支 ${branch}（含待推送提交历史）涉及 Git LFS 对象，但上传 LFS 对象到 ${pushUrl} 失败（已禁用仓库 hooks 以保障安全；请确认本机已安装 git-lfs 并具备远端推送权限）：${lfsOut.slice(-600)}`,
+            };
+          }
+        }
       }
     }
   }

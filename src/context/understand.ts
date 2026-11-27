@@ -250,6 +250,8 @@ export class Understander {
       filterObs?: (conv: string, obs: Obs[]) => Obs[];
       isMentionsOnly?: (conv: string) => boolean;
       claimCheck?: { convs: string[]; holder: string; procOwner: string };
+      /** 提交事务内执行的同步策略版本守卫：返回 false 时整体丢弃本批模型结果且不消费观测 */
+      commitGuard?: () => boolean;
     },
   ): Promise<ApplyResult & { convs: string[]; fresh: number }> {
     if (signal?.aborted) throw new Error("aborted");
@@ -301,7 +303,7 @@ export class Understander {
       const claimCheck = opts?.claimCheck
         ? { ...opts.claimCheck, convs: batch.convs.filter((id) => opts.claimCheck!.convs.includes(id)) }
         : undefined;
-      const res = this.apply(out, batch.obs, batch.fresh, disallowedConvs, claimCheck);
+      const res = this.apply(out, batch.obs, batch.fresh, disallowedConvs, claimCheck, opts?.commitGuard);
       this.app.ledger.endStep(step, "ok", `新事项 ${res.created.length}，关闭 ${res.closed.length}，知识 ${res.knowledge}`);
       return { ...res, convs: batch.convs, fresh: res.processed };
     } catch (e) {
@@ -313,6 +315,7 @@ export class Understander {
   /**
    * 写入模型结果（原子事务内校验）：
    *   - 若传入 `claimCheck`，先在同一 BEGIN IMMEDIATE 写事务内校验所有会话认领租约仍归当前执行者有效持有，失去租约则整体放弃，避免陈旧执行者覆盖继任者结果；
+   *   - 若传入 `commitGuard`，在写事务内同步复核策略签名与开关版本未发生二次漂移，漂移则整体丢弃且不消费观测；
    *   - 证据必须指向这批里真实存在的观测，且在提交时刻未被编辑、撤回、静音或因策略变更而被禁止（disallowedConvs）；
    *   - 若本批中任一观测在推理期间失效/撤回/被静音（`batchPartiallyStale`），因为 `out.projects` 与 `out.people` 无逐条证据归属，
    *     整体放弃该批模型输出且不消费其余仍有效的待处理观测，留待下轮基于干净批次重跑，杜绝被排除会话的信息渗入项目或人物图谱。
@@ -323,6 +326,7 @@ export class Understander {
     fresh: string[],
     disallowedConvs?: Set<string>,
     claimCheck?: { convs: string[]; holder: string; procOwner: string },
+    commitGuard?: () => boolean,
   ): ApplyResult {
     const res = emptyResult();
     const byId = new Map(obs.map((o) => [o.id, o]));
@@ -347,6 +351,12 @@ export class Understander {
           res.rejected += out.items.length + out.knowledge.length + out.updates.length + out.projects.length + out.people.length;
           return;
         }
+      }
+
+      // 1b) 在写事务内强校验策略版本守卫：防止 validateBeforeApply 异步复核期间发生第二次策略变更而将过期批次写入图谱
+      if (commitGuard && !commitGuard()) {
+        res.rejected += out.items.length + out.knowledge.length + out.updates.length + out.projects.length + out.people.length;
+        return;
       }
 
       // 2) 在同一 BEGIN IMMEDIATE 事务内核对本批观测当前修订、撤回状态、会话静音状态及策略复核结果

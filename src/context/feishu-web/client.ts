@@ -249,12 +249,8 @@ export class FeishuWebClient {
     } catch (err) {
       // verifyOwner 已确认会话归属；若 loadWebMetadata 遭遇 5xx/缺 appKey 前收到了 Set-Cookie 轮换，
       // 须立即落盘已验证会话的新增 Cookie，避免重连回退到已失效的旧磁盘 Cookie
-      if (client.hasPendingCookieDelta() && !(err instanceof WebHttpError && err.code === "credential_denied")) {
-        try {
-          client.notifySessionConfirmed();
-        } catch {
-          // 保留 loadWebMetadata 原始错误
-        }
+      if (!(err instanceof WebHttpError && err.code === "credential_denied")) {
+        client.flushVerifiedCookieDeltaBestEffort();
       }
       throw err;
     }
@@ -320,6 +316,16 @@ export class FeishuWebClient {
   private hasPendingCookieDelta(): boolean {
     const d = this.jar.peekDelta();
     return d.upserts.length > 0 || d.deletes.length > 0;
+  }
+
+  /** 对已验证会话在遭遇瞬时非鉴权错误（如 5xx、网关解码异常、票据异常）前落盘已收到的 Set-Cookie 轮换，避免短生命周期客户端丢失新 Cookie */
+  private flushVerifiedCookieDeltaBestEffort(): void {
+    if (!this.hasPendingCookieDelta()) return;
+    try {
+      this.notifySessionConfirmed();
+    } catch {
+      // 保留原始非鉴权错误，不吞掉上游失败信息
+    }
   }
 
   private notifySessionConfirmed(): boolean {
@@ -400,9 +406,16 @@ export class FeishuWebClient {
       throw new WebHttpError("credential_denied", `个人 Web 网关鉴权失败 (HTTP ${res.status})`, res.status);
     }
     if (res.status !== 200) {
+      this.flushVerifiedCookieDeltaBestEffort();
       throw new WebHttpError("http_error", `个人 Web 网关请求被拒绝 (HTTP ${res.status})`, res.status);
     }
-    const unpacked = unwrapGatewayPayload(res.body);
+    let unpacked: Buffer;
+    try {
+      unpacked = unwrapGatewayPayload(res.body);
+    } catch (err) {
+      this.flushVerifiedCookieDeltaBestEffort();
+      throw err;
+    }
     if (!opts.deferCookiePersist && (res.cookiesUpdated || this.hasPendingCookieDelta())) {
       if (!this.notifySessionConfirmed()) {
         throw new WebHttpError("aborted", "本地凭据已被登出或更新");
@@ -671,18 +684,22 @@ export class FeishuWebClient {
         throw new WebHttpError("credential_denied", `获取长连接票据鉴权失败 (HTTP ${res.status})`, res.status);
       }
       if (res.status !== 200) {
+        this.flushVerifiedCookieDeltaBestEffort();
         throw new WebHttpError("http_error", `获取长连接票据失败 (HTTP ${res.status})`, res.status);
       }
       let parsed: { code?: number; ticket?: string };
       try {
         parsed = JSON.parse(res.body.toString("utf8")) as typeof parsed;
       } catch {
+        this.flushVerifiedCookieDeltaBestEffort();
         throw new WebHttpError("http_error", "长连接票据响应不可解析");
       }
       if (typeof parsed.code === "number" && parsed.code !== 0) {
+        this.flushVerifiedCookieDeltaBestEffort();
         throw new WebHttpError("http_error", `长连接票据服务返回异常 (code=${parsed.code})`);
       }
       if (!parsed.ticket) {
+        this.flushVerifiedCookieDeltaBestEffort();
         throw new WebHttpError("http_error", "长连接票据暂不可用");
       }
       if (res.cookiesUpdated || this.hasPendingCookieDelta()) {

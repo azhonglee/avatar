@@ -255,7 +255,7 @@ export class Ledger {
   claim<P = Record<string, unknown>>(
     kind: WorkKind,
     leaseMs: number,
-    opts?: { excludeEffectOps?: string[] },
+    opts?: { excludeEffectOps?: string[]; allowEffectIds?: string[] },
   ): WorkItem<P> | undefined {
     const now = Date.now();
     const order =
@@ -263,9 +263,13 @@ export class Ledger {
         ? `AND NOT EXISTS (SELECT 1 FROM work e WHERE e.kind = 'effect' AND e.ref = w.ref AND e.seq < w.seq AND e.terminal = 0)`
         : "";
     const excludedOps = kind === "effect" ? (opts?.excludeEffectOps ?? []).filter(Boolean) : [];
+    const allowedIds = kind === "effect" ? (opts?.allowEffectIds ?? []).filter(Boolean) : [];
     const opFilter = excludedOps.length
-      ? `AND COALESCE(json_extract(w.payload, '$.op'), '') NOT IN (${excludedOps.map(() => "?").join(", ")})`
+      ? allowedIds.length
+        ? `AND (COALESCE(json_extract(w.payload, '$.op'), '') NOT IN (${excludedOps.map(() => "?").join(", ")}) OR w.id IN (${allowedIds.map(() => "?").join(", ")}))`
+        : `AND COALESCE(json_extract(w.payload, '$.op'), '') NOT IN (${excludedOps.map(() => "?").join(", ")})`
       : "";
+    const filterArgs = excludedOps.length ? [...excludedOps, ...allowedIds] : [];
     const r = this.db
       .prepare(
         `UPDATE work SET lease_owner = ?, lease_until = ?, attempts = attempts + 1, updated = ?
@@ -273,7 +277,7 @@ export class Ledger {
                       ORDER BY next_at, seq LIMIT 1)
          RETURNING *`,
       )
-      .get(this.owner, now + leaseMs, now, kind, now, now, ...excludedOps) as Row | undefined;
+      .get(this.owner, now + leaseMs, now, kind, now, now, ...filterArgs) as Row | undefined;
     return r ? toItem<P>(r) : undefined;
   }
 
@@ -418,9 +422,19 @@ export class Ledger {
       .run(Date.now(), e.source, e.actor, e.command, e.target, JSON.stringify(e.args ?? {}), e.ok ? 1 : 0, e.message);
   }
 
-  auditLog(limit = 100, target?: string): AuditEntry[] {
-    if (target) return this.db.prepare("SELECT * FROM audit WHERE target = ? ORDER BY id DESC LIMIT ?").all(target, limit) as unknown as AuditEntry[];
-    return this.db.prepare("SELECT * FROM audit ORDER BY id DESC LIMIT ?").all(limit) as unknown as AuditEntry[];
+  auditLog(limit = 100, target?: string, before?: number): AuditEntry[] {
+    const where: string[] = [];
+    const args: (string | number)[] = [];
+    if (target) {
+      where.push("target = ?");
+      args.push(target);
+    }
+    if (before !== undefined) {
+      where.push("id < ?");
+      args.push(before);
+    }
+    const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    return this.db.prepare(`SELECT * FROM audit ${clause} ORDER BY id DESC LIMIT ?`).all(...args, limit) as unknown as AuditEntry[];
   }
 
   isCancelled(id: string): boolean {

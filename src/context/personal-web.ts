@@ -1017,12 +1017,17 @@ export class PersonalWebBridge {
     return out;
   }
 
-  private isDirectlyDenied(pwConv: string, chatName: string, confirmedOcDenyNames?: Set<string>): boolean {
+  private isDirectlyDenied(
+    pwConv: string,
+    chatName: string,
+    confirmedOcDenyNames?: Set<string>,
+    kind: "group" | "dm" = "group",
+  ): boolean {
     const rawId = pwConv.startsWith("pw_chat:") ? pwConv.slice("pw_chat:".length) : pwConv;
     if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(rawId)) return true;
     if (this.matchesDirectNativeIdDeny(pwConv)) return true;
     if (chatName && this.nameDenyPatterns().some((d) => chatName.includes(d))) return true;
-    if (chatName) {
+    if (kind !== "dm" && chatName) {
       const ocDeny = confirmedOcDenyNames ?? this.confirmedOpenGroupDenyNames();
       if (ocDeny.has(norm(chatName))) return true;
     }
@@ -1032,9 +1037,10 @@ export class PersonalWebBridge {
   /**
    * 评估当前个人 Web 会话是否命中排除/静音规则：
    *   - 返回 `{ excluded: true, verifiedChatName }`：明确命中排除，应丢弃；
-   *   - 返回 `{ excluded: false, verifiedChatName }`：确认未命中排除，允许继续（携带最新核验过的群名供提交前终检使用）；
+   *   - 返回 `{ excluded: false, verifiedChatName }`：确认未命中排除，允许继续（携带最新核验过的群/私聊展示名供提交前终检使用）；
    *   - 抛错：存在无法实时确认的排除规则，按 fail-closed 暂缓入库（不发 ACK）。
-   * 当存在关键词或 oc_* 排除且群名来自缓存时，强制实时刷新群名再判定，既防止改名命中规则后逃逸，也防止改名脱离规则后永久卡死。
+   * 当存在关键词或 oc_* 排除且群名/私聊对方展示名来自缓存或缺失时，强制实时刷新再判定，
+   * 既防止改名命中规则或私聊裸数字 ID 逃逸，也防止改名脱离规则后永久卡死。
    */
   private async evaluateChatExclusion(params: {
     chatId: string;
@@ -1058,19 +1064,25 @@ export class PersonalWebBridge {
     }
 
     const ensureFreshChatName = async (reason: string): Promise<void> => {
-      if (chatNameRefreshed) return;
+      if (chatNameRefreshed && chatName) return;
       if (!activeClient) {
-        throw new Error(`无在线个人 Web 客户端，无法实时刷新群名称以核验${reason}，按 fail-closed 暂缓入库`);
+        throw new Error(
+          `无在线个人 Web 客户端，无法实时刷新${kind === "dm" ? "私聊对方展示名" : "群名称"}以核验${reason}，按 fail-closed 暂缓入库`,
+        );
       }
       try {
         chatName = (await activeClient.readChat(chatId, { force: true, signal })).name.trim();
         chatNameRefreshed = true;
-        if (chatName) this.pwGroupNameCache.set(pwConv, chatName);
+        if (kind === "group" && chatName) this.pwGroupNameCache.set(pwConv, chatName);
       } catch {
-        throw new Error(`实时刷新群名称失败，无法核验${reason}，按 fail-closed 暂缓入库`);
+        throw new Error(
+          `实时刷新${kind === "dm" ? "私聊对方展示名" : "群名称"}失败，无法核验${reason}，按 fail-closed 暂缓入库`,
+        );
       }
       if (!chatName) {
-        throw new Error(`群名称为空，无法核验${reason}，按 fail-closed 暂缓入库`);
+        throw new Error(
+          `${kind === "dm" ? "个人 Web 私聊未返回对方展示名" : "群名称为空"}，无法核验${reason}，按 fail-closed 暂缓入库`,
+        );
       }
     };
 
@@ -1093,8 +1105,27 @@ export class PersonalWebBridge {
         if (nameRules.some((d) => chatName.includes(d))) {
           return { excluded: true, verifiedChatName: chatName };
         }
-      } else if (nameRules.some((d) => convName.includes(d))) {
-        return { excluded: true, verifiedChatName: chatName };
+      } else {
+        // 原生私聊默认 convName 仅含数字 actorId/chatId：存在 groups_deny 名称规则时必须实时解析对方展示名，
+        // 无法解析时按 fail-closed 暂缓入库/理解（绝不让按姓名排除的同事私聊经个人 Web 漏入快通道模型）
+        const staleLabels = [chatName, convName].filter(Boolean);
+        const staleMatched = staleLabels.some((lbl) => nameRules.some((d) => lbl.includes(d)));
+        if (!chatNameRefreshed && activeClient) {
+          try {
+            await ensureFreshChatName("groups_deny 关键词排除规则");
+          } catch (err) {
+            if (staleMatched) return { excluded: true, verifiedChatName: chatName };
+            throw err;
+          }
+        } else if (staleMatched) {
+          return { excluded: true, verifiedChatName: chatName };
+        } else {
+          await ensureFreshChatName("groups_deny 关键词排除规则");
+        }
+        const dmFormatted = chatName.startsWith("私聊：") ? chatName : `私聊：${chatName}`;
+        if (nameRules.some((d) => chatName.includes(d) || dmFormatted.includes(d))) {
+          return { excluded: true, verifiedChatName: chatName };
+        }
       }
     }
 
@@ -1616,6 +1647,12 @@ export class PersonalWebBridge {
         ? `私聊：${isMe ? effectiveMsg.conversationId : effectiveMsg.actorId || effectiveMsg.conversationId}`
         : chatName || `群聊(${effectiveMsg.conversationId})`;
 
+    const formatDmConvName = (label: string): string => {
+      const clean = label.trim();
+      if (!clean) return `私聊：${isMe ? effectiveMsg.conversationId : effectiveMsg.actorId || effectiveMsg.conversationId}`;
+      return clean.startsWith("私聊：") ? clean : `私聊：${clean}`;
+    };
+
     const exclPolicyBefore = this.nativeExclusionPolicyKey();
     const exclRes = await this.evaluateChatExclusion({
       chatId: effectiveMsg.conversationId,
@@ -1630,11 +1667,12 @@ export class PersonalWebBridge {
     if (exclRes.verifiedChatName) {
       chatName = exclRes.verifiedChatName;
       if (convKind === "group") convName = chatName;
+      else convName = formatDmConvName(chatName);
     }
     if (exclRes.excluded) return;
 
     // 5) 落库前最终核验会话代际、中止信号与当前采集策略（包含 oc_* 与关键词排除规则）：
-    //    如果异步排除查询期间策略变化，先重跑排除校验并用核验后的真实群名做同步终检，
+    //    如果异步排除查询期间策略变化，先重跑排除校验并用核验后的真实群名/私聊名做同步终检，
     //    彻底杜绝「登出/静音/新增关键词排除/关闭 sources.im 发生在最后一次 await 期间仍把消息写入数据库」的竞态。
     const checkFinalIngestSync = (): boolean => {
       if (signal?.aborted) {
@@ -1649,7 +1687,7 @@ export class PersonalWebBridge {
       }
       if (!this.cfg.context.sources.im || !this.cfg.context.personal_web.enabled) return false;
       if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(effectiveMsg.conversationId)) return false;
-      if (this.isDirectlyDenied(pwConv, chatName || convName)) return false;
+      if (this.isDirectlyDenied(pwConv, chatName || convName, undefined, convKind)) return false;
       return true;
     };
 
@@ -1669,6 +1707,7 @@ export class PersonalWebBridge {
       if (exclResNow.verifiedChatName) {
         chatName = exclResNow.verifiedChatName;
         if (convKind === "group") convName = chatName;
+        else convName = formatDmConvName(chatName);
       }
       if (exclResNow.excluded) return;
       if (!checkFinalIngestSync()) return;
