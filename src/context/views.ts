@@ -17,7 +17,7 @@ import type {
 } from "../api/types.ts";
 import { defaultDraftKind } from "./drafts.ts";
 import { hasWorkspaceOwnerMismatch } from "./personal-web.ts";
-import type { ContextStore, DraftRow, ItemRow, ProjectRow } from "./store.ts";
+import { obsRevision, type ContextStore, type DraftRow, type ItemRow, type ProjectRow } from "./store.ts";
 
 /**
  * 排序与视图：确定性规则给事项打分（并说明原因），组装今天页、项目页等视图。
@@ -171,8 +171,10 @@ export class ContextViews {
       const cl = c.claims[i];
       const obs = cl.obs_id ? this.store.obs(cl.obs_id) : undefined;
       if (obs?.meta.withdrawn === true) continue;
+      if (obs && cl.obs_rev && obsRevision(obs) !== cl.obs_rev) continue;
       claims.push({
         index: i,
+        ...(cl.obs_rev ? { obs_rev: cl.obs_rev } : {}),
         claim: cl.claim,
         quote: cl.quote,
         time: cl.time,
@@ -290,8 +292,9 @@ export class ContextViews {
     const kv = this.app.store;
     const ownerMismatch = ownerMismatchOverride ?? hasWorkspaceOwnerMismatch(kv, this.app.cfg.owner.open_id);
     const sources = ["meego", "tasks", "im", "minutes", "calendar", "docs"].map((s) => {
+      if (ownerMismatch) return { source: s, last_pull: null, last_count: 0, error: "" };
       const r = JSON.parse(kv.get(`ctx.source.${s}`) ?? "null") as { at?: number; count?: number; error?: string } | null;
-      return { source: s, last_pull: r?.at ?? null, last_count: r?.count ?? 0, error: ownerMismatch ? "" : r?.error ?? "" };
+      return { source: s, last_pull: r?.at ?? null, last_count: r?.count ?? 0, error: r?.error ?? "" };
     });
     const safePersonalWeb =
       personalWeb && ownerMismatch
@@ -306,9 +309,9 @@ export class ContextViews {
           }
         : personalWeb;
     return {
-      last_cycle: Number(kv.get("ctx.last_cycle") ?? 0) || null,
+      last_cycle: ownerMismatch ? null : Number(kv.get("ctx.last_cycle") ?? 0) || null,
       last_error: ownerMismatch ? "当前工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已隔离上下文" : kv.get("ctx.last_error") ?? "",
-      running,
+      running: ownerMismatch ? false : running,
       sources,
       pending_obs: ownerMismatch ? 0 : this.store.pendingCount(),
       totals: ownerMismatch

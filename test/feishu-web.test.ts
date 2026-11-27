@@ -120,7 +120,7 @@ import {
   tryGit,
   writeScopedStaticCredentialHelper,
 } from "../src/delivery/git.ts";
-import { registerDelivery } from "../src/delivery/index.ts";
+import { maskUrl, registerDelivery } from "../src/delivery/index.ts";
 import { runDoctor } from "../src/doctor.ts";
 import { card as cardEffect, comment as commentEffect, effectHandler, move as moveEffect } from "../src/effects.ts";
 import {
@@ -7135,6 +7135,7 @@ context:
                 create_time: String(nowSec),
                 sender: { id: "cli_meego", name: "MeegoBot", sender_type: "app" },
                 content: "@张三 你的需求流转到待验收",
+                mentions: [{ id: "ou_owner_a", name: "张三" }],
               },
             ],
           };
@@ -24923,6 +24924,816 @@ test("Codex 第三十轮回归：自动预起草不覆盖待确认回复、命�
         assert.equal(steps[0].status, "failed", "准备阶段失败后账本 step 必须被结束为 failed，绝不能永久卡在 running");
       } finally {
         app.store.db.close();
+      }
+    }
+  } finally {
+    if (prevPwKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevPwKey;
+    if (prevCredEnv === undefined) delete process.env.PA_FEISHU_WEB_CRED_FILE;
+    else process.env.PA_FEISHU_WEB_CRED_FILE = prevCredEnv;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("第三十一轮 Codex Review 缺陷回归：未入选群须显式@我、CLI草稿投递前复检、LFS报错脱敏查询串、冲突修订失效、已撤回复活回读、证据摘录保留、跨主状态零泄露、Codex覆盖指令与QR登录Retry-After/瞬态重试", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-r31-"));
+  const prevPwKey = process.env.PA_FEISHU_WEB_KEY;
+  const prevCredEnv = process.env.PA_FEISHU_WEB_CRED_FILE;
+  delete process.env.PA_FEISHU_WEB_CRED_FILE;
+  process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
+
+  const makeR31Config = (
+    dataDir: string,
+    opts: { groups?: "all" | "auto" | "allowlist"; groupsAllow?: string[]; groupsDeny?: string[]; ownerOpenId?: string } = {},
+  ) => ({
+    data_dir: dataDir,
+    owner: { open_id: opts.ownerOpenId ?? "ou_r31_owner_A", name: "测试主人", timezone: "Asia/Shanghai" },
+    roles: { brain: "stub", reviewer: "stub" },
+    harnesses: { stub: { type: "codex-exec", bin: "echo" } },
+    dispatch: { default_harness: "stub" },
+    lark: { enabled: true },
+    server: { enabled: false },
+    cards: { enabled: false },
+    context: {
+      enabled: true,
+      groups: opts.groups ?? "allowlist",
+      groups_allow: opts.groupsAllow ?? ["已入选群"],
+      groups_deny: opts.groupsDeny ?? [],
+      sources: { meego: false, tasks: false, im: true, minutes: false, calendar: false, docs: false },
+      personal_web: { enabled: false, pre_draft: false },
+    },
+    bins: { lark_cli: path.join(STUBS, "lark-cli.mjs") },
+  });
+
+  const makeR31App = (
+    sub: string,
+    opts: { groups?: "all" | "auto" | "allowlist"; groupsAllow?: string[]; groupsDeny?: string[]; ownerOpenId?: string } = {},
+  ) => {
+    const dataDir = path.join(dir, `${sub}-data`);
+    fs.mkdirSync(dataDir, { recursive: true });
+    const cfgFile = path.join(dir, `${sub}-config.yaml`);
+    fs.writeFileSync(cfgFile, JSON.stringify(makeR31Config(dataDir, opts), null, 2), "utf8");
+    return { app: createApp(loadConfig(cfgFile)), cfgFile, dataDir };
+  };
+
+  try {
+    // 1) [R31 #1 P1] 未入选群命中 --is-at-me 搜索但 lark-cli 省略 mentions 时必须拒绝入库并撤回历史 @我 观测；显式带 mentions:[{id:me}] 才放行
+    {
+      const { app } = makeR31App("r31-unselected-mention");
+      try {
+        const ctxSvc = registerContext(app)!;
+        const now = Date.now();
+        // 预先写入一条此前曾入库的未入选群 @我 观测
+        ctxSvc.store.addObs([
+          {
+            id: "im:om_r31_omit_mention",
+            source: "im",
+            kind: "at_me",
+            conv: "oc_r31_unselected",
+            conv_name: "未入选群",
+            actor_id: "ou_other",
+            actor_name: "同事",
+            is_me: false,
+            time: now - 5_000,
+            text: "@测试主人 原先提到了你",
+            url: "",
+            meta: { message_id: "om_r31_omit_mention", chat_type: "group", poll_observed_at: now - 5_000 },
+          },
+        ]);
+        const fakeLark = app.lark as unknown as {
+          authStatus: () => Promise<unknown>;
+          run: (argv: string[]) => Promise<unknown>;
+        };
+        fakeLark.authStatus = async () => ({ identity: "user", user: { open_id: "ou_r31_owner_A" } });
+        let phase = 1;
+        fakeLark.run = async (argv: string[]) => {
+          if (argv[0] === "im" && argv[1] === "+messages-search") {
+            if (argv.includes("--is-at-me")) {
+              if (phase === 1) {
+                return {
+                  messages: [
+                    {
+                      message_id: "om_r31_omit_mention",
+                      chat_id: "oc_r31_unselected",
+                      chat_name: "未入选群",
+                      chat_type: "group",
+                      sender: { id: "ou_other", name: "同事" },
+                      content: "编辑后已删掉最后一个 at，lark-cli 省略了 mentions 字段",
+                      create_time: String(now - 5_000),
+                      update_time: String(now),
+                    },
+                  ],
+                  has_more: false,
+                };
+              }
+              return {
+                messages: [
+                  {
+                    message_id: "om_r31_real_mention",
+                    chat_id: "oc_r31_unselected",
+                    chat_name: "未入选群",
+                    chat_type: "group",
+                    sender: { id: "ou_other", name: "同事" },
+                    content: "@测试主人 请确认这个方案",
+                    mentions: [{ id: "ou_r31_owner_A", name: "测试主人" }],
+                    create_time: String(now + 1_000),
+                  },
+                ],
+                has_more: false,
+              };
+            }
+            return { messages: [], has_more: false };
+          }
+          if (argv[0] === "im" && argv[1] === "+chat-list") return { items: [], has_more: false };
+          return {};
+        };
+
+        await ctxSvc.connectors.pullIm(0, "ou_r31_owner_A");
+        const retired = ctxSvc.store.obs("im:om_r31_omit_mention");
+        assert.equal(retired?.meta.withdrawn, true, "未入选群缺少当前正文显式 mentions 时必须拒绝入库并撤回历史待处理 @我 观测");
+        assert.ok(!retired?.text.includes("编辑后已删掉"), "缺少显式 mentions 的编辑后正文绝不得入库");
+        assert.equal(ctxSvc.store.pendingCount(), 0, "未入选群被撤回后待处理观测应为 0");
+
+        phase = 2;
+        await ctxSvc.connectors.pullIm(0, "ou_r31_owner_A");
+        const accepted = ctxSvc.store.obs("im:om_r31_real_mention");
+        assert.ok(accepted && accepted.meta.withdrawn !== true, "未入选群带当前正文显式 mentions:[{id:me}] 的消息必须正常入库");
+        assert.equal(accepted?.kind, "at_me");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 2) [R31 #2 P1] CLI 草稿所有路由（im.reply & im.send）在审批与投递前都必须复检源观测未撤回且仍在允许范围内
+    {
+      const { app } = makeR31App("r31-cli-draft-recheck");
+      try {
+        const ctxSvc = registerContext(app)!;
+        const now = Date.now();
+        ctxSvc.store.addObs([
+          {
+            id: "im:om_r31_withdrawn_followup",
+            source: "im",
+            kind: "at_me",
+            conv: "oc_r31_unselected_g",
+            conv_name: "外部群",
+            actor_id: "ou_other",
+            actor_name: "同事",
+            is_me: false,
+            time: now - 3_000,
+            text: "@测试主人 跟进一下",
+            url: "",
+            meta: { message_id: "om_r31_withdrawn_followup", chat_type: "group", mentions: [{ id: "ou_r31_owner_A" }] },
+          },
+          {
+            id: "im:om_r31_reply_src",
+            source: "im",
+            kind: "at_me",
+            conv: "oc_r31_unselected_g",
+            conv_name: "外部群",
+            actor_id: "ou_other",
+            actor_name: "同事",
+            is_me: false,
+            time: now - 2_000,
+            text: "@测试主人 帮我看看",
+            url: "",
+            meta: { message_id: "om_r31_reply_src", chat_type: "group", mentions: [{ id: "ou_r31_owner_A" }] },
+          },
+          {
+            id: "im:om_r31_send_src",
+            source: "im",
+            kind: "at_me",
+            conv: "oc_r31_unselected_g",
+            conv_name: "外部群",
+            actor_id: "ou_other",
+            actor_name: "同事",
+            is_me: false,
+            time: now - 1_000,
+            text: "@测试主人 明天确认",
+            url: "",
+            meta: { message_id: "om_r31_send_src", chat_type: "group", mentions: [{ id: "ou_r31_owner_A" }] },
+          },
+        ]);
+        const { item: it1 } = ctxSvc.store.upsertItem({ title: "已撤回跟进", kind: "ask_me", source: "im" });
+        const { item: it2 } = ctxSvc.store.upsertItem({ title: "审批后撤回回复", kind: "ask_me", source: "im" });
+        const { item: it3 } = ctxSvc.store.upsertItem({ title: "审批后去@跟进", kind: "ask_me", source: "im" });
+
+        // (a) followup (im.send) 在审批时若源观测已撤回，必须直接拒绝审批
+        const dWithdrawn = ctxSvc.store.addDraft({
+          item_id: it1.id,
+          project_id: "",
+          kind: "followup",
+          target_label: "外部群",
+          target: {
+            chat_id: "oc_r31_unselected_g",
+            obs_id: "im:om_r31_withdrawn_followup",
+            label: "外部群",
+          },
+          content: "我来跟进一下",
+        });
+        ctxSvc.store.retirePendingObs("im:om_r31_withdrawn_followup");
+        await assert.rejects(
+          () => app.commands.exec("context.draft_approve", { id: dWithdrawn.id }, { source: "card", actor: "owner" }),
+          /撤回/,
+          "followup (im.send) 源观测撤回后必须在审批阶段拒绝",
+        );
+
+        // (b) 两个合法草稿先审批入队（一个 im.reply，一个 im.send），随后在投递前分别撤回源消息 / 编辑去掉 @我
+        const dReply = ctxSvc.store.addDraft({
+          item_id: it2.id,
+          project_id: "",
+          kind: "reply",
+          target_label: "外部群 · 同事",
+          target: {
+            chat_id: "oc_r31_unselected_g",
+            message_id: "om_r31_reply_src",
+            obs_id: "im:om_r31_reply_src",
+            label: "外部群 · 同事",
+          },
+          content: "好的我来看看",
+        });
+        const dSend = ctxSvc.store.addDraft({
+          item_id: it3.id,
+          project_id: "",
+          kind: "followup",
+          target_label: "外部群",
+          target: {
+            chat_id: "oc_r31_unselected_g",
+            obs_id: "im:om_r31_send_src",
+            label: "外部群",
+          },
+          content: "明天同步结果",
+        });
+        await app.commands.exec("context.draft_approve", { id: dReply.id }, { source: "card", actor: "owner" });
+        await app.commands.exec("context.draft_approve", { id: dSend.id }, { source: "card", actor: "owner" });
+
+        const replyWork = app.ledger.list({ kinds: ["effect"], ref: `ctx-draft:${dReply.id}`, limit: 5 })[0];
+        const sendWork = app.ledger.list({ kinds: ["effect"], ref: `ctx-draft:${dSend.id}`, limit: 5 })[0];
+        assert.ok(replyWork && sendWork, "审批后应已生成两条待投递 effect");
+
+        // 投递前变更状态：reply 源消息被撤回；send 源消息被编辑移除 @我（不再属于 allowlist 群允许范围）
+        ctxSvc.store.retirePendingObs("im:om_r31_reply_src");
+        ctxSvc.store.addObs([
+          {
+            id: "im:om_r31_send_src",
+            source: "im",
+            kind: "group",
+            conv: "oc_r31_unselected_g",
+            conv_name: "外部群",
+            actor_id: "ou_other",
+            actor_name: "同事",
+            is_me: false,
+            time: now - 1_000,
+            text: "已编辑去掉 at，不再提及你",
+            url: "",
+            meta: { message_id: "om_r31_send_src", chat_type: "group", edit_version: 2, at_me: false, mentions: [] },
+          },
+        ]);
+
+        const sentCalls: string[][] = [];
+        const fakeLark = app.lark as unknown as {
+          authStatus: () => Promise<unknown>;
+          run: (argv: string[]) => Promise<unknown>;
+        };
+        fakeLark.authStatus = async () => ({ identity: "user", user: { open_id: "ou_r31_owner_A" } });
+        fakeLark.run = async (argv: string[]) => {
+          sentCalls.push(argv);
+          return {};
+        };
+        const effHandler = (app.engine as unknown as { handlers: Map<string, { run: (it: unknown, ctx: unknown) => Promise<void> }> }).handlers.get("effect");
+        assert.ok(effHandler, "effect handler 应已注册");
+        const dummyCtx = { attempt: 1, signal: new AbortController().signal };
+        await assert.rejects(() => effHandler.run(replyWork, dummyCtx), /撤回/, "投递前源消息已撤回时 im.reply 必须拒发");
+        await assert.rejects(() => effHandler.run(sendWork, dummyCtx), /移出|移除/, "投递前源消息移除 @我 后 im.send 必须拒发");
+        assert.equal(sentCalls.length, 0, "两起被阻断的投递绝不得调用 lark-cli 发送消息");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 3) [R31 #3 P1] maskUrl / git() / LFS prePush 失败报告必须彻底脱敏查询串凭据并仅报告 remote 名
+    {
+      const masked = maskUrl("fatal: unable to access 'https://u:p@ss@git.corp.example/org/repo.git?token=r31_secret_tok&sig=xyz': 403");
+      assert.ok(masked.includes("https://***@git.corp.example/org/repo.git?***"), `maskUrl 应同时脱敏 userinfo 与 query：${masked}`);
+      assert.ok(!masked.includes("p@ss") && !masked.includes("r31_secret_tok") && !masked.includes("sig=xyz"), "maskUrl 绝不得残留密码或查询串令牌");
+
+      const lfsRepo = path.join(dir, "r31-lfs-repo");
+      fs.mkdirSync(lfsRepo, { recursive: true });
+      await git(lfsRepo, ["init", "-b", "main"]);
+      fs.writeFileSync(path.join(lfsRepo, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n", "utf8");
+      const fakeOid = "a".repeat(64);
+      fs.writeFileSync(
+        path.join(lfsRepo, "blob.bin"),
+        `version https://git-lfs.github.com/spec/v1\noid sha256:${fakeOid}\nsize 12\n`,
+        "utf8",
+      );
+      await git(lfsRepo, ["add", ".gitattributes", "blob.bin"]);
+      await git(lfsRepo, ["commit", "-m", "add lfs pointer"]);
+      await git(lfsRepo, [
+        "remote",
+        "add",
+        "origin",
+        "http://127.0.0.1:1/org/repo.git?token=r31_lfs_query_secret&sig=r31_sig_999",
+      ]);
+
+      const pushRes = await pushBranch(lfsRepo, "main", "origin");
+      assert.equal(pushRes.ok, false, "指向不可达端点的 LFS 推送应失败");
+      assert.ok(pushRes.message?.includes("origin"), `失败报告应使用远端名 origin：${pushRes.message}`);
+      assert.ok(!pushRes.message?.includes("r31_lfs_query_secret"), `LFS 失败报告绝不得泄露查询串 token：${pushRes.message}`);
+      assert.ok(!pushRes.message?.includes("r31_sig_999"), `LFS 失败报告绝不得泄露查询串 sig：${pushRes.message}`);
+    }
+
+    // 4) [R31 #4 P2] 冲突源消息被编辑后旧选项失效且重理解可原地替换；旧卡片 obs_rev 拒收、新卡片 obs_rev 放行
+    {
+      const { app } = makeR31App("r31-conflict-edit");
+      try {
+        const ctxSvc = registerContext(app)!;
+        ctxSvc.store.addObs([
+          {
+            id: "pw:r31_c1",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:c31",
+            conv_name: "私聊：甲",
+            actor_id: "2",
+            actor_name: "甲",
+            is_me: false,
+            time: 100,
+            text: "Meet Friday",
+            url: "",
+            meta: { edit_version: 1 },
+          },
+          {
+            id: "pw:r31_c2",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:c31",
+            conv_name: "私聊：乙",
+            actor_id: "3",
+            actor_name: "乙",
+            is_me: false,
+            time: 110,
+            text: "Meet Tuesday",
+            url: "",
+            meta: { edit_version: 1 },
+          },
+        ]);
+        const cf = ctxSvc.store.addConflict({
+          project_id: "",
+          topic: "评审时间",
+          claims: [
+            { claim: "周五评审", quote: "Meet Friday", obs_id: "pw:r31_c1", time: 100 },
+            { claim: "周二评审", quote: "Meet Tuesday", obs_id: "pw:r31_c2", time: 110 },
+          ],
+        });
+        const oldView = ctxSvc.views.conflictView(ctxSvc.store.conflict(cf.id)!);
+        const oldRev1 = oldView.claims[0].obs_rev;
+        assert.ok(oldRev1, "初始冲突说法应绑定 obs_rev");
+
+        // 编辑第一条消息：未重理解前视图隐藏旧说法，且旧选项（无论是否传 obs_rev）均被拒绝
+        ctxSvc.store.addObs([
+          {
+            id: "pw:r31_c1",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:c31",
+            conv_name: "私聊：甲",
+            actor_id: "2",
+            actor_name: "甲",
+            is_me: false,
+            time: 100,
+            text: "Meet Monday",
+            url: "",
+            meta: { edit_version: 2 },
+          },
+        ]);
+        const afterEditView = ctxSvc.views.conflictView(ctxSvc.store.conflict(cf.id)!);
+        assert.equal(afterEditView.claims.length, 1, "源消息编辑后未更新的旧说法不得再展示");
+        assert.equal(afterEditView.claims[0].index, 1);
+
+        await assert.rejects(
+          () => app.commands.exec("context.conflict_resolve", { id: cf.id, choice: 0 }, { source: "card", actor: "owner" }),
+          /编辑|失效/,
+          "源消息已编辑时旧卡片按 choice=0 裁决必须拒绝",
+        );
+        await assert.rejects(
+          () => app.commands.exec("context.conflict_resolve", { id: cf.id, choice: 0, obs_rev: oldRev1 }, { source: "card", actor: "owner" }),
+          /编辑|失效/,
+          "源消息已编辑时携带旧 obs_rev 必须拒绝",
+        );
+
+        // 重理解再次 addConflict：同 obs_id 原地替换新说法与新 obs_rev
+        ctxSvc.store.addConflict({
+          project_id: "",
+          topic: "评审时间",
+          ref: cf.id,
+          claims: [{ claim: "周一评审", quote: "Meet Monday", obs_id: "pw:r31_c1", time: 100 }],
+        });
+        const refreshedView = ctxSvc.views.conflictView(ctxSvc.store.conflict(cf.id)!);
+        assert.equal(refreshedView.claims.length, 2);
+        assert.equal(refreshedView.claims[0].claim, "周一评审");
+        const newRev1 = refreshedView.claims[0].obs_rev;
+        assert.ok(newRev1 && newRev1 !== oldRev1, "重理解后 obs_rev 必须更新");
+
+        await assert.rejects(
+          () => app.commands.exec("context.conflict_resolve", { id: cf.id, choice: 0, obs_rev: oldRev1 }, { source: "card", actor: "owner" }),
+          /编辑|失效/,
+          "重理解原地替换后，旧卡片发回的旧 obs_rev 仍必须被拒绝",
+        );
+        const okRes = await app.commands.exec(
+          "context.conflict_resolve",
+          { id: cf.id, choice: refreshedView.claims[0].index, obs_rev: newRev1 },
+          { source: "card", actor: "owner" },
+        );
+        assert.equal(okRes.ok, true);
+        assert.equal(ctxSvc.store.conflict(cf.id)?.resolution, "周一评审");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 5) [R31 #5 P2] 本地仅带 poll_observed_at 的已撤回消息再次出现单一 --is-at-me 存活行时，必须进入 +messages-mget 权威回读（失败保游标，成功复活）
+    {
+      const { app } = makeR31App("r31-revive-withdrawn");
+      try {
+        const ctxSvc = registerContext(app)!;
+        const now = Date.now();
+        ctxSvc.store.addObs([
+          {
+            id: "im:om_r31_revive",
+            source: "im",
+            kind: "at_me",
+            conv: "oc_r31_revive_grp",
+            conv_name: "外部项目群",
+            actor_id: "ou_other",
+            actor_name: "同事",
+            is_me: false,
+            time: now - 10_000,
+            text: "@测试主人 初始版本",
+            url: "",
+            meta: { message_id: "om_r31_revive", chat_type: "group", poll_observed_at: now - 10_000 },
+          },
+        ]);
+        ctxSvc.store.retirePendingObs("im:om_r31_revive", { pollObservedAt: now - 5_000 });
+        assert.equal(ctxSvc.store.obs("im:om_r31_revive")?.meta.withdrawn, true);
+
+        let mgetCalls = 0;
+        let mgetShouldFail = true;
+        const fakeLark = app.lark as unknown as {
+          authStatus: () => Promise<unknown>;
+          run: (argv: string[]) => Promise<unknown>;
+        };
+        fakeLark.authStatus = async () => ({ identity: "user", user: { open_id: "ou_r31_owner_A" } });
+        fakeLark.run = async (argv: string[]) => {
+          if (argv[0] === "im" && argv[1] === "+messages-search") {
+            if (argv.includes("--is-at-me")) {
+              return {
+                messages: [
+                  {
+                    message_id: "om_r31_revive",
+                    chat_id: "oc_r31_revive_grp",
+                    chat_name: "外部项目群",
+                    chat_type: "group",
+                    sender: { id: "ou_other", name: "同事" },
+                    content: "@测试主人 重新加回艾特请你确认",
+                    mentions: [{ id: "ou_r31_owner_A", name: "测试主人" }],
+                    create_time: String(now - 10_000),
+                  },
+                ],
+                has_more: false,
+              };
+            }
+            return { messages: [], has_more: false };
+          }
+          if (argv[0] === "im" && argv[1] === "+messages-mget") {
+            mgetCalls++;
+            if (mgetShouldFail) throw new Error("transient mget timeout");
+            return {
+              messages: [
+                {
+                  message_id: "om_r31_revive",
+                  chat_id: "oc_r31_revive_grp",
+                  chat_name: "外部项目群",
+                  chat_type: "group",
+                  sender: { id: "ou_other", name: "同事" },
+                  content: "@测试主人 重新加回艾特请你确认",
+                  mentions: [{ id: "ou_r31_owner_A", name: "测试主人" }],
+                  create_time: String(now - 10_000),
+                },
+              ],
+            };
+          }
+          if (argv[0] === "im" && argv[1] === "+chat-list") return { items: [], has_more: false };
+          return {};
+        };
+
+        // 第一次 mget 失败：保持 withdrawn 且绝不推进 cursor.im.at_me
+        const priorAtMeCursor = String(now - 60_000);
+        app.store.set("ctx.cursor.im.at_me", priorAtMeCursor);
+        await ctxSvc.connectors.pullIm(0, "ou_r31_owner_A");
+        assert.equal(mgetCalls, 1, "已撤回观测单行重现必须触发 im +messages-mget 权威回读");
+        assert.equal(ctxSvc.store.obs("im:om_r31_revive")?.meta.withdrawn, true, "mget 失败时不得恢复撤回观测");
+        assert.equal(app.store.get("ctx.cursor.im.at_me"), priorAtMeCursor, "mget 失败时必须保留 cursor.im.at_me 以便下次重试");
+
+        // 第二次 mget 成功：写入 authoritative_live 并成功复活观测
+        mgetShouldFail = false;
+        await ctxSvc.connectors.pullIm(0, "ou_r31_owner_A");
+        assert.equal(mgetCalls, 2);
+        const revived = ctxSvc.store.obs("im:om_r31_revive");
+        assert.ok(revived && revived.meta.withdrawn !== true, "mget 权威确认存活后必须复活观测");
+        assert.equal(ctxSvc.store.pendingCount(), 1, "复活后的观测必须重新进入待处理队列");
+        assert.equal(revived?.text, "@测试主人 重新加回艾特请你确认");
+        assert.ok(Number(app.store.get("ctx.cursor.im.at_me") ?? 0) >= now, "复活成功后应正常推进 cursor.im.at_me");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 6) [R31 #6 P2] 长消息局部编辑时，仍存在于新正文中的证据摘录必须原样保留，仅清空已从新正文移除的摘录
+    {
+      const { app } = makeR31App("r31-evidence-preserve");
+      try {
+        const ctxSvc = registerContext(app)!;
+        ctxSvc.store.addObs([
+          {
+            id: "pw:r31_long",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:long",
+            conv_name: "私聊：甲",
+            actor_id: "2",
+            actor_name: "甲",
+            is_me: false,
+            time: 100,
+            text: "前言有笔误。\n段落A：接口周五冻结。\n段落B：数据库下周迁移。",
+            url: "",
+            meta: { edit_version: 1 },
+          },
+        ]);
+        const { item: itemA } = ctxSvc.store.upsertItem({ title: "接口冻结", kind: "todo", source: "im" });
+        const { item: itemB } = ctxSvc.store.upsertItem({ title: "数据库迁移", kind: "todo", source: "im" });
+        ctxSvc.store.addEvidence("item", itemA.id, "pw:r31_long", "段落A：接口周五冻结。", 100);
+        ctxSvc.store.addEvidence("item", itemB.id, "pw:r31_long", "段落B：数据库下周迁移。", 100);
+
+        ctxSvc.store.addObs([
+          {
+            id: "pw:r31_long",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:long",
+            conv_name: "私聊：甲",
+            actor_id: "2",
+            actor_name: "甲",
+            is_me: false,
+            time: 100,
+            text: "前言已修正。\n段落A：接口周五冻结。\n段落B：数据库改为本月迁移。",
+            url: "",
+            meta: { edit_version: 2 },
+          },
+        ]);
+        const rawA = app.store.db
+          .prepare("SELECT quote FROM ctx_evidence WHERE entity = 'item' AND entity_id = ? AND obs_id = ?")
+          .get(itemA.id, "pw:r31_long") as { quote: string };
+        const rawB = app.store.db
+          .prepare("SELECT quote FROM ctx_evidence WHERE entity = 'item' AND entity_id = ? AND obs_id = ?")
+          .get(itemB.id, "pw:r31_long") as { quote: string };
+        assert.equal(rawA.quote, "段落A：接口周五冻结。", "仍在新正文中的摘录不得被前 300 字符覆写");
+        assert.equal(rawB.quote, "", "已从新正文中移除的旧摘录必须被清空以防残留过期说法");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 7) [R31 #7 P2] 工作区主人切换时，status() 必须隐藏旧主人的 last_cycle / running / 各数据源拉取时间与条数
+    {
+      const { app } = makeR31App("r31-status-isolation", { ownerOpenId: "ou_r31_owner_B" });
+      try {
+        saveWorkspaceBinding(app.store, "7001", "ou_r31_owner_A");
+        app.store.set("ctx.last_cycle", String(1700000000000));
+        app.store.set("ctx.source.im", JSON.stringify({ at: 1700000000100, count: 88, error: "old im err" }));
+        app.store.set("ctx.source.tasks", JSON.stringify({ at: 1700000000200, count: 12, error: "" }));
+        const ctxSvc = registerContext(app)!;
+        const st = ctxSvc.views.status(true);
+        assert.equal(st.last_cycle, null, "跨主人冲突时不得暴露旧主人 last_cycle");
+        assert.equal(st.running, false, "跨主人冲突时不得暴露旧主人 running 状态");
+        assert.ok(st.last_error.includes("不一致"), "仍需保留说明主人不一致的诊断信息");
+        for (const s of st.sources) {
+          assert.equal(s.last_pull, null, `跨主人冲突时数据源 ${s.source} 不得暴露旧主人 last_pull`);
+          assert.equal(s.last_count, 0, `跨主人冲突时数据源 ${s.source} 不得暴露旧主人 last_count`);
+          assert.equal(s.error, "", `跨主人冲突时数据源 ${s.source} 不得暴露旧主人 error`);
+        }
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 8) [R31 #8 P2] stageIsolatedCodexHome 必须随 AGENTS.md 一并保留全局 AGENTS.override.md
+    {
+      const fakeCodexHome = path.join(dir, "r31-codex-home");
+      const fakeDataDir = path.join(dir, "r31-codex-data");
+      fs.mkdirSync(fakeCodexHome, { recursive: true });
+      fs.mkdirSync(fakeDataDir, { recursive: true });
+      fs.writeFileSync(path.join(fakeCodexHome, "config.toml"), 'model = "gpt-5"\n', { mode: 0o600 });
+      fs.writeFileSync(path.join(fakeCodexHome, "AGENTS.md"), "# base agents\n", "utf8");
+      fs.writeFileSync(path.join(fakeCodexHome, "AGENTS.override.md"), "# override priority instructions\n", "utf8");
+      const staged = stageIsolatedCodexHome(fakeCodexHome, { copyUserConfig: true, dataDir: fakeDataDir });
+      try {
+        assert.equal(
+          fs.readFileSync(path.join(staged.scratchDir, "AGENTS.override.md"), "utf8"),
+          "# override priority instructions\n",
+          "隔离暂存的 CODEX_HOME 必须保留 AGENTS.override.md",
+        );
+        assert.equal(fs.readFileSync(path.join(staged.scratchDir, "AGENTS.md"), "utf8"), "# base agents\n");
+      } finally {
+        staged.cleanup();
+      }
+    }
+
+    // 9 & 10) [R31 #9 P2 + #10 P2] pollLogin 严格尊重完整 Retry-After（秒数与 HTTP-date）且在扫码确认后重试瞬态验证失败（立即拒绝 403 / 账号不匹配）
+    {
+      let pollCount = 0;
+      let profileCount = 0;
+      let metaCount = 0;
+      let scenario: "retry_after_exceeds_ttl_sec" | "retry_after_exceeds_ttl_date" | "retry_after_wait_ok" | "verify_transient_ok" | "verify_403" | "verify_mismatch" =
+        "retry_after_exceeds_ttl_sec";
+      const pollTimestamps: number[] = [];
+
+      const srv = http.createServer((req, res) => {
+        const u = new URL(req.url ?? "/", "http://127.0.0.1");
+        if (u.pathname === "/qr/poll") {
+          pollCount++;
+          pollTimestamps.push(Date.now());
+          if (scenario === "retry_after_exceeds_ttl_sec") {
+            res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "60" });
+            res.end("{}");
+            return;
+          }
+          if (scenario === "retry_after_exceeds_ttl_date") {
+            res.writeHead(429, {
+              "Content-Type": "application/json",
+              "Retry-After": new Date(Date.now() + 60_000).toUTCString(),
+            });
+            res.end("{}");
+            return;
+          }
+          if (scenario === "retry_after_wait_ok" && pollCount === 1) {
+            res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "1" });
+            res.end("{}");
+            return;
+          }
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Set-Cookie": [
+              "session=r31_approved_sess; Path=/",
+              "passport_web_did=did_r31_verify; Path=/",
+            ],
+          });
+          res.end(
+            JSON.stringify({
+              code: 0,
+              data: { step_info: { status: 0, front_user_id: 7310 }, next_step: "enter_app" },
+            }),
+          );
+          return;
+        }
+        if (u.pathname === "/profile") {
+          profileCount++;
+          if (scenario === "verify_403") {
+            res.writeHead(403, { "Content-Type": "application/json" });
+            res.end("{}");
+            return;
+          }
+          if (scenario === "verify_transient_ok" && profileCount === 1) {
+            res.writeHead(503, { "Content-Type": "text/plain" });
+            res.end("upstream unavailable");
+            return;
+          }
+          const uid = scenario === "verify_mismatch" ? "9999" : "7310";
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              code: 0,
+              data: { user: { id: uid, name: "第三十一轮用户", open_id: "ou_r31_user" } },
+            }),
+          );
+          return;
+        }
+        if (u.pathname === "/messenger/") {
+          metaCount++;
+          if (scenario === "verify_transient_ok" && metaCount === 1) {
+            res.writeHead(503, { "Content-Type": "text/plain" });
+            res.end("temporary gateway error");
+            return;
+          }
+          res.writeHead(200, { "Content-Type": "text/html" });
+          res.end('<script>window.__APP__ = {"appKey":"r31_app_key"};</script>');
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+
+      await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", () => resolve()));
+      const addr = srv.address() as net.AddressInfo;
+      const base = `http://127.0.0.1:${addr.port}`;
+      const ep: Partial<WebEndpoints> = {
+        accountsOrigin: base,
+        accountsReferer: `${base}/`,
+        messengerOrigin: base,
+        messengerUrl: `${base}/messenger/`,
+        qrInitUrl: `${base}/qr/init`,
+        qrPollUrl: `${base}/qr/poll`,
+        qrRedirectUri: `${base}/messenger/`,
+        profileUrl: `${base}/profile`,
+        allowInsecureHttp: true,
+        extraAllowedHosts: ["127.0.0.1"],
+      };
+      const baseChallenge = (ttlMs: number) => ({
+        webId: "web_r31",
+        proxyUnit: "unit_r31",
+        qrCode: '{"qrlogin":{"token":"tok_r31"}}',
+        flowKey: "flow_r31",
+        cookies: [{ name: "passport_web_did", value: "did_r31_init", domain: "127.0.0.1", path: "/" }],
+        createdAtMs: Date.now(),
+        expiresAtMs: Date.now() + ttlMs,
+      });
+
+      try {
+        // 9a) Retry-After 秒数超过二维码剩余寿命 -> 立刻过期退出，不提早发第二次轮询
+        scenario = "retry_after_exceeds_ttl_sec";
+        pollCount = 0;
+        await assert.rejects(
+          () => pollLogin(baseChallenge(1_500), { endpoints: ep, pollIntervalMs: 20 }),
+          (e: unknown) => e instanceof WebHttpError && e.code === "credential_denied" && /限流等待期/.test(e.message),
+          "Retry-After 超过剩余寿命时必须立刻过期退出",
+        );
+        assert.equal(pollCount, 1, "Retry-After 超过剩余寿命后绝不得发第二次轮询");
+
+        // 9b) Retry-After HTTP-date 超过二维码剩余寿命 -> 同样立刻过期退出
+        scenario = "retry_after_exceeds_ttl_date";
+        pollCount = 0;
+        await assert.rejects(
+          () => pollLogin(baseChallenge(1_500), { endpoints: ep, pollIntervalMs: 20 }),
+          (e: unknown) => e instanceof WebHttpError && e.code === "credential_denied" && /限流等待期/.test(e.message),
+          "HTTP-date 形式的 Retry-After 超过剩余寿命时同样必须立刻过期退出",
+        );
+        assert.equal(pollCount, 1);
+
+        // 9c) Retry-After: 1（在剩余寿命内）-> 必须完整等待至少 ~900ms 后才发第二次轮询并成功登录
+        scenario = "retry_after_wait_ok";
+        pollCount = 0;
+        profileCount = 0;
+        metaCount = 0;
+        pollTimestamps.length = 0;
+        const waitedLogin = await pollLogin(baseChallenge(15_000), { endpoints: ep, pollIntervalMs: 20 });
+        assert.equal(waitedLogin.owner_id, "7310");
+        assert.equal(pollCount, 2);
+        assert.ok(
+          pollTimestamps[1] - pollTimestamps[0] >= 850,
+          `应尊重完整的 Retry-After: 1，实际间隔 ${pollTimestamps[1] - pollTimestamps[0]}ms`,
+        );
+
+        // 10a) 扫码确认后 profile & messenger metadata 各出现一次瞬态 503 -> 复用同一 jar 重试并成功完成登录
+        scenario = "verify_transient_ok";
+        pollCount = 0;
+        profileCount = 0;
+        metaCount = 0;
+        const verifiedLogin = await pollLogin(baseChallenge(15_000), {
+          endpoints: ep,
+          pollIntervalMs: 20,
+          verifyTimeoutMs: 5_000,
+        });
+        assert.equal(pollCount, 1, "扫码确认后不应重新轮询二维码");
+        assert.equal(profileCount, 2, "profile 瞬态 503 应自动重试一次并成功");
+        assert.equal(metaCount, 2, "messenger metadata 瞬态 503 应自动重试一次并成功");
+        assert.equal(verifiedLogin.owner_id, "7310");
+        assert.equal(verifiedLogin.owner_name, "第三十一轮用户");
+        assert.ok(
+          verifiedLogin.cookies.some((c) => c.name === "session" && c.value === "r31_approved_sess"),
+          "重试验证必须复用扫码确认时写入 jar 的 session Cookie",
+        );
+
+        // 10b) 扫码确认后 profile 返回 403 -> 立即以 credential_denied 拒绝，不重试
+        scenario = "verify_403";
+        pollCount = 0;
+        profileCount = 0;
+        await assert.rejects(
+          () => pollLogin(baseChallenge(15_000), { endpoints: ep, pollIntervalMs: 20, verifyTimeoutMs: 5_000 }),
+          (e: unknown) => e instanceof WebHttpError && e.code === "credential_denied",
+        );
+        assert.equal(profileCount, 1, "403 鉴权拒绝绝不得重试");
+
+        // 10c) 扫码确认后 profile 账号与扫码确认账号不一致 -> 立即以 credential_denied 拒绝，不重试
+        scenario = "verify_mismatch";
+        pollCount = 0;
+        profileCount = 0;
+        await assert.rejects(
+          () => pollLogin(baseChallenge(15_000), { endpoints: ep, pollIntervalMs: 20, verifyTimeoutMs: 5_000 }),
+          (e: unknown) => e instanceof WebHttpError && e.code === "credential_denied" && /不一致/.test(e.message),
+        );
+        assert.equal(profileCount, 1, "账号不一致绝不得重试");
+      } finally {
+        await new Promise<void>((resolve) => srv.close(() => resolve()));
       }
     }
   } finally {

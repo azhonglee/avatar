@@ -8624,7 +8624,8 @@ export function stageIsolatedCodexHome(
           const srcPath = path.join(hostCodexHome, ent.name);
           const dstPath = path.join(scratchDir, ent.name);
           const isRequiredConfig = ent.name === "config.toml" || ent.name.endsWith(".config.toml");
-          const isOptionalDoc = ent.name === "instructions.md" || ent.name === "AGENTS.md";
+          const isOptionalDoc =
+            ent.name === "instructions.md" || ent.name === "AGENTS.md" || ent.name === "AGENTS.override.md";
           if (isRequiredConfig) {
             let st: fs.Stats;
             try {

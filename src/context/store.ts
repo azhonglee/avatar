@@ -126,7 +126,7 @@ export interface ConflictRow {
   id: string;
   project_id: string;
   topic: string;
-  claims: { claim: string; obs_id: string; quote: string; time: number }[];
+  claims: { claim: string; obs_id: string; quote: string; time: number; obs_rev?: string }[];
   status: "open" | "resolved";
   resolution: string;
   created: number;
@@ -397,9 +397,19 @@ export class ContextStore {
               JSON.stringify(mergedMeta),
               o.id,
             );
-            // 原消息正文被编辑或撤回后复活为新正文时，立即刷新已引用该观测的证据摘录，防止旧卡片/详情/委派继续展示过期原文
+            // 原消息正文被编辑时，保留在修订后正文中仍然出现的精确证据摘录（避免长消息修一处错字把多条事项的不同引文都抹成开头 300 字），
+            // 仅将已从修订后正文中移除的过期摘录清空失效，等待重理解给出替换摘录（视图层会安全回退至当前正文）
             if (String(cur.text ?? "") !== o.text) {
-              this.db.prepare("UPDATE ctx_evidence SET quote = ? WHERE obs_id = ?").run(o.text.slice(0, 300), o.id);
+              const evRows = this.db
+                .prepare("SELECT id, quote FROM ctx_evidence WHERE obs_id = ?")
+                .all(o.id) as { id: number; quote: string }[];
+              const clearQuote = this.db.prepare("UPDATE ctx_evidence SET quote = '' WHERE id = ?");
+              for (const ev of evRows) {
+                const q = (ev.quote ?? "").trim();
+                if (q && !o.text.includes(q)) {
+                  clearQuote.run(ev.id);
+                }
+              }
             }
             n++;
           } else {
@@ -1159,17 +1169,31 @@ export class ContextStore {
   // ───────── 冲突 ─────────
 
   addConflict(c: { project_id: string; topic: string; claims: ConflictRow["claims"]; ref?: string }): ConflictRow {
+    const stampedClaims: ConflictRow["claims"] = c.claims.map((cl) => {
+      if (cl.obs_rev) return cl;
+      const obs = cl.obs_id ? this.obs(cl.obs_id) : undefined;
+      return obs ? { ...cl, obs_rev: obsRevision(obs) } : cl;
+    });
+    const normalizedInput = { ...c, claims: stampedClaims };
     const byRef = c.ref ? this.conflicts("open").find((x) => x.id === c.ref) : undefined;
-    const open = byRef ?? this.conflicts("open").find((x) => sameConflict(x, c));
+    const open = byRef ?? this.conflicts("open").find((x) => sameConflict(x, normalizedInput));
     if (open) {
       const claims = [...open.claims];
-      for (const cl of c.claims) if (!claims.some((x) => x.obs_id === cl.obs_id)) claims.push(cl);
+      for (const cl of stampedClaims) {
+        const idx = claims.findIndex((x) => x.obs_id === cl.obs_id);
+        if (idx >= 0) {
+          // 同一观测经编辑重理解后再次写入冲突时，原地替换旧修订说法，避免旧说法残留为可选裁决项
+          claims[idx] = cl;
+        } else {
+          claims.push(cl);
+        }
+      }
       this.db.prepare("UPDATE ctx_conflict SET claims = ? WHERE id = ?").run(JSON.stringify(claims), open.id);
       return { ...open, claims };
     }
     const id = newId("cfl");
-    this.db.prepare("INSERT INTO ctx_conflict (id, project_id, topic, claims, status, created) VALUES (?, ?, ?, ?, 'open', ?)").run(id, c.project_id, c.topic, JSON.stringify(c.claims), Date.now());
-    return { id, ...c, status: "open", resolution: "", created: Date.now() };
+    this.db.prepare("INSERT INTO ctx_conflict (id, project_id, topic, claims, status, created) VALUES (?, ?, ?, ?, 'open', ?)").run(id, c.project_id, c.topic, JSON.stringify(stampedClaims), Date.now());
+    return { id, ...normalizedInput, status: "open", resolution: "", created: Date.now() };
   }
 
   conflicts(status?: "open" | "resolved"): ConflictRow[] {
@@ -1191,7 +1215,17 @@ export class ContextStore {
       for (let k = i + 1; k < open.length; k++) {
         const dup = open[k];
         if (gone.has(dup.id) || !sameConflict(keep, dup)) continue;
-        for (const cl of dup.claims) if (!keep.claims.some((x) => x.obs_id === cl.obs_id && x.claim === cl.claim)) keep.claims.push(cl);
+        for (const cl of dup.claims) {
+          const existingIdx = keep.claims.findIndex((x) => x.obs_id === cl.obs_id);
+          if (existingIdx >= 0) {
+            const obs = cl.obs_id ? this.obs(cl.obs_id) : undefined;
+            if (obs && cl.obs_rev && obsRevision(obs) === cl.obs_rev) {
+              keep.claims[existingIdx] = cl;
+            }
+          } else {
+            keep.claims.push(cl);
+          }
+        }
         this.db.prepare("UPDATE ctx_conflict SET claims = ? WHERE id = ?").run(JSON.stringify(keep.claims), keep.id);
         this.db.prepare("DELETE FROM ctx_conflict WHERE id = ?").run(dup.id);
         gone.add(dup.id);

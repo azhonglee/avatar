@@ -552,7 +552,10 @@ export class Understander {
           }
           continue;
         }
-        const claims = inBatchClaims.map((cl) => ({ claim: cl.claim, obs_id: cl.obs_id, quote: cl.quote, time: byId.get(cl.obs_id)!.time }));
+        const claims = inBatchClaims.map((cl) => {
+          const srcObs = byId.get(cl.obs_id)!;
+          return { claim: cl.claim, obs_id: cl.obs_id, quote: cl.quote, time: srcObs.time, obs_rev: obsRevision(srcObs) };
+        });
         if (claims.length < 2) continue;
         const project = resolveProject(c.project, Date.now());
         this.store.addConflict({ project_id: project?.id ?? "", topic: c.topic, claims, ref: c.ref || undefined });

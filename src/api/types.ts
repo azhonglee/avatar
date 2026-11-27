@@ -306,7 +306,7 @@ export interface CommandArgs {
   "context.feedback": { entity: "item" | "project" | "knowledge" | "update" | "person"; id: string; verdict: "right" | "wrong" | "unimportant"; note?: string };
   "context.project_mute": { id: string; muted: boolean };
   "context.conv_mute": { conv: string; muted: boolean; name?: string };
-  "context.conflict_resolve": { id: string; choice?: number; resolution?: string };
+  "context.conflict_resolve": { id: string; choice?: number; obs_rev?: string; resolution?: string };
   "context.draft_create": { item_id: string; kind?: CtxDraftKind };
   "context.draft_approve": { id: string; content?: string };
   "context.draft_discard": { id: string };
@@ -442,7 +442,7 @@ export interface CtxConflictView {
   project_id: string;
   project_name: string;
   topic: string;
-  claims: { index?: number; claim: string; quote: string; time: number; url: string }[];
+  claims: { index?: number; obs_rev?: string; claim: string; quote: string; time: number; url: string }[];
   status: "open" | "resolved";
   resolution: string;
   created: number;

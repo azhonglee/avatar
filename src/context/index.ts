@@ -124,6 +124,47 @@ export class ContextService {
     }
   }
 
+  /**
+   * 审批或真正投递 CLI 草稿（`im.reply` / `im.send`）前实时核验源消息与会话策略：
+   *   - 刷新磁盘隐私策略并确认工作区主人一致、IM 采集未关闭；
+   *   - 若草稿绑定了源观测 `target.obs_id`，核验源观测存在、未被撤回、会话未被静音/排除且仍在当前群范围或仍保留 @本人；
+   *   - 若草稿仅含 `chat_id`，核验目标会话未被静音或排除。
+   */
+  async verifyCliDraftTargetForDelivery(draftId: string, fallbackChatId?: string): Promise<void> {
+    this.personalWeb.syncDiskPrivacyConfig({ throwOnError: true });
+    this.assertWorkspaceOwnerMatches();
+    if (!this.cfg.context.sources.im) {
+      throw new Error("IM 采集已关闭，拒绝投递基于会话消息起草的草稿");
+    }
+    const d = draftId ? this.store.draft(draftId) : undefined;
+    if (draftId && !d) {
+      throw new Error("草稿记录不存在，拒绝发送");
+    }
+    if (d?.target.obs_id) {
+      const obs = this.store.obs(d.target.obs_id);
+      if (!obs || obs.meta.withdrawn === true) {
+        throw new Error("该草稿对应的原消息已被撤回或移除，拒绝发送");
+      }
+      const convDecision = await this.personalWeb.checkConvAllowedForUnderstand(obs.conv, obs.conv_name);
+      if (convDecision !== "allowed") {
+        throw new Error("该草稿对应的会话已被静音、排除或暂时无法确认排除状态，拒绝发送");
+      }
+      const nativeExcl = await this.personalWeb.resolveNativeExclusionsForPolling();
+      const kept = this.personalWeb.filterWindowByCurrentScope(obs.conv, [obs], nativeExcl);
+      if (!kept.length) {
+        throw new Error("该草稿对应的原消息已移出当前允许的群范围或已移除 @本人，拒绝发送");
+      }
+      return;
+    }
+    const chatId = d?.target.chat_id || fallbackChatId || "";
+    if (chatId) {
+      const convDecision = await this.personalWeb.checkConvAllowedForUnderstand(chatId, "");
+      if (convDecision !== "allowed") {
+        throw new Error("该草稿目标会话已被静音、排除或暂时无法确认排除状态，拒绝发送");
+      }
+    }
+  }
+
   renderCtx(notice?: string): CtxRenderCtx {
     const { cfg } = this;
     return {
@@ -1164,6 +1205,9 @@ export function registerContext(app: App): ContextService | undefined {
   app.effectHooks.shouldDeferPwReply = (cid, isDaemon) =>
     svc.personalWeb.shouldDeferReplyToCredentialedConsumer(cid, isDaemon);
   app.effectHooks.isContextOwnerMismatched = () => svc.isWorkspaceOwnerMismatched();
+  app.effectHooks.verifyCliDraftDelivery = async ({ draft_id, chat_id }) => {
+    await svc.verifyCliDraftTargetForDelivery(draft_id ?? "", chat_id);
+  };
   bus.on("effect.settled", (e) => {
     if (e.ref.startsWith("ctx-draft:")) svc.syncDraft(e.ref.slice("ctx-draft:".length));
   });
@@ -1355,7 +1399,12 @@ export function registerContext(app: App): ContextService | undefined {
   commands.register({
     name: "context.conflict_resolve",
     title: "确认冲突的结论",
-    schema: z.object({ id, choice: z.coerce.number().int().min(0).optional(), resolution: z.string().max(1000).optional() }),
+    schema: z.object({
+      id,
+      choice: z.coerce.number().int().min(0).optional(),
+      obs_rev: z.string().optional(),
+      resolution: z.string().max(1000).optional(),
+    }),
     target: (a) => a.id,
     run: async (a) => {
       svc.assertWorkspaceOwnerMatches();
@@ -1366,8 +1415,19 @@ export function registerContext(app: App): ContextService | undefined {
       if (a.choice !== undefined && !chosen) {
         throw new CommandError("invalid", "选择的说法不存在");
       }
-      if (chosen?.obs_id && svc.store.obs(chosen.obs_id)?.meta.withdrawn === true) {
-        throw new CommandError("conflict", "该说法对应的原消息已被撤回，无法以此为准，请刷新后重新选择或手写结论");
+      if (chosen?.obs_id) {
+        const srcObs = svc.store.obs(chosen.obs_id);
+        if (srcObs?.meta.withdrawn === true) {
+          throw new CommandError("conflict", "该说法对应的原消息已被撤回，无法以此为准，请刷新后重新选择或手写结论");
+        }
+        const curRev = srcObs ? obsRevision(srcObs) : "";
+        if (
+          (srcObs && chosen.obs_rev && curRev !== chosen.obs_rev) ||
+          (a.obs_rev && chosen.obs_rev && a.obs_rev !== chosen.obs_rev) ||
+          (a.obs_rev && srcObs && curRev !== a.obs_rev)
+        ) {
+          throw new CommandError("conflict", "该说法对应的原消息已被编辑，旧选项已失效，请刷新后重新选择或手写结论");
+        }
       }
       const resolution = a.resolution?.trim() || chosen?.claim;
       if (!resolution) throw new CommandError("invalid", "请选择一个说法或写下结论");
@@ -1415,7 +1475,11 @@ export function registerContext(app: App): ContextService | undefined {
       let effect: Effect;
       try {
         effect = svc.drafter.effectFor(d, content);
+        if (effect.op === "im.reply" || effect.op === "im.send") {
+          await svc.verifyCliDraftTargetForDelivery(d.id, d.target.chat_id);
+        }
       } catch (e) {
+        if (e instanceof CommandError) throw e;
         throw new CommandError("invalid", errMsg(e));
       }
       if (!svc.store.casDraft(d.id, ["proposed", "failed"], "approved", content)) {

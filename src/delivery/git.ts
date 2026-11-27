@@ -23,6 +23,12 @@ import {
 } from "../harness.ts";
 import { errMsg, killGroup, runProcess, type ProcResult } from "../util.ts";
 
+function redactGitUrls(text: string): string {
+  return text
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s?#]+@/gi, "$1***@")
+    .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s"'`<>?#]+)\?[^\s"'`<>#)]+/gi, "$1?***");
+}
+
 function killChildGroup(child: { pid?: number; kill: (sig?: NodeJS.Signals) => boolean }): void {
   if (child.pid) killGroup(child.pid, "SIGKILL");
   try {
@@ -2077,7 +2083,7 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
 
 export async function git(cwd: string, args: string[], opts?: GitRunOpts): Promise<string> {
   const r = await tryGit(cwd, args, opts);
-  if (r.code !== 0) throw new Error(`git ${args.join(" ")} 失败：${(r.stderr || r.stdout).trim()}`);
+  if (r.code !== 0) throw new Error(redactGitUrls(`git ${args.join(" ")} 失败：${(r.stderr || r.stdout).trim()}`));
   return r.stdout;
 }
 
@@ -3714,9 +3720,9 @@ export async function ensureGitLfsObjectsForCheckout(
       : {}),
   });
   if (fetchRes.code !== 0) {
-    const out = `${fetchRes.stdout}\n${fetchRes.stderr}`.trim();
+    const out = redactGitUrls(`${fetchRes.stdout}\n${fetchRes.stderr}`.trim());
     throw new Error(
-      `检出隔离工作树前预拉取 ${missingOids.length} 个缺失 Git LFS 对象失败（remote=${remote}, rev=${targetRev}）：${out.slice(-600)}`,
+      `检出隔离工作树前预拉取 ${missingOids.length} 个缺失 Git LFS 对象失败（remote=${redactGitUrls(remote)}, rev=${targetRev}）：${out.slice(-600)}`,
     );
   }
   return { fetched: true, missingCount: missingOids.length, remote, ...storageMeta };
@@ -3870,12 +3876,13 @@ export async function pushBranch(
       });
       if (prePush.code !== 0) {
         const lfsOut = `${prePush.stdout}\n${prePush.stderr}`.trim();
+        const safeLfsOut = redactGitUrls(lfsOut);
         const missingLfs = /not a git command|git-lfs.*not found|No such file/i.test(lfsOut);
         const lockRejected = /locked|lock verification/i.test(lfsOut);
         return {
           ok: false,
           rejected: missingLfs || lockRejected,
-          message: `检测到分支 ${branch}（含待推送提交历史）涉及 Git LFS 对象，但 LFS 预推校验/上传到 ${pushUrl} 失败（已禁用仓库 hooks 以保障安全；请确认本机已安装 git-lfs、未命中他人文件锁且具备远端推送权限）：${lfsOut.slice(-600)}`,
+          message: `检测到分支 ${branch}（含待推送提交历史）涉及 Git LFS 对象，但 LFS 预推校验/上传到远端 ${redactGitUrls(remote)} 失败（已禁用仓库 hooks 以保障安全；请确认本机已安装 git-lfs、未命中他人文件锁且具备远端推送权限）：${safeLfsOut.slice(-600)}`,
         };
       }
 
@@ -3898,11 +3905,12 @@ export async function pushBranch(
           });
           if (lfs.code !== 0) {
             const lfsOut = `${lfs.stdout}\n${lfs.stderr}`.trim();
+            const safeLfsOut = redactGitUrls(lfsOut);
             const missingLfs = /not a git command|git-lfs.*not found|No such file/i.test(lfsOut);
             return {
               ok: false,
               rejected: missingLfs,
-              message: `检测到分支 ${branch}（含待推送提交历史）涉及 Git LFS 对象，但上传 LFS 对象到 ${useNamedRemoteLfs ? remote : pushUrl} 失败（已禁用仓库 hooks 以保障安全；请确认本机已安装 git-lfs 并具备远端推送权限）：${lfsOut.slice(-600)}`,
+              message: `检测到分支 ${branch}（含待推送提交历史）涉及 Git LFS 对象，但上传 LFS 对象到远端 ${redactGitUrls(remote)} 失败（已禁用仓库 hooks 以保障安全；请确认本机已安装 git-lfs 并具备远端推送权限）：${safeLfsOut.slice(-600)}`,
             };
           }
           if (useNamedRemoteLfs) {
@@ -3922,5 +3930,5 @@ export async function pushBranch(
   });
   if (r.code === 0) return { ok: true };
   const out = `${r.stdout}\n${r.stderr}`.trim();
-  return { ok: false, rejected: /rejected|stale info|non-fast-forward/i.test(out), message: out.slice(-800) };
+  return { ok: false, rejected: /rejected|stale info|non-fast-forward/i.test(out), message: redactGitUrls(out).slice(-800) };
 }

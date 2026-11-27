@@ -1139,7 +1139,29 @@ export class Connectors {
       }
     }
 
-    // 对跨时钟或内容冲突的重复消息批量调用 `im +messages-mget` 权威回读最新版本
+    // 若本地已记录该消息为 withdrawn，且当前拉取行无法凭严格更高的可比服务端修订号证明自己更新（例如历史撤回仅带本地 poll_observed_at 或当前行无服务端修订号），
+    // 必须将其纳入 `im +messages-mget` 权威回读批次：确认存活后写入 authoritative_live 以恢复，回读失败则设 verifyFailed 并保留游标待下次重试
+    for (const [id, entry] of mergedById) {
+      if (entry.needsVerify || entry.deleted) continue;
+      const stored = this.store.obs(`im:${id}`);
+      if (stored?.meta.withdrawn !== true) continue;
+      const curVer =
+        typeof stored.meta.edit_version === "number" && Number.isFinite(stored.meta.edit_version)
+          ? stored.meta.edit_version
+          : undefined;
+      const curEditTime =
+        typeof stored.meta.edit_time === "number" && Number.isFinite(stored.meta.edit_time)
+          ? stored.meta.edit_time
+          : undefined;
+      const hasComparableNewerServerRev =
+        (curVer !== undefined && entry.editCounter !== undefined && entry.editCounter > curVer) ||
+        (curEditTime !== undefined && entry.editTimeMs !== undefined && entry.editTimeMs > curEditTime);
+      if (!hasComparableNewerServerRev) {
+        entry.needsVerify = true;
+      }
+    }
+
+    // 对跨时钟/内容冲突的重复消息及待确认复活的已撤回消息批量调用 `im +messages-mget` 权威回读最新版本
     const verifyIds = [...mergedById.entries()].filter(([, e]) => e.needsVerify).map(([id]) => id);
     if (verifyIds.length > 0) {
       const freshById = new Map<string, Raw>();
@@ -1413,14 +1435,16 @@ export class Connectors {
           }
           continue;
         }
-        // 范围外群的非 @我 消息（含曾命中 --is-at-me 搜索但正文已被编辑移除 @我 的白名单外/排位外群消息）不入库，
+        // 范围外群的非 @我 消息（含曾命中 --is-at-me 搜索但正文已被编辑移除 @我，或 lark-cli 省略 mentions 缺少当前正文显式 @本人 实证的白名单外/排位外群消息）不入库，
         // 并按修订水位撤回该 ID 此前可能入库的 @我 待处理记录
-        const outOfScopeGroup =
-          entry.kind !== "at_me" &&
+        const hasPositiveCurrentMention = this.explicitMentionsMe(m, me) === true;
+        const isUnselectedGroup =
           !isP2pFinal &&
           chatId.startsWith("oc_") &&
           !rankedSet.has(chatId) &&
           (this.cfg.context.groups === "allowlist" || entry.kind !== "mine");
+        const outOfScopeGroup =
+          isUnselectedGroup && (entry.kind !== "at_me" || !hasPositiveCurrentMention);
         if (outOfScopeGroup) {
           if (msgId && entry.streams.has("at_me")) {
             retiredEntries.push({

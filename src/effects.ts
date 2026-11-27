@@ -31,6 +31,8 @@ export interface EffectHooks {
   shouldDeferPwReply?: (cid?: string, isDaemon?: boolean) => boolean;
   /** 检查上下文模块是否已检测到磁盘 config.yaml 主人变更或绑定冲突（不改写共享 cfg.owner.open_id） */
   isContextOwnerMismatched?: () => boolean;
+  /** 投递基于草稿的 CLI 外部消息（`im.reply` / `im.send`）前实时复检源消息未撤回、会话未排除且仍在允许范围内 */
+  verifyCliDraftDelivery?: (args: { draft_id?: string; chat_id?: string; message_id?: string }) => Promise<void> | void;
 }
 
 export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: Lark, store: Store, hooks: EffectHooks = {}): Handler<Effect> {
@@ -124,18 +126,28 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
           await upsertCard(lark, store, cfg.owner.open_id, e.args.key, e.args.card);
           break;
         // ── 以下只会在你确认草稿 / 开启对应自主动作后产生，均以你本人身份执行 ──
-        case "im.reply":
+        case "im.reply": {
+          const draftId = e.args.draft_id || (item.ref.startsWith("ctx-draft:") ? item.ref.slice("ctx-draft:".length) : undefined);
+          if (draftId && hooks.verifyCliDraftDelivery) {
+            await hooks.verifyCliDraftDelivery({ draft_id: draftId, message_id: e.args.message_id });
+          }
           await lark.run(["im", "+messages-reply", "--message-id", e.args.message_id, "--text", "-", "--idempotency-key", item.id.slice(0, 50)], {
             as: "user",
             input: e.args.text,
           });
           break;
-        case "im.send":
+        }
+        case "im.send": {
+          const draftId = e.args.draft_id || (item.ref.startsWith("ctx-draft:") ? item.ref.slice("ctx-draft:".length) : undefined);
+          if (draftId && hooks.verifyCliDraftDelivery) {
+            await hooks.verifyCliDraftDelivery({ draft_id: draftId, chat_id: e.args.chat_id });
+          }
           await lark.run(["im", "+messages-send", "--chat-id", e.args.chat_id, "--text", "-", "--idempotency-key", item.id.slice(0, 50)], {
             as: "user",
             input: e.args.text,
           });
           break;
+        }
         case "pw.reply": {
           const { cid } = computePwReplyCid({
             draft_id: e.args.draft_id,

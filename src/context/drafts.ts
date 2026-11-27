@@ -549,6 +549,19 @@ export class Drafter {
       };
     };
 
+    const assertCliDraftSourceEligible = () => {
+      if (d.target.obs_id) {
+        if (!obs || obs.meta.withdrawn === true) {
+          throw new Error("该草稿对应的原消息已被撤回或不存在，拒绝发送");
+        }
+        if (this.isConvSyncBlocked(obs.conv)) {
+          throw new Error("该草稿对应的会话已被静音或已关闭 IM 采集，拒绝发送");
+        }
+      } else if (d.target.chat_id && this.isConvSyncBlocked(d.target.chat_id)) {
+        throw new Error("该草稿目标会话已被静音或已关闭 IM 采集，拒绝发送");
+      }
+    };
+
     switch (d.kind) {
       case "reply": {
         if (lockedRoute === "pw.reply" || d.target.transport === "personal_web") {
@@ -558,9 +571,7 @@ export class Drafter {
           if (lockedRoute && lockedRoute !== "im.reply") {
             throw new Error(`草稿已绑定发送路由 ${lockedRoute}，拒绝切换为 im.reply`);
           }
-          if (obs?.meta.withdrawn === true) {
-            throw new Error("该草稿对应的原消息已被撤回，拒绝发送回复");
-          }
+          assertCliDraftSourceEligible();
           return { op: "im.reply", args: { message_id: d.target.message_id, text: content, draft_id: d.id } };
         }
         if (lockedRoute === "im.reply") {
@@ -569,6 +580,7 @@ export class Drafter {
         if (!d.target.chat_id) {
           throw new Error("该回复草稿缺少目标会话 ID");
         }
+        assertCliDraftSourceEligible();
         return { op: "im.send", args: { chat_id: d.target.chat_id, text: content, draft_id: d.id } };
       }
       case "followup": {
@@ -581,6 +593,7 @@ export class Drafter {
         if (!d.target.chat_id) {
           throw new Error("该跟进草稿缺少目标会话 ID");
         }
+        assertCliDraftSourceEligible();
         return { op: "im.send", args: { chat_id: d.target.chat_id, text: content, draft_id: d.id } };
       }
       case "meego_comment":

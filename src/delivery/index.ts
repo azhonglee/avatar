@@ -74,9 +74,11 @@ export function resolveProvider(cfg: Config, spec: RepoSpec): { name: string; cf
   return { name, cfg: all[name] };
 }
 
-/** 去掉文本里 URL 的账号密码（remote 地址可能内嵌令牌，git 的报错会原样带出）。 */
+/** 去掉文本里 URL 的内嵌账号密码（userinfo@）与查询串（?token=... 等凭据），防止凭据进入账本、日志或飞书任务评论。 */
 export function maskUrl(text: string): string {
-  return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^@\s/]+@/gi, "$1***@");
+  return text
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s?#]+@/gi, "$1***@")
+    .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s"'`<>?#]+)\?[^\s"'`<>#)]+/gi, "$1?***");
 }
 
 function isPermanent(e: unknown): boolean {

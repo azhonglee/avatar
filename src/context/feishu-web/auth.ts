@@ -339,18 +339,34 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+function parseRetryAfterMs(headerVal: string, nowMs = Date.now()): number | undefined {
+  const trimmed = headerVal.trim();
+  if (!trimmed) return undefined;
+  if (/^\d+$/.test(trimmed)) {
+    const sec = Number(trimmed);
+    return Number.isFinite(sec) && sec >= 0 ? sec * 1000 : undefined;
+  }
+  const targetMs = Date.parse(trimmed);
+  if (Number.isFinite(targetMs)) {
+    return Math.max(0, targetMs - nowMs);
+  }
+  return undefined;
+}
+
 /** Step 3 & 4: Poll until the human scans and approves the QR code, then verify owner & metadata. */
 export async function pollLogin(
   initialChallenge: LoginChallenge,
   opts: {
     endpoints?: Partial<WebEndpoints>;
     pollIntervalMs?: number;
+    verifyTimeoutMs?: number;
     signal?: AbortSignal;
     onProgress?: (status: LoginPollStatus, challenge: LoginChallenge) => void;
   } = {},
 ): Promise<WebLogin> {
   const ep = resolveEndpoints(opts.endpoints);
   const pollIntervalMs = opts.pollIntervalMs ?? QR_POLL_INTERVAL_MS;
+  const verifyTimeoutMs = opts.verifyTimeoutMs ?? Math.max(30_000, pollIntervalMs * 10);
   let challenge: LoginChallenge = { ...initialChallenge, cookies: [...initialChallenge.cookies] };
 
   if (!challenge.createdAtMs || !challenge.flowKey) {
@@ -359,12 +375,52 @@ export async function pollLogin(
 
   const jar = RecordingCookieJar.fromRecords(challenge.cookies, ep.extraAllowedHosts);
 
+  const isTransientVerifyError = (err: unknown): boolean => {
+    if (!(err instanceof WebHttpError)) return false;
+    if (err.code === "transport") return true;
+    if (err.code === "http_error") {
+      return (
+        err.status === undefined ||
+        err.status === 200 ||
+        err.status === 408 ||
+        err.status === 429 ||
+        (err.status >= 500 && err.status <= 599)
+      );
+    }
+    return false;
+  };
+
+  const runVerifyStep = async <T>(step: () => Promise<T>, deadlineMs: number): Promise<T> => {
+    let attempt = 0;
+    while (true) {
+      if (opts.signal?.aborted) {
+        throw new WebHttpError("aborted", "扫码登录已取消");
+      }
+      try {
+        return await step();
+      } catch (err) {
+        if (opts.signal?.aborted) {
+          throw new WebHttpError("aborted", "扫码登录已取消");
+        }
+        if (!isTransientVerifyError(err)) {
+          throw err;
+        }
+        attempt++;
+        const remaining = deadlineMs - Date.now();
+        if (remaining <= 0) throw err;
+        const delayMs = Math.min(Math.min(pollIntervalMs * 2 ** Math.min(attempt - 1, 3), 5_000), remaining);
+        await sleep(delayMs, opts.signal);
+      }
+    }
+  };
+
   const finalize = async (): Promise<WebLogin> => {
-    const profile = await readNativeProfile(jar, ep, { signal: opts.signal });
+    const deadlineMs = Date.now() + verifyTimeoutMs;
+    const profile = await runVerifyStep(() => readNativeProfile(jar, ep, { signal: opts.signal }), deadlineMs);
     if (challenge.approvedOwnerId && profile.id !== challenge.approvedOwnerId) {
       throw new WebHttpError("credential_denied", "已登录账号与扫码确认的账号不一致");
     }
-    await loadWebMetadata(jar, ep, { signal: opts.signal });
+    await runVerifyStep(() => loadWebMetadata(jar, ep, { signal: opts.signal }), deadlineMs);
     return {
       cookies: jar.records(),
       owner_id: profile.id,
@@ -434,17 +490,22 @@ export async function pollLogin(
     }
     if (isTransientStatus(res.status)) {
       transientFailures++;
-      const remaining = challenge.expiresAtMs - Date.now();
+      const nowMs = Date.now();
+      const remaining = challenge.expiresAtMs - nowMs;
       if (remaining <= 0) {
         throw new WebHttpError("credential_denied", "登录二维码已过期，请重新执行扫码");
       }
-      const retryAfterSec = Number(getHeader(res.headers, "retry-after").trim());
-      const baseDelayMs = Math.min(pollIntervalMs * 2 ** Math.min(transientFailures - 1, 4), maxTransientBackoffMs);
-      const delayMs =
-        Number.isFinite(retryAfterSec) && retryAfterSec > 0
-          ? Math.min(Math.max(baseDelayMs, retryAfterSec * 1000), maxTransientBackoffMs)
-          : baseDelayMs;
-      await sleep(Math.min(delayMs, remaining), opts.signal);
+      const clientBackoffMs = Math.min(pollIntervalMs * 2 ** Math.min(transientFailures - 1, 4), maxTransientBackoffMs);
+      const serverDelayMs = parseRetryAfterMs(getHeader(res.headers, "retry-after"), nowMs);
+      if (serverDelayMs !== undefined) {
+        // 严格尊重服务端 Retry-After（含秒数与 HTTP-date），绝不截断提早重试；若超过二维码剩余寿命则直接过期退出
+        if (serverDelayMs >= remaining) {
+          throw new WebHttpError("credential_denied", "登录二维码在服务端限流等待期内已过期，请重新执行扫码");
+        }
+        await sleep(Math.max(Math.min(clientBackoffMs, remaining), serverDelayMs), opts.signal);
+      } else {
+        await sleep(Math.min(clientBackoffMs, remaining), opts.signal);
+      }
       continue;
     }
     if (res.status !== 200) {
