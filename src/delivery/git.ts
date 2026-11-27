@@ -68,6 +68,8 @@ export interface GitRunOpts {
   /** 仅限仓库级显式要求 SSH 提交签名且公钥/加密私钥依赖代理时，为单次 `git commit` 窄范围透传 SSH_AUTH_SOCK */
   allowCommitSigningSshSock?: boolean;
   extraEnv?: Record<string, string>;
+  /** 仅用于测试：覆写易失内存目录（tmpfs/ramfs）候选列表，验证含密凭据在无 tmpfs 时拒绝落盘 */
+  volatileTmpfsCandidates?: string[];
 }
 
 function resolveValidatedSshAuthSock(
@@ -920,17 +922,145 @@ export function rewriteGitCredentialHelperChain(
   return gitConfigArgs;
 }
 
+function isGitPathInsideOrEqual(candidate: string, root: string): boolean {
+  if (!candidate || !root) return false;
+  const rel = path.relative(root, candidate);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+function collectProtectedGitDirs(
+  cwd: string,
+  opts?: GitRunOpts,
+): {
+  realCwd: string;
+  realTrustedRepoRoot: string;
+  protectedGitDirs: string[];
+  repoCheckoutRoots: string[];
+} {
+  const realCwd = fs.existsSync(cwd) ? fs.realpathSync(cwd) : path.resolve(cwd);
+  const realTrustedRepoRoot =
+    opts?.trustedRepoRoot && fs.existsSync(opts.trustedRepoRoot) ? fs.realpathSync(opts.trustedRepoRoot) : "";
+  const protectedGitDirs: string[] = [];
+  const repoCheckoutRoots = new Set<string>([realCwd]);
+  if (realTrustedRepoRoot) repoCheckoutRoots.add(realTrustedRepoRoot);
+
+  const localDotGit = path.join(realCwd, ".git");
+  try {
+    const st = fs.lstatSync(localDotGit);
+    if (st.isDirectory()) protectedGitDirs.push(fs.realpathSync(localDotGit));
+  } catch {
+    // ignore
+  }
+  try {
+    const wt = detectGitWorktreeDirs(realCwd, {
+      trustedRepoRoot: opts?.trustedRepoRoot,
+      dataDir: opts?.cfg?.dataDir,
+    });
+    if (wt.gitDir) protectedGitDirs.push(wt.gitDir);
+    if (wt.commonDir) {
+      protectedGitDirs.push(wt.commonDir);
+      if (path.basename(wt.commonDir) === ".git") {
+        repoCheckoutRoots.add(path.dirname(wt.commonDir));
+      }
+    }
+  } catch {
+    // ignore; worktree validation happens during isolation build
+  }
+  return {
+    realCwd,
+    realTrustedRepoRoot,
+    protectedGitDirs: [...new Set(protectedGitDirs)],
+    repoCheckoutRoots: [...repoCheckoutRoots],
+  };
+}
+
 /**
- * 按精确优先级读取单个生效的 Git LFS 端点 URL：
- *   - 逐键按顺序先查受信任 Git 配置（`--includes --get`，尊重后写覆盖），未命中时仅对 `git-lfs` 允许的安全键回退查 `.lfsconfig`；
+ * 判断 `git config --show-origin` 的配置来源是否位于不可信 worker 可写的检出目录内：
+ *   - `command` 作用域（调用方显式 `-c`）不属于检出文件；
+ *   - 其余来源必须为可解析真实路径的 `file:<path>`，否则按不可信处理；
+ *   - 同时检查未解符号链接路径与 `realpathSync` 真实路径，防止双向符号链接绕过；
+ *   - 位于任意检出根目录下且不在受只读保护的 `.git` 管理目录内的一律视为 worker 可写检出文件。
+ */
+function isConfigOriginWorkerWritable(
+  scope: string,
+  originRaw: string,
+  realCwd: string,
+  repoCheckoutRoots: string[],
+  protectedGitDirs: string[],
+): boolean {
+  if (scope === "command") return false;
+  const trimmed = originRaw.trim();
+  if (!trimmed.startsWith("file:")) return true;
+  const rawPath = trimmed.slice("file:".length);
+  if (!rawPath) return true;
+  const resolvedOrigin = path.isAbsolute(rawPath) ? path.resolve(rawPath) : path.resolve(realCwd, rawPath);
+  let realOrigin: string;
+  try {
+    realOrigin = fs.realpathSync(resolvedOrigin);
+  } catch {
+    return true;
+  }
+  const inProtectedGit = (p: string) => protectedGitDirs.some((gd) => isGitPathInsideOrEqual(p, gd));
+  for (const root of repoCheckoutRoots) {
+    if (isGitPathInsideOrEqual(resolvedOrigin, root) && !inProtectedGit(resolvedOrigin)) return true;
+    if (isGitPathInsideOrEqual(realOrigin, root) && !inProtectedGit(realOrigin)) return true;
+  }
+  return false;
+}
+
+/**
+ * 判断一个 `credential*.helper` 是否允许在宿主机 shell（沙箱外）执行：
+ *   - 作用域必须为 `global` 或 `system`；
+ *   - 来源必须是可解析真实路径的 `file:<path>`；
+ *   - 未解路径与真实路径均绝不得落在检出工作区、仓库根目录、`.git`/worktree 管理目录或常驻 `dataDir` 内，
+ *     防止 global `include`/`includeIf` 指向 worker 可写文件在宿主机触发任意命令执行。
+ */
+function isTrustedHostCredentialHelperOrigin(
+  scope: string,
+  originRaw: string,
+  realCwd: string,
+  untrustedRoots: string[],
+): boolean {
+  if (scope !== "global" && scope !== "system") return false;
+  const trimmed = originRaw.trim();
+  if (!trimmed.startsWith("file:")) return false;
+  const rawPath = trimmed.slice("file:".length);
+  if (!rawPath) return false;
+  const resolvedOrigin = path.isAbsolute(rawPath) ? path.resolve(rawPath) : path.resolve(realCwd, rawPath);
+  let realOrigin: string;
+  try {
+    realOrigin = fs.realpathSync(resolvedOrigin);
+  } catch {
+    return false;
+  }
+  for (const root of untrustedRoots) {
+    if (!root) continue;
+    if (isGitPathInsideOrEqual(resolvedOrigin, root) || isGitPathInsideOrEqual(realOrigin, root)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+interface ResolvedLfsEndpoint {
+  url: string;
+  /** 仅当端点来自检出树之外的受信任 Git 配置（而非 `.lfsconfig` 或被 include 进检出目录的配置文件）时，才允许为本地路径镜像授权宿主机目录挂载 */
+  fromTrustedConfig: boolean;
+}
+
+/**
+ * 按精确优先级读取单个生效的 Git LFS 端点 URL 及其来源可信度：
+ *   - 逐键按顺序先查 Git 配置（`--includes --show-scope --show-origin --null --get-all`，取最后一条生效值并校验来源不在 worker 可写检出目录内）；
+ *   - 未命中时仅对 `git-lfs` 允许的安全键回退查 `.lfsconfig`，但强制标记 `fromTrustedConfig: false`（绝不为版本控制文件声明的本地路径开放宿主机目录挂载）；
  *   - 命中首个非空键即停止，绝不把被更高优先级覆盖的旧端点或下载端点暴露给上传操作。
  */
 async function readFirstLfsEndpointKey(
   cwd: string,
   specs: { key: string; allowLfsConfig: boolean }[],
   opts?: GitRunOpts,
-): Promise<string | undefined> {
+): Promise<ResolvedLfsEndpoint | undefined> {
   if (specs.length === 0) return undefined;
+  const { realCwd, protectedGitDirs, repoCheckoutRoots } = collectProtectedGitDirs(cwd, opts);
   const lfsConfigPath = path.join(cwd, ".lfsconfig");
   let hasLfsConfig = false;
   try {
@@ -939,17 +1069,42 @@ async function readFirstLfsEndpointKey(
   } catch {
     hasLfsConfig = false;
   }
-  const readSingle = async (extraCfgArgs: string[], key: string): Promise<string> => {
-    const r = await tryGit(cwd, ["config", ...extraCfgArgs, "--get", key], { ...opts, readOnly: true });
+  const readFromGitConfig = async (key: string): Promise<ResolvedLfsEndpoint | undefined> => {
+    const r = await tryGit(cwd, ["config", "--includes", "--show-scope", "--show-origin", "--null", "--get-all", key], {
+      ...opts,
+      readOnly: true,
+    });
+    if (r.code !== 0 || !r.stdout) return undefined;
+    const tokens = r.stdout.split("\0");
+    let last: { scope: string; origin: string; value: string } | undefined;
+    for (let i = 0; i + 2 < tokens.length; i += 3) {
+      last = {
+        scope: tokens[i].trim(),
+        origin: tokens[i + 1].trim(),
+        value: tokens[i + 2].trim(),
+      };
+    }
+    if (!last || !last.value) return undefined;
+    const workerWritable = isConfigOriginWorkerWritable(
+      last.scope,
+      last.origin,
+      realCwd,
+      repoCheckoutRoots,
+      protectedGitDirs,
+    );
+    return { url: last.value, fromTrustedConfig: !workerWritable };
+  };
+  const readFromLfsConfig = async (key: string): Promise<string> => {
+    const r = await tryGit(cwd, ["config", "--file", lfsConfigPath, "--get", key], { ...opts, readOnly: true });
     if (r.code !== 0 || !r.stdout) return "";
     return r.stdout.trim();
   };
   for (const spec of specs) {
-    const fromGit = await readSingle(["--includes"], spec.key);
+    const fromGit = await readFromGitConfig(spec.key);
     if (fromGit) return fromGit;
     if (spec.allowLfsConfig && hasLfsConfig) {
-      const fromFile = await readSingle(["--file", lfsConfigPath], spec.key);
-      if (fromFile) return fromFile;
+      const fromFile = await readFromLfsConfig(spec.key);
+      if (fromFile) return { url: fromFile, fromTrustedConfig: false };
     }
   }
   return undefined;
@@ -984,21 +1139,21 @@ async function resolveNamedRemoteLfsOverrides(
         ]
       : [{ key: `remote.${remote}.lfsurl`, allowLfsConfig: true }];
   const selected = await readFirstLfsEndpointKey(cwd, specs, opts);
-  return selected ? [selected] : [];
+  return selected ? [selected.url] : [];
 }
 
 /**
- * 按 `git-lfs` 实际端点优先级解析唯一生效的 LFS 传输端点 URL：
+ * 按 `git-lfs` 实际端点优先级解析唯一生效的 LFS 传输端点及来源可信度：
  *   - push：`lfs.pushurl` > `lfs.url` > `remote.<target>.lfspushurl`（仅受信任 Git 配置）> `remote.<target>.lfsurl`；
  *   - fetch：`lfs.url` > `remote.<target>.lfsurl`；
  * 仅返回本次传输真正选中的单个端点，避免在独立下载/上传镜像配置下为未被选中的下载主机授权凭据或可写挂载。
  */
-async function resolveEffectiveLfsUrls(
+async function resolveEffectiveLfsEndpoints(
   cwd: string,
   spec: { mode: "push" | "fetch"; target?: string },
   baseUrls: Iterable<string>,
   opts?: GitRunOpts,
-): Promise<string[]> {
+): Promise<ResolvedLfsEndpoint[]> {
   const keySpecs: { key: string; allowLfsConfig: boolean }[] = [];
   if (spec.mode === "push") {
     keySpecs.push({ key: "lfs.pushurl", allowLfsConfig: true });
@@ -1016,22 +1171,36 @@ async function resolveEffectiveLfsUrls(
 
   const baseHttpUrl = [...baseUrls].find((u) => /^https?:\/\//i.test(u.trim()));
   if (
-    /^[a-z][a-z0-9+.-]*:\/\//i.test(selected) ||
-    selected.startsWith("/") ||
-    selected.startsWith("./") ||
-    selected.startsWith("../") ||
-    parseScpGitUrl(selected, cwd)
+    /^[a-z][a-z0-9+.-]*:\/\//i.test(selected.url) ||
+    selected.url.startsWith("/") ||
+    selected.url.startsWith("./") ||
+    selected.url.startsWith("../") ||
+    parseScpGitUrl(selected.url, cwd)
   ) {
     return [selected];
   }
   if (baseHttpUrl) {
     try {
-      return [new URL(selected, baseHttpUrl.endsWith("/") ? baseHttpUrl : `${baseHttpUrl}/`).href];
+      return [
+        {
+          url: new URL(selected.url, baseHttpUrl.endsWith("/") ? baseHttpUrl : `${baseHttpUrl}/`).href,
+          fromTrustedConfig: selected.fromTrustedConfig,
+        },
+      ];
     } catch {
       return [];
     }
   }
   return [];
+}
+
+async function resolveEffectiveLfsUrls(
+  cwd: string,
+  spec: { mode: "push" | "fetch"; target?: string },
+  baseUrls: Iterable<string>,
+  opts?: GitRunOpts,
+): Promise<string[]> {
+  return (await resolveEffectiveLfsEndpoints(cwd, spec, baseUrls, opts)).map((e) => e.url);
 }
 
 async function resolveEffectiveRemoteUrls(
@@ -1327,10 +1496,15 @@ async function prepareScopedGitHttpCredentials(
     ...(xdgConfigHome ? [path.join(xdgConfigHome, "git", "credentials")] : []),
   ];
 
-  // 读取宿主机/仓库生效的全部 credential.helper 与 credential.<url>.helper（含 --includes、作用域与空值重置，严格保持配置出现顺序）
+  const { realCwd, protectedGitDirs, repoCheckoutRoots } = collectProtectedGitDirs(cwd, opts);
+  const dataDir = opts?.cfg?.dataDir;
+  const realData = dataDir && fs.existsSync(dataDir) ? fs.realpathSync(dataDir) : "";
+  const untrustedHelperRoots = [...new Set([...repoCheckoutRoots, ...protectedGitDirs, ...(realData ? [realData] : [])])];
+
+  // 读取宿主机/仓库生效的全部 credential.helper 与 credential.<url>.helper（含 --includes、--show-scope、--show-origin 与空值重置，严格保持配置出现顺序）
   const helperCfg = await tryGit(
     cwd,
-    ["config", "--includes", "--show-scope", "--null", "--get-regexp", "^credential(\\..+)?\\.helper$"],
+    ["config", "--includes", "--show-scope", "--show-origin", "--null", "--get-regexp", "^credential(\\..+)?\\.helper$"],
     { ...opts, readOnly: true },
   );
   if (helperCfg.code !== 0 || !helperCfg.stdout) return undefined;
@@ -1340,20 +1514,40 @@ async function prepareScopedGitHttpCredentials(
     pattern?: string;
     value: string;
     scope: string;
+    origin: string;
+    trustedHostOrigin: boolean;
+    workerWritableOrigin: boolean;
     orderIdx: number;
   }
   const rawHelperEntries: RawHelperEntry[] = [];
   const tokens = helperCfg.stdout.split("\0");
   let orderSeq = 0;
-  for (let i = 0; i + 1 < tokens.length; i += 2) {
+  for (let i = 0; i + 2 < tokens.length; i += 3) {
     const scope = tokens[i].trim();
-    const rec = tokens[i + 1];
+    const origin = tokens[i + 1].trim();
+    const rec = tokens[i + 2];
     if (!rec) continue;
     const nl = rec.indexOf("\n");
     const rawKey = nl === -1 ? rec : rec.slice(0, nl);
     const val = nl === -1 ? "" : rec.slice(nl + 1).trim();
+    const trustedHostOrigin = isTrustedHostCredentialHelperOrigin(scope, origin, realCwd, untrustedHelperRoots);
+    const workerWritableOrigin = isConfigOriginWorkerWritable(
+      scope,
+      origin,
+      realCwd,
+      repoCheckoutRoots,
+      protectedGitDirs,
+    );
     if (/^credential\.helper$/i.test(rawKey)) {
-      rawHelperEntries.push({ normKey: "credential.helper", value: val, scope, orderIdx: orderSeq++ });
+      rawHelperEntries.push({
+        normKey: "credential.helper",
+        value: val,
+        scope,
+        origin,
+        trustedHostOrigin,
+        workerWritableOrigin,
+        orderIdx: orderSeq++,
+      });
     } else {
       const subMatch = rawKey.match(/^credential\.(.+)\.helper$/i);
       if (!subMatch) continue;
@@ -1363,6 +1557,9 @@ async function prepareScopedGitHttpCredentials(
         pattern,
         value: val,
         scope,
+        origin,
+        trustedHostOrigin,
+        workerWritableOrigin,
         orderIdx: orderSeq++,
       });
     }
@@ -1422,8 +1619,6 @@ async function prepareScopedGitHttpCredentials(
     return useHttpPath || (hostGroupCount.get(hostScopeUrl) ?? 0) > 1 ? scopeUrl : hostScopeUrl;
   };
 
-  const dataDir = opts?.cfg?.dataDir;
-  const realData = dataDir && fs.existsSync(dataDir) ? fs.realpathSync(dataDir) : "";
   const isOutsideDataDir = (p: string): boolean => {
     if (!realData) return true;
     try {
@@ -1477,14 +1672,13 @@ async function prepareScopedGitHttpCredentials(
 
   type TargetSandboxAction =
     | { kind: "store-line"; prefix: "store" | "helper"; line: string }
-    | { kind: "static-responder"; responseLines: string[]; rejectNonEmptyUser: boolean }
+    | { kind: "static-responder"; responseLines: string[]; rejectNonEmptyUser: boolean; containsSecret: boolean }
     | { kind: "local-helper"; value: string };
 
   const allMatchingConfigKeys = new Set<string>();
   const localKeysToClear = new Set<string>();
   let anyHostManaged = false;
-  const extraUsernameArgs: string[] = [];
-  const seenUsernameArgs = new Set<string>();
+  let anyDeferredGlobalHelper = false;
   const planByTarget: {
     url: URL;
     scopeUrl: string;
@@ -1501,7 +1695,7 @@ async function prepareScopedGitHttpCredentials(
       const matches = entry.pattern === undefined || gitCredentialSectionMatchesUrl(entry.pattern, t);
       if (!matches) continue;
       allMatchingConfigKeys.add(entry.normKey);
-      if (entry.scope === "local" || entry.scope === "worktree") {
+      if (entry.scope === "local" || entry.scope === "worktree" || !entry.trustedHostOrigin) {
         localKeysToClear.add(entry.normKey);
       }
       if (!entry.value) {
@@ -1522,36 +1716,91 @@ async function prepareScopedGitHttpCredentials(
 
     const actions: TargetSandboxAction[] = [];
     let encounteredLocalHelper = false;
+    let hasUnflushedHostPartial = false;
+    let lastFlushed: Partial<HostCredentialState> = {
+      username: initialUser || undefined,
+    };
+
+    const flushPendingHostPartial = () => {
+      if (!hasUnflushedHostPartial) return;
+      const lines: string[] = [];
+      if (state.username && state.username !== lastFlushed.username && !t.username) {
+        lines.push(`username=${state.username}`);
+      }
+      if (state.password && state.password !== lastFlushed.password) {
+        lines.push(`password=${state.password}`);
+      }
+      if (
+        state.authtype &&
+        state.credential &&
+        (state.authtype !== lastFlushed.authtype || state.credential !== lastFlushed.credential)
+      ) {
+        lines.push("capability[]=authtype", `authtype=${state.authtype}`, `credential=${state.credential}`);
+      }
+      if (state.oauthRefreshToken && state.oauthRefreshToken !== lastFlushed.oauthRefreshToken) {
+        lines.push(`oauth_refresh_token=${state.oauthRefreshToken}`);
+      }
+      if (
+        state.passwordExpiryUtc &&
+        state.passwordExpiryUtc !== lastFlushed.passwordExpiryUtc &&
+        (state.password || state.credential)
+      ) {
+        lines.push(`password_expiry_utc=${state.passwordExpiryUtc}`);
+      }
+      if (state.ephemeral && !lastFlushed.ephemeral && (state.password || state.credential)) {
+        lines.push("ephemeral=1");
+      }
+      hasUnflushedHostPartial = false;
+      lastFlushed = { ...state };
+      if (lines.length === 0) return;
+      const containsSecret = lines.some(
+        (l) => l.startsWith("password=") || l.startsWith("credential=") || l.startsWith("oauth_refresh_token="),
+      );
+      actions.push({
+        kind: "static-responder",
+        responseLines: lines,
+        rejectNonEmptyUser: !encounteredLocalHelper && !initialUser,
+        containsSecret,
+      });
+    };
+
     for (const entry of activeForTarget) {
       const parsed = parseStoreHelperFile(entry.value, hostHome, cwd);
-      if (parsed.isStore) {
+      if (parsed.isStore && !entry.workerWritableOrigin) {
         sawHostManagedForTarget = true;
         const filesForSlot = parsed.explicitFile ? [parsed.explicitFile] : defaultStoreFiles;
         const matchedLine = findFirstMatchingStoreLine(filesForSlot, t, useHttpPath, state.username);
         if (matchedLine) {
+          hasUnflushedHostPartial = false;
           actions.push({ kind: "store-line", prefix: "store", line: matchedLine });
           const matchedUrl = parseHttpUrlSafe(matchedLine);
           if (matchedUrl) {
             if (matchedUrl.username) state.username = decodeUrlUser(matchedUrl.username);
             if (matchedUrl.password) state.password = decodeUrlUser(matchedUrl.password);
           }
+          lastFlushed = { ...state };
           if (!encounteredLocalHelper && isHostCredentialComplete(state)) {
             break;
           }
         }
-      } else if (entry.scope === "global" || entry.scope === "system") {
+      } else if (entry.trustedHostOrigin) {
         sawHostManagedForTarget = true;
+        const prevState = state;
         state = await invokeSingleHostCredentialHelper(entry.value, state, useHttpPath, rawEnv);
         if (state.quit) {
+          hasUnflushedHostPartial = false;
           // 原位保留宿主机 helper 的 quit=1 决策，确保沙箱内 Git 在同一槽位立即中止而绝不继续执行后续仓库本地 helper
           actions.push({
             kind: "static-responder",
             responseLines: ["quit=1"],
             rejectNonEmptyUser: !encounteredLocalHelper && !initialUser,
+            containsSecret: false,
           });
           break;
         }
         if (isHostCredentialComplete(state)) {
+          hasUnflushedHostPartial = false;
+          lastFlushed = { ...state };
           if (state.authtype && state.credential) {
             const respLines = [
               "capability[]=authtype",
@@ -1566,38 +1815,69 @@ async function prepareScopedGitHttpCredentials(
               kind: "static-responder",
               responseLines: respLines,
               rejectNonEmptyUser: !encounteredLocalHelper && !initialUser,
+              containsSecret: true,
             });
           } else {
             const line = formatCredentialStoreLine(state, t, useHttpPath);
-            if (line) {
+            if (line && !state.oauthRefreshToken && !state.passwordExpiryUtc && !state.ephemeral) {
               actions.push({ kind: "store-line", prefix: "helper", line });
+            } else {
+              const respLines = [
+                ...(state.username ? [`username=${state.username}`] : []),
+                ...(state.password ? [`password=${state.password}`] : []),
+                ...(state.oauthRefreshToken ? [`oauth_refresh_token=${state.oauthRefreshToken}`] : []),
+                ...(state.passwordExpiryUtc ? [`password_expiry_utc=${state.passwordExpiryUtc}`] : []),
+                ...(state.ephemeral ? ["ephemeral=1"] : []),
+              ];
+              if (respLines.length > 0) {
+                actions.push({
+                  kind: "static-responder",
+                  responseLines: respLines,
+                  rejectNonEmptyUser: !encounteredLocalHelper && !initialUser,
+                  containsSecret: true,
+                });
+              }
             }
           }
           if (!encounteredLocalHelper) break;
+        } else if (
+          state.username !== prevState.username ||
+          state.password !== prevState.password ||
+          state.oauthRefreshToken !== prevState.oauthRefreshToken ||
+          state.authtype !== prevState.authtype ||
+          state.credential !== prevState.credential
+        ) {
+          // 宿主机 helper 仅提供了部分字段（如只返回 password 或只返回 username / oauth_refresh_token）：
+          // 标记待原位回放，在进入后续仓库本地 helper 前（或链尾）以目标作用域限定的静态响应器原序透传
+          hasUnflushedHostPartial = true;
         }
       } else {
-        // 仓库 local/worktree 作用域自定义 helper 不在宿主机执行，保留到沙箱；若前面宿主机 helper 已提供部分 username，则透传给沙箱
-        encounteredLocalHelper = true;
-        if (state.username && state.username !== initialUser && !t.username) {
-          const arg = `credential.${emitScopeUrlFor(t, scopeUrl, useHttpPath)}.username=${state.username}`;
-          if (!seenUsernameArgs.has(arg)) {
-            seenUsernameArgs.add(arg);
-            extraUsernameArgs.push("-c", arg);
-          }
+        // 仓库 local/worktree 作用域或来自 worker 可写检出目录（含 global include/includeIf 引入）的自定义 helper：
+        // 绝不在宿主机 shell 执行；先原位刷出前序宿主机 helper 产生的全部部分字段，再把本 helper 保留到沙箱内按原序执行
+        flushPendingHostPartial();
+        if (entry.scope === "global" || entry.scope === "system") {
+          anyDeferredGlobalHelper = true;
         }
+        encounteredLocalHelper = true;
         actions.push({ kind: "local-helper", value: entry.value });
       }
     }
+
+    flushPendingHostPartial();
 
     if (sawHostManagedForTarget) anyHostManaged = true;
     planByTarget.push({ url: t, scopeUrl, useHttpPath, initialUser, actions });
   }
 
-  if (allMatchingConfigKeys.size === 0 || !anyHostManaged) {
+  if (allMatchingConfigKeys.size === 0 || (!anyHostManaged && !anyDeferredGlobalHelper)) {
     return undefined;
   }
 
-  let scoped: { dir: string; cleanup: () => void } | undefined;
+  const needsSecretStorage = planByTarget.some((plan) =>
+    plan.actions.some((act) => act.kind === "store-line" || (act.kind === "static-responder" && act.containsSecret)),
+  );
+
+  let scoped: { dir: string; volatile: boolean; cleanup: () => void } | undefined;
   let fileSeq = 0;
   let wroteAnyStagedFile = false;
   const gitConfigArgs: string[] = [];
@@ -1616,13 +1896,19 @@ async function prepareScopedGitHttpCredentials(
       const decodedPath = plan.useHttpPath ? decodeCredPath(plan.url.pathname) || undefined : undefined;
       for (const act of plan.actions) {
         if (act.kind === "store-line") {
-          scoped ??= createScopedSecretDir("pa-git-http-cred-", rawEnv);
+          scoped ??= createScopedSecretDir("pa-git-http-cred-", rawEnv, {
+            requireVolatile: needsSecretStorage,
+            tmpfsCandidates: opts?.volatileTmpfsCandidates,
+          });
           const slotFile = path.join(scoped.dir, `${act.prefix}-${fileSeq++}.creds`);
           fs.writeFileSync(slotFile, `${act.line}\n`, { mode: 0o600 });
           gitConfigArgs.push("-c", `${targetKey}=store --file=${slotFile}`);
           wroteAnyStagedFile = true;
         } else if (act.kind === "static-responder") {
-          scoped ??= createScopedSecretDir("pa-git-http-cred-", rawEnv);
+          scoped ??= createScopedSecretDir("pa-git-http-cred-", rawEnv, {
+            requireVolatile: needsSecretStorage,
+            tmpfsCandidates: opts?.volatileTmpfsCandidates,
+          });
           const helperCmd = writeScopedStaticCredentialHelper(
             scoped.dir,
             fileSeq++,
@@ -1645,9 +1931,7 @@ async function prepareScopedGitHttpCredentials(
       }
     }
 
-    gitConfigArgs.push(...extraUsernameArgs);
-
-    if (!wroteAnyStagedFile && localKeysToClear.size === 0 && extraUsernameArgs.length === 0) {
+    if (!wroteAnyStagedFile && localKeysToClear.size === 0) {
       scoped?.cleanup();
       return undefined;
     }
@@ -3108,11 +3392,26 @@ async function resolveEffectiveLfsStorageDir(
   roOpts: GitRunOpts,
 ): Promise<{ storageDir: string; isExternal: boolean }> {
   const defaultDir = path.join(commonGitDir, "lfs");
-  const cfgRes = await tryGit(repoPath, ["config", "--includes", "--get", "lfs.storage"], roOpts);
-  const rawStorage = cfgRes.code === 0 ? cfgRes.stdout.trim() : "";
+  const cfgRes = await tryGit(
+    repoPath,
+    ["config", "--includes", "--show-scope", "--show-origin", "--null", "--get-all", "lfs.storage"],
+    roOpts,
+  );
+  if (cfgRes.code !== 0 || !cfgRes.stdout) {
+    return { storageDir: defaultDir, isExternal: false };
+  }
+  const tokens = cfgRes.stdout.split("\0");
+  let last: { scope: string; origin: string; value: string } | undefined;
+  for (let i = 0; i + 2 < tokens.length; i += 3) {
+    last = { scope: tokens[i].trim(), origin: tokens[i + 1].trim(), value: tokens[i + 2].trim() };
+  }
+  const rawStorage = last?.value ?? "";
   if (!rawStorage) {
     return { storageDir: defaultDir, isExternal: false };
   }
+  const { realCwd, protectedGitDirs, repoCheckoutRoots } = collectProtectedGitDirs(repoPath, roOpts);
+  const fromWorkerCheckout =
+    !!last && isConfigOriginWorkerWritable(last.scope, last.origin, realCwd, repoCheckoutRoots, protectedGitDirs);
   const effectiveRawEnv: NodeJS.ProcessEnv = roOpts.extraEnv ? { ...process.env, ...roOpts.extraEnv } : process.env;
   const hostHome = effectiveRawEnv.HOME?.trim() || os.homedir();
   const expanded =
@@ -3140,6 +3439,9 @@ async function resolveEffectiveLfsStorageDir(
   const realCommon = fs.existsSync(commonGitDir) ? fs.realpathSync(commonGitDir) : path.resolve(commonGitDir);
   const relCommon = path.relative(realCommon, realResolved);
   const isInsideCommon = relCommon === "" || (!relCommon.startsWith("..") && !path.isAbsolute(relCommon));
+  if (!isInsideCommon && fromWorkerCheckout) {
+    throw new Error(`lfs.storage (${rawStorage}) 来自 worker 可写检出配置文件，拒绝授权外部宿主机可写挂载`);
+  }
   return { storageDir: realResolved, isExternal: !isInsideCommon };
 }
 
@@ -3376,8 +3678,17 @@ export async function ensureGitLfsObjectsForCheckout(
   const fetchUrls = remoteUrlRes.code === 0
     ? [...new Set(remoteUrlRes.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean))]
     : [];
-  const effectiveLfsUrls = await resolveEffectiveLfsUrls(repoPath, { mode: "fetch", target: remote }, fetchUrls, roOpts);
-  const mountUrls = effectiveLfsUrls.length > 0 ? effectiveLfsUrls : fetchUrls;
+  const effectiveLfsEndpoints = await resolveEffectiveLfsEndpoints(
+    repoPath,
+    { mode: "fetch", target: remote },
+    fetchUrls,
+    roOpts,
+  );
+  // 仅允许检出树之外的受信任 Git 配置为本地路径 LFS 镜像授权宿主机目录挂载；版本控制的 .lfsconfig 绝不能扩大宿主机文件访问范围
+  const mountUrls =
+    effectiveLfsEndpoints.length > 0
+      ? effectiveLfsEndpoints.filter((e) => e.fromTrustedConfig).map((e) => e.url)
+      : fetchUrls;
   const localRoDirs: string[] = [];
   const localSyms: { dest: string; target: string }[] = [];
   for (const u of mountUrls) {
@@ -3510,11 +3821,19 @@ export async function pushBranch(
       if (namedRemoteLfsOverrides === undefined) {
         const roOpts = { ...opts, readOnly: true };
         namedRemoteLfsOverrides = await resolveNamedRemoteLfsOverrides(cwd, remote, "push", roOpts);
-        configuredPushLfsUrls = await resolveEffectiveLfsUrls(cwd, { mode: "push", target: remote }, effectivePushUrls, roOpts);
+        const configuredPushLfsEndpoints = await resolveEffectiveLfsEndpoints(
+          cwd,
+          { mode: "push", target: remote },
+          effectivePushUrls,
+          roOpts,
+        );
+        configuredPushLfsUrls = configuredPushLfsEndpoints.map((e) => e.url);
         const dirs = new Set<string>();
         const syms: { dest: string; target: string }[] = [];
-        for (const u of configuredPushLfsUrls) {
-          const m = resolveLocalGitRemoteMount(cwd, u);
+        // 仅允许检出树之外的受信任 Git 配置为本地路径 LFS 镜像授权可写宿主机挂载；版本控制的 .lfsconfig 绝不能把任意宿主机目录暴露为可写
+        for (const ep of configuredPushLfsEndpoints) {
+          if (!ep.fromTrustedConfig) continue;
+          const m = resolveLocalGitRemoteMount(cwd, ep.url);
           if (!m) continue;
           dirs.add(m.realDir);
           syms.push(...m.symlinks);

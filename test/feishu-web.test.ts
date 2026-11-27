@@ -133,6 +133,7 @@ import {
   coordinateClaudeOAuthRefresh,
   coordinateCodexOAuthRefresh,
   coordinateOpenCodeOAuthRefresh,
+  createScopedSecretDir,
   detectGitWorktreeDirs,
   detectIsolatedCodexKeyringConflict,
   extractSafeCodexProviderArgs,
@@ -23696,6 +23697,625 @@ test("Codex 第二十八轮回归：完整配置校验与推断主人保留、�
       } finally {
         appLfs.store.db.close();
       }
+    }
+  } finally {
+    if (prevPwKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevPwKey;
+    if (prevCredEnv === undefined) delete process.env.PA_FEISHU_WEB_CRED_FILE;
+    else process.env.PA_FEISHU_WEB_CRED_FILE = prevCredEnv;
+    for (const s of serversToClose) {
+      if ("closeAllConnections" in s && typeof s.closeAllConnections === "function") {
+        s.closeAllConnections();
+      }
+      await new Promise<void>((resolve) => s.close(() => resolve()));
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ───────── 34. Codex 第二十九轮专项回归测试 ─────────
+
+test("Codex 第二十九轮回归：热刷新不改写运行期主人、首跳上下文视图拦截磁盘换主、无密钥常驻让出未发pw.reply、恢复原主人唤醒Web监听、.lfsconfig本地路径不授权宿主机挂载、include指向检出目录helper禁在宿主机执行、部分凭据helper跨层原序保留、无tmpfs拒绝含密凭据落盘、派单详情Git探测失败降级与扫码轮询瞬态重试", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "avatar-r29-"));
+  const serversToClose: (http.Server | net.Server)[] = [];
+  const prevPwKey = process.env.PA_FEISHU_WEB_KEY;
+  const prevCredEnv = process.env.PA_FEISHU_WEB_CRED_FILE;
+  const testKeyHex = crypto.randomBytes(32).toString("hex");
+  process.env.PA_FEISHU_WEB_KEY = testKeyHex;
+  delete process.env.PA_FEISHU_WEB_CRED_FILE;
+
+  const makeR29Config = (
+    dataDir: string,
+    opts: { ownerOpenId?: string; pwEnabled?: boolean; sendReplies?: boolean } = {},
+  ) => ({
+    owner: { open_id: opts.ownerOpenId ?? "ou_r29_owner_A", timezone: "Asia/Shanghai" },
+    data_dir: dataDir,
+    roles: { brain: "stub", reviewer: "stub" },
+    harnesses: { stub: { type: "codex-exec", bin: "echo" } },
+    dispatch: { default_harness: "stub" },
+    context: {
+      enabled: true,
+      understand: false,
+      sources: { meego: false, tasks: false, im: true, minutes: false, calendar: false, docs: false },
+      personal_web: {
+        enabled: opts.pwEnabled ?? true,
+        fast_lane: false,
+        send_replies: opts.sendReplies ?? true,
+      },
+    },
+  });
+
+  const makeR29App = (
+    name: string,
+    opts: { ownerOpenId?: string; pwEnabled?: boolean; sendReplies?: boolean } = {},
+  ) => {
+    const dataDir = path.join(dir, `${name}-data`);
+    fs.mkdirSync(dataDir, { recursive: true });
+    const cfgFile = path.join(dir, `${name}-config.yaml`);
+    fs.writeFileSync(cfgFile, JSON.stringify(makeR29Config(dataDir, opts), null, 2), "utf8");
+    const app = createApp(loadConfig(cfgFile));
+    return { app, cfgFile, dataDir };
+  };
+
+  const runHostGit = async (cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env) => {
+    const r = await runProcess("git", ["-C", cwd, ...args], { env, timeoutMs: 20_000 });
+    assert.equal(r.code, 0, `git ${args.join(" ")} 失败: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+
+  try {
+    // 1) [R29 #1 P1 + #2 P1] 磁盘 owner.open_id 变更时：运行期 app.cfg.owner.open_id 保持启动主人不变；
+    //    首次 /context/today 请求必须立刻检测磁盘换主并拒绝返回旧主人上下文，/context/status 同步脱敏，恢复后立即可用
+    {
+      const { app, cfgFile, dataDir } = makeR29App("r29-owner-guard", { ownerOpenId: "ou_owner_A", pwEnabled: true });
+      try {
+        const ctxSvc = registerContext(app)!;
+        saveWorkspaceBinding(app.store, "7001", "ou_owner_A");
+        const proj = ctxSvc.store.upsertProject({ id: "p_a", name: "主人A私密项目" }, Date.now());
+        const { item } = ctxSvc.store.upsertItem(
+          {
+            strong_key: "ask:owner_a_secret",
+            title: "主人A的机密待办",
+            kind: "ask_me",
+            source: "im",
+            project_id: proj.id,
+            priority: "high",
+            confidence: 1,
+            status: "open",
+            meta: {},
+          },
+          Date.now(),
+        );
+        ctxSvc.store.addDraft({
+          item_id: item.id,
+          project_id: proj.id,
+          kind: "reply",
+          target: { chat_id: "oc_a", message_id: "om_a" },
+          target_label: "主人A的私聊",
+          content: "主人A的机密草稿",
+        });
+
+        // 切主前正常读取 A 的上下文
+        const beforeToday = app.ext.context!.today();
+        assert.ok(beforeToday.focus.some((i) => i.title === "主人A的机密待办"));
+        assert.equal(beforeToday.drafts.length, 1);
+
+        // 外部把磁盘 config.yaml 从 A 改为 B（不提前调用 status() 或 syncDiskPrivacyConfig()）
+        fs.writeFileSync(cfgFile, JSON.stringify(makeR29Config(dataDir, { ownerOpenId: "ou_owner_B", pwEnabled: true }), null, 2), "utf8");
+
+        // R29 #2: 第一次 /context/today 请求必须立刻按磁盘主人拦截，绝不能泄露 A 的事项/草稿
+        assert.throws(
+          () => app.ext.context!.today(),
+          /owner\.open_id|不一致|阻断/,
+          "磁盘换主后第一次 /context/today 必须在读取数据前直接拦截",
+        );
+
+        // R29 #1: 共享 app.cfg.owner.open_id 必须仍固定为启动主人 ou_owner_A，防止在途 BotAgent 回复错发给 B
+        assert.equal(
+          app.cfg.owner.open_id,
+          "ou_owner_A",
+          "隐私热刷新绝不得改写共享 app.cfg.owner.open_id（需重启生效）",
+        );
+
+        // /context/status 也必须立刻脱敏隐藏 A 的统计
+        const st = app.ext.context!.status();
+        assert.equal(st.totals.open_items, 0, "磁盘换主后 status.totals 必须脱敏归零");
+        assert.equal(st.personal_web?.logged_in, false, "磁盘换主后 status.personal_web.logged_in 必须为 false");
+
+        // 恢复磁盘 config.yaml 为原主人 A 后，上下文立即可恢复访问
+        fs.writeFileSync(cfgFile, JSON.stringify(makeR29Config(dataDir, { ownerOpenId: "ou_owner_A", pwEnabled: true }), null, 2), "utf8");
+        const restoredToday = app.ext.context!.today();
+        assert.ok(restoredToday.focus.some((i) => i.title === "主人A的机密待办"));
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 2) [R29 #6 P2] 监听因磁盘换主进入 needs_login 后，把 config.yaml 改回原主人无需重扫/重启即可自动唤醒重连
+    {
+      const mock = await startMockFeishuWebServer();
+      const { app, cfgFile, dataDir } = makeR29App("r29-wake-owner", { ownerOpenId: "ou_owner_A", pwEnabled: true });
+      let ctl: { stop(): void } | undefined;
+      try {
+        const ctxStore = new ContextStore(app.store.db);
+        const loginStore = new WebLoginStore(app.cfg.dataDir);
+        const saved = loginStore.save({
+          cookies: [
+            {
+              name: "session",
+              value: "r29_wake_sess",
+              domain: "127.0.0.1",
+              path: "/",
+              expires_at: new Date(Date.now() + 3600_000).toISOString(),
+            },
+          ],
+          owner_id: "7001",
+          owner_name: "测试主人",
+          session_id: "r29-wake-session-1",
+          cookie_version: 1,
+          updated_at: new Date().toISOString(),
+        });
+        saveWorkspaceBinding(app.store, saved.owner_id, "ou_owner_A");
+        app.store.set(ACTIVE_SESSION_KV_KEY, saved.session_id ?? "");
+
+        const bridge = new PersonalWebBridge(app, ctxStore, {
+          onFastTrigger: () => undefined,
+          onReconnect: () => undefined,
+          onNeedsLogin: () => undefined,
+          credentialWatchIntervalMs: 30,
+          clientOptions: { endpoints: mock.endpoints },
+        });
+        ctl = bridge.start();
+        await waitUntil(() => bridge.status().state === "listening", 5_000);
+
+        // 切磁盘 owner 为 B -> 监听必须断开并进入 needs_login，且运行期 app.cfg.owner.open_id 仍保持 A
+        fs.writeFileSync(cfgFile, JSON.stringify(makeR29Config(dataDir, { ownerOpenId: "ou_owner_B", pwEnabled: true }), null, 2), "utf8");
+        await waitUntil(() => bridge.status().state === "needs_login", 5_000);
+        assert.equal(app.cfg.owner.open_id, "ou_owner_A", "监听退回 needs_login 时运行期主人仍保持启动值");
+
+        // 仅恢复磁盘 config.yaml 回原主人 A（不动 Cookie 与绑定）-> 监听必须自动唤醒并重新进入 listening
+        fs.writeFileSync(cfgFile, JSON.stringify(makeR29Config(dataDir, { ownerOpenId: "ou_owner_A", pwEnabled: true }), null, 2), "utf8");
+        await waitUntil(() => bridge.status().state === "listening", 5_000);
+      } finally {
+        ctl?.stop();
+        app.store.db.close();
+        await mock.close();
+      }
+    }
+
+    // 3) [R29 #5 P2] 无密钥常驻进程（isDaemonRunning=true）绝不得领取未发送 pw.reply 消耗重试，同时保留已 verified 回复的免密幂等收尾
+    {
+      const { app } = makeR29App("r29-daemon-keyless-defer", { ownerOpenId: "ou_owner_A", pwEnabled: true, sendReplies: true });
+      try {
+        const ctxSvc = registerContext(app)!;
+        const loginStore = new WebLoginStore(app.cfg.dataDir);
+        loginStore.save({
+          cookies: [
+            {
+              name: "session",
+              value: "r29_defer_sess",
+              domain: "127.0.0.1",
+              path: "/",
+              expires_at: new Date(Date.now() + 3600_000).toISOString(),
+            },
+          ],
+          owner_id: "7001",
+          owner_name: "测试主人",
+          session_id: "r29-defer-s1",
+          cookie_version: 1,
+          updated_at: new Date().toISOString(),
+        });
+        saveWorkspaceBinding(app.store, "7001", "ou_owner_A");
+
+        // 模拟常驻进程模式
+        app.effectHooks.isDaemonRunning = () => true;
+
+        const unsentArgs = {
+          draft_id: "d_r29_unsent",
+          owner_id: "7001",
+          chat_id: "8001",
+          message_id: "m_r29_unsent",
+          text: "未发出的回复",
+        };
+        const verifiedArgs = {
+          draft_id: "d_r29_verified",
+          owner_id: "7001",
+          chat_id: "8001",
+          message_id: "m_r29_verified",
+          text: "已回读确认的回复",
+        };
+        app.ledger.emit("ctx-draft:d_r29_unsent", [{ op: "pw.reply", args: unsentArgs }], "r29-unsent");
+        app.ledger.emit("ctx-draft:d_r29_verified", [{ op: "pw.reply", args: verifiedArgs }], "r29-verified");
+        const unsentFx = app.ledger.effectsOf("ctx-draft:d_r29_unsent")[0]!;
+        const verifiedFx = app.ledger.effectsOf("ctx-draft:d_r29_verified")[0]!;
+        const { cid: verifiedCid, normalizedText: verifiedNorm } = computePwReplyCid({
+          ...verifiedArgs,
+          effect_id: verifiedFx.id,
+        });
+        app.store.set(
+          `pw.delivery.${verifiedCid}`,
+          JSON.stringify({
+            cid: verifiedCid,
+            owner_id: "7001",
+            chat_id: "8001",
+            message_id: "m_r29_verified",
+            root_id: "m_r29_verified",
+            parent_id: "m_r29_verified",
+            text_hash: crypto.createHash("sha256").update(verifiedNorm).digest("hex"),
+            threaded: false,
+            state: "verified",
+            reply_id: "reply_already_ok",
+            updated_at: Date.now(),
+          }),
+        );
+
+        // 无密钥常驻进程跑 drain(["effect"])
+        delete process.env.PA_FEISHU_WEB_KEY;
+        await app.engine.drain(["effect"]);
+        process.env.PA_FEISHU_WEB_KEY = testKeyHex;
+
+        assert.equal(
+          app.ledger.get(verifiedFx.id)?.state,
+          "done",
+          "无密钥常驻进程仍须保留已 verified 回复的免密幂等收尾",
+        );
+        const unsentAfter = app.ledger.get(unsentFx.id)!;
+        assert.equal(unsentAfter.terminal, false, "无密钥常驻进程绝不得把未发送 pw.reply 标死");
+        assert.equal(unsentAfter.attempts, 0, "无密钥常驻进程绝不得领取未发送 pw.reply 或消耗重试次数");
+
+        // 持钥交互式消费者（isDaemonRunning=false 且拥有密钥）接手后可顺利投递
+        let deliveredByKeyed = false;
+        app.effectHooks.isDaemonRunning = () => false;
+        app.effectHooks.pwReply = async (a) => {
+          if (a.message_id === "m_r29_unsent") deliveredByKeyed = true;
+        };
+        await app.engine.drain(["effect"]);
+        assert.equal(deliveredByKeyed, true, "持钥消费者必须正常领取并送出未发回复");
+        assert.equal(app.ledger.get(unsentFx.id)?.state, "done");
+        void ctxSvc;
+      } finally {
+        process.env.PA_FEISHU_WEB_KEY = testKeyHex;
+        app.store.db.close();
+      }
+    }
+
+    // 4) [R29 #3 P1] 版本控制文件 .lfsconfig 声明本地路径时，绝不得在 pushBranch 或 ensureGitLfsObjectsForCheckout 授权宿主机目录挂载
+    if (resolveTrustedSystemBin("git-lfs") && resolveTrustedBwrapBin()) {
+      const { app } = makeR29App("r29-lfsconfig-mount");
+      try {
+        const lfsHome = path.join(dir, "r29-lfs-home");
+        fs.mkdirSync(lfsHome, { recursive: true });
+        const lfsEnv: NodeJS.ProcessEnv = { ...process.env, HOME: lfsHome, XDG_CONFIG_HOME: path.join(lfsHome, ".config") };
+        delete lfsEnv.GIT_CONFIG_GLOBAL;
+        await runProcess("git", ["lfs", "install", "--skip-repo"], { env: lfsEnv, timeoutMs: 15_000 });
+
+        const victimDir = path.join(dir, "r29-victim-host-dir");
+        fs.mkdirSync(victimDir, { recursive: true });
+        fs.writeFileSync(path.join(victimDir, "sentinel.txt"), "host-secret");
+
+        const repo = path.join(dir, "r29-lfsconfig-repo");
+        fs.mkdirSync(repo, { recursive: true });
+        await runHostGit(repo, ["init", "-q", "-b", "main"], lfsEnv);
+        await runHostGit(repo, ["config", "user.name", "T"], lfsEnv);
+        await runHostGit(repo, ["config", "user.email", "t@t"], lfsEnv);
+        // 核准的 Git 远端是 HTTPS，但 worker 在检出目录的 .lfsconfig 里把 LFS 端点指向宿主机任意本地目录
+        await runHostGit(repo, ["remote", "add", "origin", "https://example.invalid/org/repo.git"], lfsEnv);
+        fs.writeFileSync(path.join(repo, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+        fs.writeFileSync(path.join(repo, ".lfsconfig"), `[lfs]\n\turl = file://${victimDir}\n\tpushurl = file://${victimDir}\n`);
+        fs.writeFileSync(path.join(repo, "payload.bin"), "r29-untrusted-lfsconfig-payload");
+        await runHostGit(repo, ["add", "."], lfsEnv);
+        await runHostGit(repo, ["commit", "-q", "-m", "untrusted lfsconfig local path"], lfsEnv);
+
+        const pushRes = await pushBranch(repo, "origin", "main", {
+          cfg: app.cfg,
+          trustedRepoRoot: repo,
+          extraEnv: { HOME: lfsHome, XDG_CONFIG_HOME: path.join(lfsHome, ".config") },
+        });
+        assert.equal(pushRes.ok, false, ".lfsconfig 指向宿主机本地目录绝不得获得可写挂载并成功写入");
+        assert.deepEqual(
+          fs.readdirSync(victimDir),
+          ["sentinel.txt"],
+          ".lfsconfig 指定的无关宿主机目录绝不得被写入任何 LFS 对象或目录",
+        );
+
+        // 同步验证 ensureGitLfsObjectsForCheckout 也不会为 .lfsconfig 本地路径开放只读宿主机挂载
+        const localMirror = path.join(dir, "r29-lfs-mirror.git");
+        fs.mkdirSync(localMirror, { recursive: true });
+        await runHostGit(localMirror, ["init", "--bare", "-q"], lfsEnv);
+        const repoLfsDir = path.join(repo, ".git", "lfs", "objects");
+        if (fs.existsSync(repoLfsDir)) {
+          fs.cpSync(repoLfsDir, path.join(localMirror, "lfs", "objects"), { recursive: true });
+          fs.rmSync(repoLfsDir, { recursive: true, force: true });
+        }
+        fs.writeFileSync(path.join(repo, ".lfsconfig"), `[lfs]\n\turl = file://${localMirror}\n`);
+        await assert.rejects(
+          () =>
+            ensureGitLfsObjectsForCheckout(repo, "HEAD", {
+              cfg: app.cfg,
+              trustedRepoRoot: repo,
+              extraEnv: { HOME: lfsHome, XDG_CONFIG_HOME: path.join(lfsHome, ".config") },
+            }),
+          /预拉取.*失败|LFS/i,
+          "ensureGitLfsObjectsForCheckout 绝不得为 .lfsconfig 声明的本地路径开放宿主机只读挂载",
+        );
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 5) [R29 #4 P1 + #7 P2 + #8 P2] Git HTTP 凭据隔离：
+    //    - #4: global include 指向检出目录内的 helper 绝不在宿主机 shell 执行，仅留在沙箱内执行；
+    //    - #7: password-only 全局 helper + username-only 仓库本地 helper 原序保留部分凭据；
+    //    - #8: 无易失 tmpfs 时含密凭据投影必须拒绝写入磁盘临时目录。
+    {
+      const { app } = makeR29App("r29-git-cred");
+      try {
+        const receivedAuth: string[] = [];
+        const gitServer = http.createServer((req, res) => {
+          const auth = req.headers.authorization ?? "";
+          if (!auth.startsWith("Basic ")) {
+            res.writeHead(401, { "WWW-Authenticate": 'Basic realm="r29"' });
+            res.end("auth required");
+            return;
+          }
+          const decoded = Buffer.from(auth.slice(6), "base64").toString("utf8");
+          receivedAuth.push(decoded);
+          if (decoded !== "r29_local_user:r29_partial_pw" && decoded !== "r29_inc_user:r29_inc_pw") {
+            res.writeHead(401, { "WWW-Authenticate": 'Basic realm="r29"' });
+            res.end("wrong creds");
+            return;
+          }
+          const pkt = (s: string) => `${(s.length + 4).toString(16).padStart(4, "0")}${s}`;
+          const body = `${pkt("# service=git-upload-pack\n")}00000000`;
+          res.writeHead(200, { "Content-Type": "application/x-git-upload-pack-advertisement" });
+          res.end(body);
+        });
+        await new Promise<void>((resolve) => gitServer.listen(0, "127.0.0.1", resolve));
+        serversToClose.push(gitServer);
+        const port = (gitServer.address() as net.AddressInfo).port;
+        const remoteUrl = `http://127.0.0.1:${port}/org/r29.git`;
+
+        // #4: global include 指向检出目录内的 helper（在宿主机外试图写 hostMarkerFile，同时返回凭据验证仍在沙箱内工作）
+        const repo4 = path.join(dir, "r29-4-repo");
+        fs.mkdirSync(repo4, { recursive: true });
+        await runHostGit(repo4, ["init", "-q", "-b", "main"]);
+        const hostMarker = path.join(dir, "r29-4-host-pwned.txt");
+        const evilHelper = path.join(repo4, "evil-helper.sh");
+        fs.writeFileSync(
+          evilHelper,
+          `#!/bin/sh\necho PWNED > '${hostMarker}' 2>/dev/null || true\nif [ "$1" = "get" ]; then\n  echo "username=r29_inc_user"\n  echo "password=r29_inc_pw"\nfi\n`,
+          { mode: 0o700 },
+        );
+        const includedCfg = path.join(repo4, "evil.gitconfig");
+        fs.writeFileSync(includedCfg, `[credential]\n\thelper = "!${evilHelper}"\n`, "utf8");
+        const globalCfg4 = path.join(dir, "r29-4-global.gitconfig");
+        fs.writeFileSync(globalCfg4, `[include]\n\tpath = ${includedCfg}\n`, "utf8");
+
+        const res4 = await tryGit(repo4, ["ls-remote", remoteUrl], {
+          cfg: app.cfg,
+          trustedRepoRoot: repo4,
+          extraEnv: { GIT_CONFIG_GLOBAL: globalCfg4, GIT_CONFIG_NOSYSTEM: "1" },
+        });
+        assert.equal(fs.existsSync(hostMarker), false, "global include 指向检出目录内的 helper 绝不得在宿主机 shell 执行");
+        if (resolveTrustedBwrapBin()) {
+          assert.equal(res4.code, 0, `被隔离到沙箱内的 included helper 仍应能为沙箱 Git 提供凭据：${res4.stderr}`);
+          assert.ok(receivedAuth.includes("r29_inc_user:r29_inc_pw"));
+        }
+
+        // #7: password-only 受信任全局 helper + username-only 仓库本地 helper 串联认证
+        const repo7 = path.join(dir, "r29-7-repo");
+        fs.mkdirSync(repo7, { recursive: true });
+        await runHostGit(repo7, ["init", "-q", "-b", "main"]);
+        const globalPwHelper = path.join(dir, "r29-7-global-pw.sh");
+        fs.writeFileSync(
+          globalPwHelper,
+          `#!/bin/sh\nif [ "$1" = "get" ]; then\n  echo "password=r29_partial_pw"\nfi\n`,
+          { mode: 0o700 },
+        );
+        const localUserHelper = path.join(repo7, "local-user.sh");
+        fs.writeFileSync(
+          localUserHelper,
+          `#!/bin/sh\nif [ "$1" = "get" ]; then\n  saw_pw=""\n  while IFS= read -r l; do\n    case "$l" in password=*) saw_pw="\${l#password=}" ;; esac\n  done\n  if [ "$saw_pw" = "r29_partial_pw" ]; then\n    echo "username=r29_local_user"\n  fi\nfi\n`,
+          { mode: 0o700 },
+        );
+        const globalCfg7 = path.join(dir, "r29-7-global.gitconfig");
+        fs.writeFileSync(globalCfg7, `[credential]\n\thelper = "!${globalPwHelper}"\n`, "utf8");
+        await runHostGit(repo7, ["config", "--local", "credential.helper", `!${localUserHelper}`]);
+
+        receivedAuth.length = 0;
+        const res7 = await tryGit(repo7, ["ls-remote", remoteUrl], {
+          cfg: app.cfg,
+          trustedRepoRoot: repo7,
+          extraEnv: { GIT_CONFIG_GLOBAL: globalCfg7, GIT_CONFIG_NOSYSTEM: "1" },
+        });
+        assert.equal(res7.code, 0, `password-only 全局 helper + username-only 本地 helper 必须协同认证成功：${res7.stderr}`);
+        assert.ok(
+          receivedAuth.includes("r29_local_user:r29_partial_pw"),
+          `服务端应收到跨 helper 组合出的完整凭据（实际=${JSON.stringify(receivedAuth)}）`,
+        );
+
+        // #8: 无易失 tmpfs 时，createScopedSecretDir(requireVolatile=true) 与含密 Git 凭据投影均必须拒绝落盘
+        const diskOnlyDir = path.join(dir, "r29-8-disk-only");
+        fs.mkdirSync(diskOnlyDir, { recursive: true });
+        assert.throws(
+          () => createScopedSecretDir("r29-8-secret-", process.env, { requireVolatile: true, tmpfsCandidates: [diskOnlyDir] }),
+          /易失内存|tmpfs|落盘/,
+          "requireVolatile=true 在仅有磁盘目录时必须拒绝创建目录",
+        );
+        assert.deepEqual(fs.readdirSync(diskOnlyDir), [], "拒绝落盘时不得在磁盘目录留下任何子目录或文件");
+
+        if (resolveTrustedBwrapBin()) {
+          await assert.rejects(
+            () =>
+              tryGit(repo7, ["ls-remote", remoteUrl], {
+                cfg: app.cfg,
+                trustedRepoRoot: repo7,
+                extraEnv: { GIT_CONFIG_GLOBAL: globalCfg7, GIT_CONFIG_NOSYSTEM: "1" },
+                volatileTmpfsCandidates: [diskOnlyDir],
+              }),
+            /易失内存|tmpfs|落盘/,
+            "无易失 tmpfs 时含密宿主机凭据投影必须拒绝回退到磁盘目录",
+          );
+          assert.deepEqual(fs.readdirSync(diskOnlyDir), [], "含密凭据投影被拒绝后磁盘目录必须保持完全空白");
+        }
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 6) [R29 #9 P2] 派单详情页遇到隔离 Git 探测异常时降级 diff_stat="" 并保留账本 report/steps，绝不返回 500 或回退非隔离 Git
+    {
+      const { app } = makeR29App("r29-dispatch-detail");
+      try {
+        const tamperedWorktree = path.join(dir, "r29-9-tampered-wt");
+        fs.mkdirSync(tamperedWorktree, { recursive: true });
+        fs.symlinkSync(path.join(dir, "nonexistent-gitdir"), path.join(tamperedWorktree, ".git"));
+        const workId = "dispatch:r29_detail_1:1";
+        app.ledger.enqueue({
+          id: workId,
+          kind: "dispatch",
+          ref: "r29_detail_1",
+          payload: {
+            guid: "r29_detail_1",
+            summary: "测试派单",
+            description: "普通描述",
+            cwd: tamperedWorktree,
+            branch: "feat/r29",
+            base: "main",
+            report: "已保存的完整派单报告",
+          },
+        });
+        const stepId = app.ledger.startStep({ work_id: workId, name: "plan", harness: "stub" });
+        app.ledger.endStep(stepId, "ok", "step output ok");
+
+        const detail = await Q.dispatchDetail(app, workId);
+        assert.ok(detail, "Git 探测失败时 dispatchDetail 仍须返回账本详情");
+        assert.equal(detail.report, "已保存的完整派单报告", "应完整保留账本 report");
+        assert.equal(detail.steps.length, 1, "应完整保留账本 steps");
+        assert.equal(detail.diff_stat, "", "隔离 Git 探测失败时 diff_stat 应安全降级为空字符串");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 7) [R29 #10 P2] pollLogin 对瞬态 503/429 做有界退避重试不丢弃有效二维码；对 403/取消立即中止
+    {
+      let pollMode: "transient_then_ok" | "deny_403" | "always_503" = "transient_then_ok";
+      let pollCalls = 0;
+      const qrServer = http.createServer((req, res) => {
+        const u = new URL(req.url ?? "/", "http://127.0.0.1");
+        if (u.pathname === "/poll") {
+          pollCalls++;
+          if (pollMode === "deny_403") {
+            res.writeHead(403, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ code: 403 }));
+            return;
+          }
+          if (pollMode === "always_503") {
+            res.writeHead(503, { "Content-Type": "text/plain" });
+            res.end("service unavailable");
+            return;
+          }
+          if (pollCalls === 1) {
+            res.writeHead(503, { "Content-Type": "text/plain" });
+            res.end("temporary 503");
+            return;
+          }
+          if (pollCalls === 2) {
+            res.writeHead(429, { "Content-Type": "text/plain", "Retry-After": "0" });
+            res.end("rate limited");
+            return;
+          }
+          if (pollCalls === 3) {
+            res.writeHead(200, { "Content-Type": "application/json", "x-flow-key": "flow_r29_2" });
+            res.end(JSON.stringify({ code: 0, data: { next_step: "qr_login_polling", step_info: { status: 2 } } }));
+            return;
+          }
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Set-Cookie": "session=r29_poll_ok; Path=/; HttpOnly",
+          });
+          res.end(
+            JSON.stringify({
+              code: 0,
+              data: { next_step: "enter_app", step_info: { status: 0, front_user_id: "7009" } },
+            }),
+          );
+          return;
+        }
+        if (u.pathname === "/user") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ code: 0, data: { user: { id: "7009", name: "扫码重试用户", open_id: "ou_7009" } } }));
+          return;
+        }
+        if (u.pathname === "/meta") {
+          res.writeHead(200, {
+            "Content-Type": "text/html",
+            "Set-Cookie": "passport_web_did=did_r29; Path=/",
+          });
+          res.end('<html><head><title>Lark</title></head><body><script>window.__APP__={appKey:"r29_app_key_123"};</script></body></html>');
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+      await new Promise<void>((resolve) => qrServer.listen(0, "127.0.0.1", resolve));
+      serversToClose.push(qrServer);
+      const qPort = (qrServer.address() as net.AddressInfo).port;
+      const base = `http://127.0.0.1:${qPort}`;
+      const ep: Partial<WebEndpoints> = {
+        qrPollUrl: `${base}/poll`,
+        profileUrl: `${base}/user`,
+        messengerUrl: `${base}/meta`,
+        accountsOrigin: base,
+        accountsReferer: `${base}/`,
+        messengerOrigin: base,
+        allowInsecureHttp: true,
+        extraAllowedHosts: ["127.0.0.1"],
+      };
+      const mkChallenge = (ttlMs = 10_000) => ({
+        flowKey: "flow_r29_1",
+        proxyUnit: "",
+        webId: "did_r29",
+        qrCode: "qr_r29",
+        createdAtMs: Date.now(),
+        expiresAtMs: Date.now() + ttlMs,
+        cookies: [],
+      });
+
+      // 7a: 503 -> 429 -> scanned -> approved 顺利完成，不丢弃有效挑战
+      pollMode = "transient_then_ok";
+      pollCalls = 0;
+      const progress: string[] = [];
+      const login = await pollLogin(mkChallenge(), {
+        endpoints: ep,
+        pollIntervalMs: 10,
+        onProgress: (s) => progress.push(s),
+      });
+      assert.equal(pollCalls, 4, "应经历 503、429 重试并完成扫码与确认");
+      assert.deepEqual(progress, ["scanned", "approved"]);
+      assert.equal(login.owner_id, "7009");
+
+      // 7b: 明确 403 拒绝必须首次立刻中止，不重试
+      pollMode = "deny_403";
+      pollCalls = 0;
+      await assert.rejects(
+        () => pollLogin(mkChallenge(), { endpoints: ep, pollIntervalMs: 10 }),
+        (err: unknown) => err instanceof WebHttpError && err.code === "credential_denied" && err.status === 403,
+        "HTTP 403 必须作为明确拒绝立即失败",
+      );
+      assert.equal(pollCalls, 1, "HTTP 403 绝不得重试");
+
+      // 7c: 持续 503 期间收到 AbortSignal 必须立即取消
+      pollMode = "always_503";
+      pollCalls = 0;
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 35);
+      await assert.rejects(
+        () => pollLogin(mkChallenge(30_000), { endpoints: ep, pollIntervalMs: 25, signal: ac.signal }),
+        (err: unknown) => err instanceof WebHttpError && err.code === "aborted",
+        "瞬态重试退避期间取消必须立即抛出 aborted",
+      );
     }
   } finally {
     if (prevPwKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;

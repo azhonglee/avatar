@@ -388,6 +388,11 @@ export async function pollLogin(
     }
   };
 
+  let transientFailures = 0;
+  const maxTransientBackoffMs = Math.max(pollIntervalMs, 15_000);
+  const isTransientStatus = (status: number): boolean =>
+    status === 408 || status === 429 || (status >= 500 && status <= 599);
+
   while (true) {
     if (opts.signal?.aborted) {
       throw new WebHttpError("aborted", "扫码登录已取消");
@@ -396,18 +401,56 @@ export async function pollLogin(
       throw new WebHttpError("credential_denied", "登录二维码已过期，请重新执行扫码");
     }
 
-    const res = await fetchWithJar(jar, {
-      method: "POST",
-      url: ep.qrPollUrl,
-      headers: authHeaders(ep, challenge),
-      body: "{}",
-      signal: opts.signal,
-      allowInsecureHttp: ep.allowInsecureHttp,
-      extraAllowedHosts: ep.extraAllowedHosts,
-    });
+    let res: Awaited<ReturnType<typeof fetchWithJar>>;
+    try {
+      res = await fetchWithJar(jar, {
+        method: "POST",
+        url: ep.qrPollUrl,
+        headers: authHeaders(ep, challenge),
+        body: "{}",
+        signal: opts.signal,
+        allowInsecureHttp: ep.allowInsecureHttp,
+        extraAllowedHosts: ep.extraAllowedHosts,
+      });
+    } catch (err) {
+      if (opts.signal?.aborted) {
+        throw new WebHttpError("aborted", "扫码登录已取消");
+      }
+      if (err instanceof WebHttpError && err.code === "transport") {
+        transientFailures++;
+        const remaining = challenge.expiresAtMs - Date.now();
+        if (remaining <= 0) {
+          throw new WebHttpError("credential_denied", "登录二维码已过期，请重新执行扫码");
+        }
+        const delayMs = Math.min(pollIntervalMs * 2 ** Math.min(transientFailures - 1, 4), maxTransientBackoffMs);
+        await sleep(Math.min(delayMs, remaining), opts.signal);
+        continue;
+      }
+      throw err;
+    }
+
+    if (res.status === 401 || res.status === 403) {
+      throw new WebHttpError("credential_denied", `扫码轮询被拒绝 (HTTP ${res.status})`, res.status);
+    }
+    if (isTransientStatus(res.status)) {
+      transientFailures++;
+      const remaining = challenge.expiresAtMs - Date.now();
+      if (remaining <= 0) {
+        throw new WebHttpError("credential_denied", "登录二维码已过期，请重新执行扫码");
+      }
+      const retryAfterSec = Number(getHeader(res.headers, "retry-after").trim());
+      const baseDelayMs = Math.min(pollIntervalMs * 2 ** Math.min(transientFailures - 1, 4), maxTransientBackoffMs);
+      const delayMs =
+        Number.isFinite(retryAfterSec) && retryAfterSec > 0
+          ? Math.min(Math.max(baseDelayMs, retryAfterSec * 1000), maxTransientBackoffMs)
+          : baseDelayMs;
+      await sleep(Math.min(delayMs, remaining), opts.signal);
+      continue;
+    }
     if (res.status !== 200) {
       throw new WebHttpError("http_error", `扫码轮询被拒绝 (HTTP ${res.status})`, res.status);
     }
+    transientFailures = 0;
     const decision = decodeLoginPoll(res.body);
     if (!decision.unreadable) {
       const nextFlow = getHeader(res.headers, "x-flow-key").trim();

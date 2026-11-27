@@ -14,7 +14,7 @@ import { deepFind, errMsg, log, truncate } from "../util.ts";
 import { draftCard, eveningCard, itemCard, KIND_LABEL, morningCard, type CtxRenderCtx } from "./cards.ts";
 import { Connectors, relinkMeegoItems } from "./connectors.ts";
 import { defaultDraftKind, Drafter, DraftTargetIneligibleError, DraftTargetUncertainError } from "./drafts.ts";
-import { hasWorkspaceOwnerMismatch, PersonalWebBridge, type FastAnchor } from "./personal-web.ts";
+import { PersonalWebBridge, type FastAnchor } from "./personal-web.ts";
 import { ContextStore, obsRevision, type ItemRow } from "./store.ts";
 import { splitProject, Understander, UnderstandParseError, type SplitResult } from "./understand.ts";
 import { ContextViews, startOfDay } from "./views.ts";
@@ -59,6 +59,7 @@ export class ContextService {
       this.store,
       () => this.personalWeb.resolveNativeExclusionsForPolling(),
       () => this.personalWeb.syncDiskPrivacyConfig({ throwOnError: false }),
+      () => this.personalWeb.effectiveDiskOwnerOpenId(),
     );
     this.understander = new Understander(app, this.store);
     this.views = new ContextViews(app, this.store);
@@ -111,7 +112,7 @@ export class ContextService {
   }
 
   isWorkspaceOwnerMismatched(): boolean {
-    return hasWorkspaceOwnerMismatch(this.app.store, this.cfg.owner.open_id);
+    return this.personalWeb.isWorkspaceOwnerMismatched();
   }
 
   assertWorkspaceOwnerMatches(): void {
@@ -1158,7 +1159,9 @@ export function registerContext(app: App): ContextService | undefined {
   app.effectHooks.pwReply = async (args) => {
     await svc.personalWeb.sendVerifiedReply(args);
   };
-  app.effectHooks.shouldDeferPwReply = (cid) => svc.personalWeb.shouldDeferReplyToCredentialedConsumer(cid);
+  app.effectHooks.shouldDeferPwReply = (cid, isDaemon) =>
+    svc.personalWeb.shouldDeferReplyToCredentialedConsumer(cid, isDaemon);
+  app.effectHooks.isContextOwnerMismatched = () => svc.isWorkspaceOwnerMismatched();
   bus.on("effect.settled", (e) => {
     if (e.ref.startsWith("ctx-draft:")) svc.syncDraft(e.ref.slice("ctx-draft:".length));
   });
@@ -1466,7 +1469,7 @@ export function registerContext(app: App): ContextService | undefined {
     people: () => (svc.assertWorkspaceOwnerMatches(), svc.views.people()),
     conflicts: (status) => (svc.assertWorkspaceOwnerMatches(), svc.store.conflicts(status).map((c) => svc.views.conflictView(c))),
     drafts: (status) => (svc.assertWorkspaceOwnerMatches(), svc.syncDrafts(), svc.store).drafts(status ? { status: status.split(",") as never } : {}).map((d) => svc.views.draftView(d)),
-    status: () => svc.views.status(svc.running, svc.personalWeb.status()),
+    status: () => svc.views.status(svc.running, svc.personalWeb.status(), svc.isWorkspaceOwnerMismatched()),
     start: () => svc.start(),
     refresh: () => void svc.enqueue(`cycle:hint-${Math.floor(Date.now() / 60_000)}`, { task: "cycle" }),
     runOnce: () => (svc.assertWorkspaceOwnerMatches(), svc.runOnce()),

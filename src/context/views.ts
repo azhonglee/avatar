@@ -269,9 +269,9 @@ export class ContextViews {
     return { ...this.itemView(it), evidence: this.evidence("item", id, 20), drafts: this.store.drafts({ item_id: id }).map((d) => this.draftView(d)), actions };
   }
 
-  status(running: boolean, personalWeb?: CtxPersonalWebStatus): CtxStatus {
+  status(running: boolean, personalWeb?: CtxPersonalWebStatus, ownerMismatchOverride?: boolean): CtxStatus {
     const kv = this.app.store;
-    const ownerMismatch = hasWorkspaceOwnerMismatch(kv, this.app.cfg.owner.open_id);
+    const ownerMismatch = ownerMismatchOverride ?? hasWorkspaceOwnerMismatch(kv, this.app.cfg.owner.open_id);
     const sources = ["meego", "tasks", "im", "minutes", "calendar", "docs"].map((s) => {
       const r = JSON.parse(kv.get(`ctx.source.${s}`) ?? "null") as { at?: number; count?: number; error?: string } | null;
       return { source: s, last_pull: r?.at ?? null, last_count: r?.count ?? 0, error: ownerMismatch ? "" : r?.error ?? "" };

@@ -9,6 +9,7 @@ import { repoSpec } from "../config.ts";
 import { hasWorkspaceOwnerMismatch } from "../context/personal-web.ts";
 import { availableActions } from "../core-commands.ts";
 import type { Effect, WorkItem } from "../ledger.ts";
+import { errMsg, log } from "../util.ts";
 import { parseRepo, type DispatchPayload } from "../workflows/dispatch.ts";
 import type {
   AuditView,
@@ -631,7 +632,14 @@ export async function dispatchDetail(app: App, id: string): Promise<DispatchDeta
   const latest = app.ledger.latest("dispatch", w.ref);
   let diffStat = "";
   if (p.base && p.cwd && fs.existsSync(p.cwd)) {
-    diffStat = (await tryGit(p.cwd, ["diff", "--stat", p.base], { cfg: app.cfg, readOnly: true, ...dispatchRepoGuard(app, p) })).stdout.trim();
+    try {
+      diffStat = (
+        await tryGit(p.cwd, ["diff", "--stat", p.base], { cfg: app.cfg, readOnly: true, ...dispatchRepoGuard(app, p) })
+      ).stdout.trim();
+    } catch (err) {
+      log("warn", "读取派单 diffStat 失败（保留账本详情，绝不回退非隔离 Git）", { id, err: errMsg(err) });
+      diffStat = "";
+    }
   }
   return {
     ...s,

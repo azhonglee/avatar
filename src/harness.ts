@@ -12,6 +12,7 @@ import { errMsg, log, runProcess } from "./util.ts";
 const FEISHU_WEB_KEY_CRED = "feishu-web-key";
 /** Linux kernel tmpfs magic number (`linux/magic.h`: `TMPFS_MAGIC`). */
 const LINUX_TMPFS_MAGIC = 0x01021994;
+const LINUX_RAMFS_MAGIC = 0x858458f6;
 
 export type MountMaskBackend =
   | { kind: "bwrap"; bin: string }
@@ -5571,29 +5572,46 @@ export function wrapCredentialIsolatedCommand(
   );
 }
 
-/** 检测目录是否位于易失性内存文件系统（tmpfs），绝不把无关 systemd 凭据复制到磁盘介质的 /tmp */
+/** 检测目录是否位于易失性内存文件系统（tmpfs/ramfs），绝不把宿主机密钥或凭据明文写入磁盘介质的持久化目录 */
 function findVolatileTmpfsBase(env: NodeJS.ProcessEnv, overrideCandidates?: string[]): string | undefined {
-  const candidates = (overrideCandidates ?? [env.XDG_RUNTIME_DIR?.trim(), "/dev/shm"]).filter((d): d is string => !!d);
+  const candidates = (overrideCandidates ?? [env.XDG_RUNTIME_DIR?.trim(), "/dev/shm", os.tmpdir()]).filter(
+    (d): d is string => !!d,
+  );
+  const seen = new Set<string>();
   for (const dir of candidates) {
+    if (seen.has(dir)) continue;
+    seen.add(dir);
     try {
       const st = fs.statfsSync(dir);
-      if (st.type === LINUX_TMPFS_MAGIC) {
+      if (st.type === LINUX_TMPFS_MAGIC || st.type === LINUX_RAMFS_MAGIC) {
         fs.accessSync(dir, fs.constants.W_OK | fs.constants.X_OK);
         return dir;
       }
     } catch {
-      // 跳过不可访问或非 tmpfs 目录
+      // 跳过不可访问或非 tmpfs/ramfs 目录
     }
   }
   return undefined;
 }
 
-/** 创建 0700 临时凭据投影目录（优先放入易失 tmpfs，不可用时回退 os.tmpdir()），并注册进程退出兜底清理 */
+/**
+ * 创建 0700 临时凭据投影目录（优先放入易失 tmpfs/ramfs），并注册进程退出兜底清理：
+ *   - 当 `opts.requireVolatile === true`（含宿主机钥匙串/令牌等明文凭据投影）时，严禁回退至可能落盘的持久化 `os.tmpdir()`，
+ *     无可用内存盘时直接 fail-closed 抛错，防止进程异常中止或断电后明文凭据残留磁盘。
+ */
 export function createScopedSecretDir(
   prefix: string,
   env: NodeJS.ProcessEnv = process.env,
-): { dir: string; cleanup: () => void } {
-  const base = findVolatileTmpfsBase(env) ?? os.tmpdir();
+  opts?: { requireVolatile?: boolean; tmpfsCandidates?: string[] },
+): { dir: string; volatile: boolean; cleanup: () => void } {
+  const volatileBase = findVolatileTmpfsBase(env, opts?.tmpfsCandidates);
+  if (opts?.requireVolatile && !volatileBase) {
+    throw new Error(
+      "当前宿主机缺少可写的易失内存临时目录（tmpfs/ramfs，如 XDG_RUNTIME_DIR 或 /dev/shm），" +
+        "为防止宿主机钥匙串/令牌明文落盘至持久化文件系统，已拒绝暂存明文凭据",
+    );
+  }
+  const base = volatileBase ?? os.tmpdir();
   const dir = safeRealpath(fs.mkdtempSync(path.join(base, prefix)));
   fs.chmodSync(dir, 0o700);
   let cleaned = false;
@@ -5608,7 +5626,7 @@ export function createScopedSecretDir(
     }
   };
   process.once("exit", cleanup);
-  return { dir, cleanup };
+  return { dir, volatile: !!volatileBase, cleanup };
 }
 
 /**
@@ -6381,7 +6399,9 @@ export function stageIsolatedAwsProfile(
 
   if (selectedConfig.length === 0 && selectedCreds.length === 0) return undefined;
 
-  const scoped = createScopedSecretDir("pa-aws-profile-", hostEnv);
+  const scoped = createScopedSecretDir("pa-aws-profile-", hostEnv, {
+    requireVolatile: selectedCreds.length > 0 || needsSsoCache,
+  });
   const configFile = path.join(scoped.dir, "config");
   const credentialsFile = path.join(scoped.dir, "credentials");
   const bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[] = [];

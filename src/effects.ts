@@ -27,15 +27,17 @@ export interface EffectHooks {
   pwReply?: (args: { owner_id: string; chat_id: string; message_id: string; root_id?: string; text: string; cid: string }) => Promise<void>;
   /** 判断当前进程是否正以常驻模式运行（`pa run`）；单次 CLI 返回 false */
   isDaemonRunning?: () => boolean;
-  /** 判断非持钥单次 CLI 是否应将 `pw.reply` 留给持钥常驻进程执行，避免无密钥进程误领并消耗重试次数 */
-  shouldDeferPwReply?: (cid?: string) => boolean;
+  /** 判断当前消费者（含常驻进程与单次 CLI）是否因缺少凭据而应让出未回读的 `pw.reply`，避免无密钥进程误领并消耗重试次数 */
+  shouldDeferPwReply?: (cid?: string, isDaemon?: boolean) => boolean;
+  /** 检查上下文模块是否已检测到磁盘 config.yaml 主人变更或绑定冲突（不改写共享 cfg.owner.open_id） */
+  isContextOwnerMismatched?: () => boolean;
 }
 
 export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: Lark, store: Store, hooks: EffectHooks = {}): Handler<Effect> {
   const shouldReservePwReply = (cid?: string): boolean => {
-    if (hooks.isDaemonRunning?.()) return false;
-    if (hooks.shouldDeferPwReply) return hooks.shouldDeferPwReply(cid);
-    return !hooks.pwReply && isLiveDaemonHeartbeat(store);
+    const isDaemon = !!hooks.isDaemonRunning?.();
+    if (hooks.shouldDeferPwReply) return hooks.shouldDeferPwReply(cid, isDaemon);
+    return !hooks.pwReply && !isDaemon && isLiveDaemonHeartbeat(store);
   };
   return {
     kind: "effect",
@@ -72,7 +74,7 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
         (item.ref.startsWith("context:") && item.ref !== "context:pw-needs-login") ||
         e.op === "pw.reply" ||
         (e.op === "card.upsert" && e.args.key.startsWith("ctx-"));
-      if (isContextEffect && hasWorkspaceOwnerMismatch(store, cfg.owner.open_id)) {
+      if (isContextEffect && (hasWorkspaceOwnerMismatch(store, cfg.owner.open_id) || hooks.isContextOwnerMismatched?.())) {
         throw new Error("当前工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已阻断上下文通知与外部动作投递以防跨账号泄漏");
       }
       // 归属旧主人的上下文委派派单卡片（card:dispatch:<guid>）、失败告警卡片（failure:<workId>）及任务操作，同样严格按主人隔离

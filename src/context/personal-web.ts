@@ -286,6 +286,7 @@ export function revokeWorkspacePersonalWebSession(app: App): {
 export function assertLoginAuthorizedForWorkspace(
   app: Pick<App, "cfg" | "store">,
   login: WebLogin,
+  diskOwnerOpenId?: string,
 ): void {
   const revokedAt = (app.store.get(REVOKED_AT_KV_KEY) ?? "").trim();
   if (revokedAt) {
@@ -316,10 +317,12 @@ export function assertLoginAuthorizedForWorkspace(
     );
   }
   const cfgWs = app.cfg.owner.open_id.trim();
+  const diskWs = (diskOwnerOpenId ?? cfgWs).trim();
   const boundWs = (app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
-  if (cfgWs !== boundWs) {
+  if (cfgWs !== boundWs || diskWs !== boundWs || diskWs !== cfgWs) {
+    const shownOwner = diskWs !== cfgWs ? diskWs : cfgWs;
     throw new SessionNeedsLoginError(
-      `当前 config.yaml 配置的主人 (${cfgWs || "未配置"}) 与个人 Web 凭据已绑定的工作区主人 (${boundWs || "未绑定"}) 不一致；为防私聊泄漏给错误主人，已中止启动，请清理数据目录或重新扫码绑定`,
+      `当前 config.yaml 配置的主人 (${shownOwner || "未配置"}) 与个人 Web 凭据已绑定的工作区主人 (${boundWs || "未绑定"}) 不一致；为防私聊泄漏给错误主人，已中止启动，请切回原主人、清理数据目录或重新扫码绑定`,
     );
   }
 }
@@ -495,6 +498,7 @@ export class PersonalWebBridge {
   private readonly hadInitialCfgFile: boolean;
   private lastSyncedCfgRaw: string | undefined;
   private diskPolicyError = "";
+  private diskOwnerOpenId: string | undefined;
   private diskPersonalWebVeto = false;
   private lifecycleStarted = false;
   private state: PersistedState;
@@ -580,9 +584,11 @@ export class PersonalWebBridge {
         }
       }
 
-      // 与 createApp 保持完全一致：磁盘 owner.open_id 留空时回退至 pa init 写入 SQLite 的 owner.open_id
+      // 与 createApp 保持完全一致：磁盘 owner.open_id 留空时回退至 pa init 写入 SQLite 的 owner.open_id；
+      // 严禁在热刷新时改写共享 app.cfg.owner.open_id（owner 属于需重启生效的冷配置，修改共享字段会导致在途 BotAgent 回复错发给新主人），
+      // 仅记录在独立的 diskOwnerOpenId 供上下文访问/采集/监听拦截使用。
       const resolvedOwner = nextCfg.owner.open_id.trim() || (this.app.store.get("owner.open_id") ?? "").trim();
-      this.cfg.owner.open_id = resolvedOwner;
+      this.diskOwnerOpenId = resolvedOwner;
       this.cfg.context.groups = nextCfg.context.groups;
       this.cfg.context.groups_allow = nextCfg.context.groups_allow;
       this.cfg.context.groups_deny = nextCfg.context.groups_deny;
@@ -621,10 +627,29 @@ export class PersonalWebBridge {
     return !this.syncDiskPrivacyConfig({ throwOnError: false });
   }
 
+  /** 返回磁盘 config.yaml（若已热重载）或启动期配置的 owner.open_id，绝不改写共享 app.cfg.owner.open_id */
+  effectiveDiskOwnerOpenId(): string {
+    this.syncDiskPrivacyConfig({ throwOnError: false });
+    return (this.diskOwnerOpenId ?? this.cfg.owner.open_id).trim();
+  }
+
   /**
-   * 当前工作区是否存在有效且与 config.owner.open_id 一致的个人 Web 账号绑定：
+   * 校验当前工作区主人是否与磁盘最新 config.yaml 及已绑定的个人 Web 工作区主人一致：
+   *   - 先同步刷新磁盘 config.yaml（不改写共享 app.cfg.owner.open_id）；
+   *   - 只要磁盘 owner.open_id 偏离启动期 owner.open_id，或任一者与已绑定的工作区主人冲突，均立刻返回 true 阻断上下文读取/写入/投递。
+   */
+  isWorkspaceOwnerMismatched(): boolean {
+    this.syncDiskPrivacyConfig({ throwOnError: false });
+    const runtimeOwner = this.cfg.owner.open_id.trim();
+    const diskOwner = (this.diskOwnerOpenId ?? runtimeOwner).trim();
+    if (diskOwner !== runtimeOwner) return true;
+    return hasWorkspaceOwnerMismatch(this.app.store, runtimeOwner) || hasWorkspaceOwnerMismatch(this.app.store, diskOwner);
+  }
+
+  /**
+   * 当前工作区是否存在有效且与启动期及磁盘 config.owner.open_id 一致的个人 Web 账号绑定：
    *   - 必须已由 web-login 显式写入 BOUND_OWNER_KV_KEY；
-   *   - 且 BOUND_WORKSPACE_OWNER_KV_KEY 必须与当前 config.yaml 中的 owner.open_id 完全一致。
+   *   - 且 BOUND_WORKSPACE_OWNER_KV_KEY 必须与启动期及磁盘 config.yaml 中的 owner.open_id 完全一致。
    * 绑定缺失或工作区主人变更时返回 null（调用方必须彻底拦截全部 pw:* 观测，绝不退化为无过滤）。
    */
   activeBoundNativeOwner(): string | null {
@@ -632,8 +657,9 @@ export class PersonalWebBridge {
     const boundNative = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
     if (!boundNative) return null;
     const cfgWs = this.cfg.owner.open_id.trim();
+    const diskWs = (this.diskOwnerOpenId ?? cfgWs).trim();
     const boundWs = (this.app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
-    if (cfgWs !== boundWs) return null;
+    if (cfgWs !== boundWs || diskWs !== boundWs || diskWs !== cfgWs) return null;
     return boundNative;
   }
 
@@ -673,6 +699,7 @@ export class PersonalWebBridge {
       bound,
       boundWs,
       this.cfg.owner.open_id.trim(),
+      (this.diskOwnerOpenId ?? this.cfg.owner.open_id).trim(),
     ]);
   }
 
@@ -702,20 +729,27 @@ export class PersonalWebBridge {
   }
 
   /**
-   * 判断非常驻进程（如交互式 `pa brief` / `pa job` / `pa dispatch`）是否应将 `pw.reply` 留给持钥常驻进程执行：
-   *   - 若该回复已完成 `verified` 投递，无需凭据即可幂等完结，返回 false；
-   *   - 若本进程已有在线 Web 客户端或能直接解密本地凭据，返回 false（可本地执行）；
-   *   - 若本地缺少解密密钥（`missing_key`）或默认路径缺失文件但常驻进程在线（`missing` + 活跃心跳），
-   *     返回 true，避免无密钥的交互式命令误领并消耗重试次数。
+   * 判断当前消费者（无论是常驻 `pa run` 还是交互式 CLI）是否应将未完成的 `pw.reply` 留给持钥消费者执行：
+   *   - 若该回复已完成 `verified` 投递，无需凭据即可幂等完结，返回 false（常驻进程与 CLI 均可无密钥收尾）；
+   *   - 若本进程已有在线 Web 客户端或能直接解密本地凭据（`ok`），返回 false（可本地执行）；
+   *   - 若本进程缺少解密密钥（`missing_key`），无论是否常驻进程均返回 true，避免消耗已确认回复的重试次数；
+   *   - 若本地默认路径无凭据文件（`missing`）且工作区未手动登出（未吊销）：
+   *     交互式 CLI 在常驻进程在线时让出；常驻进程在工作区已绑定（可能采用外部 PA_FEISHU_WEB_CRED_FILE）时同样让出。
    */
-  shouldDeferReplyToCredentialedConsumer(cid?: string): boolean {
+  shouldDeferReplyToCredentialedConsumer(cid?: string, isDaemon = false): boolean {
     if (cid && this.loadDelivery(cid)?.state === "verified") return false;
     if (this.client) return false;
     this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
     const inspected = this.loginStore.inspect();
     if (inspected.status === "ok") return false;
     if (inspected.status === "missing_key") return true;
-    if (inspected.status === "missing" && isLiveDaemonHeartbeat(this.app.store)) return true;
+    if (inspected.status === "missing") {
+      const revoked = !!(this.app.store.get(REVOKED_AT_KV_KEY) ?? "").trim();
+      if (!revoked) {
+        if (!isDaemon && isLiveDaemonHeartbeat(this.app.store)) return true;
+        if (isDaemon && !!(this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim()) return true;
+      }
+    }
     return false;
   }
 
@@ -735,13 +769,14 @@ export class PersonalWebBridge {
     const boundNative = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
     const boundWs = (this.app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
     const cfgWs = this.cfg.owner.open_id.trim();
-    const ownerMismatch = hasWorkspaceOwnerMismatch(this.app.store, cfgWs);
+    const diskWs = (this.diskOwnerOpenId ?? cfgWs).trim();
+    const ownerMismatch = this.isWorkspaceOwnerMismatched();
 
     let loginAuthorized = false;
     let loginAuthErr = "";
     if (login) {
       try {
-        assertLoginAuthorizedForWorkspace(this.app, login);
+        assertLoginAuthorizedForWorkspace(this.app, login, diskWs);
         loginAuthorized = true;
       } catch (err) {
         loginAuthErr = errMsg(err);
@@ -753,7 +788,7 @@ export class PersonalWebBridge {
     const savedOwnerMatches =
       !!saved.owner_id &&
       (!boundNative || saved.owner_id === boundNative) &&
-      (!boundWs || boundWs === cfgWs) &&
+      (!boundWs || (boundWs === cfgWs && boundWs === diskWs)) &&
       !ownerMismatch;
 
     // 若交互式 shell 未注入 systemd 凭据密钥（missing_key）或使用默认路径找不到 systemd 的自定义凭据文件（missing），
@@ -847,16 +882,20 @@ export class PersonalWebBridge {
   }
 
   private validateBoundOwner(login: WebLogin): void {
-    assertLoginAuthorizedForWorkspace(this.app, login);
+    this.syncDiskPrivacyConfig({ throwOnError: false });
+    assertLoginAuthorizedForWorkspace(this.app, login, this.effectiveDiskOwnerOpenId());
   }
 
-  /** 失败休眠后的唤醒键：结构化 JSON 编码，包含 cookie_version、updated_at、吊销状态与当前活跃会话代际（与活跃长连接的 sessionKeyOf 分离） */
+  /** 失败休眠后的唤醒键：结构化 JSON 编码，包含 cookie_version、updated_at、吊销状态、活跃会话代际以及运行期/磁盘最新 owner.open_id（与活跃长连接的 sessionKeyOf 分离） */
   private credentialWatchKey(login: WebLogin | undefined): string {
+    this.syncDiskPrivacyConfig({ throwOnError: false });
     const bound = this.app.store.get(BOUND_OWNER_KV_KEY) ?? "";
     const boundWs = this.app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "";
     const revoked = this.app.store.get(REVOKED_AT_KV_KEY) ?? "";
     const active = this.app.store.get(ACTIVE_SESSION_KV_KEY) ?? "";
-    if (!login) return JSON.stringify(["none", bound, boundWs, revoked, active]);
+    const cfgWs = this.cfg.owner.open_id.trim();
+    const diskWs = (this.diskOwnerOpenId ?? cfgWs).trim();
+    if (!login) return JSON.stringify(["none", bound, boundWs, revoked, active, cfgWs, diskWs]);
     return JSON.stringify([
       login.owner_id,
       login.session_id ?? "",
@@ -866,6 +905,8 @@ export class PersonalWebBridge {
       boundWs,
       revoked,
       active,
+      cfgWs,
+      diskWs,
     ]);
   }
 
@@ -1858,7 +1899,7 @@ export class PersonalWebBridge {
       if (activeSession && (capturedSessionId || activeClient) && capturedSessionId !== activeSession) {
         throw new WebHttpError("aborted", "个人 Web 会话已被更新的登录取代，放弃修改本地观测");
       }
-      if (hasWorkspaceOwnerMismatch(this.app.store, this.cfg.owner.open_id)) {
+      if (this.isWorkspaceOwnerMismatched()) {
         throw new WebHttpError("aborted", "工作区主人已变更，放弃修改本地观测");
       }
       const boundNative = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
@@ -2094,7 +2135,7 @@ export class PersonalWebBridge {
       if (activeSession && (capturedSessionId || activeClient) && capturedSessionId !== activeSession) {
         throw new WebHttpError("aborted", "个人 Web 会话已被更新的登录取代，放弃提交推送观测");
       }
-      if (hasWorkspaceOwnerMismatch(this.app.store, this.cfg.owner.open_id)) {
+      if (this.isWorkspaceOwnerMismatched()) {
         throw new WebHttpError("aborted", "工作区主人已变更，放弃提交推送观测");
       }
       const boundNative = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
@@ -2391,6 +2432,7 @@ export class PersonalWebBridge {
       const checkHydrateFinalSync = (): boolean => {
         if (signal?.aborted) return false;
         if (!this.syncDiskPrivacyConfig({ throwOnError: false })) return false;
+        if (this.isWorkspaceOwnerMismatched()) return false;
         if (!sessionStillValid()) return false;
         if (!this.cfg.context.sources.im || !this.isEffectivePersonalWebEnabled()) return false;
         if (this.store.isConvMutedById(conv) || this.store.isConvMutedById(primary.conversationId)) return false;
@@ -2543,6 +2585,9 @@ export class PersonalWebBridge {
         throw new Error(`配置文件 ${cfgFile} 不存在或无法读取，无法核验 context.personal_web.send_replies 开关，按安全原则中止发送`);
       }
       this.syncDiskPrivacyConfig({ throwOnError: true });
+      if (this.isWorkspaceOwnerMismatched()) {
+        throw new Error("检测到配置文件 owner.open_id 已变更或与已绑定主人不一致，已中止发送");
+      }
       if (!this.cfg.context.personal_web.send_replies) {
         throw new Error("检测到配置文件已关闭 context.personal_web.send_replies，已中止发送");
       }

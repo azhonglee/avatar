@@ -295,16 +295,19 @@ export class Connectors {
   store: ContextStore;
   nativeExclusions?: () => Promise<NativePollingExclusions>;
   syncDiskPolicy?: () => boolean;
+  getDiskOwnerOpenId?: () => string;
   constructor(
     app: App,
     store: ContextStore,
     nativeExclusions?: () => Promise<NativePollingExclusions>,
     syncDiskPolicy?: () => boolean,
+    getDiskOwnerOpenId?: () => string,
   ) {
     this.app = app;
     this.store = store;
     this.nativeExclusions = nativeExclusions;
     this.syncDiskPolicy = syncDiskPolicy;
+    this.getDiskOwnerOpenId = getDiskOwnerOpenId;
   }
 
   private get cfg() {
@@ -341,10 +344,11 @@ export class Connectors {
       throw new Error(`磁盘隐私配置无法核验，已中止${actionLabel}`);
     }
     const currentOwner = this.cfg.owner.open_id.trim();
-    if (currentOwner !== pinnedOwnerOpenId) {
+    const diskOwner = this.getDiskOwnerOpenId ? this.getDiskOwnerOpenId().trim() : currentOwner;
+    if (currentOwner !== pinnedOwnerOpenId || diskOwner !== pinnedOwnerOpenId) {
       throw new Error(`工作区 owner.open_id 在采集期间发生变化，已中止${actionLabel}`);
     }
-    if (this.isBoundWorkspaceOwnerMismatch(pinnedOwnerOpenId)) {
+    if (this.isBoundWorkspaceOwnerMismatch(pinnedOwnerOpenId) || this.isBoundWorkspaceOwnerMismatch(diskOwner)) {
       throw new Error(`工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已阻断${actionLabel}`);
     }
   }
