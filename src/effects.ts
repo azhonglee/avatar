@@ -1,11 +1,19 @@
 import { createHash } from "node:crypto";
 import type { Board, SectionKey } from "./board.ts";
-import { deepFind, runProcess } from "./util.ts";
+import { deepFind, errMsg, runProcess } from "./util.ts";
 import type { Store } from "./store.ts";
 import type { Config } from "./config.ts";
 import type { Handler } from "./engine.ts";
 import type { Effect, Ledger, NotifyKind } from "./ledger.ts";
 import type { Lark } from "./lark.ts";
+
+/** 确定不可重试的副作用失败：立刻落 dead 终态，不进入 10 次退避重试循环 */
+export class PermanentEffectError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, cause !== undefined ? { cause } : undefined);
+    this.name = "PermanentEffectError";
+  }
+}
 
 /**
  * 发布器：投递 outbox 里的飞书写操作。
@@ -78,13 +86,21 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
           const textHash = createHash("sha256").update(e.args.text.replace(/\r\n/g, "\n").trim()).digest("hex");
           const key = e.args.draft_id ? `draft:${e.args.draft_id}:${textHash}` : item.id;
           const cid = createHash("sha256").update(`avatar-pw\0${key}`).digest("hex").slice(0, 32);
-          await hooks.pwReply({
-            chat_id: e.args.chat_id,
-            message_id: e.args.message_id,
-            root_id: e.args.root_id,
-            text: e.args.text,
-            cid,
-          });
+          try {
+            await hooks.pwReply({
+              chat_id: e.args.chat_id,
+              message_id: e.args.message_id,
+              root_id: e.args.root_id,
+              text: e.args.text,
+              cid,
+            });
+          } catch (err) {
+            if (err instanceof PermanentEffectError) {
+              ledger.transition(item, { state: "dead", terminal: true, error: errMsg(err) });
+              return;
+            }
+            throw err;
+          }
           break;
         }
         case "meego.comment": {

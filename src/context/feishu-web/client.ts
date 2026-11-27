@@ -524,7 +524,7 @@ export class FeishuWebClient {
       for (let page = 0; page < MAX_HISTORY_WINDOWS && pos > 0 && collected.length < maxCount; page++) {
         const next = Math.max(0, pos - maxCount);
         const payload = encodeHistoryWindowPayload(anchor.conversationId, pos, next);
-        const raw = await this.gateway(CMD_HISTORY, payload, { signal: opts.signal });
+        const raw = await this.gateway(CMD_HISTORY, payload, { signal: opts.signal, allowEmptyPayload: true });
         const resp = parseProto(raw, MAX_WIRE_BYTES);
         for (const entry of resp.allBytes(1)) {
           try {
@@ -940,6 +940,7 @@ export class FeishuWebClient {
             shouldDeliverInvalid,
           );
           if (!delivered) {
+            if (loopCtrl.signal.aborted) break;
             if (!publicationBlocked) {
               publicationBlocked = true;
               onState("publication_blocked", "消息写入本地存储失败，暂缓 ACK 等待重试");

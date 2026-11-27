@@ -181,6 +181,15 @@ test("需要重启的改动：不改内存，restart_required；改回去后清�
   const back = await settings().put({ schedules: { capture: "*/15 * * * *" }, dispatch: { max_parallel: 2 } });
   assert.equal(back.restart_required, false);
   assert.equal(settings().get().restart_required, false);
+
+  // 3 层冷配置（context.personal_web.enabled）不得原地改写内存，同组热配置（debounce_ms）照常热生效
+  const r3 = await settings().put({ context: { personal_web: { enabled: true, debounce_ms: 4000 } } });
+  assert.equal(r3.ok, true);
+  assert.equal(r3.restart_required, true);
+  assert.equal(app.cfg.context.personal_web.enabled, false, "3 层冷配置未重启前不能修改内存");
+  assert.equal(app.cfg.context.personal_web.debounce_ms, 4000, "同对象下热配置字段应立即生效");
+  const back3 = await settings().put({ context: { personal_web: { enabled: false, debounce_ms: 2500 } } });
+  assert.equal(back3.restart_required, false);
 });
 
 test("并发保存按顺序串行执行，互不覆盖", async () => {

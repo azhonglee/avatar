@@ -78,6 +78,7 @@ interface MockServer {
   chats: Map<string, Buffer>;
   wsClients: Set<WsSocket>;
   acks: string[];
+  getEmptyHistoryPages: () => number;
   setPollSequence: (seq: { status?: number; headers?: Record<string, string>; body: string }[]) => void;
   setProfileStatus: (status: number) => void;
   rotateCookieOnNextProfile: (cookie: string) => void;
@@ -95,6 +96,7 @@ async function startMockFeishu(): Promise<MockServer> {
   let profileStatus = 200;
   let nextProfileCookie = "";
   let replySeq = 1;
+  let emptyHistoryPages = 0;
 
   const srv = http.createServer(async (req, res) => {
     const chunks: Buffer[] = [];
@@ -176,10 +178,19 @@ async function startMockFeishu(): Promise<MockServer> {
       }
 
       if (cmd === CMD_HISTORY) {
+        const reqFields = parseProto(payload);
+        const wanted = new Set(reqFields.allUints(2).map(Number));
         const out = new ProtoWriter();
-        for (const [id, buf] of messages) out.bytes(1, mapEntry(id, buf));
+        for (const [id, buf] of messages) {
+          const mf = parseProto(buf);
+          const pos = mf.int32(13);
+          if (wanted.size > 0 && !wanted.has(pos)) continue;
+          out.bytes(1, mapEntry(id, buf));
+        }
+        const respBuf = out.finish();
+        if (respBuf.length === 0) emptyHistoryPages++;
         res.writeHead(200, { "Content-Type": "application/x-protobuf" });
-        res.end(encodePacket(cmd, out.finish(), cid));
+        res.end(encodePacket(cmd, respBuf, cid));
         return;
       }
 
@@ -255,6 +266,7 @@ async function startMockFeishu(): Promise<MockServer> {
     chats,
     wsClients,
     acks,
+    getEmptyHistoryPages: () => emptyHistoryPages,
     setPollSequence: (seq) => {
       pollSeq = [...seq];
     },
@@ -360,7 +372,7 @@ describe("feishu-web client end-to-end (mock Feishu HTTP + ws server)", () => {
         }),
       );
 
-      // readContext fetches earlier history
+      // readContext fetches earlier history across multiple windows even when later page returns 0-byte empty payload
       const hist = await client.readContext({
         id: "msg-orig-1",
         conversationId: "chat-100",
@@ -369,9 +381,10 @@ describe("feishu-web client end-to-end (mock Feishu HTTP + ws server)", () => {
         threadId: "",
         position: 20,
         createdAtMs: Date.now(),
-      });
+      }, { limit: 15 });
       assert.equal(hist.length, 1);
       assert.equal(hist[0]?.id, "msg-bg-1");
+      assert.ok(mock.getEmptyHistoryPages() >= 1, "mock must actually return a 0-byte CMD_HISTORY page to exercise allowEmptyPayload");
 
       // sendVerifiedReply succeeds and passes independent readback
       const reply = await client.sendVerifiedReply({

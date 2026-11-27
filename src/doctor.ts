@@ -371,6 +371,12 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
         `配置 ${code("PA_FEISHU_WEB_KEY")} 后运行 ${code("bin/pa context web-login")} 重新生成加密凭据`,
       );
     }
+    if (inspected.status === "invalid") {
+      return fail(
+        "加密凭据解密失败或已损坏（可能是密钥不匹配）",
+        `核对 ${code("PA_FEISHU_WEB_KEY")} / ${code("CREDENTIALS_DIRECTORY/feishu-web-key")}，或运行 ${code("bin/pa context web-login")} 重新扫码`,
+      );
+    }
     if (inspected.status !== "ok") {
       return warn(
         "已启用但尚未扫码登录（期间仍由每 10 分钟的飞书轮询兜底）",

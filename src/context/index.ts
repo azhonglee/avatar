@@ -46,6 +46,8 @@ export class ContextService {
   drafter: Drafter;
   personalWeb: PersonalWebBridge;
   running = false;
+  /** 正在执行理解的会话集合：防止 fastCycle 与 cycle / 连续 fastCycle 并行理解同一会话导致重复建事项与提醒 */
+  private readonly activeConvs = new Set<string>();
 
   constructor(app: App) {
     this.app = app;
@@ -140,11 +142,17 @@ export class ContextService {
         let budget = this.cfg.context.max_convs_per_cycle;
         const par = this.cfg.context.understand_parallel;
         while (budget > 0 && !signal?.aborted) {
-          const pending = this.store.pendingConvs(Math.min(budget, 8 * par));
+          const pending = this.store.pendingConvs(Math.min(budget, 8 * par)).filter((c) => !this.activeConvs.has(c.conv));
           if (!pending.length) break;
           const groups: (typeof pending)[] = Array.from({ length: Math.min(par, pending.length) }, () => []);
           pending.forEach((c, i) => groups[i % groups.length].push(c));
-          const results = await Promise.allSettled(groups.map((g) => this.understander.runBatch(workId, g, signal)));
+          for (const c of pending) this.activeConvs.add(c.conv);
+          let results: PromiseSettledResult<Awaited<ReturnType<Understander["runBatch"]>>>[];
+          try {
+            results = await Promise.allSettled(groups.map((g) => this.understander.runBatch(workId, g, signal)));
+          } finally {
+            for (const c of pending) this.activeConvs.delete(c.conv);
+          }
           if (signal?.aborted) throw new Error("aborted");
           let progress = 0;
           results.forEach((res, gi) => {
@@ -416,8 +424,17 @@ export class ContextService {
           return;
         }
         if (p.task === "fast") {
-          const r = await this.fastCycle(item.id, p, ctx.signal);
-          this.app.ledger.transition(item, { state: "done", terminal: true, payload: { ...p, report: r } as never });
+          if (this.activeConvs.has(p.conv)) {
+            this.app.ledger.release(item.id, { nextAt: Date.now() + 3_000, refund: true });
+            return;
+          }
+          this.activeConvs.add(p.conv);
+          try {
+            const r = await this.fastCycle(item.id, p, ctx.signal);
+            this.app.ledger.transition(item, { state: "done", terminal: true, payload: { ...p, report: r } as never });
+          } finally {
+            this.activeConvs.delete(p.conv);
+          }
           return;
         }
         if (p.task === "draft") {

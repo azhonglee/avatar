@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -228,6 +229,54 @@ describe("feishu-web cookies & encrypted WebLoginStore (tough-cookie)", () => {
       else process.env.PA_FEISHU_WEB_KEY = prevKey;
       if (prevCredDir === undefined) delete process.env.CREDENTIALS_DIRECTORY;
       else process.env.CREDENTIALS_DIRECTORY = prevCredDir;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes save() across processes via SQLite kernel lock and recovers immediately on SIGKILL", async () => {
+    const dir = makeTmp("pa-pw-lock-");
+    const prevKey = process.env.PA_FEISHU_WEB_KEY;
+    process.env.PA_FEISHU_WEB_KEY = "lock-test-key";
+    try {
+      const store = new WebLoginStore(dir);
+      const lockFile = `${store.file}.lock.db`;
+      const fd = fs.openSync(lockFile, "a", 0o600);
+      fs.closeSync(fd);
+
+      // Child holds lock, prints READY, and SIGKILLs itself after 150ms (kernel releases lock immediately)
+      const holder = spawn(
+        process.execPath,
+        [
+          "-e",
+          `const { DatabaseSync } = require("node:sqlite");
+           const db = new DatabaseSync(${JSON.stringify(lockFile)});
+           db.exec("BEGIN IMMEDIATE");
+           process.stdout.write("READY\\n");
+           setTimeout(() => process.kill(process.pid, "SIGKILL"), 150);`,
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      await new Promise<void>((resolve, reject) => {
+        holder.once("error", reject);
+        holder.stdout.once("data", () => resolve());
+      });
+
+      // store.save() blocks on SQLite lock until child self-SIGKILLs, then succeeds immediately
+      try {
+        const t0 = Date.now();
+        const saved = store.save({
+          owner_id: "1001",
+          owner_name: "Alice",
+          cookies: [{ name: "session", value: "after-kill", domain: "feishu.cn", path: "/" }],
+        });
+        assert.ok(Date.now() - t0 >= 80, "save() must wait while another process holds the lock");
+        assert.equal(saved.cookies[0]?.value, "after-kill");
+      } finally {
+        holder.kill("SIGKILL");
+      }
+    } finally {
+      if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+      else process.env.PA_FEISHU_WEB_KEY = prevKey;
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });

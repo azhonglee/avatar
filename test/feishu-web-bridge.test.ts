@@ -9,6 +9,8 @@ import { loadConfig } from "../src/config.ts";
 import { USER_SENDER_TYPE, WebLoginStore, type WebMessage } from "../src/context/feishu-web/index.ts";
 import { ContextService } from "../src/context/index.ts";
 import { verifyLoginForWorkspace } from "../src/context/personal-web.ts";
+import { runDoctor } from "../src/doctor.ts";
+import { EventSupervisor } from "../src/events.ts";
 import { scrubPersonalWebEnv } from "../src/harness.ts";
 
 function makeTmp(prefix: string): string {
@@ -22,6 +24,7 @@ function makeApp(dir: string, overrides: Record<string, unknown> = {}) {
     YAML.stringify({
       data_dir: dir,
       owner: { open_id: "ou_owner" },
+      cards: { enabled: false },
       harnesses: {
         brain: { type: "acpx", agent: "claude" },
       },
@@ -389,7 +392,7 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
       assert.equal(res.verified, true);
       assert.equal(res.replyId, "rep-1");
 
-      // 上次发包结果不明（sending）：拒绝自动重发，也不触网
+      // 上次发包结果不明（sending）：拒绝自动重发，也不触网，且经 effectHandler 立刻落 dead 终态而非退避重试 10 次
       app.store.set(
         "ctx.pw_delivery.cid-uncertain",
         JSON.stringify({ status: "sending", replyId: "", chatId: "chat-1", rootId: "root-1", parentId: "root-1", threaded: true, updatedAt: Date.now() }),
@@ -398,10 +401,233 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
         svc.personalWeb.sendVerifiedReply({ chat_id: "chat-1", message_id: "root-1", text: "重复投递测试", cid: "cid-uncertain" }),
         /结果不明确/,
       );
+
+      // 端到端验证：PermanentEffectError 经 engine.drain 仅尝试 1 次即落 dead，草稿立刻转为 failed
+      const p = svc.store.upsertProject({ name: "失败速报项目" });
+      const { item: it } = svc.store.upsertItem({ project_id: p.id, kind: "ask_me", title: "速报测试", priority: "high" });
+      const d = svc.store.addDraft({
+        item_id: it.id,
+        project_id: p.id,
+        kind: "reply",
+        target: { transport: "personal_web", native_chat_id: "chat-1", native_message_id: "root-1", native_root_id: "root-1" },
+        target_label: "回复对方",
+        content: "确认方案",
+      });
+      app.cfg.context.personal_web.send_replies = false;
+      app.store.set("ctx.pw_delivery.force", "");
+      await app.commands.exec("context.draft_approve", { id: d.id }, { source: "cli", actor: "owner" });
+      await app.engine.drain(["effect"]);
+      const fx = app.ledger.effectsOf(`ctx-draft:${d.id}`).at(-1)!;
+      assert.equal(fx.state, "dead");
+      assert.equal(fx.terminal, true);
+      assert.equal(fx.attempts, 1, "不可重试的 pw.reply 失败必须在第 1 次就落 dead 终态");
+      assert.equal(svc.store.draft(d.id)?.status, "failed");
     } finally {
       app.store.db.close();
       if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
       else process.env.PA_FEISHU_WEB_KEY = prevKey;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("matches p2p DMs strongly across channels, respects muted DMs, and preserves distinct pw background messages", () => {
+    const dir = makeTmp("pa-pw-dm-strong-");
+    const app = makeApp(dir);
+    try {
+      const svc = new ContextService(app);
+      const now = Date.now();
+
+      // 1) 短私聊（< 8 字）：pw 侧 conv_name="张三" vs lark-cli 侧 conv_name="私聊：张三" 应 strong 命中并回填开放平台 ID 与别名
+      assert.equal(
+        svc.store.addObs([
+          {
+            id: "pw:dm_1",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:native_dm_zs",
+            conv_name: "张三",
+            actor_id: "90001",
+            actor_name: "张三",
+            is_me: false,
+            time: now,
+            text: "好的",
+            url: "",
+            meta: { transport: "personal_web", native_message_id: "dm_1", native_chat_id: "native_dm_zs", native_root_id: "dm_1", chat_type: "p2p" },
+          },
+        ]),
+        1,
+      );
+      assert.equal(
+        svc.store.addObs([
+          {
+            id: "im:om_dm_1",
+            source: "im",
+            kind: "p2p",
+            conv: "oc_dm_zs",
+            conv_name: "私聊：张三",
+            actor_id: "ou_zs",
+            actor_name: "张三",
+            is_me: false,
+            time: now + 1000,
+            text: "好的",
+            url: "https://feishu.cn/dm/zs",
+            meta: { message_id: "om_dm_1", chat_type: "p2p" },
+          },
+        ]),
+        0,
+        "短私聊在真实姓名一致时应强匹配合并",
+      );
+      const enriched = svc.store.obs("pw:dm_1")!;
+      assert.equal(enriched.meta.open_message_id, "om_dm_1");
+      assert.equal(enriched.meta.open_chat_id, "oc_dm_zs");
+      assert.equal(svc.store.pwAlias("chat", "native_dm_zs"), "oc_dm_zs");
+
+      // 2) 本人给两个不同私聊 15 秒内发相同 >=8 字消息，不得误合并
+      assert.equal(
+        svc.store.addObs([
+          {
+            id: "pw:dm_me_1",
+            source: "im",
+            kind: "mine",
+            conv: "pw_chat:native_dm_a",
+            conv_name: "张三",
+            actor_id: "owner-1",
+            actor_name: "我",
+            is_me: true,
+            time: now + 5000,
+            text: "这个需求明天上午确认排期",
+            url: "",
+            meta: { transport: "personal_web", native_message_id: "dm_me_1", native_chat_id: "native_dm_a", chat_type: "p2p" },
+          },
+        ]),
+        1,
+      );
+      assert.equal(
+        svc.store.addObs([
+          {
+            id: "im:om_me_b",
+            source: "im",
+            kind: "mine",
+            conv: "oc_dm_ls",
+            conv_name: "私聊：李四",
+            actor_id: "ou_owner",
+            actor_name: "我",
+            is_me: true,
+            time: now + 6000,
+            text: "这个需求明天上午确认排期",
+            url: "",
+            meta: { message_id: "om_me_b", chat_type: "p2p" },
+          },
+        ]),
+        1,
+        "不同私聊的本人同文本消息绝不能误合并",
+      );
+
+      // 3) lark-cli 侧静音的私聊（name="私聊：王五"）必须拦住个人 Web（chatName="王五"）
+      svc.store.muteConv("oc_dm_ww", "私聊：王五", true);
+      assert.equal(svc.personalWeb.isDeniedChat("native_dm_ww", "王五"), true);
+
+      // 4) addBackgroundObs 不得把同群 15 秒内两位不同成员的相同短消息误判为跨通道重复
+      const bgAdded = svc.store.addBackgroundObs([
+        {
+          id: "pw:bg_1",
+          source: "im",
+          kind: "group",
+          conv: "pw_chat:c9",
+          conv_name: "发布群",
+          actor_id: "111",
+          actor_name: "111",
+          is_me: false,
+          time: now,
+          text: "收到",
+          url: "",
+          meta: { transport: "personal_web", native_chat_id: "c9", chat_type: "group" },
+        },
+        {
+          id: "pw:bg_2",
+          source: "im",
+          kind: "group",
+          conv: "pw_chat:c9",
+          conv_name: "发布群",
+          actor_id: "222",
+          actor_name: "222",
+          is_me: false,
+          time: now + 1000,
+          text: "收到",
+          url: "",
+          meta: { transport: "personal_web", native_chat_id: "c9", chat_type: "group" },
+        },
+      ]);
+      assert.equal(bgAdded, 2);
+    } finally {
+      app.store.db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("defers concurrent fastCycle on the same conv, flags invalid encryption key in doctor/status, and scrubs EventSupervisor env", async () => {
+    const dir = makeTmp("pa-pw-conc-");
+    const prevKey = process.env.PA_FEISHU_WEB_KEY;
+    const prevCredDir = process.env.CREDENTIALS_DIRECTORY;
+    const app = makeApp(dir);
+    try {
+      // 1) 密钥不匹配（invalid）时 doctor 报 fail(ready=false) 且 personalWeb.status() 报 needs_login + 解密失败原因
+      process.env.PA_FEISHU_WEB_KEY = "key-original";
+      const loginStore = new WebLoginStore(dir);
+      loginStore.save({ owner_id: "1001", owner_name: "Owner", cookies: [{ name: "session", value: "s1", domain: "feishu.cn", path: "/" }] });
+      process.env.PA_FEISHU_WEB_KEY = "key-wrong";
+
+      const svc = new ContextService(app);
+      const st = svc.personalWeb.status();
+      assert.equal(st.state, "needs_login");
+      assert.match(st.last_error, /解密失败|损坏/);
+
+      const doc = await runDoctor(app);
+      const pwCheck = doc.checks.find((c) => c.id === "personal_web");
+      assert.equal(pwCheck?.status, "fail");
+      assert.match(pwCheck?.detail ?? "", /解密失败|损坏/);
+
+      // 2) 同会话并发 fast 任务互斥：当 conv 已在 activeConvs 中时，第 2 个 fast 任务延后 release 且退回 attempts
+      (svc as unknown as { activeConvs: Set<string> }).activeConvs.add("pw_chat:busy");
+      app.ledger.enqueue({
+        id: "context:fast:busy:2",
+        kind: "context",
+        ref: "fast",
+        payload: { task: "fast", conv: "pw_chat:busy", conv_name: "忙群", trigger_obs_id: "pw:2" },
+      });
+      const claimed = app.ledger.claim("context", 60_000)!;
+      const h = svc.handler();
+      const before = Date.now();
+      await h.run(claimed as never, { signal: new AbortController().signal, attempt: claimed.attempts });
+      const deferred = app.ledger.get(claimed.id)!;
+      assert.equal(deferred.terminal, false);
+      assert.equal(deferred.attempts, 0, "延后执行不应消耗尝试次数");
+      assert.ok(deferred.next_at >= before + 2500);
+      (svc as unknown as { activeConvs: Set<string> }).activeConvs.delete("pw_chat:busy");
+
+      // 3) EventSupervisor 直接 spawn 时也必须剥离 PA_FEISHU_WEB_KEY 与 CREDENTIALS_DIRECTORY
+      const probeBin = path.join(dir, "fake-lark");
+      const envDump = path.join(dir, "event-env.txt");
+      fs.writeFileSync(
+        probeBin,
+        `#!/bin/sh\necho "KEY=\${PA_FEISHU_WEB_KEY:-EMPTY} CRED=\${CREDENTIALS_DIRECTORY:-EMPTY}" > ${JSON.stringify(envDump)}\n`,
+        { mode: 0o755 },
+      );
+      process.env.PA_FEISHU_WEB_KEY = "leak-check-key";
+      process.env.CREDENTIALS_DIRECTORY = "/tmp/leak-cred-dir";
+      app.cfg.bins.lark = probeBin;
+      const sup = new EventSupervisor(app.cfg, () => undefined);
+      sup.start([{ key: "im.message.receive_v1", as: "bot" }]);
+      const deadline = Date.now() + 3000;
+      while (!fs.existsSync(envDump) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+      await sup.stop();
+      assert.equal(fs.readFileSync(envDump, "utf8").trim(), "KEY=EMPTY CRED=EMPTY");
+    } finally {
+      app.store.db.close();
+      if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+      else process.env.PA_FEISHU_WEB_KEY = prevKey;
+      if (prevCredDir === undefined) delete process.env.CREDENTIALS_DIRECTORY;
+      else process.env.CREDENTIALS_DIRECTORY = prevCredDir;
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });

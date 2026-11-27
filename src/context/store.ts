@@ -149,9 +149,22 @@ export function norm(s: string): string {
 /** 会话名未知时（只有占位名），正文至少这么长才认为是同一条消息 */
 const WEAK_MERGE_MIN_CHARS = 8;
 
-/** 占位会话名（个人 Web 未查到名称时的“群聊(…)”/“私聊：…”，或 lark-cli 缺 chat_name 时的“群聊”/“私聊”）不能证明是同一会话 */
+/** 提取真实会话名：剥离 "私聊：" 前缀后排除占位名（空 / "私聊" / "本人" / 纯数字）；群聊排除 "群聊" / "群聊(...)" */
+export function realConvName(s: string): string {
+  const t = s.trim();
+  if (!t) return "";
+  if (t.startsWith("私聊：")) {
+    const rest = t.slice("私聊：".length).trim();
+    if (!rest || rest === "私聊" || rest === "本人" || !isRealActorName(rest)) return "";
+    return rest;
+  }
+  if (/^(群聊|私聊)($|\()/.test(t)) return "";
+  return t;
+}
+
+/** 占位会话名（个人 Web 未查到名称时的“群聊(…)”/“私聊：数字”，或 lark-cli 缺 chat_name 时的“群聊”/“私聊”）不能证明是同一会话 */
 export function isRealConvName(s: string): boolean {
-  return !!s && !/^(群聊|私聊)($|\(|：)/.test(s);
+  return !!realConvName(s);
 }
 
 /** 个人 Web 拿不到姓名时 actor_name 是原生数字 ID，不能用来比对 */
@@ -159,13 +172,15 @@ export function isRealActorName(s: string): boolean {
   return !!s && !/^\d+$/.test(s);
 }
 
-/** 跨通道判断两条观测是否同一条消息：会话名或发送人明确不同 → none；双方都有真实会话名且一致 → strong；否则 weak。 */
-function crossMatch(a: Row, b: Pick<Obs, "conv_name" | "actor_name">): "strong" | "weak" | "none" {
-  const aConv = String(a.conv_name ?? "");
+/** 跨通道判断两条观测是否同一条消息：会话名或发送人明确不同 → none；已确认同一会话（别名命中或真实会话名一致）→ strong；否则 weak。 */
+function crossMatch(a: Row, b: Pick<Obs, "conv_name" | "actor_name">, sameChatAlias = false): "strong" | "weak" | "none" {
   const aActor = String(a.actor_name ?? "");
-  const convKnown = isRealConvName(aConv) && isRealConvName(b.conv_name);
-  if (convKnown && aConv !== b.conv_name) return "none";
   if (isRealActorName(aActor) && isRealActorName(b.actor_name) && aActor !== b.actor_name) return "none";
+  if (sameChatAlias) return "strong";
+  const aConv = realConvName(String(a.conv_name ?? ""));
+  const bConv = realConvName(b.conv_name);
+  const convKnown = !!aConv && !!bConv;
+  if (convKnown && aConv !== bConv) return "none";
   return convKnown ? "strong" : "weak";
 }
 
@@ -327,7 +342,13 @@ export class ContextStore {
                 const cMeta = j<Record<string, unknown>>(c.meta, {});
                 const cChatType = String(cMeta.chat_type ?? "");
                 if (inChatType && cChatType && inChatType !== cChatType) return false;
-                const m = crossMatch(c, o);
+                const isIncomingLark = o.id.startsWith("im:");
+                const nativeChat = String(isIncomingLark ? (cMeta.native_chat_id ?? "") : (o.meta.native_chat_id ?? ""));
+                const openChat = isIncomingLark ? o.conv : String(c.conv ?? "");
+                const mappedOpen = nativeChat ? this.pwAlias("chat", nativeChat) : undefined;
+                if (mappedOpen && openChat.startsWith("oc_") && mappedOpen !== openChat) return false;
+                const sameChatAlias = !!mappedOpen && mappedOpen === openChat;
+                const m = crossMatch(c, o, sameChatAlias);
                 if (m === "none" || (m === "weak" && nt.length < WEAK_MERGE_MIN_CHARS)) return false;
                 strong = m === "strong";
                 return true;
@@ -357,10 +378,7 @@ export class ContextStore {
                       native_root_id: String(o.meta.native_root_id ?? ""),
                     };
                 const curConvName = String(hit.conv_name ?? "");
-                const betterConv =
-                  isIncomingLark && o.conv_name && (!curConvName || curConvName.startsWith("群聊(") || curConvName === "群聊" || /^私聊：\d+$/.test(curConvName))
-                    ? o.conv_name
-                    : curConvName;
+                const betterConv = isIncomingLark && isRealConvName(o.conv_name) && !isRealConvName(curConvName) ? o.conv_name : curConvName;
                 const curActorName = String(hit.actor_name ?? "");
                 const betterActor =
                   isIncomingLark && o.actor_name && (!curActorName || /^\d+$/.test(curActorName)) ? o.actor_name : curActorName;
@@ -386,7 +404,8 @@ export class ContextStore {
     const now = Date.now();
     const get = this.db.prepare("SELECT 1 FROM ctx_obs WHERE id = ?");
     const nearIm = this.db.prepare(
-      `SELECT text, conv_name, actor_name FROM ctx_obs WHERE source = 'im' AND is_me = ? AND time BETWEEN ? AND ? LIMIT 30`,
+      `SELECT id, conv, text, conv_name, actor_name, meta FROM ctx_obs
+       WHERE source = 'im' AND is_me = ? AND time BETWEEN ? AND ? AND id LIKE ? LIMIT 30`,
     );
     const ins = this.db.prepare(
       `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed)
@@ -398,11 +417,22 @@ export class ContextStore {
         if (!o.id || !o.time) continue;
         if (get.get(o.id)) continue;
         const nt = norm(o.text);
-        if (o.source === "im" && nt.length >= 2) {
-          const cands = nearIm.all(o.is_me ? 1 : 0, o.time - 15_000, o.time + 15_000) as Row[];
+        if (o.source === "im" && (o.id.startsWith("im:") || o.id.startsWith("pw:")) && nt.length >= 2) {
+          const otherPrefix = o.id.startsWith("im:") ? "pw:%" : "im:%";
+          const inChatType = String(o.meta.chat_type ?? "");
+          const cands = nearIm.all(o.is_me ? 1 : 0, o.time - 15_000, o.time + 15_000, otherPrefix) as Row[];
           const dup = cands.some((c) => {
             if (norm(String(c.text ?? "")) !== nt) return false;
-            const m = crossMatch(c, o);
+            const cMeta = j<Record<string, unknown>>(c.meta, {});
+            const cChatType = String(cMeta.chat_type ?? "");
+            if (inChatType && cChatType && inChatType !== cChatType) return false;
+            const isIncomingLark = o.id.startsWith("im:");
+            const nativeChat = String(isIncomingLark ? (cMeta.native_chat_id ?? "") : (o.meta.native_chat_id ?? ""));
+            const openChat = isIncomingLark ? o.conv : String(c.conv ?? "");
+            const mappedOpen = nativeChat ? this.pwAlias("chat", nativeChat) : undefined;
+            if (mappedOpen && openChat.startsWith("oc_") && mappedOpen !== openChat) return false;
+            const sameChatAlias = !!mappedOpen && mappedOpen === openChat;
+            const m = crossMatch(c, o, sameChatAlias);
             return m === "strong" || (m === "weak" && nt.length >= WEAK_MERGE_MIN_CHARS);
           });
           if (dup) continue;

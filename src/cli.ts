@@ -164,7 +164,9 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
           ? "存在加密凭据，但缺少 PA_FEISHU_WEB_KEY / CREDENTIALS_DIRECTORY"
           : inspected.status === "plaintext_rejected"
             ? "检测到未加密旧文件（已拒绝加载，请重新扫码）"
-            : "未登录";
+            : inspected.status === "invalid"
+              ? "加密凭据解密失败或已损坏（请核对 PA_FEISHU_WEB_KEY 或重新扫码）"
+              : "未登录";
     console.log(`凭据文件：${store.file}（${credDesc}）`);
     if (st) {
       console.log(`常驻状态：${st.state}${st.last_message_at ? `，最近消息 ${new Date(st.last_message_at).toLocaleString("zh-CN", { timeZone: app.cfg.owner.timezone, hour12: false })}` : ""}`);

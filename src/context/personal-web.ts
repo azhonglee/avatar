@@ -1,11 +1,14 @@
 import type { App } from "../app.ts";
 import type { CtxPersonalWebStatus } from "../api/types.ts";
+import { PermanentEffectError } from "../effects.ts";
 import { errMsg, log } from "../util.ts";
 import {
   FeishuWebClient,
   GatewayError,
   isUsableWebMessage,
+  MessageNotFoundError,
   SessionNeedsLoginError,
+  UnusableOriginalMessageError,
   USER_SENDER_TYPE,
   WebHttpError,
   WebLoginStore,
@@ -15,7 +18,7 @@ import {
   type WebLogin,
   type WebMessage,
 } from "./feishu-web/index.ts";
-import { isRealConvName, type ContextStore, type Obs } from "./store.ts";
+import { isRealConvName, realConvName, type ContextStore, type Obs } from "./store.ts";
 
 /**
  * 个人 Web 协议桥接层：把 FeishuWebClient 的实时推送接入 Working Context。
@@ -157,10 +160,13 @@ export class PersonalWebBridge {
     } else if (!loggedIn) {
       if (inspected.status === "missing_key") {
         state = "needs_login";
-        lastError = lastError || "缺少解密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）";
+        lastError = "缺少解密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）";
       } else if (inspected.status === "plaintext_rejected") {
         state = "needs_login";
-        lastError = lastError || "检测到未加密的旧凭据文件，请设置密钥后重新执行 pa context web-login";
+        lastError = "检测到未加密的旧凭据文件，请设置密钥后重新执行 pa context web-login";
+      } else if (inspected.status === "invalid") {
+        state = "needs_login";
+        lastError = "加密凭据解密失败或已损坏，请核对 PA_FEISHU_WEB_KEY 或重新执行 pa context web-login";
       } else if (state === "idle") {
         state = "needs_login";
       }
@@ -239,7 +245,9 @@ export class PersonalWebBridge {
             ? "缺少个人 Web 凭据解密密钥（请配置 PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）"
             : inspected.status === "plaintext_rejected"
               ? "检测到明文凭据文件，请配置密钥并重新运行 `pa context web-login`"
-              : "尚未完成个人 Web 扫码登录，请运行 `pa context web-login`";
+              : inspected.status === "invalid"
+                ? "加密凭据解密失败或已损坏，请核对 PA_FEISHU_WEB_KEY 或重新运行 `pa context web-login`"
+                : "尚未完成个人 Web 扫码登录，请运行 `pa context web-login`";
         if (this.state.state !== "needs_login" || this.state.last_error !== msg) {
           handleState("needs_login", msg);
         }
@@ -373,12 +381,14 @@ export class PersonalWebBridge {
     }
   }
 
-  /** 规则项 r 是否指向这个会话：ID 相等，或群名包含关键字，或 r 是 oc_ ID 且其已知群名与会话名一致 */
+  /** 规则项 r 是否指向这个会话：ID 相等，或群名包含关键字，或规范化私聊名一致，或 r 是 oc_ ID 且其已知群名与会话名一致 */
   private ruleMatches(r: string, ids: Set<string>, chatName: string): boolean {
     if (!r) return false;
     if (ids.has(r)) return true;
     if (!chatName) return false;
     if (chatName.includes(r)) return true;
+    const normR = realConvName(r);
+    if (normR && realConvName(chatName) === normR) return true;
     return r.startsWith("oc_") && this.openGroupName(r) === chatName;
   }
 
@@ -386,7 +396,14 @@ export class PersonalWebBridge {
     const ids = this.chatIds(chatId);
     if (this.cfg.context.groups_deny.some((d) => this.ruleMatches(d, ids, chatName))) return true;
     const muted = this.store.mutedConvs();
-    return muted.some((m) => ids.has(m.conv) || (!!chatName && m.name === chatName));
+    const normName = realConvName(chatName);
+    return muted.some(
+      (m) =>
+        ids.has(m.conv) ||
+        (!!chatName && m.conv.startsWith("oc_") && this.openGroupName(m.conv) === chatName) ||
+        (!!chatName && m.name === chatName) ||
+        (!!normName && realConvName(m.name) === normName),
+    );
   }
 
   /** 是否存在要靠会话名才能判定的排除或静音规则（查不到会话名时据此决定是否放行） */
@@ -440,6 +457,9 @@ export class PersonalWebBridge {
     const text = msg.text.trim();
 
     if (!isHuman && !this.botAllowed(text)) return;
+
+    // 已按 ID 命中排除/静音的会话直接丢弃，避免 readChat 失败时无谓阻塞 ACK
+    if (this.isDeniedChat(msg.conversationId, "")) return;
 
     // 群和私聊都查会话名（私聊的会话名即对方姓名），排除/静音规则和姓名展示都要用
     let chatName = "";
@@ -633,19 +653,23 @@ export class PersonalWebBridge {
     }
 
     if (prev?.status === "sending") {
-      throw new Error("上次个人 Web 发送结果不明确（对方可能已经收到），为避免重复发送已停止自动重试；请先在飞书核实");
+      throw new PermanentEffectError("上次个人 Web 发送结果不明确（对方可能已经收到），为避免重复发送已停止自动重试；请先在飞书核实");
     }
     // 已发出只差回读核验的回复不需要发送权限，关掉 send_replies 后仍可完成确认
     const readbackOnly = prev?.status === "created" && !!prev.replyId;
     if (!readbackOnly && !this.cfg.context.personal_web.send_replies) {
-      throw new Error("未开启个人 Web 回复（需在配置中设置 context.personal_web.send_replies: true）");
+      throw new PermanentEffectError("未开启个人 Web 回复（需在配置中设置 context.personal_web.send_replies: true）");
     }
 
     let client = this.client;
     if (!client) {
       const login = this.loginStore.load();
-      if (!login) throw new Error("个人 Web 未登录，请先运行 `pa context web-login`");
-      verifyLoginForWorkspace(this.app, login);
+      if (!login) throw new PermanentEffectError("个人 Web 未登录，请先运行 `pa context web-login`");
+      try {
+        verifyLoginForWorkspace(this.app, login);
+      } catch (e) {
+        throw new PermanentEffectError(errMsg(e), e);
+      }
       client = await FeishuWebClient.connect(login, {
         ...this.hooks.clientOptions,
         onSessionConfirmed: (updated) => this.loginStore.saveIfSessionMatches(updated) ?? false,
@@ -682,7 +706,7 @@ export class PersonalWebBridge {
         {
           onBeforeSend: ({ chat, rootId, parentId, threaded }) => {
             if (this.isDeniedChat(args.chat_id, chat.name)) {
-              throw new Error(`目标会话「${chat.name || args.chat_id}」已被排除或静音，拒绝发送个人 Web 回复`);
+              throw new PermanentEffectError(`目标会话「${chat.name || args.chat_id}」已被排除或静音，拒绝发送个人 Web 回复`);
             }
             // 发包前先记 sending：之后若结果不明（超时、断线、进程被杀），重试会停在这里而不是再发一次
             this.saveDelivery(args.cid, { status: "sending", replyId: "", chatId: args.chat_id, rootId, parentId, threaded, updatedAt: Date.now() });
@@ -703,8 +727,21 @@ export class PersonalWebBridge {
         },
       );
     } catch (err) {
-      // 只有服务端明确拒绝（未创建消息）才撤销 sending 允许重试；结果不明时保留 sending
-      if (entered && !created && isDefinitiveNonCreationError(err)) this.app.store.set(`${DELIVERY_KV_PREFIX}${args.cid}`, "");
+      if (err instanceof PermanentEffectError) throw err;
+      if (entered && !created) {
+        // 只有服务端明确拒绝（未创建消息）才撤销 sending 允许重试；结果不明时保留 sending 并立刻落失败终态通知人工核实
+        if (isDefinitiveNonCreationError(err)) {
+          this.app.store.set(`${DELIVERY_KV_PREFIX}${args.cid}`, "");
+          throw err;
+        }
+        throw new PermanentEffectError(
+          `个人 Web 发送结果不明确（对方可能已经收到），为避免重复发送已停止自动重试；请先在飞书核实（原错误：${errMsg(err)}）`,
+          err,
+        );
+      }
+      if (!entered && (err instanceof UnusableOriginalMessageError || err instanceof MessageNotFoundError)) {
+        throw new PermanentEffectError(errMsg(err), err);
+      }
       throw err;
     }
     this.saveDelivery(args.cid, {
