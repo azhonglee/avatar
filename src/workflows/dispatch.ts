@@ -4,7 +4,7 @@ import { z } from "zod";
 import { isContextDerivedDispatchBlocked } from "../api/queries.ts";
 import type { Board, BoardTask } from "../board.ts";
 import { repoSpec, type Config } from "../config.ts";
-import { ensureGitLfsObjectsForCheckout, removeStaleWorktreeAdminRecord, tryGit } from "../delivery/git.ts";
+import { commitAll, ensureGitLfsObjectsForCheckout, removeStaleWorktreeAdminRecord, tryGit } from "../delivery/git.ts";
 import { comment, move } from "../effects.ts";
 import { checkpoint, type Ctx, type Handler } from "../engine.ts";
 import {
@@ -686,19 +686,32 @@ export class Dispatcher {
         if (stale.locked) {
           throw new Error(`工作树 ${cwd} 存在已锁定的历史 worktree 管理记录，拒绝自动覆盖`);
         }
-        const head = await git(spec.path, ["rev-parse", "HEAD"], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path });
+        const head = (
+          await git(spec.path, ["rev-parse", "HEAD"], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path })
+        ).trim();
         const hasBranch = (await tryGit(spec.path, ["rev-parse", "--verify", "--quiet", branch], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path })).code === 0;
-        const checkoutTarget = hasBranch ? branch : head.trim();
-        await ensureGitLfsObjectsForCheckout(spec.path, checkoutTarget, {
+        const checkoutTarget = hasBranch ? branch : head;
+        const lfsPre = await ensureGitLfsObjectsForCheckout(spec.path, checkoutTarget, {
           cfg: this.cfg,
           trustedRepoRoot: spec.path,
         });
+        // 新分支必须显式以已预拉取的 head 作为起点，防止预拉取期间宿主机仓库切换分支或推进 HEAD 导致检出树与基线错位
         await git(
           spec.path,
-          hasBranch ? ["worktree", "add", cwd, branch] : ["worktree", "add", "-b", branch, cwd],
-          { cfg: this.cfg, trustedRepoRoot: spec.path, extraWritablePaths: [cwd] },
+          hasBranch ? ["worktree", "add", cwd, branch] : ["worktree", "add", "-b", branch, cwd, head],
+          {
+            cfg: this.cfg,
+            trustedRepoRoot: spec.path,
+            extraWritablePaths: [
+              cwd,
+              ...(lfsPre.lfsStorageExternal && lfsPre.lfsStorageDir ? [lfsPre.lfsStorageDir] : []),
+            ],
+            ...(lfsPre.lfsStorageExternal && lfsPre.lfsStorageDir
+              ? { extraGitConfigArgs: ["-c", `lfs.storage=${lfsPre.lfsStorageDir}`] }
+              : {}),
+          },
         );
-        if (!this.store.get(baseKey)) this.store.set(baseKey, head.trim());
+        if (!this.store.get(baseKey)) this.store.set(baseKey, head);
         ready = true;
       } catch (err) {
         try {
@@ -752,11 +765,9 @@ async function git(cwd: string, args: string[], opts?: import("../delivery/git.t
   return r.stdout;
 }
 
-/** 有改动就提交（含新文件）；没有改动什么都不做。 */
+/** 有改动就提交（含新文件）；没有改动什么都不做（复用交付层签名感知提交逻辑）。 */
 async function autoCommit(cwd: string, message: string, opts?: import("../delivery/git.ts").GitRunOpts): Promise<void> {
-  await git(cwd, ["add", "-A"], opts);
-  const dirty = (await tryGit(cwd, ["diff", "--cached", "--quiet"], { ...opts, readOnly: true })).code !== 0;
-  if (dirty) await git(cwd, ["commit", "-q", "--no-verify", "-m", message], opts);
+  await commitAll(cwd, message, opts);
 }
 
 /** 相对创建 worktree 时的基线（每轮结束都已自动提交，所以比较到 HEAD 即可）。 */

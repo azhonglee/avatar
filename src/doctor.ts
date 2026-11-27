@@ -11,6 +11,8 @@ import {
   detectIsolatedCodexKeyringConflict,
   prepareHarnessEnv,
   resolveBin,
+  resolveTrustedBwrapBin,
+  workspaceRequiresIsolation,
   wrapCredentialIsolatedCommand,
 } from "./harness.ts";
 import { consoleBaseUrl, isLoopbackHost } from "./server/index.ts";
@@ -126,6 +128,56 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
     return major > 22 || (major === 22 && minor >= 13)
       ? ok(`Node ${process.versions.node}`)
       : fail(`当前 Node ${process.versions.node}，需要 ≥ 22.13`, `安装新版 Node，例如：\n\n${code("nvm install 22 && nvm use 22")}`);
+  });
+
+  add("worker_isolation", "沙箱隔离", async () => {
+    if (!workspaceRequiresIsolation(cfg, env)) {
+      return ok("当前平台非强制内核隔离模式");
+    }
+    const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-doctor-iso-"));
+    const baseEnv = prepareHarnessEnv(env);
+    try {
+      const trueBin = resolveBin("true");
+      const wrapped = wrapCredentialIsolatedCommand(
+        trueBin,
+        [],
+        env,
+        buildWorkspaceIsolation(
+          cfg,
+          {
+            mode: "llm-none",
+            cwd: probeDir,
+            cmdPath: trueBin,
+            disableGitWorktreeMounts: true,
+          },
+          env,
+        ),
+      );
+      if (!wrapped.isolated) {
+        return fail(
+          "当前环境要求强制沙箱隔离，但未启用任何内核命名空间后端",
+          `安装 bubblewrap（如 ${code("sudo apt install bubblewrap")}）并确保非特权用户命名空间可用`,
+        );
+      }
+      const r = await runProcess(wrapped.cmd, wrapped.args, { cwd: probeDir, env: baseEnv.env, timeoutMs: cmdTimeout });
+      if (r.timedOut || r.code !== 0) {
+        const msg = truncate((r.stderr || r.stdout || `exit ${r.code}`).trim(), 200);
+        return fail(
+          `Linux 隔离沙箱探测失败（所有派单与模型执行都将被阻断）：${msg}`,
+          `安装 bubblewrap（如 ${code("sudo apt install bubblewrap")}），并检查非特权用户命名空间（${code("sysctl kernel.unprivileged_userns_clone")}）或 Ubuntu AppArmor ${code("bwrap")} 策略`,
+        );
+      }
+      const backend = resolveTrustedBwrapBin() ? "bwrap" : "unshare + pivot_root";
+      return ok(`内核 PID + 最小只读根挂载隔离可用（${backend}）`);
+    } catch (e) {
+      return fail(
+        `Linux 隔离沙箱不可用（所有派单与模型执行都将被阻断）：${errMsg(e)}`,
+        `安装 bubblewrap（如 ${code("sudo apt install bubblewrap")}），并检查非特权用户命名空间（${code("sysctl kernel.unprivileged_userns_clone")}）或 Ubuntu AppArmor ${code("bwrap")} 策略`,
+      );
+    } finally {
+      baseEnv.cleanup();
+      fs.rmSync(probeDir, { recursive: true, force: true });
+    }
   });
 
   add("config", "配置文件", async () => {

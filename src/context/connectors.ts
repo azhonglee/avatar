@@ -941,6 +941,37 @@ export class Connectors {
       return false;
     };
     const kindRank: Record<string, number> = { at_me: 4, p2p: 3, mine: 2, group: 1 };
+    const mergeNewerImRow = (prev: Raw, next: Raw, clearOmittedMentions: boolean): Raw => {
+      const mergedChatId = prev.chat_id || next.chat_id;
+      const mergedChatName = String(next.chat_name ?? "").trim() || String(prev.chat_name ?? "").trim();
+      const mergedChatType = String(next.chat_type ?? "").trim() || String(prev.chat_type ?? "").trim();
+      const mergedThreadId = next.thread_id || prev.thread_id;
+      const mergedParentId = next.parent_id || prev.parent_id;
+      const mergedRootId = next.root_id || prev.root_id;
+      const mergedSender = next.sender ?? prev.sender;
+      const mergedSenderId = next.sender_id ?? prev.sender_id;
+      const mergedSenderName = next.sender_name ?? prev.sender_name;
+      const mergedCreateTime = next.create_time ?? prev.create_time;
+      // 仅沿用稳定会话/话题/发送者/创建时间字段，绝不展开 prev 继承旧修订的 mentions 或其他可变内容字段
+      const out: Raw = {
+        ...next,
+        ...(mergedChatId ? { chat_id: mergedChatId } : {}),
+        ...(mergedChatName ? { chat_name: mergedChatName } : {}),
+        ...(mergedChatType ? { chat_type: mergedChatType } : {}),
+        ...(mergedThreadId ? { thread_id: mergedThreadId } : {}),
+        ...(mergedParentId ? { parent_id: mergedParentId } : {}),
+        ...(mergedRootId ? { root_id: mergedRootId } : {}),
+        ...(mergedSender !== undefined ? { sender: mergedSender } : {}),
+        ...(mergedSenderId !== undefined ? { sender_id: mergedSenderId } : {}),
+        ...(mergedSenderName !== undefined ? { sender_name: mergedSenderName } : {}),
+        ...(mergedCreateTime !== undefined ? { create_time: mergedCreateTime } : {}),
+      };
+      if (clearOmittedMentions && !Array.isArray(next.mentions)) {
+        out.mentions = [];
+      }
+      return out;
+    };
+
     const mergedById = new Map<
       string,
       {
@@ -998,16 +1029,8 @@ export class Connectors {
         }
 
         if (cmp === "a_newer") {
-          const nextRow: Raw = {
-            ...existing.m,
-            ...row.m,
-            ...(mergedChatId ? { chat_id: mergedChatId } : {}),
-            ...(mergedChatName ? { chat_name: mergedChatName } : {}),
-            ...(mergedChatType ? { chat_type: mergedChatType } : {}),
-            ...(mergedThreadId ? { thread_id: mergedThreadId } : {}),
-            ...(mergedParentId ? { parent_id: mergedParentId } : {}),
-            ...(mergedRootId ? { root_id: mergedRootId } : {}),
-          };
+          const hadPriorMentions = Array.isArray(existing.m.mentions) || existing.kind === "at_me";
+          const nextRow = mergeNewerImRow(existing.m, row.m, hadPriorMentions && rowEffKind !== "at_me");
           if (!rowDeleted) {
             delete nextRow.deleted;
             delete nextRow.is_deleted;
@@ -1083,12 +1106,7 @@ export class Connectors {
           entry.verifyFailed = true;
           continue;
         }
-        const mergedChatId = entry.m.chat_id || fresh.chat_id;
-        const mergedChatName = String(fresh.chat_name ?? "").trim() || String(entry.m.chat_name ?? "").trim();
         const mergedChatType = String(fresh.chat_type ?? "").trim() || String(entry.m.chat_type ?? "").trim();
-        const mergedThreadId = fresh.thread_id || entry.m.thread_id;
-        const mergedParentId = fresh.parent_id || entry.m.parent_id;
-        const mergedRootId = fresh.root_id || entry.m.root_id;
         const freshText = textOf(fresh.content ?? fresh.text ?? "");
         const freshCounter = parseEditCounter(fresh);
         const freshTimeMs = parseEditTimeMs(fresh, this.cfg.owner.timezone);
@@ -1099,31 +1117,15 @@ export class Connectors {
           entry.needsVerify = false;
           continue;
         }
-        const liveMerged: Raw = {
-          ...entry.m,
-          ...fresh,
-          ...(mergedChatId ? { chat_id: mergedChatId } : {}),
-          ...(mergedChatName ? { chat_name: mergedChatName } : {}),
-          ...(mergedChatType ? { chat_type: mergedChatType } : {}),
-          ...(mergedThreadId ? { thread_id: mergedThreadId } : {}),
-          ...(mergedParentId ? { parent_id: mergedParentId } : {}),
-          ...(mergedRootId ? { root_id: mergedRootId } : {}),
-        };
-        delete liveMerged.deleted;
-        delete liveMerged.is_deleted;
-        entry.m = liveMerged;
-        entry.deleted = false;
-        entry.authoritativeLive = true;
-        entry.editCounter = parseEditCounter(fresh);
-        entry.editTimeMs = parseEditTimeMs(fresh, this.cfg.owner.timezone);
+        const hadPriorMentions = Array.isArray(entry.m.mentions) || entry.kind === "at_me";
         const sender = fresh.sender ?? entry.m.sender ?? {};
-        const senderId = String(sender.id ?? sender.open_id ?? fresh.sender_id ?? "");
+        const senderId = String(sender.id ?? sender.open_id ?? fresh.sender_id ?? entry.m.sender_id ?? "");
         const explicitAtMe = rowMentionsMe(fresh);
+        let nextKind: string;
         if (explicitAtMe === true) {
-          entry.kind = "at_me";
+          nextKind = "at_me";
         } else if (explicitAtMe === false) {
-          entry.kind =
-            mergedChatType.toLowerCase() === "p2p" ? "p2p" : senderId === me ? "mine" : "group";
+          nextKind = mergedChatType.toLowerCase() === "p2p" ? "p2p" : senderId === me ? "mine" : "group";
         } else {
           // 若 +messages-mget 未返回 mentions 字段，仅当全部与权威正文一致的候选对是否 @我 达成一致时才推断 kind；
           // 若候选正文相同却在 @我 归类上冲突，按未决处理并保留游标待下次重试，绝不偏袒先到的 --is-at-me 流
@@ -1135,12 +1137,20 @@ export class Connectors {
               continue;
             }
             const matched = matchingCands[0];
-            entry.kind = matched.atMe ? "at_me" : matched.kind;
+            nextKind = matched.atMe ? "at_me" : matched.kind;
           } else {
-            entry.kind =
-              mergedChatType.toLowerCase() === "p2p" ? "p2p" : senderId === me ? "mine" : "group";
+            nextKind = mergedChatType.toLowerCase() === "p2p" ? "p2p" : senderId === me ? "mine" : "group";
           }
         }
+        const liveMerged = mergeNewerImRow(entry.m, fresh, hadPriorMentions && nextKind !== "at_me");
+        delete liveMerged.deleted;
+        delete liveMerged.is_deleted;
+        entry.m = liveMerged;
+        entry.kind = nextKind;
+        entry.deleted = false;
+        entry.authoritativeLive = true;
+        entry.editCounter = parseEditCounter(fresh);
+        entry.editTimeMs = parseEditTimeMs(fresh, this.cfg.owner.timezone);
         entry.needsVerify = false;
       }
     }

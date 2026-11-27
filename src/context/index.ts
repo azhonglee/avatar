@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Cron } from "croner";
 import { z } from "zod";
 import type { App } from "../app.ts";
@@ -69,7 +69,12 @@ export class ContextService {
     );
     this.personalWeb = new PersonalWebBridge(app, this.store, {
       onFastTrigger: (t) => {
-        this.enqueue(`fast:${t.conv}:${t.trigger_obs_id}:g${t.rev_gen}:${t.text_hash}`, {
+        // 使用确定性哈希作为账本 work ID，避免 work.changed SSE 事件直接暴露宿主机旧主人的原生会话/消息 ID；原生标识保留在受主人校验的 payload 中
+        const fastKey = createHash("sha256")
+          .update(`${t.conv}\0${t.trigger_obs_id}\0g${t.rev_gen}\0${t.text_hash}`)
+          .digest("hex")
+          .slice(0, 24);
+        this.enqueue(`fast:${fastKey}`, {
           task: "fast",
           conv: t.conv,
           conv_name: t.conv_name,
@@ -83,10 +88,12 @@ export class ContextService {
         this.enqueue(`cycle:pw-reconnect-${Math.floor(Date.now() / 60_000)}`, { task: "cycle" });
       },
       onNeedsLogin: (reason) => {
+        // 仅在本地日志与受主人校验的诊断接口中保留详细原因，对外私信通知脱敏以免向新配置的主人暴露旧绑定账号 ID
+        log("warn", "飞书个人 Web 实时通道需要重新登录或确认绑定", { reason: truncate(reason, 200) });
         const day = this.today();
         this.app.ledger.emit(
           "context:pw-needs-login",
-          [notify(`⚠️ 飞书个人 Web 实时通道登录已失效（${truncate(reason, 200)}）。请运行 \`pa context web-login\` 重新扫码；期间每 10 分钟的飞书定时采集仍继续兜底。`, "failure")],
+          [notify("⚠️ 飞书个人 Web 实时通道登录已失效或需要重新确认绑定，请运行 `pa context web-login` 重新扫码或在控制台查看详情；期间每 10 分钟的飞书定时采集仍继续兜底。", "failure")],
           `pw-needs-login-${day}`,
         );
         this.app.engine.kick();

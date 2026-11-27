@@ -1533,9 +1533,36 @@ function isSshPrivateKeyEncrypted(filePath: string): boolean {
   }
 }
 
+function parseGitBooleanValue(raw: string): boolean | undefined {
+  const s = raw.trim().toLowerCase();
+  if (s === "" || s === "true" || s === "yes" || s === "on") return true;
+  if (s === "false" || s === "no" || s === "off") return false;
+  if (/^[+-]?\d+$/.test(s)) return Number(s) !== 0;
+  return undefined;
+}
+
+/**
+ * 解析仓库/工作树作用域（`local` 与 `worktree`，完整展开仓库内 `[include]`/`[includeIf]`）的生效 `commit.gpgSign` 策略；
+ * 刻意忽略宿主机 `global` / `system` 作用域，避免用户个人全局签名默认值阻断隔离代理提交。
+ */
+async function resolveRepoOrWorktreeGpgSign(cwd: string, roOpts: GitRunOpts): Promise<boolean> {
+  const res = await tryGit(cwd, ["config", "--includes", "--show-scope", "--null", "--get-all", "commit.gpgSign"], roOpts);
+  if (res.code !== 0 || !res.stdout) return false;
+  const tokens = res.stdout.split("\0");
+  let effective: boolean | undefined;
+  for (let i = 0; i + 1 < tokens.length; i += 2) {
+    const scope = tokens[i];
+    const val = tokens[i + 1];
+    if (scope !== "local" && scope !== "worktree") continue;
+    const parsed = parseGitBooleanValue(val);
+    if (parsed !== undefined) effective = parsed;
+  }
+  return effective === true;
+}
+
 /**
  * 有改动就提交（含新文件）；没有改动什么都不做。返回是否提交了。
- *   - 仅当仓库本地 `.git/config` 显式要求 `commit.gpgSign=true` 时才保留提交签名策略（支持窄范围 SSH 签名密钥挂载）；
+ *   - 仅当仓库本地 `.git/config`、其 `[include]`/`[includeIf]` 或工作树配置 `config.worktree` 显式要求 `commit.gpgSign=true` 时才保留提交签名策略（支持窄范围 SSH 签名密钥挂载）；
  *   - 其余场景（例如宿主机全局 `~/.gitconfig` 设置了个人 `commit.gpgSign=true`）显式使用 `--no-gpg-sign` 执行无签名代理提交，
  *     与 `personal-agent` 提交身份及 `--no-verify` 保持一致，避免沙箱隐藏宿主机签名代理导致自动提交失败。
  */
@@ -1545,8 +1572,7 @@ export async function commitAll(cwd: string, message: string, opts?: GitRunOpts)
   if (!dirty) return false;
 
   const roOpts: GitRunOpts = { ...opts, readOnly: true };
-  const localSignRes = await tryGit(cwd, ["config", "--local", "--bool", "--get", "commit.gpgSign"], roOpts);
-  const repoRequiresSigning = localSignRes.code === 0 && localSignRes.stdout.trim().toLowerCase() === "true";
+  const repoRequiresSigning = await resolveRepoOrWorktreeGpgSign(cwd, roOpts);
   if (!repoRequiresSigning) {
     await git(cwd, ["commit", "-q", "--no-verify", "--no-gpg-sign", "-m", message], opts);
     return true;
@@ -1591,7 +1617,7 @@ export async function commitAll(cwd: string, message: string, opts?: GitRunOpts)
       }
     };
 
-    const extraCfgArgs = ["-c", "gpg.format=ssh", "-c", `user.signingkey=${signingKey}`];
+    const extraCfgArgs = ["-c", "commit.gpgSign=true", "-c", "gpg.format=ssh", "-c", `user.signingkey=${signingKey}`];
     const sshProgRes = await tryGit(cwd, ["config", "--includes", "--get", "gpg.ssh.program"], roOpts);
     const sshProg = sshProgRes.code === 0 ? sshProgRes.stdout.trim() : "";
     if (sshProg) extraCfgArgs.push("-c", `gpg.ssh.program=${sshProg}`);
@@ -2335,19 +2361,108 @@ export async function branchUsesGitLfs(
 
 const LFS_UPLOAD_OID_CHUNK = 200;
 
+function isTruthyLfsEnv(val: string | undefined): boolean {
+  const s = (val ?? "").trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "on";
+}
+
+/** 检测当前检出是否处于 skip-smudge / 无 smudge 过滤器模式（`GIT_LFS_SKIP_SMUDGE=1` 或 `git lfs install --skip-smudge`）。 */
+async function isGitLfsSmudgeDisabled(repoPath: string, roOpts: GitRunOpts): Promise<boolean> {
+  const effectiveRawEnv: NodeJS.ProcessEnv = roOpts.extraEnv ? { ...process.env, ...roOpts.extraEnv } : process.env;
+  if (isTruthyLfsEnv(effectiveRawEnv.GIT_LFS_SKIP_SMUDGE)) return true;
+  const procRes = await tryGit(repoPath, ["config", "--includes", "--get", "filter.lfs.process"], roOpts);
+  const procCmd = procRes.code === 0 ? procRes.stdout.trim() : "";
+  if (procCmd) {
+    return /(?:^|\s)--skip(?:\s|$)/.test(procCmd);
+  }
+  const smudgeRes = await tryGit(repoPath, ["config", "--includes", "--get", "filter.lfs.smudge"], roOpts);
+  const smudgeCmd = smudgeRes.code === 0 ? smudgeRes.stdout.trim() : "";
+  if (!smudgeCmd) return true;
+  return /(?:^|\s)--skip(?:\s|$)/.test(smudgeCmd);
+}
+
 /**
- * 在隔离 `git worktree add` 检出前，检查目标提交树是否引用了本地 `.git/lfs/objects` 中缺失的 Git LFS 对象；
- * 若有缺失，则通过单独授权的远程 `git lfs fetch <remote> <sha>` 提前拉入本地 LFS 缓存，
- * 使随后的本地 `git worktree add` 无需任何远端凭据即可完成 LFS smudge 检出。
+ * 按 `git-lfs-config(5)` 语义解析生效的 Git LFS 存储目录（`lfs.storage`，相对路径基于仓库 `commonGitDir`，默认为 `<commonGitDir>/lfs`）；
+ * 拒绝指向 `dataDir` 内部，并返回该目录是否位于仓库 `commonGitDir` 外部以供隔离挂载。
+ */
+async function resolveEffectiveLfsStorageDir(
+  repoPath: string,
+  commonGitDir: string,
+  roOpts: GitRunOpts,
+): Promise<{ storageDir: string; isExternal: boolean }> {
+  const defaultDir = path.join(commonGitDir, "lfs");
+  const cfgRes = await tryGit(repoPath, ["config", "--includes", "--get", "lfs.storage"], roOpts);
+  let rawStorage = cfgRes.code === 0 ? cfgRes.stdout.trim() : "";
+  if (!rawStorage) {
+    const lfsConfigPath = path.join(repoPath, ".lfsconfig");
+    try {
+      const st = fs.statSync(lfsConfigPath);
+      if (st.isFile() && st.size <= 256 * 1024) {
+        const fRes = await tryGit(repoPath, ["config", "--file", lfsConfigPath, "--get", "lfs.storage"], roOpts);
+        if (fRes.code === 0) rawStorage = fRes.stdout.trim();
+      }
+    } catch {
+      // no .lfsconfig
+    }
+  }
+  if (!rawStorage) {
+    return { storageDir: defaultDir, isExternal: false };
+  }
+  const effectiveRawEnv: NodeJS.ProcessEnv = roOpts.extraEnv ? { ...process.env, ...roOpts.extraEnv } : process.env;
+  const hostHome = effectiveRawEnv.HOME?.trim() || os.homedir();
+  const expanded =
+    rawStorage === "~"
+      ? hostHome || rawStorage
+      : rawStorage.startsWith("~/") && hostHome
+        ? path.join(hostHome, rawStorage.slice(2))
+        : rawStorage;
+  const resolved = path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(commonGitDir, expanded);
+  const realResolved = fs.existsSync(resolved) ? fs.realpathSync(resolved) : resolved;
+  const dataDir = roOpts.cfg?.dataDir;
+  if (dataDir) {
+    const realData = fs.existsSync(dataDir) ? fs.realpathSync(dataDir) : path.resolve(dataDir);
+    const relA = path.relative(realData, realResolved);
+    const relB = path.relative(realResolved, realData);
+    if (
+      relA === "" ||
+      (!relA.startsWith("..") && !path.isAbsolute(relA)) ||
+      relB === "" ||
+      (!relB.startsWith("..") && !path.isAbsolute(relB))
+    ) {
+      throw new Error(`lfs.storage (${rawStorage}) 与常驻数据目录重叠，已按安全策略拒绝使用`);
+    }
+  }
+  const realCommon = fs.existsSync(commonGitDir) ? fs.realpathSync(commonGitDir) : path.resolve(commonGitDir);
+  const relCommon = path.relative(realCommon, realResolved);
+  const isInsideCommon = relCommon === "" || (!relCommon.startsWith("..") && !path.isAbsolute(relCommon));
+  return { storageDir: realResolved, isExternal: !isInsideCommon };
+}
+
+/**
+ * 在隔离 `git worktree add` 检出前，检查目标提交树是否引用了本地 LFS 存储目录中缺失的 Git LFS 对象：
+ *   - 尊重 `GIT_LFS_SKIP_SMUDGE=1` 与 `git lfs install --skip-smudge`（关闭 smudge 时直接跳过预拉取）；
+ *   - 尊重 `lfs.storage` 自定义共享缓存路径（返回给调用方供隔离 fetch 与 worktree checkout 共同挂载使用）；
+ *   - 若有缺失，通过单独授权的远程 `git lfs fetch <remote> <sha>` 提前拉入 LFS 缓存，使随后的本地 `git worktree add` 无需远端凭据即可 smudge。
  */
 export async function ensureGitLfsObjectsForCheckout(
   repoPath: string,
   targetRev: string,
   opts?: GitRunOpts,
-): Promise<{ fetched: boolean; missingCount: number; remote?: string }> {
+): Promise<{
+  fetched: boolean;
+  missingCount: number;
+  skippedSmudge?: boolean;
+  remote?: string;
+  lfsStorageDir?: string;
+  lfsStorageExternal?: boolean;
+}> {
   const roOpts: GitRunOpts = { ...opts, readOnly: true };
   const hasLfsAttr = await targetRevHasLfsAttr(repoPath, targetRev, roOpts);
   if (!hasLfsAttr) return { fetched: false, missingCount: 0 };
+
+  if (await isGitLfsSmudgeDisabled(repoPath, roOpts)) {
+    return { fetched: false, missingCount: 0, skippedSmudge: true };
+  }
 
   const shaRes = await tryGit(repoPath, ["rev-parse", "--verify", `${targetRev}^{commit}`], roOpts);
   if (shaRes.code !== 0 || !shaRes.stdout.trim()) return { fetched: false, missingCount: 0 };
@@ -2364,6 +2479,12 @@ export async function ensureGitLfsObjectsForCheckout(
     }
   }
   if (!commonGitDir) return { fetched: false, missingCount: 0 };
+
+  const lfsStorage = await resolveEffectiveLfsStorageDir(repoPath, commonGitDir, roOpts);
+  const storageMeta = {
+    lfsStorageDir: lfsStorage.storageDir,
+    lfsStorageExternal: lfsStorage.isExternal,
+  };
 
   const lsTree = await tryGitBuffer(repoPath, ["ls-tree", "-r", "-l", "-z", targetSha], roOpts);
   if (lsTree.code !== 0) {
@@ -2383,7 +2504,7 @@ export async function ensureGitLfsObjectsForCheckout(
       smallBlobShas.push(objSha);
     }
   }
-  if (smallBlobShas.length === 0) return { fetched: false, missingCount: 0 };
+  if (smallBlobShas.length === 0) return { fetched: false, missingCount: 0, ...storageMeta };
 
   const requiredOids = new Set<string>();
   for (let i = 0; i < smallBlobShas.length; i += LFS_BATCH_CHUNK_SIZE) {
@@ -2397,14 +2518,14 @@ export async function ensureGitLfsObjectsForCheckout(
     }
     collectBatchBufferLfsOids(batchRes.stdout, requiredOids, false);
   }
-  if (requiredOids.size === 0) return { fetched: false, missingCount: 0 };
+  if (requiredOids.size === 0) return { fetched: false, missingCount: 0, ...storageMeta };
 
   const missingOids: string[] = [];
   for (const oid of requiredOids) {
-    const objPath = path.join(commonGitDir, "lfs", "objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+    const objPath = path.join(lfsStorage.storageDir, "objects", oid.slice(0, 2), oid.slice(2, 4), oid);
     if (!fs.existsSync(objPath)) missingOids.push(oid);
   }
-  if (missingOids.length === 0) return { fetched: false, missingCount: 0 };
+  if (missingOids.length === 0) return { fetched: false, missingCount: 0, ...storageMeta };
 
   // 选择拉取远端：优先目标分支或当前分支配置的 upstream remote，其次 origin，再其次仓库首个 remote
   let remote = "";
@@ -2428,7 +2549,7 @@ export async function ensureGitLfsObjectsForCheckout(
     if (remotes.includes("origin")) remote = "origin";
     else if (remotes.length > 0) remote = remotes[0];
   }
-  if (!remote) return { fetched: false, missingCount: missingOids.length };
+  if (!remote) return { fetched: false, missingCount: missingOids.length, ...storageMeta };
 
   const remoteUrlRes = await tryGit(repoPath, ["remote", "get-url", "--all", remote], roOpts);
   const fetchUrls = remoteUrlRes.code === 0
@@ -2443,11 +2564,20 @@ export async function ensureGitLfsObjectsForCheckout(
     localRoDirs.push(m.realDir);
     localSyms.push(...m.symlinks);
   }
+  if (lfsStorage.isExternal) {
+    fs.mkdirSync(lfsStorage.storageDir, { recursive: true });
+  }
 
   const fetchRes = await tryGit(repoPath, ["lfs", "fetch", remote, targetSha], {
     ...opts,
+    extraWritablePaths: [
+      ...new Set([...(opts?.extraWritablePaths ?? []), ...(lfsStorage.isExternal ? [lfsStorage.storageDir] : [])]),
+    ],
     extraReadOnlyPaths: [...new Set([...(opts?.extraReadOnlyPaths ?? []), ...localRoDirs])],
     ...(localSyms.length ? { extraSymlinks: [...(opts?.extraSymlinks ?? []), ...localSyms] } : {}),
+    ...(lfsStorage.isExternal
+      ? { extraGitConfigArgs: [...(opts?.extraGitConfigArgs ?? []), "-c", `lfs.storage=${lfsStorage.storageDir}`] }
+      : {}),
   });
   if (fetchRes.code !== 0) {
     const out = `${fetchRes.stdout}\n${fetchRes.stderr}`.trim();
@@ -2455,7 +2585,7 @@ export async function ensureGitLfsObjectsForCheckout(
       `检出隔离工作树前预拉取 ${missingOids.length} 个缺失 Git LFS 对象失败（remote=${remote}, rev=${targetRev}）：${out.slice(-600)}`,
     );
   }
-  return { fetched: true, missingCount: missingOids.length, remote };
+  return { fetched: true, missingCount: missingOids.length, remote, ...storageMeta };
 }
 
 /**
@@ -2564,6 +2694,14 @@ export async function pushBranch(
           if (!m) continue;
           dirs.add(m.realDir);
           syms.push(...m.symlinks);
+        }
+        const commonRes = await tryGit(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"], roOpts);
+        const commonGitDir = commonRes.code === 0 ? commonRes.stdout.trim() : "";
+        if (commonGitDir) {
+          const lfsStorage = await resolveEffectiveLfsStorageDir(cwd, commonGitDir, roOpts);
+          if (lfsStorage.isExternal) {
+            dirs.add(lfsStorage.storageDir);
+          }
         }
         extraLfsLocalDirs = [...dirs];
         extraLfsLocalSyms = syms;

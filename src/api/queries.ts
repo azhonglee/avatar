@@ -134,9 +134,13 @@ function startOfLocalDay(tz: string, now = Date.now()): number {
 
 export function overview(app: App): Overview {
   const { ledger, cfg } = app;
-  const recent = ledger
+  const ownerBatch = new HealthOwnerBatch(app);
+  const rawRecent = ledger
     .list<DispatchPayload>({ kinds: ["dispatch"], limit: 500 })
-    .filter((w) => (!w.terminal || w.updated > Date.now() - 14 * DAY) && !isContextDerivedDispatchBlocked(app, w.id));
+    .filter((w) => !w.terminal || w.updated > Date.now() - 14 * DAY);
+  if (ownerBatch.hasForeignOrigins) ownerBatch.preloadPage(rawRecent);
+  const recent = rawRecent.filter((w) => !ownerBatch.isDispatchBlocked(w));
+  ownerBatch.clearPageCache();
   const latest = latestPerCard(app, recent);
   const needs = latest.filter((w) => ATTENTION.includes(w.state as DispatchState)).map((w) => summarize(app, w));
   const review = latest
@@ -147,7 +151,7 @@ export function overview(app: App): Overview {
   const dayStart = startOfLocalDay(cfg.owner.timezone);
   const today = recent.filter((w) => w.created >= dayStart);
   const count = (s: string) => today.filter((w) => w.state === s).length;
-  const h = health(app);
+  const h = health(app, ownerBatch);
   // 使用 health() 在全 14 天报告窗口内分页统计出的当前主人未确认可操作失败总数，
   // 避免最新 200 条失败被旧主人隔离记录占满时把当前主人的待处理失败挤出概览或误判为健康
   const actionableCount = h.actionable_failures;
@@ -497,6 +501,7 @@ export function listDispatches(app: App, f: { filter?: DispatchFilter; q?: strin
     default:
       break;
   }
+  const ownerBatch = new HealthOwnerBatch(app);
   const pageSize = Math.min(Math.max(maxItems * 2, 50), 500);
   const matched: WorkItem<DispatchPayload>[] = [];
   let before: number | undefined;
@@ -510,15 +515,17 @@ export function listDispatches(app: App, f: { filter?: DispatchFilter; q?: strin
       before,
     });
     if (!page.length) break;
+    if (ownerBatch.hasForeignOrigins) ownerBatch.preloadPage(page);
     for (const w of page) {
       if (q && !canPushSearch && !`${w.payload.summary ?? ""} ${w.ref} ${w.id}`.toLowerCase().includes(q)) continue;
-      if (isContextDerivedDispatchBlocked(app, w.id)) continue;
+      if (ownerBatch.isDispatchBlocked(w)) continue;
       matched.push(w);
       if (matched.length >= maxItems) break;
     }
     if (matched.length >= maxItems || page.length < pageSize) break;
     before = page[page.length - 1].seq;
   }
+  ownerBatch.clearPageCache();
   return matched.map((w) => summarize(app, w));
 }
 
@@ -723,7 +730,7 @@ export function stepLog(app: App, stepId: number, offset: number): LogChunk | un
   return { step_id: stepId, offset: start, next_offset: start + len, text: buf.toString("utf8"), eof: start + len >= size, running: s.status === "running" };
 }
 
-function isContextHealthWork(w: WorkItem): boolean {
+function isContextHealthWork(w: WorkItem<unknown>): boolean {
   if (w.kind === "context") return true;
   if (w.ref.startsWith("card:ctx-") || w.ref.startsWith("ctx-draft:")) return true;
   if (w.ref.startsWith("context:") && w.ref !== "context:pw-needs-login") return true;
@@ -754,8 +761,19 @@ class HealthOwnerBatch {
   private readonly legacyDelegatedIds = new Set<string>();
   private readonly legacyDelegatedDispatchRefs = new Set<string>();
   private readonly hasAnyForeignOrigin: boolean;
-  private readonly workCache = new Map<string, WorkItem | null>();
+  /** 仅限当前分页存活的完整 WorkItem 缓存（每页开始前清空，防止大窗口故障扫描在内存中驻留全部 payload） */
+  private readonly pageWorkCache = new Map<string, WorkItem<unknown> | null>();
+  /** 跨页复用的轻量级布尔归属判定缓存（不持有任何 WorkItem payload） */
+  private readonly dispatchBlockedMemo = new Map<string, boolean>();
   private readonly ledger: App["ledger"];
+
+  get hasForeignOrigins(): boolean {
+    return this.hasAnyForeignOrigin;
+  }
+
+  clearPageCache(): void {
+    this.pageWorkCache.clear();
+  }
 
   constructor(app: Pick<App, "cfg" | "store" | "ledger">) {
     this.ledger = app.ledger;
@@ -823,15 +841,17 @@ class HealthOwnerBatch {
     this.hasAnyForeignOrigin = foreignOrigin;
   }
 
-  private collectLookupIdsFromWork(w: WorkItem, out: Set<string>): void {
-    const addNorm = (raw: string) => {
+  private collectLookupIdsFromWork(w: WorkItem<unknown>, out: Set<string>): void {
+    const addNorm = (raw: string, checkDispatchMemo = true) => {
       if (!raw) return;
       const norm = raw.startsWith("card:") ? raw.slice("card:".length) : raw;
-      if (norm && !this.workCache.has(norm)) out.add(norm);
+      if (!norm || this.pageWorkCache.has(norm)) return;
+      if (checkDispatchMemo && this.dispatchBlockedMemo.has(norm)) return;
+      out.add(norm);
     };
     const addFailureTarget = (raw: string) => {
-      if (raw.startsWith("card:failure:")) addNorm(raw.slice("card:failure:".length));
-      else if (raw.startsWith("failure:")) addNorm(raw.slice("failure:".length));
+      if (raw.startsWith("card:failure:")) addNorm(raw.slice("card:failure:".length), false);
+      else if (raw.startsWith("failure:")) addNorm(raw.slice("failure:".length), false);
     };
 
     addFailureTarget(w.ref);
@@ -860,11 +880,13 @@ class HealthOwnerBatch {
     }
   }
 
-  preloadPage(items: WorkItem[]): void {
+  preloadPage<P = Record<string, unknown>>(items: readonly WorkItem<P>[]): void {
+    // 严格按页释放上一页的完整 WorkItem payload，仅跨页保留轻量归属事实
+    this.pageWorkCache.clear();
     for (const w of items) {
-      this.workCache.set(w.id, w);
+      this.pageWorkCache.set(w.id, w as WorkItem<unknown>);
     }
-    let frontier = items;
+    let frontier: WorkItem<unknown>[] = items as WorkItem<unknown>[];
     for (let depth = 0; depth < 3 && frontier.length > 0; depth++) {
       const missing = new Set<string>();
       for (const w of frontier) {
@@ -876,35 +898,51 @@ class HealthOwnerBatch {
           if (id.startsWith("delivery:dispatch:")) {
             const parts = id.slice("delivery:".length).split(":");
             const parsedDispatchId = parts.length >= 3 ? parts.slice(0, 3).join(":") : "";
-            if (parsedDispatchId && !this.workCache.has(parsedDispatchId)) missing.add(parsedDispatchId);
+            if (parsedDispatchId && !this.pageWorkCache.has(parsedDispatchId) && !this.dispatchBlockedMemo.has(parsedDispatchId)) {
+              missing.add(parsedDispatchId);
+            }
           }
         }
       }
       if (missing.size === 0) break;
       const missingList = [...missing];
       const fetched = this.ledger.getMany(missingList);
-      const nextFrontier: WorkItem[] = [];
+      const nextFrontier: WorkItem<unknown>[] = [];
       for (const id of missingList) {
         const hit = fetched.get(id) ?? null;
-        this.workCache.set(id, hit);
+        this.pageWorkCache.set(id, hit);
         if (hit) nextFrontier.push(hit);
       }
       frontier = nextFrontier;
     }
   }
 
-  private getCachedWork(id: string): WorkItem | undefined {
-    if (this.workCache.has(id)) return this.workCache.get(id) ?? undefined;
+  private getCachedWork(id: string): WorkItem<unknown> | undefined {
+    if (this.pageWorkCache.has(id)) return this.pageWorkCache.get(id) ?? undefined;
     const hit = this.ledger.get(id) ?? null;
-    this.workCache.set(id, hit);
+    this.pageWorkCache.set(id, hit);
     return hit ?? undefined;
+  }
+
+  isDispatchBlocked(w: Pick<WorkItem, "id" | "ref">): boolean {
+    if (!this.hasAnyForeignOrigin) return false;
+    return this.isContextDerivedDispatchBlockedFast(w.id) || (!!w.ref && this.isContextDerivedDispatchBlockedFast(w.ref));
   }
 
   private isContextDerivedDispatchBlockedFast(dispatchId: string, visited: Set<string> = new Set()): boolean {
     if (!dispatchId || !this.hasAnyForeignOrigin) return false;
     const normalized = dispatchId.startsWith("card:") ? dispatchId.slice("card:".length) : dispatchId;
     if (!normalized || visited.has(normalized)) return false;
+    if (this.dispatchBlockedMemo.has(normalized)) return this.dispatchBlockedMemo.get(normalized)!;
+    const isTopLevel = visited.size === 0;
     visited.add(normalized);
+
+    const remember = (res: boolean): boolean => {
+      if (isTopLevel && this.dispatchBlockedMemo.size < 50_000) {
+        this.dispatchBlockedMemo.set(normalized, res);
+      }
+      return res;
+    };
 
     const w = this.getCachedWork(normalized);
     if (w?.kind === "delivery") {
@@ -914,15 +952,17 @@ class HealthOwnerBatch {
         typeof p.dispatch_id === "string" ? p.dispatch_id : "",
         typeof p.guid === "string" ? p.guid : "",
       ].filter(Boolean);
-      if (candidates.some((c) => c !== normalized && this.isContextDerivedDispatchBlockedFast(c, visited))) return true;
+      if (candidates.some((c) => c !== normalized && this.isContextDerivedDispatchBlockedFast(c, visited))) {
+        return remember(true);
+      }
     } else if (!w && normalized.startsWith("delivery:")) {
       const rest = normalized.slice("delivery:".length);
       if (rest.startsWith("dispatch:")) {
         const parts = rest.split(":");
         const parsedDispatchId = parts.length >= 3 ? parts.slice(0, 3).join(":") : "";
         const parsedDeliveryGuid = parts[1] ?? "";
-        if (parsedDispatchId && this.isContextDerivedDispatchBlockedFast(parsedDispatchId, visited)) return true;
-        if (parsedDeliveryGuid && this.isContextDerivedDispatchBlockedFast(parsedDeliveryGuid, visited)) return true;
+        if (parsedDispatchId && this.isContextDerivedDispatchBlockedFast(parsedDispatchId, visited)) return remember(true);
+        if (parsedDeliveryGuid && this.isContextDerivedDispatchBlockedFast(parsedDeliveryGuid, visited)) return remember(true);
       }
     }
 
@@ -934,20 +974,20 @@ class HealthOwnerBatch {
     const parsedGuidOrigin = parsedGuid ? (this.dispatchRefOwner.get(parsedGuid) ?? "") : "";
     const ownTaskOrigin = candidateGuids.map((g) => this.ownTaskOwner.get(g) ?? "").find(Boolean) ?? "";
     const originOwner = directOrigin || refOrigin || idAsRefOrigin || parsedGuidOrigin || ownTaskOrigin;
-    if (originOwner && originOwner !== this.curOwner) return true;
-    if (!this.ownerSwitched) return false;
-    if (originOwner) return true;
+    if (originOwner && originOwner !== this.curOwner) return remember(true);
+    if (!this.ownerSwitched) return remember(false);
+    if (originOwner) return remember(true);
 
     for (const g of candidateGuids) {
-      if (this.legacyOwnTaskGuids.has(g)) return true;
+      if (this.legacyOwnTaskGuids.has(g)) return remember(true);
     }
-    if (this.legacyDelegatedIds.has(normalized)) return true;
+    if (this.legacyDelegatedIds.has(normalized)) return remember(true);
     const candidateRef = w?.ref || parsedGuid || normalized;
     if (candidateRef) {
-      if (this.legacyDelegatedIds.has(candidateRef)) return true;
-      if (this.legacyDelegatedDispatchRefs.has(candidateRef)) return true;
+      if (this.legacyDelegatedIds.has(candidateRef)) return remember(true);
+      if (this.legacyDelegatedDispatchRefs.has(candidateRef)) return remember(true);
     }
-    return false;
+    return remember(false);
   }
 
   private isContextOwnedTaskBlockedFast(guid: string): boolean {
@@ -960,7 +1000,7 @@ class HealthOwnerBatch {
     return this.legacyOwnTaskGuids.has(guid);
   }
 
-  isWorkBlocked(workOrId: WorkItem | string, visited: Set<string> = new Set()): boolean {
+  isWorkBlocked(workOrId: WorkItem<unknown> | string, visited: Set<string> = new Set()): boolean {
     const rawId = typeof workOrId === "string" ? workOrId : workOrId.id;
     if (!rawId || visited.has(rawId)) return false;
     visited.add(rawId);
@@ -1095,9 +1135,9 @@ function buildHealthItem(w: WorkItem, isolated: boolean): HealthItem {
   };
 }
 
-export function health(app: App): Health {
+export function health(app: App, existingBatch?: HealthOwnerBatch): Health {
   const { ledger, store, cfg } = app;
-  const ownerBatch = new HealthOwnerBatch(app);
+  const ownerBatch = existingBatch ?? new HealthOwnerBatch(app);
   const kinds = ["event", "effect", "job", "delivery", "context"] as const;
   const retryingRaw = kinds.flatMap((k) => ledger.active(k)).filter((w) => w.attempts > 1 || !!w.error);
   ownerBatch.preloadPage(retryingRaw);
@@ -1149,6 +1189,7 @@ export function health(app: App): Health {
     if (page.length < PAGE_SIZE) break;
     before = page[page.length - 1].seq;
   }
+  ownerBatch.clearPageCache();
   const failed: HealthItem[] = [];
   for (const bucket of [actionableOwnFailed, acknowledgedOwnFailed, isolatedFailed]) {
     if (failed.length >= DISPLAY_LIMIT) break;

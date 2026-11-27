@@ -936,9 +936,37 @@ function discoverEffectiveGlobalGitConfig(
     parseStaticIncludes(path.join(xdgConfigBase, "git", "config"), 0);
   }
 
+  const repoScopedDirs: string[] = [];
+  if (opts?.cwd && fs.existsSync(opts.cwd)) {
+    repoScopedDirs.push(safeRealpath(opts.cwd));
+    const wt = detectGitWorktreeDirs(opts.cwd);
+    if (wt.gitDir) repoScopedDirs.push(safeRealpath(wt.gitDir));
+    if (wt.commonDir) repoScopedDirs.push(safeRealpath(wt.commonDir));
+  }
+  const isSafeExternalRepoIncludeTarget = (realPath: string): boolean => {
+    // 绝不把仓库自身 .git/config 或 config.worktree 以只读叠加到可写仓库/工作树目录之上（否则 git config 写入会 EROFS 失败）
+    if (repoScopedDirs.some((d) => isPathInsideOrEqual(realPath, d))) return false;
+    if (!isSafeGitConfigIncludeTarget(realPath, resolvedData)) return false;
+    for (const sensitiveSub of [
+      ".ssh",
+      ".aws",
+      ".gnupg",
+      ".codex",
+      ".claude",
+      ".gemini",
+      ".acpx",
+      path.join(".config", "opencode"),
+      path.join(".local", "share", "opencode"),
+    ]) {
+      const sensitiveDir = path.join(resolvedHome, sensitiveSub);
+      if (isPathInsideOrEqual(realPath, sensitiveDir)) return false;
+    }
+    return true;
+  };
+
   let usedGit = false;
   const gitBin = resolveTrustedSystemBin("git");
-  if (gitBin && rawGitGlobal !== "/dev/null") {
+  if (gitBin && (rawGitGlobal !== "/dev/null" || (opts?.cwd && fs.existsSync(opts.cwd)))) {
     try {
       const gitEnv: NodeJS.ProcessEnv = {
         PATH: TRUSTED_BOOTSTRAP_PATH,
@@ -974,7 +1002,21 @@ function discoverEffectiveGlobalGitConfig(
             const scope = tokens[i];
             const origin = tokens[i + 1];
             const rec = tokens[i + 2];
-            if (scope !== "global" || !rec) continue;
+            if (!rec) continue;
+            if (scope === "local" || scope === "worktree") {
+              if (origin.startsWith("file:")) {
+                const rawOrigin = origin.slice("file:".length);
+                if (rawOrigin) {
+                  const absOrigin =
+                    path.isAbsolute(rawOrigin) || !opts?.cwd ? path.resolve(rawOrigin) : path.resolve(opts.cwd, rawOrigin);
+                  if (fs.existsSync(absOrigin) && isSafeExternalRepoIncludeTarget(safeRealpath(absOrigin))) {
+                    addLogicalFile(absOrigin);
+                  }
+                }
+              }
+              continue;
+            }
+            if (scope !== "global") continue;
             if (origin.startsWith("file:")) {
               const rawOrigin = origin.slice("file:".length);
               if (rawOrigin) {
@@ -2690,34 +2732,582 @@ export function stageIsolatedGeminiState(
   }
 }
 
-function sanitizeOpenCodeConfigForNoTools(raw: string): string | undefined {
-  try {
-    // 兼容 JSONC（移除整行 // 注释与块注释）
-    const stripped = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-    const parsed = JSON.parse(stripped) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-    const src = parsed as Record<string, unknown>;
-    const out: Record<string, unknown> = {};
-    for (const key of ["$schema", "model", "small_model", "provider", "disabled_providers", "enabled_providers"] as const) {
-      if (Object.prototype.hasOwnProperty.call(src, key)) out[key] = src[key];
+/**
+ * 字符串感知的 JSONC 解析器（零外部运行时依赖）：
+ *   - 完整保留字符串字面量内部的 `//`、`/*` 与引号转义（如 `"baseURL": "https://api.corp.example/v1"`）；
+ *   - 正确剥离行尾 `// ...` 注释、块注释 `/* ... *\/`（未闭合块注释显式抛错）以及对象/数组尾随逗号；
+ *   - 解析失败时直接抛错以便调用方 fail-closed，绝不静默丢弃配置文件导致切换默认供应商。
+ */
+export function parseJsonc(raw: string): unknown {
+  const src = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  const n = src.length;
+  let out = "";
+  let i = 0;
+  let inString = false;
+  let escaped = false;
+
+  const skipWhitespaceAndComments = (pos: number): number => {
+    let j = pos;
+    while (j < n) {
+      const ch = src[j];
+      if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n") {
+        j++;
+      } else if (ch === "/" && src[j + 1] === "/") {
+        j += 2;
+        while (j < n && src[j] !== "\n") j++;
+      } else if (ch === "/" && src[j + 1] === "*") {
+        const end = src.indexOf("*/", j + 2);
+        if (end < 0) throw new SyntaxError("JSONC 中存在未闭合的块注释");
+        j = end + 2;
+      } else {
+        break;
+      }
     }
-    return Object.keys(out).length > 0 ? `${JSON.stringify(out, null, 2)}\n` : undefined;
+    return j;
+  };
+
+  while (i < n) {
+    const ch = src[i];
+    if (inString) {
+      out += ch;
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === "/" && src[i + 1] === "/") {
+      i += 2;
+      while (i < n && src[i] !== "\n") i++;
+      continue;
+    }
+    if (ch === "/" && src[i + 1] === "*") {
+      const end = src.indexOf("*/", i + 2);
+      if (end < 0) throw new SyntaxError("JSONC 中存在未闭合的块注释");
+      i = end + 2;
+      continue;
+    }
+    if (ch === ",") {
+      const next = skipWhitespaceAndComments(i + 1);
+      if (next < n && (src[next] === "}" || src[next] === "]")) {
+        i++;
+        continue;
+      }
+    }
+    out += ch;
+    i++;
+  }
+  return JSON.parse(out) as unknown;
+}
+
+export function sanitizeOpenCodeConfigForNoTools(raw: string): string {
+  const parsed = parseJsonc(raw);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("OpenCode 配置文件根节点必须是 JSON 对象");
+  }
+  const src = parsed as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const key of ["$schema", "model", "small_model", "provider", "disabled_providers", "enabled_providers"] as const) {
+    if (Object.prototype.hasOwnProperty.call(src, key)) out[key] = src[key];
+  }
+  return `${JSON.stringify(out, null, 2)}\n`;
+}
+
+interface OpenCodeOAuthEntry {
+  refresh: string;
+  access: string;
+  expiresMs?: number;
+}
+
+function parseOpenCodeOAuthEntry(val: unknown): OpenCodeOAuthEntry | undefined {
+  if (!isPlainJsonRecord(val)) return undefined;
+  const refresh =
+    (typeof val.refresh === "string" && val.refresh.trim()) ||
+    (typeof val.refresh_token === "string" && val.refresh_token.trim()) ||
+    (typeof val.refreshToken === "string" && val.refreshToken.trim()) ||
+    "";
+  if (!refresh) return undefined;
+  const access =
+    (typeof val.access === "string" && val.access.trim()) ||
+    (typeof val.access_token === "string" && val.access_token.trim()) ||
+    (typeof val.accessToken === "string" && val.accessToken.trim()) ||
+    "";
+  const rawExp = val.expires ?? val.expires_at ?? val.expiresAt;
+  let expiresMs: number | undefined;
+  if (typeof rawExp === "number" && Number.isFinite(rawExp) && rawExp > 0) {
+    expiresMs = rawExp < 1e12 ? rawExp * 1000 : rawExp;
+  } else if (typeof rawExp === "string" && rawExp.trim()) {
+    const num = Number(rawExp.trim());
+    if (Number.isFinite(num) && num > 0) expiresMs = num < 1e12 ? num * 1000 : num;
+    else {
+      const parsed = Date.parse(rawExp.trim());
+      if (Number.isFinite(parsed) && parsed > 0) expiresMs = parsed;
+    }
+  }
+  return { refresh, access, expiresMs };
+}
+
+function extractOpenCodeOAuthProviders(obj: Record<string, unknown>): Map<string, OpenCodeOAuthEntry> {
+  const out = new Map<string, OpenCodeOAuthEntry>();
+  for (const [providerId, val] of Object.entries(obj)) {
+    const entry = parseOpenCodeOAuthEntry(val);
+    if (entry) out.set(providerId, entry);
+  }
+  return out;
+}
+
+function hasOpenCodeOAuthRefreshToken(obj: Record<string, unknown>): boolean {
+  return extractOpenCodeOAuthProviders(obj).size > 0;
+}
+
+export function isOpenCodeOAuthRefreshNeeded(
+  authJson: Record<string, unknown>,
+  nowMs = Date.now(),
+  runWindowMs = 0,
+): boolean {
+  const providers = extractOpenCodeOAuthProviders(authJson);
+  if (providers.size === 0) return false;
+  const safetyBufferMs = 10 * 60_000 + Math.max(0, runWindowMs);
+  for (const entry of providers.values()) {
+    if (entry.expiresMs === undefined) return true;
+    if (entry.expiresMs <= nowMs + safetyBufferMs) return true;
+  }
+  return false;
+}
+
+interface OpenCodeAuthOrigSnapshot {
+  hostAuthPath: string;
+  resolvedAuthPath: string;
+  wasSymlink: boolean;
+  origBytes: Buffer;
+  origJson: Record<string, unknown>;
+  origDev: number;
+  origIno: number;
+  canSyncBack: boolean;
+}
+
+export interface StagedOpenCodeState extends StagedAgentState {
+  stageDataDir: string;
+  origAuth?: OpenCodeAuthOrigSnapshot;
+}
+
+export interface OpenCodeOAuthRefreshLease {
+  held: boolean;
+  resolvedAuthPath?: string;
+  attachScratch?: (staged: StagedOpenCodeState) => void;
+  release: () => void;
+}
+
+function applyValidatedOpenCodeAuthSyncLocked(
+  meta: {
+    hostAuthPath: string;
+    resolvedAuthPath: string;
+    wasSymlink: boolean;
+    origDev: number;
+    origIno: number;
+    origJson: Record<string, unknown>;
+  },
+  scratchAuthPath: string,
+): boolean {
+  if (!fs.existsSync(scratchAuthPath)) return false;
+  let scratchBytes: Buffer;
+  try {
+    const st = fs.lstatSync(scratchAuthPath);
+    if (st.isSymbolicLink() || !st.isFile() || st.size === 0 || st.size > 512 * 1024) return false;
+    scratchBytes = fs.readFileSync(scratchAuthPath);
   } catch {
-    return undefined;
+    return false;
+  }
+  let scratchJson: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(scratchBytes.toString("utf8")) as unknown;
+    if (!isPlainJsonRecord(parsed)) return false;
+    scratchJson = parsed;
+  } catch {
+    return false;
+  }
+
+  const origProviders = extractOpenCodeOAuthProviders(meta.origJson);
+  const scratchProviders = extractOpenCodeOAuthProviders(scratchJson);
+  const changedProviders = new Map<string, Record<string, unknown>>();
+  for (const [pid, origEntry] of origProviders) {
+    const nextEntry = scratchProviders.get(pid);
+    if (!nextEntry) continue;
+    const rawNext = scratchJson[pid];
+    if (!isPlainJsonRecord(rawNext)) continue;
+    const changed =
+      nextEntry.refresh !== origEntry.refresh ||
+      nextEntry.access !== origEntry.access ||
+      nextEntry.expiresMs !== origEntry.expiresMs;
+    if (!changed) continue;
+    if (origEntry.expiresMs !== undefined && nextEntry.expiresMs !== undefined && nextEntry.expiresMs < origEntry.expiresMs) {
+      continue;
+    }
+    changedProviders.set(pid, rawNext);
+  }
+  if (changedProviders.size === 0) return false;
+
+  const verifyEntryPointsToTarget = (): boolean => {
+    try {
+      const entryLst = fs.lstatSync(meta.hostAuthPath);
+      if (meta.wasSymlink) {
+        if (!entryLst.isSymbolicLink()) return false;
+        if (fs.realpathSync(meta.hostAuthPath) !== meta.resolvedAuthPath) return false;
+      } else {
+        if (entryLst.isSymbolicLink() || !entryLst.isFile()) return false;
+        if (fs.realpathSync(meta.hostAuthPath) !== meta.resolvedAuthPath) return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (!verifyEntryPointsToTarget()) return false;
+
+  let beforeStat: fs.Stats;
+  let hostCurJson: Record<string, unknown>;
+  try {
+    beforeStat = fs.lstatSync(meta.resolvedAuthPath);
+    if (beforeStat.isSymbolicLink() || !beforeStat.isFile() || !isCurrentUidOwner(beforeStat)) return false;
+    if (beforeStat.size === 0 || beforeStat.size > 512 * 1024) return false;
+    const curParsed = JSON.parse(fs.readFileSync(meta.resolvedAuthPath, "utf8")) as unknown;
+    if (!isPlainJsonRecord(curParsed)) return false;
+    hostCurJson = curParsed;
+  } catch {
+    return false;
+  }
+
+  // 逐供应商合并：仅写回宿主机上未被并发改写/重登的 OAuth 供应商凭据，保留宿主机其他供应商及更新登录
+  const merged: Record<string, unknown> = { ...hostCurJson };
+  let appliedCount = 0;
+  for (const [pid, nextVal] of changedProviders) {
+    const origRaw = meta.origJson[pid];
+    const hostRaw = hostCurJson[pid];
+    if (JSON.stringify(hostRaw) !== JSON.stringify(origRaw)) {
+      continue;
+    }
+    merged[pid] = nextVal;
+    appliedCount++;
+  }
+  if (appliedCount === 0) return false;
+
+  const outBuf = Buffer.from(`${JSON.stringify(merged, null, 2)}\n`, "utf8");
+  const targetDir = path.dirname(meta.resolvedAuthPath);
+  const dirSt = fs.lstatSync(targetDir);
+  if (!dirSt.isDirectory() || !isCurrentUidOwner(dirSt)) return false;
+  const tmpPath = path.join(
+    targetDir,
+    `.${path.basename(meta.resolvedAuthPath)}.pa-tmp-${process.pid}-${Date.now()}-${randomUUID().slice(0, 8)}`,
+  );
+  const tmpFlags =
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
+  let tmpFd: number | undefined;
+  try {
+    tmpFd = fs.openSync(tmpPath, tmpFlags, 0o600);
+    let written = 0;
+    while (written < outBuf.length) {
+      const n = fs.writeSync(tmpFd, outBuf, written, outBuf.length - written, written);
+      if (n <= 0) throw new Error("short write to temporary OpenCode auth.json");
+      written += n;
+    }
+    try {
+      fs.fchmodSync(tmpFd, 0o600);
+    } catch {
+      // ignore
+    }
+    fs.fsyncSync(tmpFd);
+    fs.closeSync(tmpFd);
+    tmpFd = undefined;
+
+    if (!verifyEntryPointsToTarget()) {
+      fs.rmSync(tmpPath, { force: true });
+      return false;
+    }
+    const preRenameStat = fs.lstatSync(meta.resolvedAuthPath);
+    if (
+      preRenameStat.isSymbolicLink() ||
+      !preRenameStat.isFile() ||
+      !isCurrentUidOwner(preRenameStat) ||
+      Number(preRenameStat.dev) !== Number(beforeStat.dev) ||
+      Number(preRenameStat.ino) !== Number(beforeStat.ino) ||
+      preRenameStat.size !== beforeStat.size ||
+      preRenameStat.mtimeMs !== beforeStat.mtimeMs
+    ) {
+      fs.rmSync(tmpPath, { force: true });
+      return false;
+    }
+    fs.renameSync(tmpPath, meta.resolvedAuthPath);
+    fsyncDirectoryBestEffort(targetDir);
+    return true;
+  } catch (err) {
+    if (tmpFd !== undefined) {
+      try {
+        fs.closeSync(tmpFd);
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {
+      // ignore
+    }
+    throw err;
+  }
+}
+
+function recoverOrphanedOpenCodeAuthLocked(
+  db: DatabaseSync,
+  resolvedAuthPath: string,
+  expiredLeaseHolder?: string,
+): boolean {
+  const rows = db
+    .prepare(
+      "SELECT holder, pid, scratch_auth_path, scratch_dir, host_auth_path, was_symlink, orig_dev, orig_ino, orig_sha256, orig_auth_mode, orig_account_id, orig_last_refresh, created_at FROM pending_recovery WHERE orig_auth_mode = 'opencode_oauth' ORDER BY created_at DESC",
+    )
+    .all() as unknown as CodexPendingRecoveryRow[];
+  let recoveredAny = false;
+  for (const rec of rows) {
+    const dead = !isPidAlive(rec.pid);
+    const isExpiredHolder = !!expiredLeaseHolder && rec.holder === expiredLeaseHolder;
+    if (!dead && !isExpiredHolder) continue;
+    try {
+      const origSnapFile = path.join(rec.scratch_dir, "orig-auth.json");
+      if (fs.existsSync(origSnapFile)) {
+        const origParsed = JSON.parse(fs.readFileSync(origSnapFile, "utf8")) as unknown;
+        if (isPlainJsonRecord(origParsed)) {
+          const ok = applyValidatedOpenCodeAuthSyncLocked(
+            {
+              hostAuthPath: rec.host_auth_path,
+              resolvedAuthPath,
+              wasSymlink: rec.was_symlink !== 0,
+              origDev: rec.orig_dev,
+              origIno: rec.orig_ino,
+              origJson: origParsed,
+            },
+            rec.scratch_auth_path,
+          );
+          if (ok) recoveredAny = true;
+        }
+      }
+    } catch {
+      // ignore invalid orphan scratch
+    }
+    try {
+      if (rec.scratch_dir && path.basename(rec.scratch_dir).startsWith(".pa-opencode-state-")) {
+        fs.rmSync(rec.scratch_dir, { recursive: true, force: true });
+      }
+    } catch {
+      // ignore cleanup error
+    }
+    db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(rec.holder);
+  }
+  return recoveredAny;
+}
+
+/** 跨进程协调 OpenCode 文件态 OAuth（`auth.json`）刷新与崩溃恢复，仅写回变更供应商凭据，绝不持久化会话历史 */
+export async function coordinateOpenCodeOAuthRefresh(
+  hostDataDir: string,
+  opts?: {
+    signal?: AbortSignal;
+    leaseTtlMs?: number;
+    pollIntervalMs?: number;
+    maxWaitMs?: number;
+    runWindowMs?: number;
+  },
+): Promise<OpenCodeOAuthRefreshLease> {
+  if (!hostDataDir || !fs.existsSync(hostDataDir)) {
+    return { held: false, release: () => undefined };
+  }
+  const hostAuthPath = path.join(hostDataDir, "auth.json");
+  const initial = inspectHostCodexAuth(hostAuthPath);
+  if (initial.kind === "broken_symlink") {
+    throw new Error(initial.error);
+  }
+  if (initial.kind !== "ok" || !initial.origJson || !hasOpenCodeOAuthRefreshToken(initial.origJson)) {
+    return { held: false, release: () => undefined };
+  }
+  if (!initial.canSyncBack) {
+    throw new Error(
+      `宿主机 OpenCode OAuth 凭据不可安全写回（${initial.unwritableReason ?? "权限不足"}）；为防止隔离沙箱旋转 refresh 令牌后丢失新令牌，已中止执行`,
+    );
+  }
+
+  const resolvedAuthPath = initial.resolvedAuthPath;
+  const leaseTtlMs = opts?.leaseTtlMs ?? 60_000;
+  const pollMs = opts?.pollIntervalMs ?? 120;
+  const deadline = Date.now() + (opts?.maxWaitMs ?? 180_000);
+  const holder = `${process.pid}:${randomUUID().slice(0, 8)}`;
+
+  const makeAttachScratch = (): ((staged: StagedOpenCodeState) => void) => (staged: StagedOpenCodeState) => {
+    const snap = staged.origAuth;
+    if (!snap || !snap.canSyncBack || !hasOpenCodeOAuthRefreshToken(snap.origJson)) return;
+    try {
+      const scratchRoot = path.dirname(staged.stageDataDir);
+      fs.writeFileSync(path.join(scratchRoot, "orig-auth.json"), snap.origBytes, { mode: 0o600 });
+      withCodexAuthSyncLock(snap.resolvedAuthPath, (db) => {
+        db.prepare(
+          `INSERT OR REPLACE INTO pending_recovery
+            (holder, pid, scratch_auth_path, scratch_dir, host_auth_path, was_symlink, orig_dev, orig_ino, orig_sha256, orig_auth_mode, orig_account_id, orig_last_refresh, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          holder,
+          process.pid,
+          path.join(staged.stageDataDir, "auth.json"),
+          scratchRoot,
+          snap.hostAuthPath,
+          snap.wasSymlink ? 1 : 0,
+          snap.origDev,
+          snap.origIno,
+          sha256Hex(snap.origBytes),
+          "opencode_oauth",
+          null,
+          null,
+          Date.now(),
+        );
+      });
+    } catch {
+      // best-effort recovery registration
+    }
+  };
+
+  for (;;) {
+    if (opts?.signal?.aborted) throw new Error("aborted");
+    const attempt = withCodexAuthSyncLock(resolvedAuthPath, (db) => {
+      const now = Date.now();
+      const row = db
+        .prepare("SELECT holder, pid, expires_at FROM refresh_lease WHERE id = 1")
+        .get() as { holder: string; pid: number; expires_at: number } | undefined;
+      if (row && row.expires_at > now && isPidAlive(row.pid)) {
+        return { action: "wait" as const };
+      }
+      recoverOrphanedOpenCodeAuthLocked(db, resolvedAuthPath, row?.holder);
+
+      const cur = inspectHostCodexAuth(hostAuthPath);
+      if (cur.kind === "broken_symlink") throw new Error(cur.error);
+      if (cur.kind !== "ok" || !cur.origJson || !hasOpenCodeOAuthRefreshToken(cur.origJson)) {
+        if (row) db.prepare("DELETE FROM refresh_lease WHERE id = 1").run();
+        return { action: "proceed_unlocked" as const };
+      }
+      if (!cur.canSyncBack) {
+        throw new Error(`宿主机 OpenCode OAuth 凭据不可安全写回（${cur.unwritableReason ?? "权限不足"}）；已中止执行`);
+      }
+      if (!isOpenCodeOAuthRefreshNeeded(cur.origJson, now, opts?.runWindowMs)) {
+        if (row) db.prepare("DELETE FROM refresh_lease WHERE id = 1").run();
+        return { action: "proceed_unlocked" as const };
+      }
+      db.prepare("INSERT OR REPLACE INTO refresh_lease (id, holder, pid, expires_at) VALUES (1, ?, ?, ?)").run(
+        holder,
+        process.pid,
+        now + leaseTtlMs,
+      );
+      return { action: "acquired" as const };
+    });
+
+    if (attempt.action === "proceed_unlocked") {
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        process.off("exit", release);
+        try {
+          withCodexAuthSyncLock(resolvedAuthPath, (db) => {
+            db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+          });
+        } catch {
+          // ignore
+        }
+      };
+      process.once("exit", release);
+      return { held: false, resolvedAuthPath, attachScratch: makeAttachScratch(), release };
+    }
+    if (attempt.action === "acquired") {
+      let released = false;
+      const heartbeat = setInterval(() => {
+        if (released) return;
+        try {
+          withCodexAuthSyncLock(resolvedAuthPath, (db) => {
+            db.prepare("UPDATE refresh_lease SET expires_at = ? WHERE id = 1 AND holder = ?").run(
+              Date.now() + leaseTtlMs,
+              holder,
+            );
+          });
+        } catch {
+          // best-effort heartbeat
+        }
+      }, Math.max(500, Math.floor(leaseTtlMs / 3)));
+      heartbeat.unref?.();
+      const release = () => {
+        if (released) return;
+        released = true;
+        clearInterval(heartbeat);
+        process.off("exit", release);
+        try {
+          withCodexAuthSyncLock(resolvedAuthPath, (db) => {
+            db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+            db.prepare("DELETE FROM refresh_lease WHERE id = 1 AND holder = ?").run(holder);
+          });
+        } catch {
+          // ignore
+        }
+      };
+      process.once("exit", release);
+      return { held: true, resolvedAuthPath, attachScratch: makeAttachScratch(), release };
+    }
+
+    if (Date.now() >= deadline) {
+      throw new Error(`等待宿主机 OpenCode OAuth 刷新协调锁超时 (${resolvedAuthPath})，已中止执行`);
+    }
+    await sleepAbortableMs(pollMs, opts?.signal);
+  }
+}
+
+/** 在清理暂存 OpenCode 目录前，逐供应商条件验证并原子写回旋转后的 OAuth `auth.json`（绝不写回会话数据库或覆盖宿主机更新登录） */
+export function syncRefreshedOpenCodeAuth(staged: StagedOpenCodeState): boolean {
+  const snap = staged.origAuth;
+  if (!snap || !snap.canSyncBack || !hasOpenCodeOAuthRefreshToken(snap.origJson)) return false;
+  const scratchAuthPath = path.join(staged.stageDataDir, "auth.json");
+  try {
+    return withCodexAuthSyncLock(snap.resolvedAuthPath, () =>
+      applyValidatedOpenCodeAuthSyncLocked(
+        {
+          hostAuthPath: snap.hostAuthPath,
+          resolvedAuthPath: snap.resolvedAuthPath,
+          wasSymlink: snap.wasSymlink,
+          origDev: snap.origDev,
+          origIno: snap.origIno,
+          origJson: snap.origJson,
+        },
+        scratchAuthPath,
+      ),
+    );
+  } catch (err) {
+    log("warn", "写回刷新后的 OpenCode auth.json 失败（保留原文件）", { err: errMsg(err) });
+    return false;
   }
 }
 
 /**
  * 为隔离运行的 OpenCode ACP 工人构造按次隔离的 `0700` 可写配置与数据目录：
- *   - 配置目录仅复制 `opencode.json` / `opencode.jsonc` / `config.json`（`tools="none"` 时剥离 `mcp`/`tools`/`plugin`/`agent`/`permission`）及非 `tools="none"` 时的 `AGENTS.md`；
- *   - 数据目录仅复制 `auth.json`，绝不暴露宿主机 `storage/`、`opencode.db`、`sessions/`、`snapshot/`、`log/` 等跨项目会话数据库。
+ *   - 配置目录仅复制 `opencode.json` / `opencode.jsonc` / `config.json`（`tools="none"` 时按 JSONC 完整解析并剥离 `mcp`/`tools`/`plugin`/`agent`/`permission`；解析失败时 fail-closed 报错以防静默切换供应商）及非 `tools="none"` 时的 `AGENTS.md`；
+ *   - 数据目录仅复制 `auth.json`（含 OAuth 刷新令牌时启用持久化 scratch 与崩溃可恢复写回），绝不暴露宿主机 `storage/`、`opencode.db`、`sessions/`、`snapshot/`、`log/` 等跨项目会话数据库。
  */
 export function stageIsolatedOpenCodeState(
   hostHome: string,
   effectiveEnv: NodeJS.ProcessEnv = process.env,
   dataDir?: string,
   opts?: { tools?: "none" | "read" | "write" },
-): StagedAgentState | undefined {
+): StagedOpenCodeState | undefined {
   const effectiveHome = effectiveEnv.HOME?.trim() || hostHome || os.homedir();
   if (!effectiveHome) return undefined;
   const resolvedHome = safeRealpath(effectiveHome);
@@ -2732,12 +3322,79 @@ export function stageIsolatedOpenCodeState(
   const hostConfigDir = fs.existsSync(logicalConfigDir) ? safeRealpath(logicalConfigDir) : logicalConfigDir;
   const hostDataDir = fs.existsSync(logicalDataDir) ? safeRealpath(logicalDataDir) : logicalDataDir;
 
-  const scoped = createScopedSecretDir("pa-opencode-state-", effectiveEnv);
+  let authInspected: ReturnType<typeof inspectHostCodexAuth> = { kind: "absent" };
+  if (fs.existsSync(hostDataDir) && isSafeSource(hostDataDir)) {
+    const hostAuthPath = path.join(hostDataDir, "auth.json");
+    authInspected = inspectHostCodexAuth(hostAuthPath);
+    if (authInspected.kind === "broken_symlink") {
+      throw new Error(authInspected.error);
+    }
+    if (
+      authInspected.kind === "ok" &&
+      authInspected.canSyncBack &&
+      authInspected.origJson &&
+      hasOpenCodeOAuthRefreshToken(authInspected.origJson) &&
+      fs.existsSync(canonicalCodexLockFilePath(authInspected.resolvedAuthPath))
+    ) {
+      const targetResolved = authInspected.resolvedAuthPath;
+      try {
+        const recovered = withCodexAuthSyncLock(targetResolved, (db) => {
+          const row = db
+            .prepare("SELECT holder, pid, expires_at FROM refresh_lease WHERE id = 1")
+            .get() as { holder: string; pid: number; expires_at: number } | undefined;
+          if (row && row.expires_at > Date.now() && isPidAlive(row.pid)) return false;
+          return recoverOrphanedOpenCodeAuthLocked(db, targetResolved, row?.holder);
+        });
+        if (recovered) {
+          authInspected = inspectHostCodexAuth(hostAuthPath);
+          if (authInspected.kind === "broken_symlink") throw new Error(authInspected.error);
+        }
+      } catch {
+        // best-effort pre-stage recovery
+      }
+    }
+  }
+
+  const hasWritableOAuth =
+    authInspected.kind === "ok" &&
+    authInspected.canSyncBack &&
+    !!authInspected.origJson &&
+    hasOpenCodeOAuthRefreshToken(authInspected.origJson);
+  if (
+    authInspected.kind === "ok" &&
+    !!authInspected.origJson &&
+    hasOpenCodeOAuthRefreshToken(authInspected.origJson) &&
+    !authInspected.canSyncBack
+  ) {
+    throw new Error(
+      `宿主机 OpenCode OAuth 凭据不可安全写回（${authInspected.unwritableReason ?? "权限不足"}）；为防止隔离沙箱旋转 refresh 令牌后丢失新令牌，已中止执行`,
+    );
+  }
+
+  let scopedDir = "";
+  let cleanupScoped: () => void;
+  if (hasWritableOAuth && authInspected.kind === "ok") {
+    const persistentBase = resolvePersistentOAuthScratchBase(
+      "opencode-scratch",
+      authInspected.resolvedAuthPath,
+      hostDataDir,
+      resolvedData,
+    );
+    scopedDir = safeRealpath(fs.mkdtempSync(path.join(persistentBase, ".pa-opencode-state-")));
+    fs.chmodSync(scopedDir, 0o700);
+    cleanupScoped = () => fs.rmSync(scopedDir, { recursive: true, force: true });
+  } else {
+    const scoped = createScopedSecretDir("pa-opencode-state-", effectiveEnv);
+    scopedDir = scoped.dir;
+    cleanupScoped = scoped.cleanup;
+  }
+
   try {
-    const stageConfigDir = path.join(scoped.dir, "config");
-    const stageDataDir = path.join(scoped.dir, "data");
+    const stageConfigDir = path.join(scopedDir, "config");
+    const stageDataDir = path.join(scopedDir, "data");
     fs.mkdirSync(stageConfigDir, { recursive: true, mode: 0o700 });
     fs.mkdirSync(stageDataDir, { recursive: true, mode: 0o700 });
+    let origAuth: OpenCodeAuthOrigSnapshot | undefined;
 
     const copySafe = (src: string, dst: string, maxBytes: number) => {
       try {
@@ -2752,41 +3409,77 @@ export function stageIsolatedOpenCodeState(
     };
 
     if (fs.existsSync(hostConfigDir) && isSafeSource(hostConfigDir)) {
+      let isDir = false;
       try {
-        if (fs.statSync(hostConfigDir).isDirectory()) {
-          for (const cfgName of ["opencode.json", "opencode.jsonc", "config.json"]) {
-            const src = path.join(hostConfigDir, cfgName);
-            if (!fs.existsSync(src)) continue;
-            if (opts?.tools === "none") {
-              try {
-                const st = fs.statSync(src);
-                if (st.isFile() && st.size <= 512 * 1024) {
-                  const realSrc = fs.realpathSync(src);
-                  if (isSafeSource(realSrc)) {
-                    const sanitized = sanitizeOpenCodeConfigForNoTools(fs.readFileSync(realSrc, "utf8"));
-                    if (sanitized) fs.writeFileSync(path.join(stageConfigDir, cfgName), sanitized, { mode: 0o600 });
-                  }
-                }
-              } catch {
-                // ignore
-              }
-            } else {
-              copySafe(src, path.join(stageConfigDir, cfgName), 512 * 1024);
-            }
+        isDir = fs.statSync(hostConfigDir).isDirectory();
+      } catch {
+        isDir = false;
+      }
+      if (isDir) {
+        for (const cfgName of ["opencode.json", "opencode.jsonc", "config.json"]) {
+          const src = path.join(hostConfigDir, cfgName);
+          let exists = false;
+          try {
+            fs.lstatSync(src);
+            exists = true;
+          } catch {
+            exists = false;
           }
-          if (opts?.tools !== "none") {
-            copySafe(path.join(hostConfigDir, "AGENTS.md"), path.join(stageConfigDir, "AGENTS.md"), 1024 * 1024);
+          if (!exists) continue;
+          if (opts?.tools === "none") {
+            let st: fs.Stats;
+            let realSrc: string;
+            try {
+              st = fs.statSync(src);
+              realSrc = fs.realpathSync(src);
+            } catch (err) {
+              throw new Error(
+                `宿主机 OpenCode 配置文件 (${src}) 不可访问或符号链接已损坏：${errMsg(err)}；为避免无工具模式下静默切换模型供应商，已中止执行`,
+              );
+            }
+            if (!st.isFile() || st.size > 512 * 1024) {
+              throw new Error(
+                `宿主机 OpenCode 配置文件 (${src}) 非合法常规文件或超过 512KB；为避免无工具模式下静默切换模型供应商，已中止执行`,
+              );
+            }
+            if (!isSafeSource(realSrc)) continue;
+            let sanitized: string;
+            try {
+              sanitized = sanitizeOpenCodeConfigForNoTools(fs.readFileSync(realSrc, "utf8"));
+            } catch (err) {
+              throw new Error(
+                `宿主机 OpenCode 配置文件 (${src}) 解析脱敏失败：${errMsg(err)}；为避免无工具模式下静默切换模型供应商，已中止执行`,
+              );
+            }
+            fs.writeFileSync(path.join(stageConfigDir, cfgName), sanitized, { mode: 0o600 });
+          } else {
+            copySafe(src, path.join(stageConfigDir, cfgName), 512 * 1024);
           }
         }
-      } catch {
-        // ignore
+        if (opts?.tools !== "none") {
+          copySafe(path.join(hostConfigDir, "AGENTS.md"), path.join(stageConfigDir, "AGENTS.md"), 1024 * 1024);
+        }
       }
     }
 
     if (fs.existsSync(hostDataDir) && isSafeSource(hostDataDir)) {
       try {
         if (fs.statSync(hostDataDir).isDirectory()) {
-          copySafe(path.join(hostDataDir, "auth.json"), path.join(stageDataDir, "auth.json"), 256 * 1024);
+          if (authInspected.kind === "ok" && isSafeSource(authInspected.resolvedAuthPath)) {
+            fs.writeFileSync(path.join(stageDataDir, "auth.json"), authInspected.origBytes, { mode: 0o600 });
+            if (authInspected.origJson) {
+              origAuth = {
+                hostAuthPath: authInspected.hostAuthPath,
+                resolvedAuthPath: authInspected.resolvedAuthPath,
+                wasSymlink: authInspected.wasSymlink,
+                origBytes: authInspected.origBytes,
+                origJson: authInspected.origJson,
+                origDev: authInspected.origDev,
+                origIno: authInspected.origIno,
+                canSyncBack: authInspected.canSyncBack,
+              };
+            }
+          }
         }
       } catch {
         // ignore
@@ -2795,14 +3488,16 @@ export function stageIsolatedOpenCodeState(
 
     return {
       hostDirsToSkip: [...new Set([hostConfigDir, hostDataDir])],
+      stageDataDir,
+      origAuth,
       bindMounts: [
         { src: stageConfigDir, dest: logicalConfigDir, mode: "rw" },
         { src: stageDataDir, dest: logicalDataDir, mode: "rw" },
       ],
-      cleanup: scoped.cleanup,
+      cleanup: cleanupScoped,
     };
   } catch (err) {
-    scoped.cleanup();
+    cleanupScoped();
     throw err;
   }
 }
@@ -5982,7 +6677,7 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
   let stagedAcpx: StagedAcpxState | undefined;
   let stagedClaude: StagedClaudeState | undefined;
   let stagedGemini: StagedAgentState | undefined;
-  let stagedOpenCode: StagedAgentState | undefined;
+  let stagedOpenCode: StagedOpenCodeState | undefined;
   let stagedAdapterCache: ScopedAcpxAdapterCache | undefined;
   let stagedDoubao: StagedDoubaoDataDir | undefined;
   let stagedNpmrc: StagedSanitizedNpmrc | undefined;
@@ -5991,8 +6686,10 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
   let stagedAws: StagedAwsProfile | undefined;
   let oauthLease: CodexOAuthRefreshLease | undefined;
   let claudeOAuthLease: ClaudeOAuthRefreshLease | undefined;
+  let openCodeOAuthLease: OpenCodeOAuthRefreshLease | undefined;
   let syncedCodexAuth = false;
   let syncedClaudeAuth = false;
+  let syncedOpenCodeAuth = false;
   let r: Awaited<ReturnType<typeof runProcess>>;
   try {
     const mode: WorkspaceIsolationMode =
@@ -6074,7 +6771,25 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       stagedGemini = stageIsolatedGeminiState(hostHome, acpxIsolationEnv, cfg.dataDir, { tools: run.tools });
     }
     if (isOpenCodeAcpx && willIsolate) {
+      const effectiveOcHome = acpxIsolationEnv.HOME?.trim() || hostHome || os.homedir();
+      if (effectiveOcHome) {
+        const resolvedOcHome = safeRealpath(effectiveOcHome);
+        const xdgOcData = acpxIsolationEnv.XDG_DATA_HOME?.trim() || path.join(resolvedOcHome, ".local", "share");
+        const logicalOcDataDir = path.join(xdgOcData, "opencode");
+        const realOcDataDir = fs.existsSync(logicalOcDataDir) ? safeRealpath(logicalOcDataDir) : logicalOcDataDir;
+        const collidesData =
+          !!resolvedDataDir &&
+          (isPathInsideOrEqual(realOcDataDir, resolvedDataDir) || isPathInsideOrEqual(resolvedDataDir, realOcDataDir));
+        if (!collidesData) {
+          openCodeOAuthLease = await coordinateOpenCodeOAuthRefresh(realOcDataDir, {
+            signal: run.signal,
+            runWindowMs: acpxTimeoutMs + 60_000,
+            maxWaitMs: Math.max(180_000, acpxTimeoutMs + 30_000),
+          });
+        }
+      }
       stagedOpenCode = stageIsolatedOpenCodeState(hostHome, acpxIsolationEnv, cfg.dataDir, { tools: run.tools });
+      if (stagedOpenCode) openCodeOAuthLease?.attachScratch?.(stagedOpenCode);
     }
 
     // tools === "none" 时显式传入空 --mcp-config，阻断宿主机全局配置与项目 .acpxrc.json 注入 MCP 服务器
@@ -6289,6 +7004,10 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       syncedClaudeAuth = true;
       syncRefreshedClaudeAuth(stagedClaude);
     }
+    if (stagedOpenCode && !syncedOpenCodeAuth) {
+      syncedOpenCodeAuth = true;
+      syncRefreshedOpenCodeAuth(stagedOpenCode);
+    }
   } finally {
     if (stagedCodexHome && !syncedCodexAuth) {
       syncedCodexAuth = true;
@@ -6298,6 +7017,10 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       syncedClaudeAuth = true;
       syncRefreshedClaudeAuth(stagedClaude);
     }
+    if (stagedOpenCode && !syncedOpenCodeAuth) {
+      syncedOpenCodeAuth = true;
+      syncRefreshedOpenCodeAuth(stagedOpenCode);
+    }
     stagedCodexHome?.cleanup();
     oauthLease?.release();
     stagedAws?.cleanup();
@@ -6305,6 +7028,7 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
     stagedNpmrc?.cleanup();
     stagedDoubao?.cleanup();
     stagedOpenCode?.cleanup();
+    openCodeOAuthLease?.release();
     stagedGemini?.cleanup();
     stagedClaude?.cleanup();
     claudeOAuthLease?.release();

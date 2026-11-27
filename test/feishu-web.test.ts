@@ -127,6 +127,7 @@ import {
   collectSafeGitConfigMounts,
   coordinateClaudeOAuthRefresh,
   coordinateCodexOAuthRefresh,
+  coordinateOpenCodeOAuthRefresh,
   detectGitWorktreeDirs,
   detectIsolatedCodexKeyringConflict,
   extractSafeCodexProviderArgs,
@@ -136,6 +137,7 @@ import {
   isCodexOAuthRefreshNeeded,
   isolatedSandboxTempEnv,
   mergeHarnessEnv,
+  parseJsonc,
   parseShellCommandTokens,
   prepareHarnessEnv,
   renderSafeCodexConfigToml,
@@ -145,6 +147,7 @@ import {
   runHarness,
   sanitizeGitConfigEntries,
   sanitizeNpmrcContent,
+  sanitizeOpenCodeConfigForNoTools,
   selectAcpxAgentConfigPaths,
   selectDoubaoRuntimePaths,
   selectLarkCliAuthPaths,
@@ -160,6 +163,7 @@ import {
   stageScopedAcpxAdapterCache,
   syncRefreshedClaudeAuth,
   syncRefreshedCodexAuth,
+  syncRefreshedOpenCodeAuth,
   workspaceRequiresIsolation,
   wrapCredentialIsolatedCommand,
   type HarnessRun,
@@ -5796,7 +5800,8 @@ data_dir: ${dir}
     mock.addMessage("r7_revert_1", revertMsgOrig);
     mock.setChatKind("9512", CHAT_KIND_GROUP);
     await svc.personalWeb.handleMessage(decodeMessage(revertMsgOrig, "7001"), client);
-    const fastWorks1 = app.ledger.list({ kinds: ["context"], limit: 50 }).filter((w) => w.id.includes("pw:r7_revert_1"));
+    const isRevertFastWork = (w: { payload: Record<string, unknown> }) => w.payload.trigger_obs_id === "pw:r7_revert_1";
+    const fastWorks1 = app.ledger.list({ kinds: ["context"], limit: 50 }).filter(isRevertFastWork);
     assert.equal(fastWorks1.length, 1);
     const firstFastId = fastWorks1[0].id;
     // 把第一次 fast 作业标为终态，再重复投递完全相同的推送 -> edit_gen 不变，不产生新作业
@@ -5804,7 +5809,7 @@ data_dir: ${dir}
     svc.store.markProcessed(["pw:r7_revert_1"]);
     await svc.personalWeb.handleMessage(decodeMessage(revertMsgOrig, "7001"), client);
     assert.equal(
-      app.ledger.list({ kinds: ["context"], limit: 50 }).filter((w) => w.id.includes("pw:r7_revert_1")).length,
+      app.ledger.list({ kinds: ["context"], limit: 50 }).filter(isRevertFastWork).length,
       1,
       "重复推送未变更消息绝不产生重复 fast 作业",
     );
@@ -5814,7 +5819,7 @@ data_dir: ${dir}
     // 再编辑恢复回一字不差的原 @我 文本 -> edit_gen 再度递增，必须生成全新 fastWorkId 入队！
     mock.addMessage("r7_revert_1", revertMsgOrig);
     await svc.personalWeb.handleMessage(decodeMessage(revertMsgOrig, "7001"), client);
-    const fastWorksAfterRevert = app.ledger.list({ kinds: ["context"], limit: 50 }).filter((w) => w.id.includes("pw:r7_revert_1"));
+    const fastWorksAfterRevert = app.ledger.list({ kinds: ["context"], limit: 50 }).filter(isRevertFastWork);
     assert.equal(fastWorksAfterRevert.length, 2, "撤回后再恢复完全相同的 @我 文本必须生成新的 fast 作业立即触发快通道");
     assert.notEqual(fastWorksAfterRevert.find((w) => w.id !== firstFastId)?.id, firstFastId);
 
@@ -20365,6 +20370,595 @@ test("第 24 轮 Codex review 修复回归：AWS SSO 单会话隔离 / Gemini&Op
       // 仅含 3 个真实定位符自身贡献的 6 次边框模式，计入 N3 后不应多出额外伪定位符惩罚
       assert.ok(chosenMask >= 0 && chosenMask <= 7);
       assert.ok(countN3(qr.modules, qr.size) <= 6, `计入 N3 后选中掩码 ${chosenMask} 不应产生额外伪定位符（实际 ${countN3(qr.modules, qr.size)}）`);
+    }
+  } finally {
+    if (prevPwKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevPwKey;
+    for (const s of serversToClose) {
+      await new Promise<void>((resolve) => s.close(() => resolve()));
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("第 25 轮 Codex review 修复回归：新修订省略 mentions 清除陈旧 @我 / OpenCode JSONC 解析与 OAuth 写回 / 仓库 include 与 worktree 签名策略 / 派单检查点签名提交 / 快通道不透明 work ID 与重登通知脱敏 / LFS skip-smudge 与外部 lfs.storage / 固定预拉取起点建 worktree / 派单批量归属校验与分页健康缓存 / 无仓库时 Doctor 强制隔离探测", async () => {
+  const dir = makeTmp("pa-r25-");
+  const serversToClose: (http.Server | net.Server)[] = [];
+  const prevPwKey = process.env.PA_FEISHU_WEB_KEY;
+  if (!process.env.PA_FEISHU_WEB_KEY) {
+    process.env.PA_FEISHU_WEB_KEY = crypto.randomBytes(32).toString("hex");
+  }
+
+  const makeR25App = (
+    name: string,
+    opts?: {
+      ownerOpenId?: string;
+      pwEnabled?: boolean;
+      groupsMode?: "all" | "allowlist";
+      groupAllowlist?: string[];
+      repos?: Record<string, string>;
+    },
+  ) => {
+    const sub = path.join(dir, name);
+    fs.mkdirSync(sub, { recursive: true });
+    const cfgPath = path.join(sub, "config.yaml");
+    fs.writeFileSync(
+      cfgPath,
+      JSON.stringify({
+        data_dir: path.join(sub, "data"),
+        bins: {
+          lark: path.join(STUBS, "ctx-lark"),
+          acpx: path.join(STUBS, "acpx"),
+          bytedcli: path.join(STUBS, "ctx-bytedcli"),
+        },
+        harnesses: {
+          codex: { type: "codex-exec", cmd: path.join(STUBS, "ctx-codex") },
+        },
+        roles: { brain: "codex" },
+        owner: { open_id: opts?.ownerOpenId ?? "ou_owner" },
+        cards: { enabled: false },
+        dispatch: { repos: opts?.repos ?? {} },
+        engine: { retry_base_ms: 20, retry_max_ms: 50, tick_ms: 50, effect_attempts: 1 },
+        context: {
+          enabled: true,
+          harness: "codex",
+          groups: opts?.groupsMode ?? "allowlist",
+          groups_allow: opts?.groupAllowlist ?? [],
+          groups_deny: [],
+          sources: { im: true, minutes: false, docs: false, tasks: false, calendar: false, meego: false },
+          personal_web: { enabled: opts?.pwEnabled ?? false, fast_lane: true, debounce_ms: 0, pre_draft: false },
+        },
+      }),
+    );
+    return createApp(loadConfig(cfgPath));
+  };
+
+  try {
+    // 1) [R25 #1 P1] 多流合并与 +messages-mget 合并新修订时，若新修订省略 mentions（最后一条 @ 已被编辑删除），绝不得继承旧修订 mentions
+    {
+      const app = makeR25App("r25-1-merge-mentions", {
+        ownerOpenId: "ou_owner",
+        groupsMode: "allowlist",
+        groupAllowlist: ["oc_grp_r25"],
+      });
+      try {
+        const ctxSvc = new ContextService(app);
+        const now = Date.now();
+        (ctxSvc.connectors as unknown as { lark: (args: string[]) => Promise<Record<string, unknown>> }).lark = async (args) => {
+          if (args[0] === "auth" && args[1] === "status") {
+            return { identity: "user", open_id: "ou_owner" };
+          }
+          if (args[0] === "im" && args[1] === "+messages-search" && args.includes("--is-at-me")) {
+            return {
+              messages: [
+                {
+                  // Case A: 旧版 rev=1 含 mentions: [ou_owner]，列表流 rev=2 省略 mentions
+                  message_id: "om_r25_edit_omit",
+                  chat_id: "oc_grp_r25",
+                  chat_type: "group",
+                  chat_name: "协同群",
+                  sender: { id: "ou_peer", name: "同事", sender_type: "user" },
+                  create_time: String(now - 5_000),
+                  edit_version: 1,
+                  content: "@我 原消息",
+                  mentions: [{ id: "ou_owner", name: "主人" }],
+                },
+                {
+                  // Case B: 冲突无同标尺时钟 -> 触发 +messages-mget，权威回读省略 mentions
+                  message_id: "om_r25_mget_omit",
+                  chat_id: "oc_grp_r25",
+                  chat_type: "group",
+                  chat_name: "协同群",
+                  sender: { id: "ou_peer", name: "同事", sender_type: "user" },
+                  create_time: String(now - 4_000),
+                  edit_version: 1,
+                  content: "@我 冲突旧文",
+                  mentions: [{ id: "ou_owner", name: "主人" }],
+                },
+              ],
+            };
+          }
+          if (args[0] === "im" && args[1] === "+chat-messages-list") {
+            return {
+              messages: [
+                {
+                  message_id: "om_r25_edit_omit",
+                  chat_id: "oc_grp_r25",
+                  chat_type: "group",
+                  sender: { id: "ou_peer", name: "同事", sender_type: "user" },
+                  create_time: String(now - 5_000),
+                  edit_version: 2,
+                  content: "已编辑成普通消息",
+                  // 刻意省略 mentions 字段，模拟飞书移除最后一个 @ 后的响应
+                },
+                {
+                  message_id: "om_r25_mget_omit",
+                  chat_id: "oc_grp_r25",
+                  chat_type: "group",
+                  sender: { id: "ou_peer", name: "同事", sender_type: "user" },
+                  create_time: String(now - 4_000),
+                  update_time: String(now - 1_000),
+                  content: "已编辑的普通内容",
+                  // 无 edit_version 与搜索流不可比 -> 触发 +messages-mget
+                },
+              ],
+            };
+          }
+          if (args[0] === "im" && args[1] === "+messages-mget") {
+            return {
+              messages: [
+                {
+                  message_id: "om_r25_mget_omit",
+                  chat_id: "oc_grp_r25",
+                  chat_type: "group",
+                  sender: { id: "ou_peer", name: "同事", sender_type: "user" },
+                  create_time: String(now - 4_000),
+                  edit_version: 2,
+                  content: "已编辑的普通内容",
+                  // +messages-mget 权威版本同样省略 mentions
+                },
+              ],
+            };
+          }
+          return { messages: [], items: [] };
+        };
+
+        await ctxSvc.connectors.pullIm();
+        const rowA = app.store.db.prepare("SELECT kind, text, meta FROM ctx_obs WHERE id = ?").get("im:om_r25_edit_omit") as {
+          kind: string;
+          text: string;
+          meta: string;
+        };
+        assert.equal(rowA.text, "已编辑成普通消息");
+        assert.equal(rowA.kind, "group");
+        assert.equal(JSON.parse(rowA.meta).at_me, false, "a_newer 合并省略 mentions 的新修订绝不得继承旧 at_me=true");
+
+        const rowB = app.store.db.prepare("SELECT kind, text, meta FROM ctx_obs WHERE id = ?").get("im:om_r25_mget_omit") as {
+          kind: string;
+          text: string;
+          meta: string;
+        };
+        assert.equal(rowB.text, "已编辑的普通内容");
+        assert.equal(rowB.kind, "group");
+        assert.equal(JSON.parse(rowB.meta).at_me, false, "+messages-mget 合并省略 mentions 的权威行绝不得继承旧 at_me=true");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 2) [R25 #2 P1] OpenCode JSONC 解析保留带行尾 // 注释与 URL 字符串的供应商配置，解析失败时 fail-closed 报错
+    {
+      const validJsonc = [
+        "{",
+        '  // 选择私有网关模型',
+        '  "model": "corp/claude-sonnet-4", // 行尾注释',
+        '  "provider": {',
+        '    "corp": {',
+        '      "options": { "baseURL": "https://gateway.corp.example/v1" /* 块注释 */ },',
+        "    },",
+        "  },",
+        '  "mcp": { "evil": { "command": "bad" } },',
+        '  "tools": { "bash": true },',
+        "}",
+      ].join("\n");
+      const parsed = parseJsonc(validJsonc) as Record<string, unknown>;
+      assert.equal(parsed.model, "corp/claude-sonnet-4");
+      const sanitized = JSON.parse(sanitizeOpenCodeConfigForNoTools(validJsonc)) as {
+        model: string;
+        provider: { corp: { options: { baseURL: string } } };
+      };
+      assert.equal(sanitized.model, "corp/claude-sonnet-4");
+      assert.equal(sanitized.provider.corp.options.baseURL, "https://gateway.corp.example/v1", "字符串内的 // 必须完整保留");
+      assert.equal("mcp" in sanitized, false);
+      assert.equal("tools" in sanitized, false);
+
+      const ocHome = path.join(dir, "r25-2-oc-home");
+      const ocCfgDir = path.join(ocHome, ".config", "opencode");
+      const ocDataDir = path.join(ocHome, ".local", "share", "opencode");
+      fs.mkdirSync(ocCfgDir, { recursive: true });
+      fs.mkdirSync(ocDataDir, { recursive: true });
+      fs.writeFileSync(path.join(ocCfgDir, "opencode.jsonc"), validJsonc);
+      fs.writeFileSync(path.join(ocDataDir, "auth.json"), '{"anthropic":{"type":"api","key":"sk-ant"}}', { mode: 0o600 });
+
+      const stagedOk = stageIsolatedOpenCodeState(ocHome, { HOME: ocHome }, undefined, { tools: "none" });
+      try {
+        assert.ok(stagedOk);
+        const cfgStage = stagedOk!.bindMounts.find((m) => m.dest.endsWith(path.join(".config", "opencode")))!.src;
+        const outCfg = JSON.parse(fs.readFileSync(path.join(cfgStage, "opencode.jsonc"), "utf8")) as {
+          model: string;
+          provider: { corp: { options: { baseURL: string } } };
+        };
+        assert.equal(outCfg.model, "corp/claude-sonnet-4");
+        assert.equal(outCfg.provider.corp.options.baseURL, "https://gateway.corp.example/v1");
+      } finally {
+        stagedOk?.cleanup();
+      }
+
+      // 损坏 JSONC 在 tools="none" 下必须 fail-closed 抛错，绝不静默丢弃配置文件并保留 auth.json
+      fs.writeFileSync(path.join(ocCfgDir, "opencode.jsonc"), '{ "model": "corp/a", /* 未闭合注释');
+      assert.throws(
+        () => stageIsolatedOpenCodeState(ocHome, { HOME: ocHome }, undefined, { tools: "none" }),
+        /解析脱敏失败/,
+        "OpenCode 配置文件解析失败时必须 fail-closed 报错",
+      );
+    }
+
+    // 3) [R25 #4 P2 & R25 #5 P2] 快通道 work ID 必须是不透明哈希（不含原始会话/消息 ID），重登通知必须脱敏旧绑定账号 ID
+    {
+      const app = makeR25App("r25-4-5-privacy", { ownerOpenId: "ou_new_owner", pwEnabled: true });
+      try {
+        const ctxSvc = new ContextService(app);
+        const hooks = (ctxSvc.personalWeb as unknown as {
+          hooks: {
+            onFastTrigger: (t: {
+              conv: string;
+              conv_name: string;
+              trigger_obs_id: string;
+              rev_gen: number;
+              text_hash: string;
+            }) => void;
+            onNeedsLogin: (reason: string) => void;
+          };
+        }).hooks;
+
+        const emittedIds: string[] = [];
+        app.bus.on("work.changed", (ev: unknown) => {
+          const rec = ev as { id?: string };
+          if (rec.id) emittedIds.push(rec.id);
+        });
+        hooks.onFastTrigger({
+          conv: "pw_chat:99887766",
+          conv_name: "私密群",
+          trigger_obs_id: "pw:777888999",
+          rev_gen: 1,
+          text_hash: "abc123",
+        });
+        const fastId = emittedIds.find((id) => id.startsWith("context:fast:"));
+        assert.ok(fastId, "应入队快通道任务");
+        assert.equal(fastId!.includes("99887766"), false, "快通道 work ID 与 SSE 事件绝不得暴露原生群 ID");
+        assert.equal(fastId!.includes("777888999"), false, "快通道 work ID 与 SSE 事件绝不得暴露原生消息 ID");
+        assert.match(fastId!, /^context:fast:[0-9a-f]{24}$/);
+
+        hooks.onNeedsLogin("工作区已绑定旧账号 ou_prev_secret_owner (native 7001999)，与当前 ou_new_owner 不一致");
+        const effs = app.ledger.list<{ op?: string; args?: { markdown?: string } }>({
+          kinds: ["effect"],
+          ref: "context:pw-needs-login",
+          limit: 5,
+        });
+        assert.equal(effs.length, 1);
+        const notifyMd = effs[0]!.payload.op === "notify" ? (effs[0]!.payload.args?.markdown ?? "") : "";
+        assert.equal(notifyMd.includes("ou_prev_secret_owner"), false, "对外重登私信通知绝不得包含旧绑定主人 ID");
+        assert.equal(notifyMd.includes("7001999"), false, "对外重登私信通知绝不得包含旧原生账号 ID");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 4) [R25 #6 P2] OpenCode 隔离运行旋转 OAuth 刷新令牌时，清理前逐供应商原子写回且不覆盖宿主机其他或更新的供应商登录
+    {
+      const ocHome = path.join(dir, "r25-6-oc-oauth");
+      const ocDataDir = path.join(ocHome, ".local", "share", "opencode");
+      fs.mkdirSync(ocDataDir, { recursive: true });
+      const authFile = path.join(ocDataDir, "auth.json");
+      const now = Date.now();
+      fs.writeFileSync(
+        authFile,
+        JSON.stringify({
+          anthropic: { type: "oauth", refresh: "rt_ant_old", access: "at_ant_old", expires: now + 60_000 },
+          openai: { type: "oauth", refresh: "rt_oai_old", access: "at_oai_old", expires: now + 60_000 },
+        }),
+        { mode: 0o600 },
+      );
+
+      const lease = await coordinateOpenCodeOAuthRefresh(ocDataDir, { runWindowMs: 120_000, maxWaitMs: 5_000 });
+      const staged = stageIsolatedOpenCodeState(ocHome, { HOME: ocHome }, undefined, { tools: "write" });
+      try {
+        assert.ok(staged);
+        lease.attachScratch?.(staged!);
+        // 模拟宿主机在工人运行期间新增无关供应商 google，且并发重登了 openai
+        fs.writeFileSync(
+          authFile,
+          JSON.stringify({
+            anthropic: { type: "oauth", refresh: "rt_ant_old", access: "at_ant_old", expires: now + 60_000 },
+            openai: { type: "oauth", refresh: "rt_oai_host_relogin", access: "at_oai_host_relogin", expires: now + 7_200_000 },
+            google: { type: "api", key: "host-new-google-key" },
+          }),
+          { mode: 0o600 },
+        );
+        // 模拟隔离工人在暂存目录中旋转了 anthropic 和 openai，且生成了临时 opencode.db
+        fs.writeFileSync(
+          path.join(staged!.stageDataDir, "auth.json"),
+          JSON.stringify({
+            anthropic: { type: "oauth", refresh: "rt_ant_new", access: "at_ant_new", expires: now + 3_600_000 },
+            openai: { type: "oauth", refresh: "rt_oai_stale_worker", access: "at_oai_stale_worker", expires: now + 3_600_000 },
+          }),
+          { mode: 0o600 },
+        );
+        fs.writeFileSync(path.join(staged!.stageDataDir, "opencode.db"), "WORKER_SESSION_DB_MUST_NOT_PERSIST");
+
+        assert.equal(syncRefreshedOpenCodeAuth(staged!), true);
+      } finally {
+        staged?.cleanup();
+        lease.release();
+      }
+      const after = JSON.parse(fs.readFileSync(authFile, "utf8")) as Record<string, Record<string, unknown>>;
+      assert.equal(after.anthropic.refresh, "rt_ant_new", "未在宿主机变更的 anthropic 旋转令牌必须写回");
+      assert.equal(after.openai.refresh, "rt_oai_host_relogin", "宿主机已并发重登的 openai 绝不得被工人旧值覆盖");
+      assert.equal(after.google.key, "host-new-google-key", "宿主机新增的无关供应商必须保留");
+      assert.equal(fs.existsSync(path.join(ocDataDir, "opencode.db")), false, "绝不得持久化沙箱内的 OpenCode 会话数据库");
+    }
+
+    // 5) [R25 #3 P1 & R25 #7 P2] commitAll 与派单检查点提交遵守仓库 include 与 worktree 配置中的 commit.gpgSign=true
+    if (hasCredentialMountIsolation() && resolveTrustedSystemBin("ssh-keygen")) {
+      const signHome = path.join(dir, "r25-7-sign-home");
+      const dataDir7 = path.join(dir, "r25-7-data");
+      fs.mkdirSync(path.join(signHome, ".ssh"), { recursive: true });
+      fs.mkdirSync(dataDir7, { recursive: true });
+      const keyPath = path.join(signHome, ".ssh", "r25_sign_ed25519");
+      const gen = await runProcess("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", keyPath]);
+      assert.equal(gen.code, 0, gen.stderr);
+
+      const isoCfg7 = { dataDir: dataDir7, context: { personal_web: { enabled: true } } as Config["context"] };
+
+      // Case A: 仓库 .git/config 通过外部 [include] 设置 commit.gpgSign=true + gpg.format=ssh
+      const repoInc = path.join(dir, "r25-7-repo-inc");
+      const extPolicyFile = path.join(dir, "r25-7-team-signing.gitconfig");
+      fs.writeFileSync(
+        extPolicyFile,
+        ["[commit]", "\tgpgSign = true", "[gpg]", "\tformat = ssh", "[user]", `\tsigningkey = ${keyPath}`].join("\n") + "\n",
+      );
+      await runProcess("git", ["init", "-q", repoInc]);
+      await runProcess("git", ["-C", repoInc, "config", "--local", "include.path", extPolicyFile]);
+      fs.writeFileSync(path.join(repoInc, "inc.txt"), "via include\n");
+      assert.equal(await commitAll(repoInc, "signed via repo include", { cfg: isoCfg7, extraEnv: { HOME: signHome } }), true);
+      const rawInc = (await runProcess("git", ["-C", repoInc, "cat-file", "-p", "HEAD"])).stdout;
+      assert.ok(rawInc.includes("-----BEGIN SSH SIGNATURE-----"), `仓库 include 启用 commit.gpgSign=true 时必须生成签名提交：\n${rawInc}`);
+
+      // Case B: worktree 作用域（extensions.worktreeConfig=true + config.worktree）设置 commit.gpgSign=true
+      const repoWtBase = path.join(dir, "r25-7-repo-wtbase");
+      const wtDir7 = path.join(dir, "r25-7-wt");
+      await runProcess("git", ["init", "-q", repoWtBase]);
+      await runProcess("git", ["-C", repoWtBase, "config", "user.name", "Tester"]);
+      await runProcess("git", ["-C", repoWtBase, "config", "user.email", "t@example.com"]);
+      fs.writeFileSync(path.join(repoWtBase, "base.txt"), "base\n");
+      await runProcess("git", ["-C", repoWtBase, "add", "base.txt"]);
+      await runProcess("git", ["-C", repoWtBase, "-c", "commit.gpgSign=false", "commit", "-qm", "base"]);
+      await runProcess("git", ["-C", repoWtBase, "config", "extensions.worktreeConfig", "true"]);
+      await runProcess("git", ["-C", repoWtBase, "worktree", "add", "-q", "-b", "pa/r25-wt-sign", wtDir7]);
+      await runProcess("git", ["-C", wtDir7, "config", "--worktree", "commit.gpgSign", "true"]);
+      await runProcess("git", ["-C", wtDir7, "config", "--worktree", "gpg.format", "ssh"]);
+      await runProcess("git", ["-C", wtDir7, "config", "--worktree", "user.signingkey", keyPath]);
+      fs.writeFileSync(path.join(wtDir7, "wt-file.txt"), "worktree signed\n");
+      assert.equal(
+        await commitAll(wtDir7, "signed via worktree config", {
+          cfg: isoCfg7,
+          trustedRepoRoot: repoWtBase,
+          extraEnv: { HOME: signHome },
+        }),
+        true,
+      );
+      const rawWt = (await runProcess("git", ["-C", wtDir7, "cat-file", "-p", "HEAD"])).stdout;
+      assert.ok(rawWt.includes("-----BEGIN SSH SIGNATURE-----"), `config.worktree 启用 commit.gpgSign=true 时必须生成签名提交：\n${rawWt}`);
+    }
+
+    // 6) [R25 #8 P2 & R25 #9 P2 & R25 #10 P2] LFS 预拉取尊重 skip-smudge 与外部 lfs.storage 共享缓存，并从精确预拉取提交建 worktree
+    if (hasCredentialMountIsolation() && resolveTrustedSystemBin("git-lfs")) {
+      let lfsServerHits = 0;
+      const lfsDeadSrv = http.createServer((_req, res) => {
+        lfsServerHits++;
+        res.writeHead(500);
+        res.end("should not be called");
+      });
+      await new Promise<void>((resolve) => lfsDeadSrv.listen(0, "127.0.0.1", resolve));
+      serversToClose.push(lfsDeadSrv);
+      const deadPort = (lfsDeadSrv.address() as { port: number }).port;
+
+      const lfsHome8 = path.join(dir, "r25-8-home");
+      const dataDir8 = path.join(dir, "r25-8-data");
+      const sharedLfsCache = path.join(dir, "r25-9-shared-lfs-cache");
+      const repo8 = path.join(dir, "r25-8-repo");
+      fs.mkdirSync(lfsHome8, { recursive: true });
+      fs.mkdirSync(dataDir8, { recursive: true });
+      fs.mkdirSync(sharedLfsCache, { recursive: true });
+
+      const payload9 = Buffer.from("FROM_EXTERNAL_SHARED_LFS_STORAGE_R25\n", "utf8");
+      const oid9 = crypto.createHash("sha256").update(payload9).digest("hex");
+      const isoCfg8 = { dataDir: dataDir8, context: { personal_web: { enabled: true } } as Config["context"] };
+
+      await runProcess("git", ["init", "-q", repo8]);
+      await runProcess("git", ["-C", repo8, "config", "user.name", "Tester"]);
+      await runProcess("git", ["-C", repo8, "config", "user.email", "t@example.com"]);
+      await runProcess("git", ["-C", repo8, "remote", "add", "origin", `http://127.0.0.1:${deadPort}/org/repo.git`]);
+      fs.writeFileSync(path.join(repo8, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+      fs.writeFileSync(
+        path.join(repo8, "blob.bin"),
+        `version https://git-lfs.github.com/spec/v1\noid sha256:${oid9}\nsize ${payload9.length}\n`,
+      );
+      await runProcess("git", [
+        "-C",
+        repo8,
+        "-c",
+        "filter.lfs.clean=",
+        "-c",
+        "filter.lfs.process=",
+        "-c",
+        "filter.lfs.required=false",
+        "add",
+        ".gitattributes",
+        "blob.bin",
+      ]);
+      await runProcess("git", ["-C", repo8, "-c", "commit.gpgSign=false", "commit", "-qm", "lfs pointer"]);
+
+      // 6a) GIT_LFS_SKIP_SMUDGE=1 时必须跳过预拉取，不访问远端
+      fs.writeFileSync(
+        path.join(lfsHome8, ".gitconfig"),
+        ['[filter "lfs"]', "\tclean = git-lfs clean -- %f", "\tsmudge = git-lfs smudge -- %f", "\tprocess = git-lfs filter-process", "\trequired = true"].join("\n") + "\n",
+      );
+      const skipEnvRes = await ensureGitLfsObjectsForCheckout(repo8, "HEAD", {
+        cfg: isoCfg8,
+        trustedRepoRoot: repo8,
+        extraEnv: { HOME: lfsHome8, GIT_LFS_SKIP_SMUDGE: "1" },
+      });
+      assert.equal(skipEnvRes.fetched, false);
+      assert.equal(skipEnvRes.skippedSmudge, true, "GIT_LFS_SKIP_SMUDGE=1 必须跳过 LFS 预拉取");
+      assert.equal(lfsServerHits, 0);
+
+      // 6b) git lfs install --skip-smudge 配置时同样必须跳过预拉取
+      fs.writeFileSync(
+        path.join(lfsHome8, ".gitconfig"),
+        ['[filter "lfs"]', "\tclean = git-lfs clean -- %f", "\tsmudge = git-lfs smudge --skip -- %f", "\tprocess = git-lfs filter-process --skip", "\trequired = true"].join("\n") + "\n",
+      );
+      const skipCfgRes = await ensureGitLfsObjectsForCheckout(repo8, "HEAD", {
+        cfg: isoCfg8,
+        trustedRepoRoot: repo8,
+        extraEnv: { HOME: lfsHome8 },
+      });
+      assert.equal(skipCfgRes.fetched, false);
+      assert.equal(skipCfgRes.skippedSmudge, true, "filter.lfs.process --skip 必须跳过 LFS 预拉取");
+      assert.equal(lfsServerHits, 0);
+
+      // 6c) 配置外部共享 lfs.storage 且对象已在共享缓存中 -> 零远端请求且隔离 worktree 检出直接 smudge 成功
+      fs.writeFileSync(
+        path.join(lfsHome8, ".gitconfig"),
+        ['[filter "lfs"]', "\tclean = git-lfs clean -- %f", "\tsmudge = git-lfs smudge -- %f", "\tprocess = git-lfs filter-process", "\trequired = true"].join("\n") + "\n",
+      );
+      await runProcess("git", ["-C", repo8, "config", "--local", "lfs.storage", sharedLfsCache]);
+      const extObjDir = path.join(sharedLfsCache, "objects", oid9.slice(0, 2), oid9.slice(2, 4));
+      fs.mkdirSync(extObjDir, { recursive: true });
+      fs.writeFileSync(path.join(extObjDir, oid9), payload9);
+
+      const headSha8 = (await runProcess("git", ["-C", repo8, "rev-parse", "HEAD"])).stdout.trim();
+      const storagePre = await ensureGitLfsObjectsForCheckout(repo8, headSha8, {
+        cfg: isoCfg8,
+        trustedRepoRoot: repo8,
+        extraEnv: { HOME: lfsHome8 },
+      });
+      assert.equal(storagePre.fetched, false, "外部 lfs.storage 已命中对象，不应访问远端");
+      assert.equal(storagePre.lfsStorageExternal, true);
+      assert.equal(storagePre.lfsStorageDir, fs.realpathSync(sharedLfsCache));
+      assert.equal(lfsServerHits, 0);
+
+      // 在主仓推进一个新提交模拟预拉取后 HEAD 漂移，验证 worktree add -b <branch> <cwd> <headSha8> 精确锁定预拉取提交
+      fs.writeFileSync(path.join(repo8, "later.txt"), "advanced head\n");
+      await runProcess("git", ["-C", repo8, "add", "later.txt"]);
+      await runProcess("git", ["-C", repo8, "-c", "commit.gpgSign=false", "commit", "-qm", "later head"]);
+
+      const wt8 = path.join(dir, "r25-9-wt");
+      fs.mkdirSync(wt8, { recursive: true });
+      const wtRes8 = await tryGit(repo8, ["worktree", "add", "-b", "pa/r25-ext-lfs", wt8, headSha8], {
+        cfg: isoCfg8,
+        trustedRepoRoot: repo8,
+        extraWritablePaths: [wt8, storagePre.lfsStorageDir!],
+        extraGitConfigArgs: ["-c", `lfs.storage=${storagePre.lfsStorageDir!}`],
+        extraEnv: { HOME: lfsHome8 },
+      });
+      assert.equal(wtRes8.code, 0, `外部共享 lfs.storage 隔离 worktree 检出应成功：${wtRes8.stderr}`);
+      assert.equal(fs.readFileSync(path.join(wt8, "blob.bin"), "utf8"), "FROM_EXTERNAL_SHARED_LFS_STORAGE_R25\n");
+      assert.equal(fs.existsSync(path.join(wt8, "later.txt")), false, "worktree 必须锁定预拉取的 headSha8 而非漂移后的 HEAD");
+      assert.equal(lfsServerHits, 0);
+    }
+
+    // 7) [R25 #11 P2 & R25 #12 P2] listDispatches / overview 批量归属校验消除 N+1，且 health() 分页扫描释放旧页 WorkItem 缓存
+    {
+      const app = makeR25App("r25-11-12-batch", { ownerOpenId: "ou_cur_r25" });
+      try {
+        const now = Date.now();
+        app.store.set("ctx.dispatch_owner.dispatch:foreign_card:1", "ou_prev_r25");
+        app.ledger.tx(() => {
+          const ins = app.ledger.db.prepare(
+            `INSERT INTO work (id, kind, ref, state, terminal, outcome, reason, attempts, next_at, lease_owner, lease_until, cancel, payload, error, created, updated)
+             VALUES (?, ?, ?, ?, ?, '', '', 1, 0, '', 0, 0, ?, ?, ?, ?)`,
+          );
+          for (let i = 0; i < 220; i++) {
+            const isForeign = i === 10;
+            const id = isForeign ? "dispatch:foreign_card:1" : `dispatch:own_card_${i}:1`;
+            const ref = isForeign ? "foreign_card" : `own_card_${i}`;
+            ins.run(
+              id,
+              "dispatch",
+              ref,
+              "executing",
+              0,
+              JSON.stringify({ summary: `Task ${i}`, harness: "codex", round: 1, maxRounds: 2 }),
+              "",
+              now - 5000 + i,
+              now - 5000 + i,
+            );
+          }
+          // 再写入 2,200 条跨多页的失败 effect 验证 health() 分页扫描准确且保持低耗时
+          for (let i = 0; i < 2200; i++) {
+            ins.run(
+              `eff:r25:${i}`,
+              "effect",
+              i % 11 === 0 ? "dispatch:foreign_card:1" : `own_eff_${i}`,
+              "dead",
+              1,
+              JSON.stringify({ op: "task.comment", args: { guid: `g_${i}`, content: "x".repeat(512) } }),
+              "failed",
+              now - 3000 + i,
+              now - 3000 + i,
+            );
+          }
+        });
+
+        let storeGetCalls = 0;
+        const origGet = app.store.get.bind(app.store);
+        app.store.get = ((k: string) => {
+          storeGetCalls++;
+          return origGet(k);
+        }) as typeof app.store.get;
+        try {
+          const listed = Q.listDispatches(app, { filter: "all", limit: 200 });
+          assert.equal(listed.length, 200);
+          assert.equal(listed.some((d) => d.id === "dispatch:foreign_card:1"), false, "批量过滤必须隐藏旧主人派单");
+          assert.ok(storeGetCalls < 20, `listDispatches 200 条应批量查归属而非逐条 Store.get（实际 ${storeGetCalls} 次）`);
+
+          storeGetCalls = 0;
+          const ov = Q.overview(app);
+          assert.equal(ov.running.some((d) => d.id === "dispatch:foreign_card:1"), false);
+          assert.equal(ov.health.dead, 2000, "2,200 条中扣除 200 条关联旧主人派单后应精确统计 2,000 条");
+          assert.ok(storeGetCalls < 30, `overview() + health() 应批量查归属（实际 ${storeGetCalls} 次）`);
+        } finally {
+          app.store.get = origGet;
+        }
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 8) [R25 #13 P2] 无仓库别名时 doctor 仍独立探测 Linux 强制沙箱隔离能力
+    {
+      const app = makeR25App("r25-13-doctor-iso", { repos: {} });
+      try {
+        const rep = await runDoctor(app);
+        const isoChk = rep.checks.find((c) => c.id === "worker_isolation");
+        assert.ok(isoChk, "即使未配置任何仓库别名，doctor 也必须包含 worker_isolation 检查项");
+        if (process.platform === "linux" && hasCredentialMountIsolation()) {
+          assert.equal(isoChk!.status, "ok", `可用内核隔离环境下应返回 ok：${isoChk!.detail}`);
+        }
+      } finally {
+        app.store.db.close();
+      }
     }
   } finally {
     if (prevPwKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
