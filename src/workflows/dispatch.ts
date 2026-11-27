@@ -108,6 +108,7 @@ const REASON_TEXT: Record<string, string> = {
   unverified: "没有配置任何校验（无 reviewer、无 verify 命令），结果未经验证",
   errored: "执行反复失败",
   cancelled: "卡片被移出派单列，已取消",
+  budget: "超出用量预算，已暂停",
 };
 
 /**
@@ -133,7 +134,8 @@ export function planReconcile(input: {
     const w = input.latest.get(g);
     return !!w && w.terminal && w.pendingEffects === 0;
   });
-  const suspects = [...input.latest.entries()].filter(([g, w]) => !w.terminal && !visible.has(g)).map(([, w]) => w.id);
+  // 自己的移动卡片还没投递（例如刚被命令重新派单）时，看板还没跟上，不算可疑
+  const suspects = [...input.latest.entries()].filter(([g, w]) => !w.terminal && !visible.has(g) && w.pendingEffects === 0).map(([, w]) => w.id);
   return { enqueue, redo, suspects };
 }
 
@@ -161,6 +163,12 @@ export interface DispatchPayload {
   report: string;
   feedback: string;
   history: { round: number; checks: CheckResult[] }[];
+  /** 重新派单时指定的执行者（覆盖标题前缀 / 默认执行者） */
+  harness_override?: string;
+  /** 重新派单（带意见返工）时，第一轮就带上的意见 */
+  initial_feedback?: string;
+  /** 由哪一项派单重新派出（返工 / 换执行者 / 重试） */
+  redispatch_of?: string;
 }
 
 type Item = WorkItem<DispatchPayload>;
@@ -177,6 +185,11 @@ export class Dispatcher {
   ledger: Ledger;
   store: Store;
   board: Board;
+  /**
+   * 每次运行 harness 之前调用：返回非空字符串表示不能继续（如超出预算），派单收尾为“需人工介入”。
+   * 由用量模块设置。
+   */
+  guard?: (it: WorkItem<DispatchPayload>) => string | undefined;
 
   constructor(cfg: Config, ledger: Ledger, store: Store, board: Board) {
     this.cfg = cfg;
@@ -244,6 +257,32 @@ export class Dispatcher {
     return { enqueued, cancelled, deferred };
   }
 
+  /**
+   * 重新派单（返工 / 换执行者 / 重试）：新建一项派单，并在同一事务里把卡片移回“派给Agent”、写一条评论。
+   * 在同一个 worktree 分支上继续。已有未终结派单时抛错（同一卡片至多一项）。
+   */
+  redispatch(guid: string, o: { reason: string; feedback?: string; harness?: string; from?: string }): string {
+    const last = this.ledger.latest<DispatchPayload>("dispatch", guid);
+    if (last && !last.terminal) throw new Error("这张卡片已有进行中的派单，请先取消或等它结束");
+    const id = `dispatch:${guid}:${Date.now()}`;
+    const p = last?.payload;
+    const payload: Partial<DispatchPayload> = {
+      guid,
+      summary: p?.summary ?? "",
+      description: p?.description ?? "",
+      harness_override: o.harness,
+      initial_feedback: o.feedback,
+      redispatch_of: o.from ?? last?.id,
+    };
+    const note = [`🔁 重新派单：${o.reason}`, o.harness ? `执行者：${o.harness}` : "", o.feedback ? `意见：\n${truncate(o.feedback, 1500)}` : ""]
+      .filter(Boolean)
+      .join("\n");
+    const added = this.ledger.enqueue({ id, kind: "dispatch", ref: guid, state: "queued", payload }, [comment(guid, note), move(guid, "dispatch")]);
+    if (!added) throw new Error("这张卡片已有进行中的派单");
+    log("info", "重新派单", { task: guid, reason: o.reason, harness: o.harness });
+    return id;
+  }
+
   /** 唯一索引保证同一卡片至多一项未终结派单：并发对账时后到的插入被忽略。返回是否新入队。 */
   private enqueue(t: BoardTask): boolean {
     const added = this.ledger.enqueue({
@@ -289,6 +328,16 @@ export class Dispatcher {
         return;
       }
       checkpoint(ctx);
+      if ((it.state === "executing" || it.state === "verifying") && this.guard) {
+        const why = this.guard(it);
+        if (why) {
+          this.finish(it, "needs_human", "budget", [
+            comment(it.payload.guid, `⏸️ ${REASON_TEXT.budget}：${why}\n调整预算后可在控制台或卡片上“重试”。`),
+            move(it.payload.guid, "attention"),
+          ]);
+          return;
+        }
+      }
       if (it.state === "queued") it = await this.prepare(it);
       else if (it.state === "executing") it = await this.execute(it, ctx);
       else if (it.state === "verifying") it = await this.verify(it, ctx);
@@ -305,7 +354,8 @@ export class Dispatcher {
   /** queued：读取最新的卡片内容，选执行者/审查者，准备工作目录。 */
   private async prepare(it: Item): Promise<Item> {
     const t = { ...it.payload, ...(await this.board.getTask(it.payload.guid)) };
-    const harness = parseHarness(t, Object.keys(this.cfg.harnesses)) ?? (this.cfg.dispatch.default_harness || this.cfg.roles.brain);
+    const override = it.payload.harness_override && this.cfg.harnesses[it.payload.harness_override] ? it.payload.harness_override : undefined;
+    const harness = override ?? parseHarness(t, Object.keys(this.cfg.harnesses)) ?? (this.cfg.dispatch.default_harness || this.cfg.roles.brain);
     const reviewer = pickReviewer(this.cfg.roles, harness);
     const ws = await this.prepareWorkspace(t);
     fs.mkdirSync(this.logDir(t.guid), { recursive: true });
@@ -323,8 +373,11 @@ export class Dispatcher {
       maxRounds: 1 + this.cfg.dispatch.fix_rounds,
       checkpoints: {},
       report: "",
-      feedback: "",
+      feedback: it.payload.initial_feedback ?? "",
       history: [],
+      harness_override: override,
+      initial_feedback: it.payload.initial_feedback,
+      redispatch_of: it.payload.redispatch_of,
     };
     const checks = [reviewer && `${reviewer} 审查`, ws.verify && `命令 \`${ws.verify}\``].filter(Boolean).join(" + ") || "无（结果将标为未验证）";
     return this.ledger.transition(it, { state: "executing", payload }, [
@@ -367,6 +420,7 @@ export class Dispatcher {
       logFile,
       signal: ctx.signal,
       onSpawn: (pid) => this.ledger.setStepPid(step, pid),
+      stepId: step,
     });
     const report = r.text || "（无输出）";
     if (!r.ok) {
@@ -467,6 +521,7 @@ export class Dispatcher {
         logFile,
         signal: ctx.signal,
         onSpawn: (pid) => this.ledger.setStepPid(step, pid),
+        stepId: step,
       });
       checkpoint(ctx);
       const parsed = rv.text ? parseReview(rv.text) : undefined;

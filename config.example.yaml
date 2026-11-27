@@ -19,17 +19,30 @@ harnesses:
     agent: gemini
   dsh:
     agent: deepseek-harness  # DeepSeek Harness（需安装 dsh 并配置好 provider）
-  # Doubao 有两种常见接入方式，按你实际使用的选一种：
-  # 1) TRAE CLI：
+  # Doubao 有三种常见接入方式，按你实际使用的选一种：
+  # 1) 豆包 CLI（@bytedance/doubao-cli，需先执行 doubao login）：
   # doubao:
+  #   type: doubao-cli
+  #   cmd: doubao              # 可省略，默认 doubao
+  #   model: ""                # 可选，留空用豆包 CLI 默认模型；可用 doubao model list 查看
+  #   extraArgs: ["--effort", "medium"]
+  # 2) TRAE CLI（acpx 原生内置）：
+  # trae:
   #   agent: trae
-  # 2) 用 Claude Code 指向方舟（Ark）的 Anthropic 兼容端点，密钥用 ${环境变量} 引用，不要写进本文件：
+  # 3) 用 Claude Code 指向方舟（Ark）的 Anthropic 兼容端点，密钥用 ${环境变量} 引用，不要写进本文件：
   # doubao:
   #   agent: claude
   #   model: <方舟上的模型名>
   #   env:
   #     ANTHROPIC_BASE_URL: <方舟的 Anthropic 兼容地址>
   #     ANTHROPIC_AUTH_TOKEN: ${ARK_API_KEY}
+
+  # Codex CLI 直连（codex exec，只读沙箱、无工具）：适合「工作上下文」的理解与起草，不需要 acpx
+  # codex-ro:
+  #   type: codex-exec
+  #   cmd: codex               # 可写绝对路径
+  #   model: ""               # 留空用 codex 默认模型
+  #   extraArgs: ["-c", "model_reasoning_effort=medium"]   # 抽取不需要最高推理强度，medium 快很多
 
 roles:
   brain: claude      # 分诊、私聊对话、知识库整理
@@ -41,21 +54,106 @@ dispatch:
   timeout_sec: 3600
   fix_rounds: 1             # 校验不通过时返工几轮
   max_attempts: 2           # 同一阶段最多尝试几次（含进程崩溃中断），超过后进“需人工介入”
-  repos:                    # 任务描述里写 “repo: 别名” 即在该仓库的独立 worktree 里执行
-    # web: ~/code/web
-    # api: { path: ~/code/api, verify: "npm test" }   # verify：确定性校验命令，失败即打回返工
+  repos: {}                 # 任务描述里写 “repo: 别名” 即在该仓库的独立 worktree 里执行
+  # repos:
+  #   web: ~/code/web
+  #   api:
+  #     path: ~/code/api
+  #     verify: "npm test"        # 确定性校验命令，失败即打回返工
+  #     provider: github          # 交付平台名（见下方 delivery.providers）
+  #     target_branch: main       # PR / 本地合并的目标分支（缺省用仓库默认分支）
 
 # 验收关卡：派单“完成”由它定义，而不是由执行者的退出码定义
 acceptance:
   on_unverified: needs_human  # 没有任何校验（无 reviewer、无 verify）时：needs_human 进“需人工介入”；review 标为未验证进“待验收”
   review_retries: 1           # reviewer 故障（超时/无输出/结论无法解析）重试次数；仍失败进“需人工介入”，不算打回
 
+# Web 控制台与 API（默认监听 0.0.0.0，同局域网可直接访问，令牌鉴权；仅限本机可改为 127.0.0.1）
+server:
+  enabled: true
+  host: 0.0.0.0
+  port: 7878
+
+# 飞书交互卡片（需 lark-cli ≥ 1.0.100 并在开发者后台开启 card.action.trigger 回调）
+cards:
+  enabled: true
+
+# 交付：把派单结果推送并创建 PR/MR、本地快进合并，或放弃（保留期内可恢复）
+delivery:
+  default_provider: ""        # 默认平台名；仅配了一个平台时自动选用
+  discard_retention_days: 7   # 放弃后保留 worktree 和本地分支的天数
+  providers: {}
+  # 示例（令牌填环境变量名，不要把密钥写进本文件）：
+  # providers:
+  #   github:
+  #     type: github
+  #     token_env: GITHUB_TOKEN
+  #     remote: origin
+  #   gitlab:
+  #     type: gitlab
+  #     base_url: https://gitlab.example.com
+  #     token_env: GITLAB_TOKEN
+  #     remote: origin
+  #   codebase:
+  #     type: codebase          # 使用本机 bytedcli 登录态，无需令牌环境变量
+  #     remote: origin
+
+# 用量与预算：0 表示不限；pricing 单位为美元 / 百万 token（未配时只记录耗时不估算费用）
+budget:
+  daily_usd: 0
+  per_task_usd: 0
+  pricing: {}
+  # pricing:
+  #   claude: { input: 3, output: 15 }
+  #   codex:  { input: 2, output: 8 }
+
+# 通知偏好：免打扰时段按 owner.timezone，支持跨午夜；失败告警（failure）始终立即发送
+notify:
+  quiet_start: ""             # 例如 "22:00"，留空关闭
+  quiet_end: ""               # 例如 "08:00"
+  types:
+    candidate: true
+    progress: true
+    result: true
+    failure: true
+    brief: true
+    nudge: true               # 工作上下文的实时提醒（新出现的紧急请求 / 风险）
+
+# 工作上下文：从 Meego、飞书消息、妙记、日历、飞书任务、文档评论里识别你的项目 / 事项 / 知识 / 动态 / 人，
+# 每天给你晨间卡、收尾卡，紧急的事实时提醒，并起草回复 / 跟进 / Meego 评论 / 周报（你确认后才以你本人身份发出）。
+# ⚠️ 隐私：开启 understand 后，采集到的消息内容会发给 context.harness（缺省 roles.brain）对应的模型服务。
+context:
+  enabled: true
+  harness: ""                 # 理解与起草用哪个 harness；留空用 roles.brain。例如上面的 codex-ro
+  understand: true            # false：只采集 Meego 与飞书任务，不把消息内容发给模型
+  lookback_days: 7            # 第一次运行回看几天
+  schedule: "*/10 * * * *"    # 采集 + 理解周期
+  morning: "30 8 * * 1-5"     # 晨间卡（启用后代替原来的晨报）
+  evening: "30 18 * * 1-5"    # 收尾卡（代替晚报）
+  weekly: "0 17 * * 5"        # 周报草稿
+  sources: { meego: true, im: true, minutes: true, calendar: true, tasks: true, docs: true }
+  groups: spoken              # spoken：@我、私聊和我发言过的群；allowlist：只看 groups_allow 里的群
+  groups_allow: []
+  groups_deny: []             # 永远不读的会话（chat_id 或群名关键字）
+  max_groups: 40
+  bot_allow: [Meego, 项目管理, Codebase, 云文档, 审批, 智能纪要, MLOps, Bits]   # 保留哪些机器人的通知，其余当噪音
+  legacy_days: 180            # Meego / 飞书任务超过这么久没动静视为历史遗留（自动静音）
+  min_confidence: 0.5         # 低于它的识别结果标为「待确认」
+  max_convs_per_cycle: 30
+  understand_parallel: 2      # 同时跑几批理解；首次回看积压多时可调大
+  not_important: [阅读申请, 权限申请, 编辑权限, 审批待办, 临期权限, "权限.*续期"]   # 你说不重要的事项类型（标题正则）：自动降为不重要，排在最后、不提醒
+  nudge: true
+  autonomy:                   # 只影响你自己的低风险动作；对外可见的动作永远需要你确认草稿
+    auto_close: true          # 有证据（你已回复、Meego 节点已流转）时自动关闭事项
+    mute_legacy: true
+    create_own_todo: false    # 把你的承诺建成飞书任务（只建给你自己）
+
 capture:
   min_confidence: 0.6        # ≥ 该值进“待确认”
   auto_inbox_confidence: 0.9 # ≥ 该值直接进 Inbox
   lookback_hours: 24         # 第一次运行回看多久的消息
 
-schedules:                   # cron 表达式，按 owner.timezone
+schedules:                   # cron 表达式，按 owner.timezone（启用工作上下文时 capture / brief_* 不再使用）
   capture: "*/15 * * * *"
   dispatch: "*/5 * * * *"
   brief_morning: "30 8 * * 1-5"
@@ -66,8 +164,11 @@ events:                      # 需在飞书开发者后台「事件与回调 →
   task_updates: true         # task.task.update_user_access_v2：任务变更后尽快扫描派单列
   doc_comments: true         # drive.notice.comment_add_v1：文档评论 @我 → 识别任务
   minutes: true              # minutes.minute.generated_v1：妙记生成 → 识别待办 + 写会议纪要
+  card_actions: true         # card.action.trigger：飞书交互卡片按钮 / 表单回调
 
 kb:
+  enabled: true
+  space_id: ""                # 可填已有知识空间 ID 或 "my_library"；留空按 space_name 查找/新建，无新建权限时自动回退到我的文档库
   space_name: 个人知识库
   nodes: ["00 Inbox", "会议纪要", "项目", "主题", "变更日志"]
   minutes_notes: true

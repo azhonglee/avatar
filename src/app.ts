@@ -1,18 +1,28 @@
+import fs from "node:fs";
 import { Cron } from "croner";
 import { Board, KnowledgeBase } from "./board.ts";
+import { Bus } from "./bus.ts";
+import { Commands } from "./commands.ts";
+import { registerCoreCommands } from "./core-commands.ts";
+import type { EffectHooks } from "./effects.ts";
+import type { Extensions } from "./ext.ts";
+import { registerModules } from "./modules.ts";
 import type { Config } from "./config.ts";
-import { effectHandler, notify } from "./effects.ts";
+import { card, effectHandler, notify } from "./effects.ts";
 import { Engine, type Handler } from "./engine.ts";
 import { EventSupervisor, type Subscription } from "./events.ts";
 import { loadPrompt } from "./harness.ts";
-import { Lark } from "./lark.ts";
+import { extractOwnerOpenId, Lark } from "./lark.ts";
 import { Ledger, type WorkItem } from "./ledger.ts";
+import { startServer, type ConsoleServer } from "./server/index.ts";
 import { Store } from "./store.ts";
-import { deepFind, errMsg, log, render, truncate } from "./util.ts";
+import { errMsg, log, render, truncate } from "./util.ts";
 import { BotHandler, enqueueJob, jobHandler, type JobPayload } from "./workflows/agent.ts";
 import { buildBrief } from "./workflows/brief.ts";
 import { Capture } from "./workflows/capture.ts";
 import { Dispatcher, type DispatchPayload } from "./workflows/dispatch.ts";
+
+export const VERSION = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version as string;
 
 /**
  * 组装所有组件。命令行单次命令和常驻进程共用。
@@ -24,7 +34,9 @@ import { Dispatcher, type DispatchPayload } from "./workflows/dispatch.ts";
 export function createApp(cfg: Config) {
   const store = new Store(cfg.dataDir);
   cfg.owner.open_id ||= store.get("owner.open_id") ?? "";
+  const bus = new Bus();
   const ledger = new Ledger(store.db);
+  ledger.bus = bus;
   const lark = new Lark(cfg);
   const board = new Board(cfg, lark, store);
   const kb = new KnowledgeBase(cfg, lark, store);
@@ -39,11 +51,20 @@ export function createApp(cfg: Config) {
   });
   const bot = new BotHandler(cfg, lark, store, ledger, board, capture, dispatcher, () => engine.kick());
   const hooks = { onTaskUpdate: () => undefined as void, onSignals: () => undefined as void };
-  const app = { cfg, store, ledger, lark, board, kb, capture, dispatcher, engine, bot, hooks };
-  engine.register(effectHandler(cfg, ledger, board, lark));
+  capture.onCandidate = (e) => bus.emit("candidate.created", e);
+  const commands = new Commands(ledger, bus);
+  commands.kick = () => engine.kick();
+  // 账本每次变更（含 transition/enqueue 附带的 outbox 副作用）都立刻唤醒引擎，不必等下一个 tick_ms
+  bus.on("work.changed", () => engine.kick());
+  const ext: Extensions = {};
+  const effectHooks: EffectHooks = {};
+  const app = { cfg, store, ledger, lark, board, kb, capture, dispatcher, engine, bot, hooks, bus, commands, ext, effectHooks };
+  engine.register(effectHandler(cfg, ledger, board, lark, store, effectHooks));
   engine.register(dispatcher.handler());
   engine.register(jobHandler(cfg, store, ledger));
   engine.register(eventHandler(app));
+  registerCoreCommands(commands, { cfg, ledger, board, dispatcher });
+  registerModules(app);
   return app;
 }
 export type App = ReturnType<typeof createApp>;
@@ -52,7 +73,7 @@ export type App = ReturnType<typeof createApp>;
  * inbox 处理器：飞书事件落库后由这里处理。每个分支都是幂等的，失败抛错即可，引擎会退避重试；
  * 重试耗尽私信告诉你。这里只做“把输入变成账本里的工作”，耗时的事交给对应的工作类型。
  */
-function eventHandler(app: Pick<App, "cfg" | "ledger" | "capture" | "bot" | "engine" | "hooks">): Handler<Record<string, unknown>> {
+function eventHandler(app: Pick<App, "cfg" | "ledger" | "capture" | "bot" | "engine" | "hooks" | "ext">): Handler<Record<string, unknown>> {
   const { cfg, ledger, capture, bot, engine, hooks } = app;
   return {
     kind: "event",
@@ -75,12 +96,16 @@ function eventHandler(app: Pick<App, "cfg" | "ledger" | "capture" | "bot" | "eng
         case "minutes.minute.generated_v1": {
           if (await capture.onMinutes(ev)) hooks.onSignals();
           const token = String(ev.minute_token ?? "");
-          if (cfg.kb.minutes_notes && token) {
+          if (cfg.kb.enabled && cfg.kb.minutes_notes && token) {
             const task = render(loadPrompt("kb-minutes.md"), { minute_token: token, title: String(ev.title ?? "") });
             if (enqueueJob(ledger, `kb-minutes:${token}`, { name: "kb-minutes", task, notify: false })) engine.kick();
           }
           break;
         }
+        case "card.action.trigger":
+          if (app.ext.cards) await app.ext.cards.onAction(ev, ctx);
+          else log("warn", "收到卡片操作，但卡片模块未启用", {});
+          break;
         default:
           log("warn", "未知事件类型，忽略", { key: item.ref });
       }
@@ -96,8 +121,8 @@ function eventHandler(app: Pick<App, "cfg" | "ledger" | "capture" | "bot" | "eng
 /** 初始化：确定主人 open_id，建看板清单与分组、知识空间与节点。可重复执行。 */
 export async function initApp(app: App): Promise<void> {
   if (!app.cfg.owner.open_id) {
-    const status = await app.lark.run(["auth", "status", "--json"]);
-    const id = String(deepFind(status, "open_id") ?? deepFind(status, "user_open_id") ?? "");
+    const status = await app.lark.authStatus();
+    const id = extractOwnerOpenId(status);
     if (!id.startsWith("ou_")) {
       throw new Error(`无法从 lark-cli auth status 得到你的 open_id，请在 config.yaml 的 owner.open_id 手动填写。输出：${JSON.stringify(status)}`);
     }
@@ -108,10 +133,13 @@ export async function initApp(app: App): Promise<void> {
   await app.kb.init();
 }
 
-/** 生成概览并经 outbox 私信（同一天同一种只发一次）。 */
+/** 生成概览并经 outbox 私信（同一天同一种只发一次）。启用卡片时以卡片发送。 */
 export async function sendBrief(app: App, mode: "morning" | "evening"): Promise<void> {
   const text = await buildBrief(app.cfg, app.lark, app.store, app.ledger, app.board, mode);
-  app.ledger.emit("brief", [notify(text)], `brief-${mode}-${new Date().toISOString().slice(0, 10)}`);
+  const date = new Date().toISOString().slice(0, 10);
+  const c = app.cfg.cards.enabled ? app.ext.cards?.brief?.(mode, text) : undefined;
+  if (c) app.ledger.emit(`card:brief:${date}-${mode}`, [card(`brief:${date}-${mode}`, c, "brief")], `brief-${mode}-${date}`);
+  else app.ledger.emit("brief", [notify(text)], `brief-${mode}-${date}`);
 }
 
 /** 立即执行一个配置的作业并等待结果（命令行用）。 */
@@ -168,7 +196,10 @@ export async function runDaemon(app: App): Promise<void> {
   );
   const triageSoon = debounce(2000, guard("任务识别", () => capture.process()));
   hooks.onTaskUpdate = reconcileSoon;
-  hooks.onSignals = triageSoon;
+  // 启用工作上下文时，新信号（文档评论 @我、妙记）交给它理解，不再走候选任务分诊
+  const ctxRefresh = app.ext.context?.refresh;
+  const ctxSoon = ctxRefresh ? debounce(5000, async () => ctxRefresh()) : undefined;
+  hooks.onSignals = ctxSoon ?? triageSoon;
 
   engine.start();
   const subs: Subscription[] = [];
@@ -176,6 +207,7 @@ export async function runDaemon(app: App): Promise<void> {
   if (cfg.events.task_updates) subs.push({ key: "task.task.update_user_access_v2", as: "user" });
   if (cfg.events.doc_comments) subs.push({ key: "drive.notice.comment_add_v1", as: "user" });
   if (cfg.events.minutes) subs.push({ key: "minutes.minute.generated_v1", as: "user" });
+  if (cfg.events.card_actions && app.ext.cards) subs.push({ key: "card.action.trigger", as: "bot" });
   const events = new EventSupervisor(cfg, (key, id, ev) => {
     if (ledger.enqueue({ id: `event:${key}:${id}`, kind: "event", ref: key, payload: ev })) engine.kick();
   });
@@ -184,10 +216,16 @@ export async function runDaemon(app: App): Promise<void> {
   const opts = { timezone: cfg.owner.timezone, protect: true };
   const slot = (c: Cron) => (c.currentRun() ?? new Date()).toISOString().slice(0, 16);
   const crons = [
-    new Cron(cfg.schedules.capture, opts, guard("任务识别", () => capture.run())),
+    // 启用工作上下文时，消息由它采集与理解，不再跑候选任务识别
+    ...(app.ext.context ? [] : [new Cron(cfg.schedules.capture, opts, guard("任务识别", () => capture.run()))]),
     new Cron(cfg.schedules.dispatch, opts, async () => reconcileSoon()),
-    new Cron(cfg.schedules.brief_morning, opts, guard("晨报", async () => (await sendBrief(app, "morning"), engine.kick()))),
-    new Cron(cfg.schedules.brief_evening, opts, guard("晚报", async () => (await sendBrief(app, "evening"), engine.kick()))),
+    // 启用工作上下文时，晨报 / 晚报由它的晨间卡、收尾卡代替
+    ...(app.ext.context
+      ? []
+      : [
+          new Cron(cfg.schedules.brief_morning, opts, guard("晨报", async () => (await sendBrief(app, "morning"), engine.kick()))),
+          new Cron(cfg.schedules.brief_evening, opts, guard("晚报", async () => (await sendBrief(app, "evening"), engine.kick()))),
+        ]),
     new Cron(
       "17 3 * * *",
       opts,
@@ -204,6 +242,19 @@ export async function runDaemon(app: App): Promise<void> {
         }),
     ),
   ];
+  const contextSchedule = app.ext.context?.start();
+  // 心跳：控制台据此判断常驻进程是否在线
+  const beat = () => store.set("daemon.heartbeat", `${ledger.owner}|${Date.now()}`);
+  beat();
+  const heartbeat = setInterval(beat, 15_000);
+  let server: ConsoleServer | undefined;
+  if (cfg.server.enabled) {
+    try {
+      server = await startServer(app, { version: VERSION });
+    } catch (e) {
+      log("error", "控制台启动失败（常驻进程继续运行）", { err: errMsg(e) });
+    }
+  }
   reconcileSoon(); // 启动时先对一次账：停机期间拖进派单列的卡片、被拖走的卡片
   log("info", "personal-agent 已启动", { owner: ledger.owner, events: subs.map((s) => s.key), jobs: Object.keys(cfg.jobs) });
 
@@ -211,8 +262,12 @@ export async function runDaemon(app: App): Promise<void> {
     const shutdown = async (sig: string) => {
       log("info", "收到退出信号，正在停止", { sig });
       crons.forEach((c) => c.stop());
+      contextSchedule?.stop();
       reconcileSoon.cancel();
       triageSoon.cancel();
+      ctxSoon?.cancel();
+      clearInterval(heartbeat);
+      await server?.close();
       await events.stop();
       await engine.stop(); // 中止进行中的 harness；租约释放，下次启动从检查点继续
       resolve();

@@ -3,8 +3,9 @@ import { parseArgs } from "node:util";
 import { createApp, initApp, runConfiguredJob, runDaemon, runDispatchOnce, sendBrief } from "./app.ts";
 import { loadConfig } from "./config.ts";
 import { decide, type Profile } from "./guard.ts";
-import { resolveBin } from "./harness.ts";
-import { errMsg, runProcess } from "./util.ts";
+import { consoleBaseUrl, isLoopbackHost, resolveConsoleHost, serverToken } from "./server/index.ts";
+import { formatReport, runDoctor } from "./doctor.ts";
+import { errMsg } from "./util.ts";
 import { runAgentJob, statusText } from "./workflows/agent.ts";
 import { buildBrief } from "./workflows/brief.ts";
 
@@ -16,7 +17,13 @@ const USAGE = `用法：pa <命令>
   brief [morning|evening]     生成概览并私信给你（--print 只打印不发送）
   capture                     立即识别一轮任务
   dispatch                    立即对账“派给Agent”列并执行派单（含崩溃后未完成的），等待完成
+  context run                 立即采集并理解一轮（Meego / 飞书任务 / 消息 / 妙记 / 日历），打印结果
+  context today               打印「今天」：最该处理的事、冲突、草稿、今天的会
+  context digest [morning|evening]   发送晨间卡 / 收尾卡（--print 只打印不发送）
+  context split <项目>        把一个大项目拆成子项目（模型归类，可重复执行）
   status                      最近 24 小时的派单、作业，以及重试中/失败的事件和飞书写入
+  console [--rotate]          打印控制台登录链接（--rotate 作废旧链接）；常驻进程运行时可用
+  command <名称> [JSON 参数]   执行一条命令（与控制台/卡片按钮相同），如 pa command dispatch.cancel '{"id":"…"}'
   job <名称>                  立即执行 config.yaml 里定义的 agent 作业
   ask <文字>                  让 superagent 处理一句话并打印回复
   publish-doc <file.md>       把 Markdown 发布为飞书文档（--title 标题，--parent 知识库节点名，缺省放“我的文档库”）
@@ -39,10 +46,14 @@ async function main(): Promise<void> {
   switch (cmd) {
     case "doctor":
       return doctor(app);
-    case "init":
+    case "init": {
       await initApp(app);
-      console.log(`✅ 初始化完成\n主人 open_id：${cfg.owner.open_id}\n看板清单：${app.store.get("board.tasklist")}\n知识空间：${app.store.get("kb.space")}`);
+      const kbSpace = app.store.get("kb.space");
+      const kbRoot = app.store.get("kb.root");
+      const kbInfo = !cfg.kb.enabled ? "已关闭" : kbRoot ? `${kbSpace}（我的文档库 / 根节点 ${kbRoot}）` : (kbSpace ?? "未初始化");
+      console.log(`✅ 初始化完成\n主人 open_id：${cfg.owner.open_id}\n看板清单：${app.store.get("board.tasklist")}\n知识空间：${kbInfo}`);
       return;
+    }
     case "run":
       return runDaemon(app);
     case "brief": {
@@ -65,8 +76,33 @@ async function main(): Promise<void> {
       if (pending) console.log(`⚠️ 还有 ${pending} 条飞书写入待重试，常驻进程会继续投递`);
       return;
     }
+    case "context":
+      return context(app, rest);
     case "status":
       return void console.log(statusText(app.ledger));
+    case "console": {
+      const token = serverToken(app, rest.includes("--rotate"));
+      const displayHost = resolveConsoleHost(cfg.server.host);
+      const base = consoleBaseUrl(displayHost, cfg.server.port);
+      if (isLoopbackHost(cfg.server.host)) {
+        console.log(`控制台登录链接（仅本机监听；远程开发机请先转发端口 ${cfg.server.port}）：\n${base}/login?token=${token}`);
+        console.log(`\n端口转发示例：ssh -L ${cfg.server.port}:127.0.0.1:${cfg.server.port} <开发机>   （VS Code Remote 会自动转发）`);
+      } else if (isLoopbackHost(displayHost)) {
+        console.log(`控制台登录链接（未检测到局域网 IP，已回退到本机地址）：\n${base}/login?token=${token}`);
+      } else {
+        console.log(`控制台登录链接（同局域网浏览器可直接打开）：\n${base}/login?token=${token}`);
+      }
+      if (!cfg.server.enabled) console.log("⚠️  config.yaml 里 server.enabled 为 false，常驻进程不会启动控制台");
+      return;
+    }
+    case "command": {
+      const [name, json] = rest;
+      if (!name) return void console.log(`可用命令：\n${app.commands.names().map((n) => `  ${n}`).join("\n")}`);
+      const r = await app.commands.exec(name, json ? JSON.parse(json) : {}, { source: "cli", actor: "owner" });
+      console.log(`${r.ok ? "✅" : "❌"} ${r.message}${r.target ? `（${r.target}）` : ""}${r.url ? `\n${r.url}` : ""}`);
+      await app.engine.drain(["effect"]);
+      return;
+    }
     case "job":
       if (!rest[0]) throw new Error("用法：pa job <名称>");
       return void console.log(await runConfiguredJob(app, rest[0]));
@@ -97,39 +133,50 @@ async function main(): Promise<void> {
   }
 }
 
+async function context(app: ReturnType<typeof createApp>, rest: string[]): Promise<void> {
+  const ctx = app.ext.context;
+  if (!ctx) throw new Error("工作上下文未启用（config.yaml 里 context.enabled）");
+  const [sub, ...more] = rest;
+  if (sub === "run") {
+    const r = await ctx.runOnce();
+    for (const s of r.sources) console.log(`${s.error ? "⚠️" : "✅"} ${s.source}：${s.error || `${s.count} 条`}`);
+    console.log(`理解 ${r.convs} 个会话：新事项 ${r.created}，关闭 ${r.closed}，知识 ${r.knowledge}，动态 ${r.updates}，冲突 ${r.conflicts}，丢弃无证据 ${r.rejected}，提醒 ${r.nudged}`);
+    for (const e of r.errors) console.log(`⚠️ ${e}`);
+    return;
+  }
+  if (sub === "today") {
+    const t = ctx.today();
+    const line = (i: { title: string; project_name: string; why: string[]; kind: string }) => `- ${i.title}${i.project_name ? `（${i.project_name}）` : ""}  [${i.why.join(" · ")}]`;
+    console.log(`今天 ${t.date}\n\n先做这几件：\n${t.focus.map(line).join("\n") || "（无）"}`);
+    if (t.conflicts.length) console.log(`\n需要你判断：\n${t.conflicts.map((c) => `- ${c.topic}：${c.claims.map((x) => x.claim).join(" / ")}`).join("\n")}`);
+    if (t.drafts.length) console.log(`\n待确认草稿：\n${t.drafts.map((d) => `- ${d.target_label}`).join("\n")}`);
+    if (t.needs_review.length) console.log(`\n待确认识别：${t.needs_review.length} 件`);
+    console.log(`\n共 ${t.status.totals.projects} 个项目、${t.status.totals.open_items} 件未完成、${t.status.totals.knowledge} 条知识`);
+    return;
+  }
+  if (sub === "split") {
+    if (!more[0]) throw new Error("用法：pa context split <项目名或 ID>");
+    const r = await ctx.split(more.join(" "));
+    console.log(`「${r.project}」拆成 ${r.subprojects.length} 个子项目：`);
+    for (const s of r.subprojects) console.log(`- ${s.name}（${s.moved} 条）`);
+    console.log(`留在原项目：${r.left} 条`);
+    return;
+  }
+  if (sub === "digest") {
+    const { values, positionals } = parseArgs({ args: more, options: { print: { type: "boolean" } }, allowPositionals: true });
+    const mode = positionals[0] === "evening" ? "evening" : "morning";
+    if (values.print) return void console.log(JSON.stringify(ctx.today(), null, 2));
+    ctx.sendDigest(mode);
+    await app.engine.drain(["effect"]);
+    return;
+  }
+  throw new Error("用法：pa context run | today | split <项目> | digest [morning|evening] [--print]");
+}
+
 async function doctor(app: ReturnType<typeof createApp>): Promise<void> {
-  const { cfg, store } = app;
-  const line = (ok: boolean, msg: string) => console.log(`${ok ? "✅" : "❌"} ${msg}`);
-  const [major, minor] = process.versions.node.split(".").map(Number);
-  line(major > 22 || (major === 22 && minor >= 13), `Node ${process.versions.node}（需要 ≥ 22.13）`);
-  for (const [name, bin] of [["lark-cli", cfg.bins.lark], ["acpx", cfg.bins.acpx]] as const) {
-    try {
-      const p = resolveBin(bin);
-      const v = await runProcess(p, ["--version"], { timeoutMs: 15_000 });
-      line(v.code === 0, `${name}: ${p} ${v.stdout.trim()}`);
-    } catch (e) {
-      line(false, `${name}: ${errMsg(e)}`);
-    }
-  }
-  try {
-    const s = await app.lark.run(["auth", "status", "--json"]);
-    line(true, `lark-cli 已登录：${JSON.stringify(s).slice(0, 200)}`);
-  } catch (e) {
-    line(false, `lark-cli 未就绪：${errMsg(e)}（运行 lark-cli config init --new 和 lark-cli auth login --recommend）`);
-  }
-  line(!!cfg.owner.open_id, `主人 open_id：${cfg.owner.open_id || "未知（运行 pa init）"}`);
-  line(!!store.get("board.tasklist"), `看板清单：${store.get("board.tasklist") ?? "未初始化（运行 pa init）"}`);
-  line(!!store.get("kb.space"), `知识空间：${store.get("kb.space") ?? "未初始化（运行 pa init）"}`);
-  for (const [name, h] of Object.entries(cfg.harnesses)) {
-    console.log(`ℹ️  harness ${name} → ${h.agent ? `acpx ${h.agent}` : `acpx --agent '${h.agentCommand}'`}${h.model ? ` (model ${h.model})` : ""}`);
-  }
-  console.log(`ℹ️  角色：brain=${cfg.roles.brain} reviewer=${cfg.roles.reviewer || "无"} 默认执行者=${cfg.dispatch.default_harness || cfg.roles.brain}`);
-  const verified = Object.entries(cfg.dispatch.repos).filter(([, v]) => typeof v !== "string" && v.verify).map(([k]) => k);
-  console.log(`ℹ️  验收：无校验时 → ${cfg.acceptance.on_unverified === "needs_human" ? "需人工介入" : "标为未验证进待验收"}；带 verify 命令的仓库：${verified.join(", ") || "无"}`);
-  if (!cfg.roles.reviewer && !verified.length && cfg.acceptance.on_unverified === "needs_human")
-    console.log("⚠️  没有配置 reviewer 也没有 verify 命令：所有派单结果都会进“需人工介入”");
-  if (store.get("board.tasklist") && !app.board.isInitialized()) console.log("⚠️  看板有新增分组尚未创建，请再运行一次 pa init");
-  console.log(`ℹ️  数据目录：${cfg.dataDir}`);
+  const report = await runDoctor(app);
+  console.log(formatReport(report));
+  if (!report.ready) process.exitCode = 1;
 }
 
 main().catch((e) => {

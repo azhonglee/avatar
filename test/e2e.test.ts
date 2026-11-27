@@ -64,6 +64,8 @@ dispatch: { default_harness: claude, repos: { demo: ${repo} } }
 events: { bot_messages: true, task_updates: false, doc_comments: true, minutes: false }
 schedules: { capture: "0 0 1 1 *", dispatch: "0 0 1 1 *", brief_morning: "0 0 1 1 *", brief_evening: "0 0 1 1 *" }
 engine: { tick_ms: 100, retry_base_ms: 300, lease_sec: 3 }
+server: { port: 0 }
+context: { enabled: false }
 `,
   );
 });
@@ -156,37 +158,51 @@ test("崩溃恢复：执行中 kill -9 常驻进程，再次运行时结束遗�
   let output = "";
   daemon.stdout.on("data", (d) => (output += d));
   daemon.stderr.on("data", (d) => (output += d));
-  const deadline = Date.now() + 60_000;
-  while (fs.readFileSync(hangFile, "utf8") === "armed" && Date.now() < deadline) await sleep(100);
-  const hungPid = Number(fs.readFileSync(hangFile, "utf8"));
-  assert.ok(hungPid > 0, `worker 没有启动。输出：\n${output}`);
-  const wt = path.join(tmp, "data", "worktrees", "task_cra");
-  assert.ok(fs.existsSync(path.join(wt, "partial.txt")), "半成品已写入");
+  let hungPid = 0;
+  try {
+    const deadline = Date.now() + 60_000;
+    // outbox 移卡片与 worker 启动并行：等两件事都到位再 kill -9
+    while ((fs.readFileSync(hangFile, "utf8") === "armed" || state().tasks.task_crash_1.section !== "sec_Agent进行中") && Date.now() < deadline)
+      await sleep(100);
+    hungPid = Number(fs.readFileSync(hangFile, "utf8"));
+    assert.ok(hungPid > 0, `worker 没有启动。输出：\n${output}`);
+    const wt = path.join(tmp, "data", "worktrees", "task_cra");
+    assert.ok(fs.existsSync(path.join(wt, "partial.txt")), "半成品已写入");
 
-  daemon.kill("SIGKILL");
-  await new Promise((r) => daemon.on("close", r));
-  assert.ok(alive(hungPid), "kill -9 后 harness 成了孤儿进程，还在运行");
-  assert.equal(state().tasks.task_crash_1.section, "sec_Agent进行中", "卡片停在进行中");
+    daemon.kill("SIGKILL");
+    await new Promise((r) => daemon.on("close", r));
+    assert.ok(alive(hungPid), "kill -9 后 harness 成了孤儿进程，还在运行");
+    assert.equal(state().tasks.task_crash_1.section, "sec_Agent进行中", "卡片停在进行中");
 
-  // 再次运行（命令行单次派单即可，常驻进程重启效果相同）：接管 → 清理孤儿 → 回检查点 → 重跑
-  const out = execFileSync(path.join(ROOT, "bin", "pa"), ["dispatch"], { env: env2, encoding: "utf8", cwd: tmp });
-  for (let i = 0; i < 50 && alive(hungPid); i++) await sleep(100);
-  assert.ok(!alive(hungPid), "遗留的 harness 进程组已被结束");
+    // 再次运行（命令行单次派单即可，常驻进程重启效果相同）：接管 → 清理孤儿 → 回检查点 → 重跑
+    const out = execFileSync(path.join(ROOT, "bin", "pa"), ["dispatch"], { env: env2, encoding: "utf8", cwd: tmp });
+    for (let i = 0; i < 50 && alive(hungPid); i++) await sleep(100);
+    assert.ok(!alive(hungPid), "遗留的 harness 进程组已被结束");
 
-  const t = state().tasks.task_crash_1;
-  assert.equal(t.section, "sec_待验收", out);
-  assert.equal(t.comments.filter((c: string) => c.includes("开始执行")).length, 1, `准备阶段不重复执行：${JSON.stringify(t.comments, null, 1)}\n${out}`);
-  assert.match(t.comments.at(-1), /✅ codex 完成，已通过验收/);
-  assert.ok(!fs.existsSync(path.join(wt, "partial.txt")), "上次的半成品被丢弃（回到本轮检查点）");
-  assert.ok(fs.existsSync(path.join(wt, "hello.txt")));
+    const t = state().tasks.task_crash_1;
+    assert.equal(t.section, "sec_待验收", out);
+    assert.equal(t.comments.filter((c: string) => c.includes("开始执行")).length, 1, `准备阶段不重复执行：${JSON.stringify(t.comments, null, 1)}\n${out}`);
+    assert.match(t.comments.at(-1), /✅ codex 完成，已通过验收/);
+    assert.ok(!fs.existsSync(path.join(wt, "partial.txt")), "上次的半成品被丢弃（回到本轮检查点）");
+    assert.ok(fs.existsSync(path.join(wt, "hello.txt")));
 
-  const d = db();
-  const steps = d.prepare("SELECT s.name, s.status FROM steps s JOIN work w ON w.id = s.work_id WHERE w.ref = 'task_crash_1' ORDER BY s.id").all();
-  d.close();
-  assert.deepEqual(
-    steps.map((s) => `${s.name}:${s.status}`),
-    ["worker#1:interrupted", "worker#1:ok", "review#1:ok"],
-  );
+    const d = db();
+    const steps = d.prepare("SELECT s.name, s.status FROM steps s JOIN work w ON w.id = s.work_id WHERE w.ref = 'task_crash_1' ORDER BY s.id").all();
+    d.close();
+    assert.deepEqual(
+      steps.map((s) => `${s.name}:${s.status}`),
+      ["worker#1:interrupted", "worker#1:ok", "review#1:ok"],
+    );
+  } finally {
+    if (daemon.exitCode === null) daemon.kill("SIGKILL");
+    if (hungPid > 0 && alive(hungPid)) {
+      try {
+        process.kill(-hungPid, "SIGKILL");
+      } catch {
+        // 已退出
+      }
+    }
+  }
 });
 
 test("取消：执行中把卡片拖回 Inbox，对账按 ID 核实后取消，结束正在跑的 harness", async () => {
@@ -198,31 +214,43 @@ test("取消：执行中把卡片拖回 Inbox，对账按 ID 核实后取消，�
   let output = "";
   daemon.stdout.on("data", (d) => (output += d));
   daemon.stderr.on("data", (d) => (output += d));
-  const started = () => fs.readFileSync(hangFile, "utf8") !== "armed" && state().tasks.task_cancel_1.comments.some((c: string) => c.includes("开始执行"));
-  for (let i = 0; i < 600 && !started(); i++) await sleep(100);
-  assert.ok(started(), `worker 没有启动。输出：\n${output}`);
-  const hungPid = Number(fs.readFileSync(hangFile, "utf8"));
+  let hungPid = 0;
+  try {
+    const started = () => fs.readFileSync(hangFile, "utf8") !== "armed" && state().tasks.task_cancel_1.comments.some((c: string) => c.includes("开始执行"));
+    for (let i = 0; i < 600 && !started(); i++) await sleep(100);
+    assert.ok(started(), `worker 没有启动。输出：\n${output}`);
+    hungPid = Number(fs.readFileSync(hangFile, "utf8"));
 
-  // 用户把正在跑的卡片拖回 Inbox；任意一次对账（这里用命令行）发现它不在两列，按 ID 核实后请求取消
-  const s = state();
-  s.tasks.task_cancel_1.section = "sec_Inbox";
-  fs.writeFileSync(env.STUB_STATE, JSON.stringify(s));
-  pa("dispatch");
+    // 用户把正在跑的卡片拖回 Inbox；任意一次对账（这里用命令行）发现它不在两列，按 ID 核实后请求取消
+    const s = state();
+    s.tasks.task_cancel_1.section = "sec_Inbox";
+    fs.writeFileSync(env.STUB_STATE, JSON.stringify(s));
+    pa("dispatch");
 
-  const cancelled = () => state().tasks.task_cancel_1.comments.some((c: string) => c.includes("已取消"));
-  for (let i = 0; i < 200 && !(cancelled() && !alive(hungPid)); i++) await sleep(100);
-  const code = await new Promise((resolve) => {
-    daemon.on("close", resolve);
-    daemon.kill("SIGTERM");
-  });
-  assert.ok(cancelled(), `没有收尾为已取消。输出：\n${output}`);
-  assert.ok(!alive(hungPid), "正在跑的 harness 已被结束");
-  assert.equal(state().tasks.task_cancel_1.section, "sec_Inbox", "取消不移动卡片：位置由用户决定");
-  assert.equal(code, 0, output);
-  const d = db();
-  const w = d.prepare("SELECT state FROM work WHERE kind = 'dispatch' AND ref = 'task_cancel_1'").get() as { state: string };
-  d.close();
-  assert.equal(w.state, "cancelled");
+    const cancelled = () => state().tasks.task_cancel_1.comments.some((c: string) => c.includes("已取消"));
+    for (let i = 0; i < 200 && !(cancelled() && !alive(hungPid)); i++) await sleep(100);
+    const code = await new Promise((resolve) => {
+      daemon.on("close", resolve);
+      daemon.kill("SIGTERM");
+    });
+    assert.ok(cancelled(), `没有收尾为已取消。输出：\n${output}`);
+    assert.ok(!alive(hungPid), "正在跑的 harness 已被结束");
+    assert.equal(state().tasks.task_cancel_1.section, "sec_Inbox", "取消不移动卡片：位置由用户决定");
+    assert.equal(code, 0, output);
+    const d = db();
+    const w = d.prepare("SELECT state FROM work WHERE kind = 'dispatch' AND ref = 'task_cancel_1'").get() as { state: string };
+    d.close();
+    assert.equal(w.state, "cancelled");
+  } finally {
+    if (daemon.exitCode === null) daemon.kill("SIGKILL");
+    if (hungPid > 0 && alive(hungPid)) {
+      try {
+        process.kill(-hungPid, "SIGKILL");
+      } catch {
+        // 已退出
+      }
+    }
+  }
 });
 
 test("brief：汇总逾期、待确认、待验收并私信主人", () => {
@@ -270,25 +298,34 @@ test("run：常驻进程处理主人私信指令和文档评论事件，并能�
   daemon.stderr.on("data", (d) => (output += d));
 
   const deadline = Date.now() + 60_000;
-  const done = () => {
+  try {
+    const done = () => {
+      const s = state();
+      const added = s.messages.slice(before) as { msg_type?: string; markdown?: string; card?: unknown }[];
+      const replied = added.some((m) => !m.msg_type);
+      const commentTask = Object.values(s.tasks).some((t) => (t as { description: string }).description.includes("comment:c1"));
+      const candidateCard = added.some((m) => m.msg_type === "interactive" && JSON.stringify(m.card).includes("候选任务"));
+      return replied && commentTask && candidateCard;
+    };
+    while (!done() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
+    assert.ok(done(), `常驻进程未按预期处理事件。输出：\n${output}`);
+
     const s = state();
-    const replied = s.messages.length > before;
-    const commentTask = Object.values(s.tasks).some((t) => (t as { description: string }).description.includes("comment:c1"));
-    return replied && commentTask;
-  };
-  while (!done() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
-  if (!done()) daemon.kill("SIGKILL"); // 失败时也别让常驻进程挂住测试
-  assert.ok(done(), `常驻进程未按预期处理事件。输出：\n${output}`);
+    const added = s.messages.slice(before) as { msg_type?: string; markdown?: string; card?: unknown }[];
+    const replies = added.filter((m) => !m.msg_type);
+    const cards = added.filter((m) => m.msg_type === "interactive");
+    assert.equal(replies.length, 1, "重复事件只处理一次，陌生人的消息被忽略");
+    assert.match(replies[0].markdown ?? "", /worker|job|dispatch|✅|❌/);
+    assert.ok(cards.some((c) => JSON.stringify(c.card).includes("候选任务")), "文档评论识别出的候选任务同步发出了交互卡片");
+    assert.match(output, /忽略非主人的机器人消息/);
+    assert.match(output, /工作失败，稍后重试[\s\S]*注入的临时故障/, "第一次拉评论失败后被重试");
 
-  const s = state();
-  assert.equal(s.messages.length - before, 1, "重复事件只处理一次，陌生人的消息被忽略");
-  assert.match(s.messages.at(-1).markdown, /worker|job|✅|❌/);
-  assert.match(output, /忽略非主人的机器人消息/);
-  assert.match(output, /工作失败，稍后重试[\s\S]*注入的临时故障/, "第一次拉评论失败后被重试");
-
-  const code = await new Promise((resolve) => {
-    daemon.on("close", resolve);
-    daemon.kill("SIGTERM");
-  });
-  assert.equal(code, 0, output);
+    const code = await new Promise((resolve) => {
+      daemon.on("close", resolve);
+      daemon.kill("SIGTERM");
+    });
+    assert.equal(code, 0, output);
+  } finally {
+    if (daemon.exitCode === null) daemon.kill("SIGKILL");
+  }
 });

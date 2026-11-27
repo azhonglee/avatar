@@ -1,7 +1,7 @@
 import type { Config } from "./config.ts";
 import type { Lark } from "./lark.ts";
 import type { Store } from "./store.ts";
-import { deepFind, findItems, log } from "./util.ts";
+import { deepFind, errMsg, findItems, log } from "./util.ts";
 
 export type SectionKey = keyof Config["board"]["sections"];
 
@@ -167,6 +167,11 @@ export class Board {
   async comment(guid: string, content: string): Promise<void> {
     await this.lark.run(["task", "+comment", "--task-id", guid, "--content", content], { as: "user" });
   }
+
+  /** 改写任务描述（整段替换）。 */
+  async updateDescription(guid: string, description: string): Promise<void> {
+    await this.lark.run(["task", "+update", "--task-id", guid, "--description", description], { as: "user" });
+  }
 }
 
 /**
@@ -191,6 +196,8 @@ export function toBoardTask(t: Record<string, unknown>): BoardTask {
   };
 }
 
+const isPermissionError = (e: unknown): boolean => /permission|forbidden|无权限|没有权限|权限不足|99991672|131006/i.test(errMsg(e));
+
 export class KnowledgeBase {
   cfg: Config;
   lark: Lark;
@@ -207,26 +214,81 @@ export class KnowledgeBase {
     return n;
   }
 
-  /** 幂等：找到同名空间/节点就复用。agent 只往这个空间里写。 */
+  /** 解析「我的文档库」（my_library）的真实 space_id，并确保其下有一个根节点（space_name）。 */
+  private async resolveMyLibrary(): Promise<{ space: string; root: string }> {
+    const lib = await this.lark.run(["wiki", "spaces", "get", "--params", JSON.stringify({ space_id: "my_library" })], { as: "user" });
+    const space = String(deepFind(lib, "space_id") ?? "my_library");
+    const topNodes = await this.lark.run(["wiki", "+node-list", "--space-id", space, "--page-all"], { as: "user" });
+    let root = (findItems(topNodes, "node_token").find((n) => String(n.title) === this.cfg.kb.space_name)?.node_token as string | undefined) ?? "";
+    if (!root) {
+      const created = await this.lark.run(["wiki", "+node-create", "--space-id", space, "--title", this.cfg.kb.space_name], { as: "user" });
+      root = String(deepFind(created, "node_token") ?? "");
+      if (!root) throw new Error(`在「我的文档库」创建知识库根节点 ${this.cfg.kb.space_name} 失败：${JSON.stringify(created)}`);
+      log("info", "已在「我的文档库」创建知识库根节点", { name: this.cfg.kb.space_name, space, root });
+    }
+    return { space, root };
+  }
+
+  /**
+   * 幂等：找到同名空间/节点就复用。agent 只往这个空间里写。
+   * 企业飞书通常不允许普通用户通过 OpenAPI 创建顶层知识空间：遇到无权限时自动回退到「我的文档库」，
+   * 在其下建一个名为 space_name 的根节点，再把子节点建在它下面。
+   */
   async init(): Promise<void> {
-    let space = this.store.get("kb.space");
-    if (!space) {
-      const spaces = await this.lark.run(["wiki", "+space-list"], { as: "user" });
-      space = findItems(spaces, "space_id").find((s) => s.name === this.cfg.kb.space_name)?.space_id as string | undefined;
+    if (!this.cfg.kb.enabled) return;
+    const configured = this.cfg.kb.space_id.trim();
+    let space = this.store.get("kb.space") ?? "";
+    let root = this.store.get("kb.root") ?? "";
+    const mode = this.store.get("kb.space_mode") ?? "";
+
+    if (configured === "my_library") {
+      if (!space || !root || mode !== "my_library") {
+        ({ space, root } = await this.resolveMyLibrary());
+        this.store.set("kb.space", space);
+        this.store.set("kb.root", root);
+        this.store.set("kb.space_mode", "my_library");
+      }
+    } else if (configured) {
+      if (space !== configured || root) {
+        space = configured;
+        root = "";
+        this.store.set("kb.space", space);
+        this.store.set("kb.root", "");
+        this.store.set("kb.space_mode", "space");
+      }
+    } else if (!space) {
+      const spaces = await this.lark.run(["wiki", "+space-list", "--page-all"], { as: "user" });
+      space = (findItems(spaces, "space_id").find((s) => s.name === this.cfg.kb.space_name)?.space_id as string | undefined) ?? "";
       if (!space) {
-        const created = await this.lark.run(["wiki", "+space-create", "--name", this.cfg.kb.space_name, "--description", "由 personal-agent 维护"], { as: "user" });
-        space = String(deepFind(created, "space_id") ?? "");
-        if (!space) throw new Error(`创建知识空间失败：${JSON.stringify(created)}`);
-        log("info", "已创建知识空间", { name: this.cfg.kb.space_name, space });
+        try {
+          const created = await this.lark.run(["wiki", "+space-create", "--name", this.cfg.kb.space_name, "--description", "由 personal-agent 维护"], { as: "user" });
+          space = String(deepFind(created, "space_id") ?? "");
+          if (!space) throw new Error(`创建知识空间失败：${JSON.stringify(created)}`);
+          log("info", "已创建知识空间", { name: this.cfg.kb.space_name, space });
+          this.store.set("kb.space_mode", "space");
+        } catch (e) {
+          if (!isPermissionError(e)) throw e;
+          log("warn", "没有创建独立知识空间的权限，回退到「我的文档库」", { err: errMsg(e) });
+          ({ space, root } = await this.resolveMyLibrary());
+          this.store.set("kb.root", root);
+          this.store.set("kb.space_mode", "my_library");
+        }
+      } else {
+        this.store.set("kb.space_mode", "space");
       }
       this.store.set("kb.space", space);
     }
-    const nodes = await this.lark.run(["wiki", "+node-list", "--space-id", space], { as: "user" });
+
+    const listArgs = ["wiki", "+node-list", "--space-id", space, "--page-all"];
+    if (root) listArgs.push("--parent-node-token", root);
+    const nodes = await this.lark.run(listArgs, { as: "user" });
     const existing = new Map(findItems(nodes, "node_token").map((n) => [String(n.title), String(n.node_token)]));
     for (const title of this.cfg.kb.nodes) {
       let token = existing.get(title);
       if (!token) {
-        const created = await this.lark.run(["wiki", "+node-create", "--space-id", space, "--title", title], { as: "user" });
+        const createArgs = ["wiki", "+node-create", "--space-id", space, "--title", title];
+        if (root) createArgs.push("--parent-node-token", root);
+        const created = await this.lark.run(createArgs, { as: "user" });
         token = String(deepFind(created, "node_token") ?? "");
         if (!token) throw new Error(`创建知识库节点 ${title} 失败：${JSON.stringify(created)}`);
         log("info", "已创建知识库节点", { title, token });

@@ -9,6 +9,14 @@ import { expandHome } from "./util.ts";
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const Harness = z.object({
+  /**
+   * 运行方式：acpx（默认，经 ACP 调任一 harness，支持工具）；
+   * codex-exec（直接调用本机已登录的 codex CLI，只读沙箱，适合「理解」这类纯文本任务，不能用于需要写权限的派单）；
+   * doubao-cli（直接调用本机已登录的豆包 CLI `doubao -p -`，支持全部工具档位与飞书守卫）
+   */
+  type: z.enum(["acpx", "codex-exec", "doubao-cli"]).default("acpx"),
+  /** codex-exec / doubao-cli 使用的命令（留空时按 type 默认取 codex / doubao） */
+  cmd: z.string().default(""),
   /** acpx 内置或在 ~/.acpx/config.json 自定义的 agent 名，例如 claude / codex / gemini / deepseek-harness / trae */
   agent: z.string().optional(),
   /** 原始 ACP 启动命令（走 acpx --agent），与 agent 二选一 */
@@ -29,7 +37,12 @@ const Schema = z.object({
     .prefault({}),
   data_dir: z.string().default("~/.personal-agent"),
   bins: z
-    .object({ lark: z.string().default("lark-cli"), acpx: z.string().default("acpx") })
+    .object({
+      lark: z.string().default("lark-cli"),
+      acpx: z.string().default("acpx"),
+      /** 交付到公司 Codebase 时用的 bytedcli */
+      bytedcli: z.string().default("bytedcli"),
+    })
     .prefault({}),
   applink_host: z.string().default("applink.feishu.cn"),
   /** 飞书网页域名，用于拼文档/妙记链接；企业租户一般是 https://<租户>.feishu.cn */
@@ -54,6 +67,9 @@ const Schema = z.object({
     .prefault({}),
   kb: z
     .object({
+      enabled: z.boolean().default(true),
+      /** 指定已有的知识空间 ID（可填 "my_library" 用我的文档库）；留空按 space_name 查找或新建，新建无权限时自动回退到我的文档库 */
+      space_id: z.string().default(""),
       space_name: z.string().default("个人知识库"),
       nodes: z.array(z.string()).default(["00 Inbox", "会议纪要", "项目", "主题", "变更日志"]),
       /** 妙记生成后，让 brain 把它整理成知识库里的会议纪要（agent 作业，见 prompts/kb-minutes.md） */
@@ -79,7 +95,22 @@ const Schema = z.object({
        * 仓库别名 → 本地路径，或 { path, verify }；任务描述里写 `repo: 别名` 即在该仓库的 git worktree 中执行。
        * verify 是确定性校验命令（如 npm test），在 worktree 里运行，失败即打回返工。
        */
-      repos: z.record(z.string(), z.union([z.string(), z.object({ path: z.string(), verify: z.string().optional() })])).default({}),
+      repos: z
+        .record(
+          z.string(),
+          z.union([
+            z.string(),
+            z.object({
+              path: z.string(),
+              verify: z.string().optional(),
+              /** 交付：用 delivery.providers 里的哪个平台创建 PR/MR（缺省用 delivery.default_provider） */
+              provider: z.string().optional(),
+              /** 交付：PR/MR 的目标分支（缺省用仓库当前默认分支） */
+              target_branch: z.string().optional(),
+            }),
+          ]),
+        )
+        .default({}),
     })
     .prefault({}),
   /** 验收关卡：派单“完成”由它定义，而不是由执行者退出码定义 */
@@ -91,6 +122,130 @@ const Schema = z.object({
       review_retries: z.number().int().min(0).default(1),
       review_timeout_sec: z.number().int().min(60).default(1200),
       verify_timeout_sec: z.number().int().min(10).default(1800),
+    })
+    .prefault({}),
+  /** Web 控制台与 API（默认监听 0.0.0.0，同局域网可直接访问，令牌鉴权；仅限本机可改为 127.0.0.1） */
+  server: z
+    .object({
+      enabled: z.boolean().default(true),
+      host: z.string().default("0.0.0.0"),
+      /** 0 表示随机端口（测试用） */
+      port: z.number().int().min(0).max(65535).default(7878),
+    })
+    .prefault({}),
+  /** 飞书交互卡片（候选任务、派单进度、验收结果、失败告警、早晚报） */
+  cards: z.object({ enabled: z.boolean().default(true) }).prefault({}),
+  /** 交付：把派单结果变成 PR/MR、合并到本地分支或放弃 */
+  delivery: z
+    .object({
+      default_provider: z.string().default(""),
+      providers: z
+        .record(
+          z.string(),
+          z.object({
+            type: z.enum(["github", "gitlab", "codebase"]),
+            /** GitLab/自建实例的地址，如 https://gitlab.example.com；GitHub 缺省 https://api.github.com */
+            base_url: z.string().optional(),
+            /** 存放访问令牌的环境变量名（codebase 走 bytedcli 登录态，不需要） */
+            token_env: z.string().optional(),
+            /** 推送用的 git remote 名 */
+            remote: z.string().default("origin"),
+          }),
+        )
+        .default({}),
+      /** 放弃后保留 worktree 与分支的天数，期间可以恢复 */
+      discard_retention_days: z.number().int().min(0).default(7),
+    })
+    .prefault({}),
+  /** 用量与预算：0 表示不限制 */
+  budget: z
+    .object({
+      daily_usd: z.number().min(0).default(0),
+      per_task_usd: z.number().min(0).default(0),
+      /** 每百万 token 单价（美元），按 harness 名；没配的只记耗时不计费 */
+      pricing: z.record(z.string(), z.object({ input: z.number().min(0), output: z.number().min(0) })).default({}),
+    })
+    .prefault({}),
+  /** 通知偏好 */
+  notify: z
+    .object({
+      /** 免打扰时段（按 owner.timezone，如 "22:00"–"08:00"）；期间的非紧急私信延后到结束时发送 */
+      quiet_start: z.string().default(""),
+      quiet_end: z.string().default(""),
+      types: z
+        .object({
+          candidate: z.boolean().default(true),
+          progress: z.boolean().default(true),
+          result: z.boolean().default(true),
+          failure: z.boolean().default(true),
+          brief: z.boolean().default(true),
+          /** 工作上下文的实时提醒（新的高优先级请求 / 风险） */
+          nudge: z.boolean().default(true),
+        })
+        .prefault({}),
+    })
+    .prefault({}),
+  /** 工作上下文：从飞书 / Meego 等信号理解你的项目、事项、知识、动态，并主动反馈与推进 */
+  context: z
+    .object({
+      enabled: z.boolean().default(true),
+      /** 理解用哪个 harness（缺省用 roles.brain） */
+      harness: z.string().default(""),
+      /** 是否把消息内容发给模型做理解；关闭时只做确定性采集（Meego / 飞书任务直接成为事项） */
+      understand: z.boolean().default(true),
+      /** 首次采集回看天数 */
+      lookback_days: z.number().int().min(1).max(30).default(7),
+      /** 采集 + 理解的周期 */
+      schedule: z.string().default("*/10 * * * *"),
+      morning: z.string().default("30 8 * * 1-5"),
+      evening: z.string().default("30 18 * * 1-5"),
+      /** 周报草稿（M3） */
+      weekly: z.string().default("0 17 * * 5"),
+      sources: z
+        .object({
+          meego: z.boolean().default(true),
+          im: z.boolean().default(true),
+          minutes: z.boolean().default(true),
+          calendar: z.boolean().default(true),
+          tasks: z.boolean().default(true),
+          /** 文档评论 @我（来自 drive.notice.comment_add_v1 事件，需在 events.doc_comments 开启） */
+          docs: z.boolean().default(true),
+        })
+        .prefault({}),
+      /** 群消息范围：spoken = @我、私聊和我发言过的群；allowlist = 只看 groups_allow 里的群（加上 @我、私聊） */
+      groups: z.enum(["spoken", "allowlist"]).default("spoken"),
+      groups_allow: z.array(z.string()).default([]),
+      /** 永远不读的会话（chat_id 或群名关键字） */
+      groups_deny: z.array(z.string()).default([]),
+      max_groups: z.number().int().min(1).max(200).default(40),
+      /** 保留哪些机器人的通知（名字或内容匹配任一正则即保留；其余机器人消息当噪音丢弃） */
+      bot_allow: z.array(z.string()).default(["Meego", "项目管理", "Codebase", "云文档", "审批", "智能纪要", "MLOps", "Bits"]),
+      /** Meego / 飞书任务创建超过这么多天且没有近期动静的，视为历史遗留 */
+      legacy_days: z.number().int().min(30).default(180),
+      /** 低于这个置信度的识别结果标为「待确认」 */
+      min_confidence: z.number().min(0).max(1).default(0.5),
+      /** 每次理解最多处理多少个会话 */
+      max_convs_per_cycle: z.number().int().min(1).default(30),
+      /**
+       * 你说「不重要」的事项类型：标题匹配任一正则的事项自动降为不重要（仍保留，排在最后），
+       * 也会告诉模型按低优先级输出。
+       */
+      not_important: z.array(z.string()).default(["阅读申请", "权限申请", "编辑权限", "审批待办", "临期权限", "权限.*续期"]),
+      /** 同时跑几批理解（会话互不重叠）；首次回看积压多时调大能明显加快 */
+      understand_parallel: z.number().int().min(1).max(8).default(2),
+      /** 实时提醒：新出现的高优先级请求 / 风险立刻发卡片 */
+      nudge: z.boolean().default(true),
+      /** 自主等级（M4）：只影响你自己的低风险动作；对外可见的动作永远需要你确认 */
+      autonomy: z
+        .object({
+          /** 有明确证据（你已回复 / Meego 已完成）时自动关闭事项 */
+          auto_close: z.boolean().default(true),
+          /** 自动静音历史遗留项目 */
+          mute_legacy: z.boolean().default(true),
+          /** 你承诺的事自动在飞书任务里给自己建一条待办 */
+          create_own_todo: z.boolean().default(false),
+        })
+        .prefault({}),
     })
     .prefault({}),
   /** 工作引擎（一般不用改） */
@@ -130,6 +285,8 @@ const Schema = z.object({
       task_updates: z.boolean().default(true),
       doc_comments: z.boolean().default(true),
       minutes: z.boolean().default(true),
+      /** card.action.trigger：飞书卡片上的按钮 / 表单 */
+      card_actions: z.boolean().default(true),
     })
     .prefault({}),
   /** 定时的 agent 作业：用 brain（或指定 harness）带受限的 lark-cli 执行一段提示词 */
@@ -149,12 +306,22 @@ const Schema = z.object({
 export type Config = z.infer<typeof Schema> & { dataDir: string; file: string };
 
 /** 解析 `repo:` 引用：配置里的别名（字符串或 {path, verify}），否则当作路径。 */
-export function repoSpec(cfg: Config, ref: string): { path: string; verify?: string } {
+export interface RepoSpec {
+  path: string;
+  verify?: string;
+  provider?: string;
+  target_branch?: string;
+}
+
+export function repoSpec(cfg: Config, ref: string): RepoSpec {
   const v = cfg.dispatch.repos[ref];
   if (v === undefined) return { path: path.resolve(expandHome(ref)) };
   if (typeof v === "string") return { path: path.resolve(expandHome(v)) };
-  return { path: path.resolve(expandHome(v.path)), verify: v.verify };
+  return { path: path.resolve(expandHome(v.path)), verify: v.verify, provider: v.provider, target_branch: v.target_branch };
 }
+
+/** 配置的 zod schema（设置服务用它校验写入）。 */
+export const ConfigSchema = Schema;
 
 export function loadConfig(file = process.env.PA_CONFIG ?? path.join(ROOT, "config.yaml")): Config {
   if (!fs.existsSync(file)) {
@@ -167,7 +334,7 @@ export function loadConfig(file = process.env.PA_CONFIG ?? path.join(ROOT, "conf
     if (!cfg.harnesses[name]) throw new Error(`配置引用了未定义的 harness：${name}`);
   }
   for (const h of Object.values(cfg.harnesses)) {
-    if (!h.agent === !h.agentCommand) throw new Error("每个 harness 必须且只能设置 agent 或 agentCommand 之一");
+    if (h.type === "acpx" && !h.agent === !h.agentCommand) throw new Error("acpx 类型的 harness 必须且只能设置 agent 或 agentCommand 之一");
   }
   const dataDir = path.resolve(expandHome(cfg.data_dir));
   for (const sub of ["logs", "runs", "workspace", "worktrees"]) fs.mkdirSync(path.join(dataDir, sub), { recursive: true });

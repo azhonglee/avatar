@@ -14,6 +14,38 @@ export interface Subscription {
 export type OnEvent = (key: string, eventId: string, ev: Record<string, unknown>) => void;
 
 /**
+ * 从 `lark-cli event consume` 的 stderr 尾部提取可读错误：
+ * 新版 lark-cli 会输出多行缩进的 JSON 错误信封（含 error.message / error.hint / error.subtype）；
+ * 不是 JSON 时回退到最后一行非空文本。
+ */
+export function parseEventStderr(lines: string[]): { message: string; hint?: string; subtype?: string } {
+  const nonEmpty = lines.filter((l) => l.trim());
+  if (!nonEmpty.length) return { message: "" };
+  for (let i = nonEmpty.length - 1; i >= 0; i--) {
+    if (!nonEmpty[i].trimStart().startsWith("{")) continue;
+    try {
+      const parsed = JSON.parse(nonEmpty.slice(i).join("\n")) as {
+        error?: { message?: unknown; hint?: unknown; subtype?: unknown };
+        message?: unknown;
+      };
+      const e = parsed.error;
+      if (e && typeof e === "object") {
+        const message = typeof e.message === "string" && e.message ? e.message : JSON.stringify(e);
+        return {
+          message,
+          ...(typeof e.hint === "string" && e.hint ? { hint: e.hint } : {}),
+          ...(typeof e.subtype === "string" && e.subtype ? { subtype: e.subtype } : {}),
+        };
+      }
+      if (typeof parsed.message === "string" && parsed.message) return { message: parsed.message };
+    } catch {
+      // 不是完整 JSON 起点，继续往前找
+    }
+  }
+  return { message: nonEmpty.at(-1)!.trim() };
+}
+
+/**
  * 守护 `lark-cli event consume` 子进程：每个 EventKey 一个进程（官方要求），
  * 读 NDJSON 交给 onEvent（写 inbox，按 event_id 去重），退出后指数退避重启。
  * 这里不做任何业务处理：事件只是“该看一眼”的提示，可靠性由 inbox + 引擎重试 + 定时对账保证。
@@ -45,11 +77,16 @@ export class EventSupervisor {
     this.procs.set(sub.key, child);
     child.stdin.on("error", () => undefined); // 子进程已退出时关闭 stdin 会 EPIPE，忽略
     const startedAt = Date.now();
-    let lastErr = "";
+    const errLines: string[] = [];
 
     readline.createInterface({ input: child.stderr }).on("line", (line) => {
-      if (line.includes("[event] ready")) log("info", "事件订阅就绪", { key: sub.key });
-      else if (line.trim()) lastErr = line;
+      if (line.includes("[event] ready")) {
+        errLines.length = 0;
+        log("info", "事件订阅就绪", { key: sub.key });
+      } else if (line.trim()) {
+        errLines.push(line);
+        if (errLines.length > 60) errLines.shift();
+      }
     });
     readline.createInterface({ input: child.stdout }).on("line", (line) => {
       if (!line.trim()) return;
@@ -74,9 +111,19 @@ export class EventSupervisor {
     child.on("close", (code) => {
       this.procs.delete(sub.key);
       if (this.stopping) return;
-      // 稳定运行超过 5 分钟就重置退避
-      const next = Date.now() - startedAt > 300_000 ? 1000 : Math.min(backoff * 2, 300_000);
-      log("warn", "事件进程退出，稍后重启", { key: sub.key, code, retryInMs: next, lastErr: lastErr.slice(0, 500) });
+      const err = parseEventStderr(errLines);
+      // 稳定运行超过 5 分钟就重置退避；前置条件未满足（如开发者后台未订阅该事件）放慢重连，避免刷屏
+      const next =
+        Date.now() - startedAt > 300_000
+          ? 1000
+          : Math.min(err.subtype === "failed_precondition" ? Math.max(backoff * 2, 60_000) : backoff * 2, 300_000);
+      log("warn", "事件进程退出，稍后重启", {
+        key: sub.key,
+        code,
+        retryInMs: next,
+        lastErr: err.message.slice(0, 500),
+        ...(err.hint ? { hint: err.hint.slice(0, 800) } : {}),
+      });
       setTimeout(() => this.spawn(sub, next), next).unref();
     });
   }

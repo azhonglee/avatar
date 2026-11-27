@@ -12,7 +12,9 @@ if (lockPath && !(argv[0] === "event" && argv[1] === "consume")) {
     try {
       fs.closeSync(fs.openSync(lockPath, "wx"));
       break;
-    } catch {
+    } catch (e) {
+      // 目录不存在等非冲突错误直接抛出，避免测试目录已清理时死循环
+      if (e && e.code !== "EEXIST") throw e;
       if (Date.now() > deadline) fs.rmSync(lockPath, { force: true });
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
     }
@@ -98,6 +100,8 @@ if (key.startsWith("event consume")) {
     }
     case "wiki +space-list":
       ok({ items: [] });
+    case "wiki spaces get":
+      ok({ space: { space_id: params.space_id === "my_library" ? "sp_my_library" : params.space_id, name: "My Document Library" } });
     case "wiki +space-create":
       ok({ space: { space_id: "sp_kb", name: flag("--name") } });
     case "wiki +node-list":
@@ -162,14 +166,50 @@ if (key.startsWith("event consume")) {
         ],
       });
     case "im +messages-send":
+      // 交互卡片：记下解析后的卡片 JSON；同一幂等键只发一次（与真实接口一致）
+      if (flag("--msg-type") === "interactive") {
+        const idem = flag("--idempotency-key");
+        const dup = idem && state.messages.find((m) => m.msg_type === "interactive" && m.idem === idem);
+        if (dup) ok({ message_id: dup.message_id });
+        const content = flag("--content") === "-" ? stdin : flag("--content");
+        let parsed;
+        try {
+          parsed = JSON.parse(content);
+        } catch {
+          fail("卡片内容不是合法 JSON");
+        }
+        const message_id = nextId("om_card");
+        state.messages.push({ to: flag("--user-id"), as: flag("--as"), msg_type: "interactive", card: parsed, message_id, idem, patches: 0 });
+        ok({ message_id });
+      }
       state.messages.push({ to: flag("--user-id"), as: flag("--as"), markdown: stdin || flag("--markdown") || flag("--text") });
       ok({ message_id: nextId("om") });
+    case "im messages patch": {
+      const m = state.messages.find((x) => x.msg_type === "interactive" && x.message_id === params.message_id);
+      if (!m) fail(`没有这条卡片消息：${params.message_id}`);
+      m.card = JSON.parse(data.content);
+      m.patches++;
+      ok({});
+    }
     case "drive +batch-query-comments":
       ok({ items: [{ comment_id: flag("--comment-ids"), reply_list: { replies: [{ content: "@主人 这里请补充一下数据来源" }] } }] });
     case "minutes +detail":
       ok({ minutes: [{ title: "周会", summary: "讨论了上线计划", todos: [{ content: "主人：整理上线清单", owner: "主人" }] }] });
     case "docs +create":
       ok({ document: { document_id: "doc_1", url: "https://feishu.cn/docx/doc_1" } });
+    case "task +update": {
+      const t = state.tasks[flag("--task-id")];
+      if (!t) fail("no such task");
+      if (flag("--description") !== undefined) t.description = flag("--description");
+      if (flag("--summary") !== undefined) t.summary = flag("--summary");
+      ok({ task: { guid: t.guid } });
+    }
+    case "task +complete": {
+      const t = state.tasks[flag("--task-id")];
+      if (!t) fail("no such task");
+      t.completed = true;
+      ok({ task: { guid: t.guid } });
+    }
     default:
       fail(`stub 不支持：${key}`);
   }

@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
+import { createApp, initApp } from "../src/app.ts";
+import { KnowledgeBase } from "../src/board.ts";
+import { loadConfig } from "../src/config.ts";
+import { parseEventStderr } from "../src/events.ts";
 import { decide } from "../src/guard.ts";
+import { runHarness } from "../src/harness.ts";
+import { extractOwnerOpenId, Lark, LarkError } from "../src/lark.ts";
+import { Store } from "../src/store.ts";
 import { endOfLocalDay } from "../src/workflows/brief.ts";
 import { parseHarness, parseRepo, parseReview, decideRound, planReconcile, type CheckResult, pickReviewer } from "../src/workflows/dispatch.ts";
 import { parseVerdicts } from "../src/workflows/triage.ts";
@@ -119,4 +129,270 @@ test("对账计划：新卡片入队；再派与取消只给出候选，飞书�
   assert.deepEqual(plan.enqueue, ["new"], "从没派过的新卡片直接入队");
   assert.deepEqual(plan.redo, ["redo"], "再派要先按 ID 核实");
   assert.deepEqual(plan.suspects, ["w2"], "两列都没看到只是候选，要按 ID 核实才取消");
+});
+
+test("lark authStatus 与 initApp：兼容新版裸 JSON（openId）和旧版信封格式，失败时报错", async () => {
+  assert.equal(
+    extractOwnerOpenId({ identities: { bot: { openId: "ou_bot" }, user: { openId: "ou_user_1", userName: "张三" } } }),
+    "ou_user_1",
+  );
+  assert.equal(extractOwnerOpenId({ identity: "user", user: { open_id: "ou_old" } }), "ou_old");
+  assert.equal(extractOwnerOpenId({ user_open_id: "ou_legacy" }), "ou_legacy");
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pa-auth-"));
+  try {
+    const outFile = path.join(tmp, "out.json");
+    const codeFile = path.join(tmp, "code.txt");
+    const fakeLark = path.join(tmp, "fake-lark");
+    fs.writeFileSync(
+      fakeLark,
+      `#!/usr/bin/env node\nconst fs = require("node:fs");\nprocess.stdout.write(fs.readFileSync(${JSON.stringify(outFile)}, "utf8"));\nprocess.exit(Number(fs.readFileSync(${JSON.stringify(codeFile)}, "utf8")));\n`,
+      { mode: 0o755 },
+    );
+    const cfgFile = path.join(tmp, "config.yaml");
+    fs.writeFileSync(
+      cfgFile,
+      JSON.stringify({
+        data_dir: path.join(tmp, "data"),
+        bins: { lark: fakeLark },
+        harnesses: { cx: { type: "codex-exec", cmd: "codex" } },
+        roles: { brain: "cx" },
+        cards: { enabled: false },
+        context: { enabled: false },
+      }),
+    );
+
+    // 1. 新版 lark-cli：裸 JSON，无 ok/data 信封，字段为 identities.user.openId
+    fs.writeFileSync(
+      outFile,
+      JSON.stringify({
+        appId: "cli_test",
+        identities: {
+          bot: { status: "ready", available: true, message: "Bot identity: ready" },
+          user: { status: "ready", available: true, openId: "ou_bare_123", userName: "李迎忠" },
+        },
+        identity: "user",
+      }),
+    );
+    fs.writeFileSync(codeFile, "0");
+    const app = createApp(loadConfig(cfgFile));
+    app.board.init = async () => undefined;
+    app.kb.init = async () => undefined;
+    await initApp(app);
+    assert.equal(app.cfg.owner.open_id, "ou_bare_123");
+    assert.equal(app.store.get("owner.open_id"), "ou_bare_123");
+    app.store.db.close();
+
+    // 2. 旧版信封格式
+    const lark = new Lark(loadConfig(cfgFile));
+    fs.writeFileSync(outFile, JSON.stringify({ ok: true, data: { identity: "user", user: { open_id: "ou_env_456" } } }));
+    assert.equal(extractOwnerOpenId(await lark.authStatus()), "ou_env_456");
+
+    // 3. 失败返回（ok: false 或退出码非 0）
+    fs.writeFileSync(outFile, JSON.stringify({ ok: false, error: { message: "未登录" } }));
+    await assert.rejects(() => lark.authStatus(), /未登录/);
+    fs.writeFileSync(outFile, JSON.stringify({ message: "token invalid" }));
+    fs.writeFileSync(codeFile, "1");
+    await assert.rejects(() => lark.authStatus(), /token invalid/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("KnowledgeBase.init：建空间无权限自动回退到我的文档库（建根节点并幂等）；支持 space_id 与 enabled=false", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pa-kb-"));
+  const makeCfg = (kb: Record<string, unknown> = {}) => {
+    const f = path.join(tmp, `cfg-${Math.random().toString(36).slice(2)}.yaml`);
+    fs.writeFileSync(
+      f,
+      JSON.stringify({
+        data_dir: path.join(tmp, `data-${Math.random().toString(36).slice(2)}`),
+        harnesses: { cx: { type: "codex-exec", cmd: "codex" } },
+        roles: { brain: "cx" },
+        kb: { space_name: "个人知识库", nodes: ["00 Inbox", "项目"], ...kb },
+      }),
+    );
+    return loadConfig(f);
+  };
+  try {
+    // 1. +space-create 无权限 → 回退到 my_library，建根节点和子节点，二次运行幂等
+    const cfg1 = makeCfg();
+    const store1 = new Store(cfg1.dataDir);
+    const calls1: string[][] = [];
+    const createdNodes: { space: string; parent: string; title: string; token: string }[] = [];
+    const fakeLark1 = {
+      async run(args: string[]) {
+        calls1.push(args);
+        const cmd = `${args[0]} ${args[1]}`;
+        const flag = (k: string) => (args.includes(k) ? args[args.indexOf(k) + 1] : "");
+        if (cmd === "wiki +space-list") return { spaces: [] };
+        if (cmd === "wiki +space-create") throw new LarkError("lark-cli wiki +space-create 失败：user lacks permission for the requested resource", 1);
+        if (cmd === "wiki spaces") return { space: { space_id: "7319320097204846595", space_type: "my_library" } };
+        if (cmd === "wiki +node-list") {
+          const sp = flag("--space-id");
+          const parent = flag("--parent-node-token");
+          return { nodes: createdNodes.filter((n) => n.space === sp && n.parent === parent).map((n) => ({ node_token: n.token, title: n.title })) };
+        }
+        if (cmd === "wiki +node-create") {
+          const title = flag("--title");
+          const token = `nd_${createdNodes.length + 1}_${title}`;
+          createdNodes.push({ space: flag("--space-id"), parent: flag("--parent-node-token"), title, token });
+          return { node: { node_token: token, title } };
+        }
+        throw new Error(`unexpected: ${args.join(" ")}`);
+      },
+    } as unknown as Lark;
+
+    const kb1 = new KnowledgeBase(cfg1, fakeLark1, store1);
+    await kb1.init();
+    assert.equal(store1.get("kb.space"), "7319320097204846595");
+    assert.equal(store1.get("kb.space_mode"), "my_library");
+    const root = store1.get("kb.root")!;
+    assert.ok(root.startsWith("nd_1_个人知识库"));
+    assert.equal(createdNodes.length, 3);
+    assert.equal(createdNodes[1].parent, root);
+    assert.equal(createdNodes[2].parent, root);
+    assert.ok(calls1[0].includes("--page-all"), "+space-list 带 --page-all");
+
+    const before = calls1.length;
+    await kb1.init();
+    assert.equal(createdNodes.length, 3, "幂等：不重复建根节点和子节点");
+    assert.equal(calls1.slice(before).length, 1, "只做一次 +node-list 检查");
+    store1.db.close();
+
+    // 2. kb.space_id = "sp_custom"：直接用指定空间，不建额外根节点
+    const cfg2 = makeCfg({ space_id: "sp_custom" });
+    const store2 = new Store(cfg2.dataDir);
+    const calls2: string[][] = [];
+    const fakeLark2 = {
+      async run(args: string[]) {
+        calls2.push(args);
+        if (args[1] === "+node-list") return { nodes: [] };
+        if (args[1] === "+node-create") return { node: { node_token: `t_${args[args.indexOf("--title") + 1]}` } };
+        throw new Error(`unexpected: ${args.join(" ")}`);
+      },
+    } as unknown as Lark;
+    await new KnowledgeBase(cfg2, fakeLark2, store2).init();
+    assert.equal(store2.get("kb.space"), "sp_custom");
+    assert.equal(store2.get("kb.root"), "");
+    assert.ok(calls2.every((c) => !c.includes("--parent-node-token")));
+    store2.db.close();
+
+    // 3. kb.enabled = false：跳过不调飞书
+    const cfg3 = makeCfg({ enabled: false });
+    const store3 = new Store(cfg3.dataDir);
+    await new KnowledgeBase(cfg3, { async run() { throw new Error("should not call"); } } as unknown as Lark, store3).init();
+    assert.equal(store3.get("kb.space"), undefined);
+    store3.db.close();
+
+    // 4. 非权限类错误（如网络故障）仍抛出，不静默回退
+    const cfg4 = makeCfg();
+    const store4 = new Store(cfg4.dataDir);
+    const fakeLark4 = {
+      async run(args: string[]) {
+        if (args[1] === "+space-list") return { spaces: [] };
+        throw new LarkError("lark-cli wiki +space-create 失败：network timeout", 1);
+      },
+    } as unknown as Lark;
+    await assert.rejects(() => new KnowledgeBase(cfg4, fakeLark4, store4).init(), /network timeout/);
+    store4.db.close();
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("parseEventStderr：解析多行 JSON 错误信封（含 message / hint / subtype），普通文本回退最后一行", () => {
+  const jsonLines = [
+    "[event] connecting...",
+    "{",
+    '  "ok": false,',
+    '  "identity": "user",',
+    '  "error": {',
+    '    "type": "validation",',
+    '    "subtype": "failed_precondition",',
+    '    "message": "EventKey task.task.update_user_access_v2 requires event types not subscribed in console",',
+    '    "hint": "subscribe these event types by scanning: https://open.feishu.cn/page/launcher?clientID=cli_x"',
+    "  }",
+    "}",
+  ];
+  assert.deepEqual(parseEventStderr(jsonLines), {
+    message: "EventKey task.task.update_user_access_v2 requires event types not subscribed in console",
+    hint: "subscribe these event types by scanning: https://open.feishu.cn/page/launcher?clientID=cli_x",
+    subtype: "failed_precondition",
+  });
+  assert.deepEqual(parseEventStderr(["line 1", "  connection reset by peer  ", ""]), {
+    message: "connection reset by peer",
+  });
+  assert.deepEqual(parseEventStderr([]), { message: "" });
+});
+
+test("doubao-cli harness：传 -C / --permission-mode / -p -，关闭更新检查并接入飞书守卫 PATH", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pa-doubao-"));
+  try {
+    const fake = path.join(tmp, "fake-doubao");
+    fs.writeFileSync(
+      fake,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const input = fs.readFileSync(0, "utf8");
+process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), input, noUpdate: process.env.DOUBAO_CLI_NO_UPDATE_CHECK, guard: process.env.PA_GUARD_PROFILE }));
+`,
+      { mode: 0o755 },
+    );
+    const cfgFile = path.join(tmp, "config.yaml");
+    fs.writeFileSync(
+      cfgFile,
+      JSON.stringify({
+        data_dir: path.join(tmp, "data"),
+        owner: { open_id: "ou_owner" },
+        harnesses: {
+          doubao: { type: "doubao-cli", cmd: fake, model: "5", extraArgs: ["--effort", "medium"] },
+          doubaoBypass: { type: "doubao-cli", cmd: fake, extraArgs: ["--dangerously-bypass-approvals-and-sandbox"] },
+        },
+        roles: { brain: "doubao" },
+      }),
+    );
+    const cfg = loadConfig(cfgFile);
+    const cwd = path.join(tmp, "work");
+    const r = await runHarness(cfg, {
+      harness: "doubao",
+      prompt: "你好豆包",
+      cwd,
+      tools: "write",
+      lark: "agent",
+      timeoutSec: 30,
+      logFile: path.join(tmp, "run1.log"),
+    });
+    assert.equal(r.ok, true);
+    const got = JSON.parse(r.text) as { argv: string[]; input: string; noUpdate: string; guard: string };
+    assert.deepEqual(got.argv, ["-C", cwd, "--permission-mode", "always_allow", "--model", "5", "--effort", "medium", "-p", "-"]);
+    assert.equal(got.input, "你好豆包");
+    assert.equal(got.noUpdate, "1");
+    assert.equal(got.guard, "agent");
+
+    const rNone = await runHarness(cfg, {
+      harness: "doubao",
+      prompt: "只读",
+      cwd,
+      tools: "none",
+      lark: "none",
+      timeoutSec: 30,
+      logFile: path.join(tmp, "run2.log"),
+    });
+    assert.ok(JSON.parse(rNone.text).argv.includes("ask_always"));
+
+    // extraArgs 显式带互斥权限参数时不重复追加 --permission-mode
+    const rBypass = await runHarness(cfg, {
+      harness: "doubaoBypass",
+      prompt: "bypass",
+      cwd,
+      tools: "write",
+      lark: "none",
+      timeoutSec: 30,
+      logFile: path.join(tmp, "run3.log"),
+    });
+    assert.ok(!JSON.parse(rBypass.text).argv.includes("--permission-mode"));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
