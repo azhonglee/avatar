@@ -713,22 +713,46 @@ export class WebLoginStore {
     return this.withLock(() => fn((login) => this.writeUnlocked(login, 1)));
   }
 
+  private snapshotLiveFileUnlocked(): { sha256: string; sessionId: string } {
+    if (!fs.existsSync(this.file)) return { sha256: "", sessionId: "" };
+    let sha256 = "";
+    try {
+      sha256 = crypto.createHash("sha256").update(fs.readFileSync(this.file)).digest("hex");
+    } catch {
+      sha256 = "";
+    }
+    const cur = this.load();
+    return { sha256, sessionId: cur?.session_id ?? "" };
+  }
+
   /**
    * 两阶段可恢复暂存提交（跨进程锁保护）：
-   *   1. `stage(login)` 将新加密凭据 fsync 到 `<file>.staged`，暂不覆盖现网 `<file>`；
-   *   2. 调用方在 SQLite 事务内写入绑定与 pending 标记并 COMMIT；
+   *   1. `stage(login)` 记录当前现网凭据代际（`prevFileSha256` / `prevSessionId`）并将新加密凭据 fsync 到 `<file>.staged`，暂不覆盖现网 `<file>`；
+   *   2. 调用方在 SQLite 事务内写入绑定与 pending 标记（含 `prev_file_sha256` / `prev_session_id`）并 COMMIT；
    *   3. SQLite COMMIT 成功后调用 `commitFile()` 原子 rename `<file>.staged -> <file>`；
    *   4. 若 SQLite 回滚则调用 `abortFile()` 清理暂存文件，旧凭据纹丝不动；
-   *   5. 若进程在 COMMIT 与 rename 之间崩溃，后续 `reconcilePendingCommit()` 会按已提交绑定自动补全 rename。
+   *   5. 若进程在 COMMIT 与 rename 之间崩溃，后续 `reconcilePendingCommit()` 会在锁内比对现网代际：
+   *      仅当现网文件仍处于暂存前的同一代际时补全 rename，若共享文件已被其他工作区安装更新会话则丢弃陈旧暂存文件而不覆盖。
    */
   stageWithLock<T>(
-    fn: (stage: (login: WebLogin) => { payload: WebLogin; commitFile: () => void; abortFile: () => void }) => T,
+    fn: (
+      stage: (login: WebLogin) => {
+        payload: WebLogin;
+        prevFileSha256: string;
+        prevSessionId: string;
+        commitFile: () => void;
+        abortFile: () => void;
+      },
+    ) => T,
   ): T {
     return this.withLock(() =>
       fn((login) => {
+        const prev = this.snapshotLiveFileUnlocked();
         const payload = this.writeTargetUnlocked(this.stagedFile, login, 1);
         return {
           payload,
+          prevFileSha256: prev.sha256,
+          prevSessionId: prev.sessionId,
           commitFile: () => {
             fs.renameSync(this.stagedFile, this.file);
             fsyncDir(path.dirname(this.file));
@@ -742,16 +766,30 @@ export class WebLoginStore {
   }
 
   /**
-   * 崩溃恢复协调（严格绑定目标凭据文件路径与 session_id）：
+   * 崩溃恢复协调（严格绑定目标凭据文件路径、session_id 与暂存前现网代际）：
    *   - 若 pending 标记指向另一个凭据路径（例如常驻进程用了 PA_FEISHU_WEB_CRED_FILE 而交互 CLI 用默认路径），直接忽略不清除标记也不删他人暂存文件；
-   *   - 若 pending 标记绑定本路径：先尝试 rename `.staged -> file`，仅在确实完成 rename 或验证现网文件已安装匹配的 owner_id + session_id 后才清除标记；
+   *   - 若 pending 标记绑定本路径：先在锁内核对现网文件是否已被其他工作区/更新登录替换；
+   *     * 仅当现网文件仍与 `prev_file_sha256` 一致（或非外部共享文件同旧会话）时补全 rename；
+   *     * 若现网已安装更新会话，直接清理陈旧 `.staged` 并清除过期 pending 标记，绝不覆盖更新会话；
    *   - 若 SQLite 无 pending 标记且本路径残留孤儿 `.staged`，安全清理。
    */
   reconcilePendingCommit(
     store: PendingCommitKvStore,
     pendingKey: string,
   ): void {
-    const parsePending = (raw: string | undefined): { file?: string; staged_file?: string; owner_id?: string; session_id?: string } | undefined => {
+    const parsePending = (
+      raw: string | undefined,
+    ):
+      | {
+          file?: string;
+          staged_file?: string;
+          owner_id?: string;
+          session_id?: string;
+          prev_file_sha256?: string;
+          prev_session_id?: string;
+          at?: number;
+        }
+      | undefined => {
       const t = (raw ?? "").trim();
       if (!t) return undefined;
       try {
@@ -761,6 +799,9 @@ export class WebLoginStore {
           staged_file: typeof obj.staged_file === "string" ? obj.staged_file : undefined,
           owner_id: typeof obj.owner_id === "string" ? obj.owner_id : undefined,
           session_id: typeof obj.session_id === "string" ? obj.session_id : undefined,
+          prev_file_sha256: typeof obj.prev_file_sha256 === "string" ? obj.prev_file_sha256 : undefined,
+          prev_session_id: typeof obj.prev_session_id === "string" ? obj.prev_session_id : undefined,
+          at: typeof obj.at === "number" && Number.isFinite(obj.at) ? obj.at : undefined,
         };
       } catch {
         return {};
@@ -795,22 +836,53 @@ export class WebLoginStore {
             : resolvedLegacyStaged;
         const stagedNow = fs.existsSync(stagedPath);
         if (pendingNow) {
-          let installed = false;
-          if (stagedNow && (stagedPath === resolvedSelfStaged || stagedPath === resolvedLegacyStaged)) {
-            fs.renameSync(stagedPath, this.file);
-            fsyncDir(path.dirname(this.file));
-            installed = true;
-          } else {
-            const cur = this.load();
-            if (
-              cur &&
-              (!pendingNow.owner_id || cur.owner_id === pendingNow.owner_id) &&
-              (!pendingNow.session_id || cur.session_id === pendingNow.session_id)
-            ) {
-              installed = true;
+          let resolved = false;
+          const liveSnap = this.snapshotLiveFileUnlocked();
+          const cur = this.load();
+          const alreadyInstalled =
+            !!cur &&
+            (!pendingNow.owner_id || cur.owner_id === pendingNow.owner_id) &&
+            (!pendingNow.session_id || cur.session_id === pendingNow.session_id);
+          if (alreadyInstalled) {
+            if (stagedNow && (stagedPath === resolvedSelfStaged || stagedPath === resolvedLegacyStaged)) {
+              fs.rmSync(stagedPath, { force: true });
+            }
+            resolved = true;
+          } else if (stagedNow && (stagedPath === resolvedSelfStaged || stagedPath === resolvedLegacyStaged)) {
+            let supersededByNewerLive = false;
+            if (pendingNow.prev_file_sha256 !== undefined) {
+              const matchesExactPrev = liveSnap.sha256 === pendingNow.prev_file_sha256;
+              const matchesLocalOldSession =
+                !this.isExternal &&
+                !!pendingNow.prev_session_id &&
+                !!liveSnap.sessionId &&
+                liveSnap.sessionId === pendingNow.prev_session_id;
+              if (!matchesExactPrev && !matchesLocalOldSession) {
+                supersededByNewerLive = true;
+              }
+            } else if (this.isExternal && cur) {
+              // 兼容旧版未记录 prev_file_sha256 的 pending 标记：共享外部文件上若现网已存在不同会话且时间不早于 pending，绝不覆写
+              const curUpdatedMs = cur.updated_at ? Date.parse(cur.updated_at) : NaN;
+              if (
+                pendingNow.session_id &&
+                cur.session_id &&
+                cur.session_id !== pendingNow.session_id &&
+                (!pendingNow.at || !Number.isFinite(curUpdatedMs) || curUpdatedMs >= pendingNow.at)
+              ) {
+                supersededByNewerLive = true;
+              }
+            }
+            if (supersededByNewerLive) {
+              // 共享凭据文件已由更新登录接管：仅清理当前工作区过期的暂存文件并消除挂起标记，绝不覆盖现网会话
+              fs.rmSync(stagedPath, { force: true });
+              resolved = true;
+            } else {
+              fs.renameSync(stagedPath, this.file);
+              fsyncDir(path.dirname(this.file));
+              resolved = true;
             }
           }
-          if (installed) {
+          if (resolved) {
             clearPendingCommitMarkerIfMatches(store, pendingKey, {
               file: pendingNow.file || this.file,
               sessionId: pendingNow.session_id ?? "",

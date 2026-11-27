@@ -33,6 +33,14 @@ export class DraftTargetIneligibleError extends Error {
   }
 }
 
+/** 目标会话的排除状态因网络抖动或在线 Web 客户端暂不可用而暂时无法核验时抛出（自动预起草应延迟重排而非永久跳过） */
+export class DraftTargetUncertainError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DraftTargetUncertainError";
+  }
+}
+
 export class Drafter {
   app: App;
   store: ContextStore;
@@ -212,7 +220,7 @@ export class Drafter {
     }
 
     if (sawUncertain) {
-      throw new DraftTargetIneligibleError("无法实时确认该会话的排除状态，已按安全策略暂缓起草回复");
+      throw new DraftTargetUncertainError("无法实时确认该会话的排除状态，已按安全策略暂缓起草回复");
     }
     if (sawExcluded) {
       throw new DraftTargetIneligibleError("该会话已被静音或排除，已停止起草回复");
@@ -388,8 +396,11 @@ export class Drafter {
       if (verifiedConv) {
         if (this.checkConvAllowed) {
           const postDecision = await this.checkConvAllowed(verifiedConv, verifiedConvName);
+          if (postDecision === "uncertain") {
+            throw new DraftTargetUncertainError("目标会话在推理后暂时无法实时核验排除状态，已暂缓发布草稿");
+          }
           if (postDecision !== "allowed") {
-            throw new DraftTargetIneligibleError("目标会话在推理期间已被静音、排除或状态未确认，已丢弃过期草稿");
+            throw new DraftTargetIneligibleError("目标会话在推理期间已被静音、排除，已丢弃过期草稿");
           }
         }
         if (this.filterObs && effectiveConvObs.length > 0) {

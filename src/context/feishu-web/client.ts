@@ -618,9 +618,9 @@ export class FeishuWebClient {
    *   4. Independent readback check verifying owner, chat, root, parent, CID, and text.
    */
   async sendVerifiedReply(
-    input: VerifiedReplyInput,
+    input: VerifiedReplyInput & { requireMentionOwnerId?: string },
     hooks?: {
-      onBeforeSend?: (meta: { rootId: string; parentId: string; threaded: boolean }) => void;
+      onBeforeSend?: (meta: { rootId: string; parentId: string; threaded: boolean; original: WebMessage; chat: ChatMeta }) => void;
       onCreated?: (meta: { replyId: string; rootId: string; parentId: string; threaded: boolean }) => void;
     },
   ): Promise<VerifiedReplyResult> {
@@ -630,6 +630,14 @@ export class FeishuWebClient {
     const original = await this.readMessage(input.messageId, input.signal);
     if (original.conversationId !== input.chatId) {
       throw new Error("原消息所属会话与草稿目标不一致，拒绝发送");
+    }
+    if (input.requireMentionOwnerId) {
+      const liveAtMe =
+        original.actorId !== input.requireMentionOwnerId &&
+        original.mentions.some((m) => m.id === input.requireMentionOwnerId);
+      if (!liveAtMe) {
+        throw new Error("实时回读原消息已不再 @本人（可能已被编辑移除 @mention），已中止发送");
+      }
     }
     const actualRoot = original.rootId || original.id;
     const actualParent = original.id;
@@ -644,7 +652,7 @@ export class FeishuWebClient {
     }
     const inThread = replyInThread(chat.kind, chat.mode);
     const threaded = group || inThread;
-    hooks?.onBeforeSend?.({ rootId: actualRoot, parentId: actualParent, threaded });
+    hooks?.onBeforeSend?.({ rootId: actualRoot, parentId: actualParent, threaded, original, chat });
     // 发包响应可能同时携带新消息 ID 与 Cookie 轮换：先让 onCreated 把 replyId 持久化为 created，
     // 再尝试刷盘轮换后的 Cookie，确保即使 Cookie 落盘报错也不会让已发送消息滞留在 sending 态而无法回读恢复。
     const created = await this.sendReply(input.chatId, actualRoot, input.cid, [{ text }], inThread, input.signal, actualParent, {

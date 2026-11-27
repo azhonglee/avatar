@@ -12,7 +12,16 @@ import {
   wrapCredentialIsolatedCommand,
   type IsolationOptions,
 } from "../harness.ts";
-import { errMsg, runProcess, type ProcResult } from "../util.ts";
+import { errMsg, killGroup, runProcess, type ProcResult } from "../util.ts";
+
+function killChildGroup(child: { pid?: number; kill: (sig?: NodeJS.Signals) => boolean }): void {
+  if (child.pid) killGroup(child.pid, "SIGKILL");
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // ignore
+  }
+}
 
 /**
  * 交付用到的 git 操作：
@@ -128,6 +137,7 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
       env: childEnv,
       input: opts?.input,
       timeoutMs: opts?.timeoutMs ?? 300_000,
+      group: true,
     });
   } finally {
     baseEnv.cleanup();
@@ -258,13 +268,14 @@ async function tryGitBuffer(
       const child = spawn(wrapped.cmd, wrapped.args, {
         env: childEnv,
         stdio: ["pipe", "pipe", "pipe"],
+        detached: true,
       });
       const outChunks: Buffer[] = [];
       let errStr = "";
       let timedOut = false;
       const timer = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGKILL");
+        killChildGroup(child);
       }, opts?.timeoutMs ?? 300_000);
       timer.unref?.();
       // 与 runProcess 一致：忽略子进程提前退出引发的 stdin EPIPE，避免未捕获错误导致常驻进程崩溃
@@ -486,8 +497,8 @@ async function targetRevHasLfsAttr(cwd: string, targetRev: string, roOpts: GitRu
         buildGitIsolation(cwd, caOpts, streamEnv.env.CREDENTIALS_DIRECTORY),
       );
 
-      const lsChild = spawn(lsWrapped.cmd, lsWrapped.args, { env: lsEnv, stdio: ["ignore", "pipe", "pipe"] });
-      const caChild = spawn(caWrapped.cmd, caWrapped.args, { env: caEnv, stdio: ["pipe", "pipe", "pipe"] });
+      const lsChild = spawn(lsWrapped.cmd, lsWrapped.args, { env: lsEnv, stdio: ["ignore", "pipe", "pipe"], detached: true });
+      const caChild = spawn(caWrapped.cmd, caWrapped.args, { env: caEnv, stdio: ["pipe", "pipe", "pipe"], detached: true });
 
       let lsErr = "";
       let caErr = "";
@@ -497,8 +508,8 @@ async function targetRevHasLfsAttr(cwd: string, targetRev: string, roOpts: GitRu
       const timeoutMs = roOpts.timeoutMs ?? 300_000;
       const timer = setTimeout(() => {
         timedOut = true;
-        lsChild.kill("SIGKILL");
-        caChild.kill("SIGKILL");
+        killChildGroup(lsChild);
+        killChildGroup(caChild);
       }, timeoutMs);
       timer.unref?.();
 
@@ -560,8 +571,8 @@ async function targetRevHasLfsAttr(cwd: string, targetRev: string, roOpts: GitRu
               if (curAttr === "filter" && field === "lfs") {
                 hasLfsAttr = true;
                 stoppedEarly = true;
-                lsChild.kill("SIGKILL");
-                caChild.kill("SIGKILL");
+                killChildGroup(lsChild);
+                killChildGroup(caChild);
                 break;
               }
             }
@@ -571,8 +582,8 @@ async function targetRevHasLfsAttr(cwd: string, targetRev: string, roOpts: GitRu
           if (stoppedEarly) break;
         }
       } catch (err) {
-        lsChild.kill("SIGKILL");
-        caChild.kill("SIGKILL");
+        killChildGroup(lsChild);
+        killChildGroup(caChild);
         await Promise.all([pumpP, lsExitP, caExitP]);
         throw err;
       } finally {
@@ -688,13 +699,14 @@ async function scanOutgoingGitLfs(
     const child = spawn(wrapped.cmd, wrapped.args, {
       env: childEnv,
       stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
     });
     let errStr = "";
     let timedOut = false;
     let stoppedEarly = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL");
+      killChildGroup(child);
     }, roOpts.timeoutMs ?? 300_000);
     timer.unref?.();
     child.stdin.on("error", () => undefined);
@@ -724,7 +736,7 @@ async function scanOutgoingGitLfs(
               chunk = [];
               if (await processMetaChunk(batch)) {
                 stoppedEarly = true;
-                child.kill("SIGKILL");
+                killChildGroup(child);
                 break;
               }
             }
@@ -741,7 +753,7 @@ async function scanOutgoingGitLfs(
         }
       }
     } catch (err) {
-      child.kill("SIGKILL");
+      killChildGroup(child);
       await exitPromise;
       throw err;
     } finally {
@@ -817,17 +829,8 @@ export async function pushBranch(
   }
   const localRemoteDirs = [...new Set(localDirByUrl.values())];
 
-  // 对目标不可变提交 localSha 仅流式执行一次 .gitattributes 属性检查，避免多 pushurl 时重复分配与扫描
-  let precomputedHasLfsAttr: boolean;
-  try {
-    precomputedHasLfsAttr = await targetRevHasLfsAttr(cwd, localSha, { ...opts, readOnly: true });
-  } catch (err) {
-    return {
-      ok: false,
-      rejected: false,
-      message: `检测分支 ${branch}（提交 ${localSha.slice(0, 12)}）的 Git LFS 属性失败，已中止推送：${errMsg(err)}`,
-    };
-  }
+  // 仅在至少存在一个需要更新的目标远端时按需执行一次 .gitattributes 流式扫描（避免已发布相同提交触发无谓扫描与 git-lfs 预检）
+  let precomputedHasLfsAttr: boolean | undefined;
 
   for (const pushUrl of effectivePushUrls) {
     const localDir = localDirByUrl.get(pushUrl);
@@ -848,6 +851,22 @@ export async function pushBranch(
         if (!sha || !ref) continue;
         if (ref === localRef) remoteSha = sha;
         if (!ref.endsWith("^{}")) knownRemoteShas.push(sha);
+      }
+    }
+    // 目标远端分支已精确指向 localSha（无任何待推送新提交）：跳过 LFS 树扫描与 git lfs pre-push，避免无 git-lfs 宿主机重试 PR 失败
+    if (lsRemote.code === 0 && remoteSha === localSha) {
+      continue;
+    }
+
+    if (precomputedHasLfsAttr === undefined) {
+      try {
+        precomputedHasLfsAttr = await targetRevHasLfsAttr(cwd, localSha, { ...opts, readOnly: true });
+      } catch (err) {
+        return {
+          ok: false,
+          rejected: false,
+          message: `检测分支 ${branch}（提交 ${localSha.slice(0, 12)}）的 Git LFS 属性失败，已中止推送：${errMsg(err)}`,
+        };
       }
     }
 

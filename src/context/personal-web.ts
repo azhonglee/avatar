@@ -635,13 +635,21 @@ export class PersonalWebBridge {
       localCredUnavailable &&
       daemonLive &&
       saved.state !== "needs_login";
-    const loggedIn = loginAuthorized || daemonHealthyWithoutLocalCred;
     const staleSavedSession =
       loginAuthorized &&
       saved.state === "needs_login" &&
       ((!!login?.session_id && saved.session_id !== login.session_id) ||
         (!!saved.owner_id && saved.owner_id !== login?.owner_id) ||
         (typeof saved.cookie_version === "number" && (login?.cookie_version ?? 1) > saved.cookie_version));
+    // 当前凭据文件的同一会话与 Cookie 版本已被服务端拒绝（saved.state === "needs_login"）：
+    // 状态接口必须如实返回 logged_in: false，而非同时报 logged_in: true 与 needs_login；
+    // 若磁盘已更换更新会话/更高 cookie_version（staleSavedSession），则仍按有效新登录放行。
+    const currentSessionRejected =
+      loginAuthorized &&
+      saved.state === "needs_login" &&
+      !staleSavedSession &&
+      (!!saved.session_id || !!saved.owner_id);
+    const loggedIn = (loginAuthorized && !currentSessionRejected) || daemonHealthyWithoutLocalCred;
 
     let state: string = staleSavedSession ? "stopped" : saved.state;
     let lastError = staleSavedSession ? "" : saved.last_error;
@@ -664,8 +672,8 @@ export class PersonalWebBridge {
       enabled,
       logged_in: loggedIn,
       state,
-      owner_id: (loginAuthorized ? login?.owner_id : "") || (loggedIn ? saved.owner_id : ""),
-      owner_name: (loginAuthorized ? login?.owner_name : "") || (loggedIn ? saved.owner_name : ""),
+      owner_id: (loggedIn && loginAuthorized ? login?.owner_id : "") || (loggedIn ? saved.owner_id : ""),
+      owner_name: (loggedIn && loginAuthorized ? login?.owner_name : "") || (loggedIn ? saved.owner_name : ""),
       last_message_at: saved.last_message_at,
       last_error: lastError,
     };
@@ -1023,13 +1031,18 @@ export class PersonalWebBridge {
       const latest = this.store.latestConvObs(ocId);
       const recordedType = classifyRecordedChatType(latest);
       if (recordedType === "dm") continue;
-      const name = (
+      const authoritativeGroupName = (
         knownNames[ocId] ||
         spoken[ocId]?.name ||
-        muteLabel ||
         (recordedType === "group" ? (latest?.conv_name ?? "") : "")
       ).trim();
-      if (name && name !== "群聊" && !name.startsWith("私聊")) {
+      const untypedMuteLabel = muteLabel.trim();
+      const name =
+        (authoritativeGroupName && authoritativeGroupName !== "群聊" ? authoritativeGroupName : "") ||
+        (untypedMuteLabel && untypedMuteLabel !== "群聊" && untypedMuteLabel !== "私聊" && !/^私聊[:：]/.test(untypedMuteLabel)
+          ? untypedMuteLabel
+          : "");
+      if (name) {
         out.add(norm(name));
       }
     }
@@ -1231,7 +1244,13 @@ export class PersonalWebBridge {
       const latest = this.store.latestConvObs(pwConv);
       const recordedType = classifyRecordedChatType(latest);
       const rawStale = (muteName || latest?.conv_name || "").trim();
-      const staleGroupName = rawStale && !/^群聊\(\d+\)$/.test(rawStale) && !rawStale.startsWith("私聊") ? rawStale : "";
+      const staleGroupName =
+        rawStale &&
+        !/^群聊\(\d+\)$/.test(rawStale) &&
+        rawStale !== "群聊" &&
+        (recordedType === "group" || (recordedType !== "dm" && rawStale !== "私聊" && !/^私聊[:：]/.test(rawStale)))
+          ? rawStale
+          : "";
 
       if (client) {
         try {
@@ -1421,11 +1440,16 @@ export class PersonalWebBridge {
 
   private resolvePwGroupName(k: string, spoken: Record<string, { name: string; at: number }>): string {
     const cached = (this.pwGroupNameCache.get(k) ?? "").trim();
-    if (cached && !/^群聊\(\d+\)$/.test(cached) && !cached.startsWith("私聊")) return cached;
+    if (cached && cached !== "群聊" && !/^群聊\(\d+\)$/.test(cached)) return cached;
     const fromSpoken = (spoken[k]?.name ?? "").trim();
-    if (fromSpoken && !/^群聊\(\d+\)$/.test(fromSpoken)) return fromSpoken;
-    const fromObs = (this.store.latestConvObs(k)?.conv_name ?? "").trim();
-    return fromObs && !/^群聊\(\d+\)$/.test(fromObs) && !fromObs.startsWith("私聊") ? fromObs : "";
+    if (fromSpoken && fromSpoken !== "群聊" && !/^群聊\(\d+\)$/.test(fromSpoken)) return fromSpoken;
+    const latest = this.store.latestConvObs(k);
+    const recordedType = classifyRecordedChatType(latest);
+    if (recordedType === "dm") return "";
+    const fromObs = (latest?.conv_name ?? "").trim();
+    if (!fromObs || fromObs === "群聊" || /^群聊\(\d+\)$/.test(fromObs)) return "";
+    if (recordedType === "group") return fromObs;
+    return fromObs !== "私聊" && !/^私聊[:：]/.test(fromObs) ? fromObs : "";
   }
 
   /**
@@ -2297,7 +2321,21 @@ export class PersonalWebBridge {
           cid: args.cid,
         },
         {
-          onBeforeSend: ({ rootId, parentId, threaded }) => {
+          onBeforeSend: ({ rootId, parentId, threaded, original, chat }) => {
+            // 若目标属于当前采集范围外的群聊（仅因 @本人 而进入草稿），发包认领前必须依据刚回读的权威原消息复核仍存在 @本人，
+            // 防止监听离线期间对方编辑移除了 @mention，导致确认草稿仍向范围外群发出回复
+            const targetIsOutOfScopeGroup =
+              isGroupChat(chat.kind) &&
+              !this.isGroupInScope(args.chat_id, `pw_chat:${args.chat_id}`, args.owner_id);
+            if (targetIsOutOfScopeGroup) {
+              const liveAtMe =
+                original.actorId !== args.owner_id &&
+                original.mentions.some((m) => m.id === args.owner_id);
+              if (!liveAtMe) {
+                this.store.retirePendingObs(`pw:${args.message_id}`);
+                throw new Error("发送前实时核验发现范围外群原消息已不再 @本人（离线期间可能已被编辑移除 @mention），已中止发送");
+              }
+            }
             const claimed = this.claimDeliveryForSend(
               {
                 cid: args.cid,
@@ -2556,7 +2594,15 @@ export function commitWorkspaceLogin(
     if (opts.signal?.aborted) {
       throw new Error("扫码登录已取消");
     }
-    let staged: { payload: WebLogin; commitFile: () => void; abortFile: () => void } | undefined;
+    let staged:
+      | {
+          payload: WebLogin;
+          prevFileSha256: string;
+          prevSessionId: string;
+          commitFile: () => void;
+          abortFile: () => void;
+        }
+      | undefined;
     let sqliteCommitted = false;
     app.store.db.exec("BEGIN IMMEDIATE");
     try {
@@ -2608,6 +2654,8 @@ export function commitWorkspaceLogin(
         staged_file: loginStore.stagedFile,
         owner_id: saved.owner_id,
         session_id: saved.session_id ?? "",
+        prev_file_sha256: staged.prevFileSha256,
+        prev_session_id: staged.prevSessionId,
         at: Date.now(),
       });
       app.store.set(PENDING_CRED_COMMIT_KV_KEY, pendingMarker);

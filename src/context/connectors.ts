@@ -131,7 +131,9 @@ export function rememberOpenGroupName(store: App["store"], chatId: string, name:
   mergeKnownOpenGroupNames(store, new Map([[chatId, name]]));
 }
 
-/** 一次性合并增量学习到的开放平台群名，避免写事务内逐条重解析整个缓存或用旧快照覆盖在线监听刚刷新的群名 */
+const isSyntheticDmLabel = (s: string): boolean => s === "私聊" || /^私聊[:：]/.test(s);
+
+/** 一次性合并增量学习到的开放平台群名，避免写事务内逐条重解析整个缓存或用旧快照覆盖在线监听刚刷新的群名（保留真实以「私聊」开头的群名） */
 export function mergeKnownOpenGroupNames(store: App["store"], delta: ReadonlyMap<string, string>): void {
   if (delta.size === 0) return;
   const cur = loadKnownOpenGroupNames(store);
@@ -139,7 +141,7 @@ export function mergeKnownOpenGroupNames(store: App["store"], delta: ReadonlyMap
   for (const [rawId, rawName] of delta) {
     const id = rawId.trim();
     const clean = rawName.trim();
-    if (!id || !clean || clean === "群聊" || clean.startsWith("私聊")) continue;
+    if (!id || !clean || clean === "群聊") continue;
     if (cur[id] !== clean) {
       cur[id] = clean;
       changed = true;
@@ -197,15 +199,25 @@ export function selectEffectiveOpenGroups(params: {
   const lookback = cfg.context.lookback_days * DAY;
   const maxGroups = Math.max(0, cfg.context.max_groups);
 
-  const concreteGroupName = (raw?: string): string => {
+  const authoritativeGroupName = (raw?: string): string => {
     const clean = (raw ?? "").trim();
-    return clean && clean !== "群聊" && !clean.startsWith("私聊") ? clean : "";
+    return clean && clean !== "群聊" ? clean : "";
+  };
+  const fallbackObsGroupName = (obs?: { kind?: string; conv_name?: string; meta?: Record<string, unknown> }): string => {
+    if (!obs) return "";
+    const ct = String(obs.meta?.chat_type ?? "").trim().toLowerCase();
+    if (ct === "p2p" || obs.kind === "p2p") return "";
+    const clean = (obs.conv_name ?? "").trim();
+    if (!clean || clean === "群聊") return "";
+    if (ct === "group" || ct === "topic_group" || obs.kind === "group") return clean;
+    // 仅对无类型的遗留回退记录剔除合成私聊标签（“私聊”或“私聊：xxx”），绝不丢弃真实群名（如“私聊问题反馈”）
+    return isSyntheticDmLabel(clean) ? "" : clean;
   };
   const resolveName = (id: string, fallback = ""): string =>
-    concreteGroupName(knownNames?.[id]) ||
-    concreteGroupName(spoken[id]?.name) ||
-    concreteGroupName(fallback) ||
-    concreteGroupName(store.latestConvObs(id)?.conv_name);
+    authoritativeGroupName(knownNames?.[id]) ||
+    authoritativeGroupName(spoken[id]?.name) ||
+    authoritativeGroupName(fallback) ||
+    fallbackObsGroupName(store.latestConvObs(id));
 
   if (cfg.context.groups === "allowlist") {
     if (maxGroups === 0) return [];
@@ -691,7 +703,7 @@ export class Connectors {
     const learnedNames = new Map<string, string>();
     const recordLearnedName = (cid: string, cname: string) => {
       const clean = cname.trim();
-      if (!cid || !clean || clean === "群聊" || clean.startsWith("私聊")) return;
+      if (!cid || !clean || clean === "群聊") return;
       knownNames[cid] = clean;
       if (cid.startsWith("oc_")) learnedNames.set(cid, clean);
     };
@@ -719,21 +731,31 @@ export class Connectors {
     const scannedGroups = !nativeExcl?.groupsInconclusive;
     const needsNameForRanking = this.hasNameDenyPatterns() || !!(nativeExcl && nativeExcl.confirmedGroupNames.size > 0);
     if (scannedGroups && needsNameForRanking && this.cfg.context.max_groups > 0) {
-      const concreteGroupName = (raw?: string): string => {
+      const authoritativeGroupName = (raw?: string): string => {
         const clean = (raw ?? "").trim();
-        return clean && clean !== "群聊" && !clean.startsWith("私聊") ? clean : "";
+        return clean && clean !== "群聊" ? clean : "";
+      };
+      const fallbackObsName = (id: string): string => {
+        const latest = this.store.latestConvObs(id);
+        if (!latest) return "";
+        const ct = String(latest.meta?.chat_type ?? "").trim().toLowerCase();
+        if (ct === "p2p" || latest.kind === "p2p") return "";
+        const clean = (latest.conv_name ?? "").trim();
+        if (!clean || clean === "群聊") return "";
+        if (ct === "group" || ct === "topic_group" || latest.kind === "group") return clean;
+        return isSyntheticDmLabel(clean) ? "" : clean;
       };
       const refreshCandidateNameIfNeeded = async (id: string, fallbackName = ""): Promise<string> => {
         let name =
-          concreteGroupName(knownNames[id]) ||
-          concreteGroupName(spoken[id]?.name) ||
-          concreteGroupName(fallbackName) ||
-          concreteGroupName(this.store.latestConvObs(id)?.conv_name);
+          authoritativeGroupName(knownNames[id]) ||
+          authoritativeGroupName(spoken[id]?.name) ||
+          authoritativeGroupName(fallbackName) ||
+          fallbackObsName(id);
         // 若名称缺失，或旧缓存名称正触发按名称排除，实时刷新一次当前群名（避免改名后的白名单/发言群永远困在旧排除缓存里）
         const excludedByCachedName = !!name && isOpenGroupDirectlyDenied(this.cfg, this.store, id, name, nativeExcl);
         if (!name || excludedByCachedName) {
           const fresh = await getChatMeta(id);
-          if (fresh?.name) {
+          if (fresh?.name && fresh.chatType !== "p2p") {
             name = fresh.name;
             if (spoken[id]) spoken[id].name = name;
             recordLearnedName(id, name);
@@ -828,37 +850,87 @@ export class Connectors {
       }
     }
 
-    // 先按 message_id 合并多路搜索/群拉取的字段（避免搜索命中缺 chat_name 提前占坑导致后续带完整元数据的群行被去重丢弃）
+    // 先按 message_id 合并多路搜索/群拉取的字段：
+    //   - 合并稳定的会话元数据（chat_id / chat_name / chat_type / fallbackGroupName）；
+    //   - 当多路拉取返回不同修订版本（例如先跑 --is-at-me 搜索、再跑群拉取期间消息被编辑）时，
+    //     以更高 edit_version/update_time 的行作为正文、可变字段与 @mention 分类的权威来源，避免陈旧版本覆盖新编辑。
+    const parseRowEditVer = (m: Raw): number | undefined => {
+      const rawEditVer = m.edit_version ?? m.update_time ?? m.edit_time;
+      if (typeof rawEditVer === "number" && Number.isFinite(rawEditVer) && rawEditVer > 0) return rawEditVer;
+      if (typeof rawEditVer === "string" && rawEditVer.trim()) {
+        const t = rawEditVer.trim();
+        return /^\d+$/.test(t) ? Number(t) : parseTime(t, this.cfg.owner.timezone) || undefined;
+      }
+      return undefined;
+    };
+    const rowMentionsMe = (m: Raw): boolean | undefined => {
+      if (!Array.isArray(m.mentions)) return undefined;
+      return m.mentions.some((x) => {
+        if (typeof x === "string") return x === me;
+        if (!x || typeof x !== "object") return false;
+        const r = x as Record<string, unknown>;
+        return r.id === me || r.open_id === me || r.user_id === me;
+      });
+    };
     const kindRank: Record<string, number> = { at_me: 4, p2p: 3, mine: 2, group: 1 };
     const mergedById = new Map<
       string,
-      { m: Raw; kind: string; streams: Set<StreamKind>; fallbackGroupName: string }
+      { m: Raw; kind: string; editVer?: number; streams: Set<StreamKind>; fallbackGroupName: string }
     >();
     for (const row of raws) {
       const id = String(row.m.message_id ?? row.m.id ?? "");
       if (!id) continue;
+      const rowVer = parseRowEditVer(row.m);
       const existing = mergedById.get(id);
       if (!existing) {
         mergedById.set(id, {
           m: { ...row.m },
           kind: row.kind,
+          editVer: rowVer,
           streams: new Set([row.stream]),
           fallbackGroupName: row.fallbackGroupName ?? "",
         });
       } else {
         existing.streams.add(row.stream);
-        if (!existing.m.chat_id && row.m.chat_id) existing.m.chat_id = row.m.chat_id;
-        if (!String(existing.m.chat_name ?? "").trim() && String(row.m.chat_name ?? "").trim()) {
-          existing.m.chat_name = row.m.chat_name;
-        }
-        if (!String(existing.m.chat_type ?? "").trim() && String(row.m.chat_type ?? "").trim()) {
-          existing.m.chat_type = row.m.chat_type;
-        }
+        const existingVer = existing.editVer;
+        const rowIsNewer = rowVer !== undefined && (existingVer === undefined || rowVer > existingVer);
+        const existingIsNewer = existingVer !== undefined && (rowVer === undefined || existingVer > rowVer);
+
+        const mergedChatId = existing.m.chat_id || row.m.chat_id;
+        const mergedChatName = String(row.m.chat_name ?? "").trim() || String(existing.m.chat_name ?? "").trim();
+        const mergedChatType = String(existing.m.chat_type ?? "").trim() || String(row.m.chat_type ?? "").trim();
+        const mergedThreadId = existing.m.thread_id || row.m.thread_id;
+        const mergedParentId = existing.m.parent_id || row.m.parent_id;
+        const mergedRootId = existing.m.root_id || row.m.root_id;
         if (!existing.fallbackGroupName && row.fallbackGroupName) {
           existing.fallbackGroupName = row.fallbackGroupName;
         }
-        if ((kindRank[row.kind] ?? 0) > (kindRank[existing.kind] ?? 0)) {
-          existing.kind = row.kind;
+
+        if (rowIsNewer) {
+          existing.m = {
+            ...existing.m,
+            ...row.m,
+            ...(mergedChatId ? { chat_id: mergedChatId } : {}),
+            ...(mergedChatName ? { chat_name: mergedChatName } : {}),
+            ...(mergedChatType ? { chat_type: mergedChatType } : {}),
+            ...(mergedThreadId ? { thread_id: mergedThreadId } : {}),
+            ...(mergedParentId ? { parent_id: mergedParentId } : {}),
+            ...(mergedRootId ? { root_id: mergedRootId } : {}),
+          };
+          existing.editVer = rowVer;
+          const explicitAtMe = rowMentionsMe(row.m);
+          existing.kind = row.kind === "at_me" || explicitAtMe === true ? "at_me" : row.kind;
+        } else {
+          if (mergedChatId) existing.m.chat_id = mergedChatId;
+          if (!String(existing.m.chat_name ?? "").trim() && String(row.m.chat_name ?? "").trim()) {
+            existing.m.chat_name = row.m.chat_name;
+          }
+          if (!String(existing.m.chat_type ?? "").trim() && String(row.m.chat_type ?? "").trim()) {
+            existing.m.chat_type = row.m.chat_type;
+          }
+          if (!existingIsNewer && (kindRank[row.kind] ?? 0) > (kindRank[existing.kind] ?? 0)) {
+            existing.kind = row.kind;
+          }
         }
       }
     }
@@ -994,7 +1066,8 @@ export class Connectors {
         }
         if (nameSupplied && chatName && chatId) {
           if (spoken[chatId]) spoken[chatId].name = chatName;
-          if (chatId.startsWith("oc_") && !isP2pFinal) {
+          const isAuthoritativeGroup = chatType === "group" || chatType === "topic_group";
+          if (chatId.startsWith("oc_") && !isP2pFinal && (isAuthoritativeGroup || !isSyntheticDmLabel(chatName))) {
             recordLearnedName(chatId, chatName);
           }
         }

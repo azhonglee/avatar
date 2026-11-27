@@ -52,8 +52,20 @@ export class Board {
         if (!tasklist) throw new Error(`创建任务清单失败：${JSON.stringify(created)}`);
         log("info", "已创建任务清单", { name: this.cfg.board.name, guid: tasklist });
       }
-      this.store.set("board.tasklist", tasklist);
-      this.store.set("board.owner_open_id", authedOwner);
+      // 将看板 ID 与已核验主人原子落盘，防止初始化中途崩溃导致遗留无主 board.tasklist
+      this.store.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.store.set("board.tasklist", tasklist);
+        this.store.set("board.owner_open_id", authedOwner);
+        this.store.db.exec("COMMIT");
+      } catch (err) {
+        try {
+          this.store.db.exec("ROLLBACK");
+        } catch {
+          // ignore
+        }
+        throw err;
+      }
     } else {
       const existingBoardOwner = (this.store.get("board.owner_open_id") ?? "").trim();
       if (existingBoardOwner) {

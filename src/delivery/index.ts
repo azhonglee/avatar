@@ -308,6 +308,71 @@ export function registerDelivery(app: App): void {
     finish(item, { ...p, message }, say(p.guid, `↩️ ${message}`));
   }
 
+/**
+ * 当已放弃派单的 worktree 目录已被外部手动删除时，仅在宿主机定向清理指向该路径的单个 `.git/worktrees/<name>` 管理记录；
+ * 严禁在隔离沙箱内执行全局 `git worktree prune`（沙箱遮蔽了 `/tmp` 与其他目录，会误删宿主机上其他正常未解锁 worktree 的记录）。
+ */
+async function removeStaleWorktreeAdminRecord(
+  repoPath: string,
+  missingWtDir: string,
+  gitOpts: { cfg: Config; trustedRepoRoot: string },
+): Promise<boolean> {
+  const commonRes = await tryGit(repoPath, ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+    ...gitOpts,
+    readOnly: true,
+  });
+  let commonGitDir = commonRes.code === 0 ? commonRes.stdout.trim() : "";
+  if (!commonGitDir) {
+    const fallbackRes = await tryGit(repoPath, ["rev-parse", "--git-common-dir"], { ...gitOpts, readOnly: true });
+    if (fallbackRes.code !== 0 || !fallbackRes.stdout.trim()) return false;
+    commonGitDir = path.resolve(repoPath, fallbackRes.stdout.trim());
+  }
+  const wtAdminRoot = path.join(commonGitDir, "worktrees");
+  if (!fs.existsSync(wtAdminRoot)) return false;
+
+  const normalizePath = (p: string): string => {
+    const abs = path.resolve(p);
+    if (fs.existsSync(abs)) {
+      try {
+        return fs.realpathSync(abs);
+      } catch {
+        return abs;
+      }
+    }
+    const parent = path.dirname(abs);
+    if (parent !== abs && fs.existsSync(parent)) {
+      try {
+        return path.join(fs.realpathSync(parent), path.basename(abs));
+      } catch {
+        return abs;
+      }
+    }
+    return abs;
+  };
+
+  const targetPaths = new Set([path.resolve(missingWtDir), normalizePath(missingWtDir)]);
+  let removedAny = false;
+  for (const ent of fs.readdirSync(wtAdminRoot, { withFileTypes: true })) {
+    if (!ent.isDirectory() || ent.isSymbolicLink()) continue;
+    const entryDir = path.join(wtAdminRoot, ent.name);
+    const gitdirFile = path.join(entryDir, "gitdir");
+    if (!fs.existsSync(gitdirFile)) continue;
+    try {
+      const raw = fs.readFileSync(gitdirFile, "utf8").trim();
+      if (!raw) continue;
+      const resolvedGitFile = path.resolve(entryDir, raw);
+      const wtDir = path.dirname(resolvedGitFile);
+      if (targetPaths.has(path.resolve(wtDir)) || targetPaths.has(normalizePath(wtDir))) {
+        fs.rmSync(entryDir, { recursive: true, force: true });
+        removedAny = true;
+      }
+    } catch {
+      // 忽略无法读取的无关记录
+    }
+  }
+  return removedAny;
+}
+
   async function cleanup(item: Item): Promise<void> {
     const p = item.payload;
     const skip = (why: string) => finish(item, { ...p, message: why }, [], "cancelled");
@@ -327,8 +392,11 @@ export function registerDelivery(app: App): void {
       if (d.cwd && fs.existsSync(d.cwd)) {
         await git(spec.path, ["worktree", "remove", "--force", d.cwd], { ...gitOpts, extraWritablePaths: [wtParent] });
         removed.push(`worktree ${d.cwd}`);
+      } else if (d.cwd) {
+        if (await removeStaleWorktreeAdminRecord(spec.path, d.cwd, gitOpts)) {
+          removed.push(`失效 worktree 记录 ${d.cwd}`);
+        }
       }
-      await tryGit(spec.path, ["worktree", "prune"], { ...gitOpts, extraWritablePaths: [wtParent] });
       if (d.branch.startsWith("pa/") && (await branchExists(spec.path, d.branch, gitOpts))) {
         await git(spec.path, ["branch", "-D", d.branch], gitOpts);
         removed.push(`本地分支 ${d.branch}`);

@@ -12,7 +12,7 @@ import type { Effect, NotifyKind } from "../ledger.ts";
 import { deepFind, errMsg, log, truncate } from "../util.ts";
 import { draftCard, eveningCard, itemCard, KIND_LABEL, morningCard, type CtxRenderCtx } from "./cards.ts";
 import { Connectors, relinkMeegoItems } from "./connectors.ts";
-import { defaultDraftKind, Drafter, DraftTargetIneligibleError } from "./drafts.ts";
+import { defaultDraftKind, Drafter, DraftTargetIneligibleError, DraftTargetUncertainError } from "./drafts.ts";
 import { hasWorkspaceOwnerMismatch, PersonalWebBridge, type FastAnchor } from "./personal-web.ts";
 import { ContextStore, type ItemRow } from "./store.ts";
 import { splitProject, Understander, UnderstandParseError, type SplitResult } from "./understand.ts";
@@ -394,6 +394,9 @@ export class ContextService {
       this.syncDrafts();
       rep.nudged = this.nudge(created);
       this.autonomy(created);
+      // 若周期理解在快通道防抖窗口内抢先消费了原生私聊或 @本人 触发消息并产出高优 ask_me 事项，
+      // 直接以与快通道相同的幂等作业 ID 补入自动预起草（无需二次理解，也绝不丢失预起草）
+      this.enqueueAutoPreDrafts(created, true);
       kv.set("ctx.last_cycle", String(Date.now()));
       kv.set("ctx.last_error", rep.errors.join("\n").slice(0, 1000));
       kv.set("ctx.last_report", JSON.stringify(rep));
@@ -619,18 +622,43 @@ export class ContextService {
       this.autonomy(r.created);
 
       // 可选：为高优先级「别人在等你」自动预起草回复草稿（标记 auto: true，入队与执行复用同一资格判据；永远不自动发送）
-      let preDrafted = 0;
-      for (const c of r.created) {
-        const it = this.store.item(c.id);
-        if (!this.canAutoPreDraft(it)) continue;
-        if (this.enqueue(`draft:${it.id}:reply:fast`, { task: "draft", item_id: it.id, kind: "reply", auto: true })) preDrafted++;
-      }
+      const preDrafted = this.enqueueAutoPreDrafts(r.created, false);
       return { fresh: r.fresh, created: r.created.length, nudged, pre_drafted: preDrafted };
     } finally {
       signal?.removeEventListener("abort", onParentAbort);
       clearInterval(claimHeartbeat);
       this.store.releaseConv(p.conv, claimToken, procOwner);
     }
+  }
+
+  /** 为刚产出的高优 ask_me 事项以幂等 ID 入队自动预起草；从周期理解调用时要求事项确实关联当前绑定账号的原生私聊或 @本人 触发证据 */
+  private enqueueAutoPreDrafts(items: ItemRow[], requireNativeTriggerEvidence: boolean): number {
+    if (!items.length) return 0;
+    const activeNativeOwner = requireNativeTriggerEvidence ? this.personalWeb.activeBoundNativeOwner() : null;
+    if (requireNativeTriggerEvidence && !activeNativeOwner) return 0;
+    let count = 0;
+    for (const c of items) {
+      const it = this.store.item(c.id);
+      if (!this.canAutoPreDraft(it)) continue;
+      if (requireNativeTriggerEvidence) {
+        const hasNativeTrigger = this.store.evidence("item", it.id, 20).some((e) => {
+          const o = this.store.obs(e.obs_id);
+          if (!o || !o.id.startsWith("pw:") || o.is_me || o.meta.withdrawn === true) return false;
+          if (String(o.meta.native_owner_id ?? "").trim() !== activeNativeOwner) return false;
+          const isDm = String(o.meta.chat_type ?? "").trim().toLowerCase() === "p2p" || o.kind === "p2p";
+          const isAtMe =
+            (o.kind === "at_me" || o.meta.at_me === true) &&
+            o.meta.at_me !== false &&
+            o.meta.is_mention_me !== false;
+          return isDm || isAtMe;
+        });
+        if (!hasNativeTrigger) continue;
+      }
+      if (this.enqueue(`draft:${it.id}:reply:fast`, { task: "draft", item_id: it.id, kind: "reply", auto: true })) {
+        count++;
+      }
+    }
+    return count;
   }
 
   /** 判断事项是否满足快通道自动预起草资格（入队与执行前复用同一判据，防止开关关闭或后续降级后仍送模型） */
@@ -868,7 +896,13 @@ export class ContextService {
             this.app.ledger.transition(item, { state: "done", terminal: true, payload: { ...p, draft_id: d.id } as never });
             this.renderDraft(d.id);
           } catch (err) {
-            // 已入队的自动预起草若目标会话/消息已被静音、排除或移出采集范围，静默跳过不送模型也不刷失败通知
+            // 暂时无法实时确认目标会话排除状态（网络抖动/在线 Web 客户端恢复中）：
+            // 对自动预起草延迟重排且退回重试次数，不落库也不永久跳过，待连通恢复后再核验起草
+            if (p.auto && err instanceof DraftTargetUncertainError) {
+              this.app.ledger.release(item.id, { nextAt: Date.now() + 5_000, refund: true });
+              return;
+            }
+            // 已入队的自动预起草若目标会话/消息已被明确静音、排除或移出采集范围，静默跳过不送模型也不刷失败通知
             if (p.auto && err instanceof DraftTargetIneligibleError) {
               this.app.ledger.transition(item, { state: "skipped", terminal: true });
               return;

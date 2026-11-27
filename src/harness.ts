@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,7 +15,7 @@ const LINUX_TMPFS_MAGIC = 0x01021994;
 
 export type MountMaskBackend =
   | { kind: "bwrap"; bin: string }
-  | { kind: "unshare"; bin: string; setprivBin: string; pivotRootBin?: string }
+  | { kind: "unshare"; bin: string; setprivBin: string; pivotRootBin?: string; killChild?: boolean }
   | { kind: "none" };
 let cachedMountMaskBackend: MountMaskBackend | undefined;
 
@@ -474,13 +475,34 @@ function probeMountMaskBackend(): MountMaskBackend {
         "rmdir /tmp/.oldroot",
         'exec "$SP" --bounding-set -all --inh-caps -all --ambient-caps -all --no-new-privs true',
       ].join("\n");
+      const probeArgsWithKill = [
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "--pid",
+        "--fork",
+        "--mount-proc",
+        "--kill-child",
+        "--",
+        "sh",
+        "-c",
+        probeScript,
+        "_",
+        pivotRootBin,
+        setprivBin,
+      ];
+      const rKill = spawnSync(unshareBin, probeArgsWithKill, { timeout: 3_000, stdio: "ignore" });
+      if (rKill.status === 0) {
+        cachedMountMaskBackend = { kind: "unshare", bin: unshareBin, setprivBin, pivotRootBin, killChild: true };
+        return cachedMountMaskBackend;
+      }
       const r = spawnSync(
         unshareBin,
         ["--user", "--map-root-user", "--mount", "--pid", "--fork", "--mount-proc", "--", "sh", "-c", probeScript, "_", pivotRootBin, setprivBin],
         { timeout: 3_000, stdio: "ignore" },
       );
       if (r.status === 0) {
-        cachedMountMaskBackend = { kind: "unshare", bin: unshareBin, setprivBin, pivotRootBin };
+        cachedMountMaskBackend = { kind: "unshare", bin: unshareBin, setprivBin, pivotRootBin, killChild: false };
         return cachedMountMaskBackend;
       }
     }
@@ -869,6 +891,7 @@ export function wrapCredentialIsolatedCommand(
       "--pid",
       "--fork",
       "--mount-proc",
+      ...(backend.killChild !== false ? ["--kill-child"] : []),
       "--",
       "sh",
       "-c",
@@ -932,12 +955,17 @@ const STRIPPED_HOST_SOCKET_ENVS = new Set([
 
 export function prepareHarnessEnv(
   env: NodeJS.ProcessEnv = process.env,
-  opts?: { tmpfsCandidates?: string[]; preserveSshAgent?: boolean },
+  opts?: { tmpfsCandidates?: string[]; preserveSshAgent?: boolean; preserveDbusSession?: boolean },
 ): { env: NodeJS.ProcessEnv; cleanup: () => void } {
   const clean: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(env)) {
     if (k.startsWith("PA_FEISHU_WEB_")) continue;
-    if (STRIPPED_HOST_SOCKET_ENVS.has(k)) continue;
+    if (STRIPPED_HOST_SOCKET_ENVS.has(k)) {
+      if (k === "DBUS_SESSION_BUS_ADDRESS" && opts?.preserveDbusSession) {
+        clean[k] = v;
+      }
+      continue;
+    }
     if (!opts?.preserveSshAgent && (k === "SSH_AUTH_SOCK" || k === "SSH_AGENT_PID")) continue;
     clean[k] = v;
   }
@@ -2006,17 +2034,21 @@ export function loadPrompt(name: string): string {
 }
 
 const MAX_CODEX_AUTH_BYTES = 256 * 1024;
+const MAX_CODEX_CONFIG_BYTES = 4 * 1024 * 1024;
 
 interface CodexAuthOrigSnapshot {
   hostAuthPath: string;
   origBytes: Buffer;
   origJson: Record<string, unknown>;
+  origDev: number;
+  origIno: number;
   canSyncBack: boolean;
 }
 
 export interface StagedCodexHome {
   scratchDir: string;
   origAuth?: CodexAuthOrigSnapshot;
+  lockDir?: string;
   cleanup: () => void;
 }
 
@@ -2024,8 +2056,21 @@ function isPlainJsonRecord(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
-function copyRegularTreeShallow(srcDir: string, dstDir: string, depth = 0): void {
+function copyRegularTreeShallow(
+  srcDir: string,
+  dstDir: string,
+  depth = 0,
+  visitedRealDirs: Set<string> = new Set(),
+): void {
   if (depth > 4) return;
+  let realSrc: string;
+  try {
+    realSrc = fs.realpathSync(srcDir);
+  } catch {
+    return;
+  }
+  if (visitedRealDirs.has(realSrc)) return;
+  visitedRealDirs.add(realSrc);
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(srcDir, { withFileTypes: true });
@@ -2034,19 +2079,68 @@ function copyRegularTreeShallow(srcDir: string, dstDir: string, depth = 0): void
   }
   fs.mkdirSync(dstDir, { recursive: true, mode: 0o700 });
   for (const ent of entries) {
-    if (ent.isSymbolicLink()) continue;
     const srcPath = path.join(srcDir, ent.name);
     const dstPath = path.join(dstDir, ent.name);
-    if (ent.isFile()) {
+    let st: fs.Stats;
+    try {
+      st = fs.statSync(srcPath);
+    } catch {
+      continue;
+    }
+    if (st.isFile()) {
       try {
-        const st = fs.lstatSync(srcPath);
-        if (!st.isFile() || st.size > 1024 * 1024) continue;
-        fs.copyFileSync(srcPath, dstPath);
+        if (st.size > 1024 * 1024) continue;
+        fs.writeFileSync(dstPath, fs.readFileSync(srcPath), { mode: 0o600 });
       } catch {
-        // ignore unreadable auxiliary config
+        // ignore unreadable auxiliary rule file
       }
-    } else if (ent.isDirectory()) {
-      copyRegularTreeShallow(srcPath, dstPath, depth + 1);
+    } else if (st.isDirectory()) {
+      copyRegularTreeShallow(srcPath, dstPath, depth + 1, visitedRealDirs);
+    }
+  }
+}
+
+function withCodexAuthSyncLock<T>(hostAuthPath: string, lockDir: string | undefined, fn: () => T): T {
+  let baseDir = lockDir?.trim() ? path.resolve(lockDir.trim()) : "";
+  if (baseDir) {
+    fs.mkdirSync(baseDir, { recursive: true });
+  } else {
+    const uid = typeof process.getuid === "function" ? String(process.getuid()) : "user";
+    const candidate = path.join(os.tmpdir(), `pa-codex-auth-locks-${uid}`);
+    fs.mkdirSync(candidate, { recursive: true, mode: 0o700 });
+    const st = fs.lstatSync(candidate);
+    if (
+      st.isSymbolicLink() ||
+      !st.isDirectory() ||
+      (typeof process.getuid === "function" && st.uid !== process.getuid())
+    ) {
+      throw new Error(`Codex 凭据同步锁目录不安全：${candidate}`);
+    }
+    baseDir = candidate;
+  }
+  const keyHash = createHash("sha256").update(safeRealpath(hostAuthPath)).digest("hex").slice(0, 16);
+  const lockFile = path.join(baseDir, `.codex-auth-sync-${keyHash}.lock.db`);
+  const db = new DatabaseSync(lockFile);
+  try {
+    db.exec("PRAGMA busy_timeout = 5000");
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const res = fn();
+      db.exec("COMMIT");
+      return res;
+    } catch (err) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // ignore
     }
   }
 }
@@ -2055,87 +2149,138 @@ function copyRegularTreeShallow(srcDir: string, dstDir: string, depth = 0): void
  * 为隔离沙箱中的 `codex exec` 准备私有临时 `CODEX_HOME`：
  *   - 宿主机真实 `~/.codex` 保持只读，防止沙箱内进程篡改 `config.toml` / `hooks` / `plugins` / `skills`；
  *   - 将 `auth.json` 以 0600 拷贝到临时 `CODEX_HOME`，允许 Codex 正常初始化临时 SQLite 与刷新过期 OAuth Token；
- *   - 非 `tools="none"` 模式下同时拷贝小体积配置文件（`config.toml`、`*.config.toml`、`instructions.md`、`AGENTS.md`、`rules/`）。
+ *   - 非 `tools="none"` 模式下按解引用后的真实内容拷贝 `config.toml`、`*.config.toml`、`instructions.md`、`AGENTS.md`、`rules/`
+ *     （兼容 dotfiles 符号链接管理）；若 `config.toml` 或 `*.config.toml` 存在但无法安全载入（损坏链接/不可读/过大），
+ *     立即 fail-closed 抛错，绝不静默退化到默认供应商。
  */
 export function stageIsolatedCodexHome(
   hostCodexHome: string,
-  opts: { copyUserConfig: boolean },
+  opts: { copyUserConfig: boolean; lockDir?: string },
 ): StagedCodexHome {
   const scratchDir = safeRealpath(fs.mkdtempSync(path.join(os.tmpdir(), "pa-codex-home-")));
   fs.chmodSync(scratchDir, 0o700);
   let origAuth: CodexAuthOrigSnapshot | undefined;
 
-  const hostAuthPath = path.join(hostCodexHome, "auth.json");
-  try {
-    if (fs.existsSync(hostAuthPath)) {
-      const lst = fs.lstatSync(hostAuthPath);
-      const st = fs.statSync(hostAuthPath);
-      if (st.isFile() && st.size > 0 && st.size <= MAX_CODEX_AUTH_BYTES) {
-        const origBytes = fs.readFileSync(hostAuthPath);
-        fs.writeFileSync(path.join(scratchDir, "auth.json"), origBytes, { mode: 0o600 });
-        try {
-          const parsed = JSON.parse(origBytes.toString("utf8")) as unknown;
-          if (isPlainJsonRecord(parsed)) {
-            origAuth = {
-              hostAuthPath,
-              origBytes,
-              origJson: parsed,
-              canSyncBack: !lst.isSymbolicLink() && lst.isFile(),
-            };
-          }
-        } catch {
-          // 非 JSON 格式仅拷贝供子进程读取，不做回写
-        }
-      }
-    }
-  } catch {
-    // 宿主机 auth.json 不可读时仍提供干净可写的临时 CODEX_HOME
-  }
+  const cleanup = () => {
+    fs.rmSync(scratchDir, { recursive: true, force: true });
+  };
 
-  if (opts.copyUserConfig && fs.existsSync(hostCodexHome)) {
+  try {
+    const hostAuthPath = path.join(hostCodexHome, "auth.json");
     try {
-      for (const ent of fs.readdirSync(hostCodexHome, { withFileTypes: true })) {
-        if (ent.isSymbolicLink()) continue;
-        const srcPath = path.join(hostCodexHome, ent.name);
-        const dstPath = path.join(scratchDir, ent.name);
-        if (
-          ent.isFile() &&
-          (ent.name === "config.toml" ||
-            ent.name.endsWith(".config.toml") ||
-            ent.name === "instructions.md" ||
-            ent.name === "AGENTS.md")
-        ) {
+      if (fs.existsSync(hostAuthPath)) {
+        const lst = fs.lstatSync(hostAuthPath);
+        const st = fs.statSync(hostAuthPath);
+        if (st.isFile() && st.size > 0 && st.size <= MAX_CODEX_AUTH_BYTES) {
+          const origBytes = fs.readFileSync(hostAuthPath);
+          fs.writeFileSync(path.join(scratchDir, "auth.json"), origBytes, { mode: 0o600 });
           try {
-            const st = fs.lstatSync(srcPath);
-            if (st.isFile() && st.size <= 1024 * 1024) {
-              fs.copyFileSync(srcPath, dstPath);
+            const parsed = JSON.parse(origBytes.toString("utf8")) as unknown;
+            if (isPlainJsonRecord(parsed)) {
+              origAuth = {
+                hostAuthPath,
+                origBytes,
+                origJson: parsed,
+                origDev: Number(lst.dev),
+                origIno: Number(lst.ino),
+                canSyncBack: !lst.isSymbolicLink() && lst.isFile(),
+              };
             }
           } catch {
-            // ignore
+            // 非 JSON 格式仅拷贝供子进程读取，不做回写
           }
-        } else if (ent.isDirectory() && ent.name === "rules") {
-          copyRegularTreeShallow(srcPath, dstPath, 0);
         }
       }
     } catch {
-      // ignore
+      // 宿主机 auth.json 不可读时仍提供干净可写的临时 CODEX_HOME
     }
-  }
 
-  return {
-    scratchDir,
-    origAuth,
-    cleanup: () => {
-      fs.rmSync(scratchDir, { recursive: true, force: true });
-    },
-  };
+    if (opts.copyUserConfig) {
+      let homeExists = false;
+      try {
+        fs.lstatSync(hostCodexHome);
+        homeExists = true;
+      } catch {
+        homeExists = false;
+      }
+      if (homeExists) {
+        let entries: fs.Dirent[];
+        try {
+          entries = fs.readdirSync(hostCodexHome, { withFileTypes: true });
+        } catch (err) {
+          throw new Error(
+            `无法读取宿主机 Codex 配置目录 (${hostCodexHome})：${errMsg(err)}；为避免将代码误发往默认供应商，已中止执行`,
+          );
+        }
+        for (const ent of entries) {
+          const srcPath = path.join(hostCodexHome, ent.name);
+          const dstPath = path.join(scratchDir, ent.name);
+          const isRequiredConfig = ent.name === "config.toml" || ent.name.endsWith(".config.toml");
+          const isOptionalDoc = ent.name === "instructions.md" || ent.name === "AGENTS.md";
+          if (isRequiredConfig) {
+            let st: fs.Stats;
+            try {
+              st = fs.statSync(srcPath);
+            } catch (err) {
+              throw new Error(
+                `无法解析宿主机 Codex 配置文件 (${srcPath})：${errMsg(err)}；为避免将代码误发往默认供应商，已中止执行`,
+              );
+            }
+            if (!st.isFile() || st.size > MAX_CODEX_CONFIG_BYTES) {
+              throw new Error(
+                `宿主机 Codex 配置文件 (${srcPath}) 不是合法普通文件或体积超过限制；为避免将代码误发往默认供应商，已中止执行`,
+              );
+            }
+            try {
+              fs.writeFileSync(dstPath, fs.readFileSync(srcPath), { mode: 0o600 });
+            } catch (err) {
+              throw new Error(
+                `无法载入宿主机 Codex 配置文件 (${srcPath}) 至隔离目录：${errMsg(err)}；为避免将代码误发往默认供应商，已中止执行`,
+              );
+            }
+          } else if (isOptionalDoc) {
+            try {
+              const st = fs.statSync(srcPath);
+              if (st.isFile() && st.size <= 1024 * 1024) {
+                fs.writeFileSync(dstPath, fs.readFileSync(srcPath), { mode: 0o600 });
+              }
+            } catch {
+              // 忽略可选说明文档读取异常
+            }
+          } else if (ent.name === "rules") {
+            try {
+              const st = fs.statSync(srcPath);
+              if (st.isDirectory()) {
+                copyRegularTreeShallow(srcPath, dstPath, 0, new Set());
+              }
+            } catch {
+              // 忽略可选规则目录读取异常
+            }
+          }
+        }
+      }
+    }
+
+    return {
+      scratchDir,
+      origAuth,
+      lockDir: opts.lockDir,
+      cleanup,
+    };
+  } catch (err) {
+    cleanup();
+    throw err;
+  }
 }
 
 /**
- * 在可信父进程侧校验临时 `CODEX_HOME/auth.json` 中的 OAuth 刷新结果并原子写回宿主机 `auth.json`（0600）：
+ * 在可信父进程侧校验临时 `CODEX_HOME/auth.json` 中的 OAuth 刷新结果并条件写回宿主机 `auth.json`（0600）：
  *   - 仅当宿主机原有合法文件态 OAuth 登录、临时文件为非符号链接普通文件、账号 ID 与 auth_mode 一致、
  *     access_token/refresh_token 有效且刷新时间未回滚时才允许回写；
- *   - 写回前重新核对宿主机文件（乐观 CAS），若期间用户已登出、换号或有更新的并发刷新则跳过不覆盖；
+ *   - 通过跨进程 POSIX 文件锁串行化并发 Avatar 进程，并以 `O_RDWR | O_NOFOLLOW`（不含 `O_CREAT`，不做 `rename`）
+ *     直接打开宿主机原 inode 核验 `(dev, ino)` 与最新内容：
+ *       * 若期间用户执行了 `codex logout` 删除文件，绝不会复活 `auth.json`；
+ *       * 若期间外部 `codex login` 原子替换了新文件（inode 变更）或写入了更新的刷新/不同账号，一律跳过不覆写；
  *   - 仅更新白名单字段（`tokens.{id_token,access_token,refresh_token,account_id}` 与 `last_refresh`）。
  */
 export function syncRefreshedCodexAuth(staged: StagedCodexHome): boolean {
@@ -2201,40 +2346,6 @@ export function syncRefreshedCodexAuth(staged: StagedCodexHome): boolean {
   const refreshAdvanced = Number.isFinite(nextRefreshMs) && (!Number.isFinite(origRefreshMs) || nextRefreshMs > origRefreshMs);
   if (!tokensChanged && !refreshAdvanced) return false;
 
-  // 写回前对宿主机 auth.json 做乐观 CAS 复核：不复活已登出文件，不覆盖换号或更新的并发刷新
-  let curHostBytes: Buffer;
-  try {
-    const hostLst = fs.lstatSync(snap.hostAuthPath);
-    if (hostLst.isSymbolicLink() || !hostLst.isFile() || hostLst.size > MAX_CODEX_AUTH_BYTES) {
-      return false;
-    }
-    curHostBytes = fs.readFileSync(snap.hostAuthPath);
-  } catch {
-    return false;
-  }
-  if (!curHostBytes.equals(snap.origBytes)) {
-    try {
-      const curHostJson = JSON.parse(curHostBytes.toString("utf8")) as unknown;
-      if (!isPlainJsonRecord(curHostJson) || !isPlainJsonRecord(curHostJson.tokens)) return false;
-      if (typeof snap.origJson.auth_mode === "string" && snap.origJson.auth_mode && curHostJson.auth_mode !== snap.origJson.auth_mode) {
-        return false;
-      }
-      if (
-        typeof origTokens.account_id === "string" &&
-        origTokens.account_id &&
-        curHostJson.tokens.account_id !== origTokens.account_id
-      ) {
-        return false;
-      }
-      const curHostRefreshMs = typeof curHostJson.last_refresh === "string" ? Date.parse(curHostJson.last_refresh) : NaN;
-      if (!Number.isFinite(nextRefreshMs) || !Number.isFinite(curHostRefreshMs) || nextRefreshMs <= curHostRefreshMs) {
-        return false;
-      }
-    } catch {
-      return false;
-    }
-  }
-
   const sanitizedTokens: Record<string, unknown> = {
     ...(typeof origTokens.id_token === "string" ? { id_token: origTokens.id_token } : {}),
     ...(typeof nextTokens.id_token === "string" ? { id_token: nextTokens.id_token } : {}),
@@ -2255,29 +2366,95 @@ export function syncRefreshedCodexAuth(staged: StagedCodexHome): boolean {
     tokens: sanitizedTokens,
     last_refresh: nextLastRefresh,
   };
+  const outBuf = Buffer.from(`${JSON.stringify(mergedPayload, null, 2)}\n`, "utf8");
 
-  const hostDir = path.dirname(snap.hostAuthPath);
-  const tmpPath = path.join(
-    hostDir,
-    `.auth.json.pa-refresh-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`,
-  );
   try {
-    const fd = fs.openSync(tmpPath, "wx", 0o600);
-    try {
-      fs.writeFileSync(fd, `${JSON.stringify(mergedPayload, null, 2)}\n`, "utf8");
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    fs.chmodSync(tmpPath, 0o600);
-    fs.renameSync(tmpPath, snap.hostAuthPath);
-    return true;
+    return withCodexAuthSyncLock(snap.hostAuthPath, staged.lockDir, () => {
+      const openFlags = fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW ?? 0);
+      let fd: number;
+      try {
+        fd = fs.openSync(snap.hostAuthPath, openFlags);
+      } catch {
+        // 文件已被登出删除、被替换为符号链接或不可写：绝不重建文件
+        return false;
+      }
+      try {
+        const fdStat = fs.fstatSync(fd);
+        if (!fdStat.isFile() || fdStat.size > MAX_CODEX_AUTH_BYTES) return false;
+        // 核验设备号与 inode 未变化：外部 codex login 经 rename 替换后的新文件 inode 不同，绝不覆盖
+        if (Number(fdStat.dev) !== snap.origDev || Number(fdStat.ino) !== snap.origIno) {
+          return false;
+        }
+        const curHostBuf = Buffer.allocUnsafe(fdStat.size);
+        let readOff = 0;
+        while (readOff < fdStat.size) {
+          const n = fs.readSync(fd, curHostBuf, readOff, fdStat.size - readOff, readOff);
+          if (n <= 0) break;
+          readOff += n;
+        }
+        const curHostBytes = curHostBuf.subarray(0, readOff);
+        if (!curHostBytes.equals(snap.origBytes)) {
+          try {
+            const curHostJson = JSON.parse(curHostBytes.toString("utf8")) as unknown;
+            if (!isPlainJsonRecord(curHostJson) || !isPlainJsonRecord(curHostJson.tokens)) return false;
+            if (
+              typeof snap.origJson.auth_mode === "string" &&
+              snap.origJson.auth_mode &&
+              curHostJson.auth_mode !== snap.origJson.auth_mode
+            ) {
+              return false;
+            }
+            if (
+              typeof origTokens.account_id === "string" &&
+              origTokens.account_id &&
+              curHostJson.tokens.account_id !== origTokens.account_id
+            ) {
+              return false;
+            }
+            const curHostRefreshMs = typeof curHostJson.last_refresh === "string" ? Date.parse(curHostJson.last_refresh) : NaN;
+            if (!Number.isFinite(nextRefreshMs) || !Number.isFinite(curHostRefreshMs) || nextRefreshMs <= curHostRefreshMs) {
+              return false;
+            }
+          } catch {
+            return false;
+          }
+        }
+        // 写入前再次确认目录项仍指向同一 inode（即使随后被并发 unlink/rename，写入也仅落入旧死 inode，绝不复活或覆写新文件）
+        try {
+          const pathStat = fs.lstatSync(snap.hostAuthPath);
+          if (
+            pathStat.isSymbolicLink() ||
+            Number(pathStat.dev) !== Number(fdStat.dev) ||
+            Number(pathStat.ino) !== Number(fdStat.ino)
+          ) {
+            return false;
+          }
+        } catch {
+          return false;
+        }
+        let written = 0;
+        while (written < outBuf.length) {
+          const n = fs.writeSync(fd, outBuf, written, outBuf.length - written, written);
+          if (n <= 0) throw new Error("short write to auth.json");
+          written += n;
+        }
+        fs.ftruncateSync(fd, outBuf.length);
+        try {
+          fs.fchmodSync(fd, 0o600);
+        } catch {
+          // ignore on fs without fchmod
+        }
+        fs.fsyncSync(fd);
+        return true;
+      } finally {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // ignore
+        }
+      }
+    });
   } catch (err) {
-    try {
-      fs.rmSync(tmpPath, { force: true });
-    } catch {
-      // ignore
-    }
     log("warn", "写回刷新后的 Codex auth.json 失败（保留原文件）", { err: errMsg(err) });
     return false;
   }
@@ -2364,11 +2541,25 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
           `执行者 ${run.harness} 配置了 cli_auth_credentials_store="keyring"，但当前 Linux 隔离沙箱已屏蔽宿主机 D-Bus 会话总线与 XDG_RUNTIME_DIR，无法访问 Secret Service；请在 ~/.codex/config.toml 中改用 cli_auth_credentials_store="file" 并重新运行 codex login，或通过 OPENAI_API_KEY / CODEX_API_KEY / 供应商 env_key 提供 API 密钥`,
         );
       }
-      stagedCodexHome = stageIsolatedCodexHome(hostCodexHome, { copyUserConfig: run.tools !== "none" });
+      stagedCodexHome = stageIsolatedCodexHome(hostCodexHome, {
+        copyUserConfig: run.tools !== "none",
+        lockDir: cfg.dataDir,
+      });
       finalEnv = {
         ...finalEnv,
         ...isolatedSandboxTempEnv(),
         CODEX_HOME: stagedCodexHome.scratchDir,
+      };
+    } else if (
+      process.platform === "linux" &&
+      effectiveCredInfo.needsCredentialStore &&
+      process.env.DBUS_SESSION_BUS_ADDRESS &&
+      !finalEnv.DBUS_SESSION_BUS_ADDRESS
+    ) {
+      // 非隔离运行且 Codex 依赖 OpenAI/ChatGPT keyring 登录态时，保留宿主机 D-Bus 会话总线地址以访问 Secret Service
+      finalEnv = {
+        ...finalEnv,
+        DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS,
       };
     }
 

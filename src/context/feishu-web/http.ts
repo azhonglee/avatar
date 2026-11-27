@@ -86,6 +86,12 @@ function singleRequest(
     }
     const mod = target.protocol === "https:" ? https : http;
     let settled = false;
+    let activeDecoder: zlib.Gunzip | zlib.Inflate | undefined;
+    const destroyDecoder = (err?: Error) => {
+      if (activeDecoder && !activeDecoder.destroyed) {
+        activeDecoder.destroy(err);
+      }
+    };
     const done = (fn: () => void) => {
       if (settled) return;
       settled = true;
@@ -109,12 +115,42 @@ function singleRequest(
         let stream: NodeJS.ReadableStream = res;
         if (!emptyBody && encoding === "gzip") {
           const gz = zlib.createGunzip();
+          activeDecoder = gz;
           res.pipe(gz);
           stream = gz;
         } else if (!emptyBody && encoding === "deflate") {
           const inf = zlib.createInflate();
+          activeDecoder = inf;
           res.pipe(inf);
           stream = inf;
+        }
+        // res.pipe(decoder) 不会将源响应流的中断/错误透传给解压器；显式转发中断与早关并销毁解压器，避免挂起到超时
+        if (activeDecoder) {
+          res.on("error", (err) => {
+            destroyDecoder(err);
+            done(() => reject(new WebHttpError("transport", `读取响应失败：${err.message}`, undefined, err)));
+          });
+          res.on("aborted", () => {
+            const err = new Error("响应连接意外中断");
+            destroyDecoder(err);
+            done(() => reject(new WebHttpError("transport", "读取响应失败：连接意外中断", undefined, err)));
+          });
+          res.on("close", () => {
+            if (!res.complete && !settled) {
+              const err = new Error("响应连接未完成即关闭");
+              destroyDecoder(err);
+              done(() => reject(new WebHttpError("transport", "读取响应失败：连接未完成即关闭", undefined, err)));
+            }
+          });
+        } else {
+          res.on("aborted", () => {
+            done(() => reject(new WebHttpError("transport", "读取响应失败：连接意外中断")));
+          });
+          res.on("close", () => {
+            if (!res.complete && !settled) {
+              done(() => reject(new WebHttpError("transport", "读取响应失败：连接未完成即关闭")));
+            }
+          });
         }
         const chunks: Buffer[] = [];
         let total = 0;
@@ -123,12 +159,14 @@ function singleRequest(
           total += buf.length;
           if (total > maxBytes) {
             req.destroy();
+            destroyDecoder();
             done(() => reject(new WebHttpError("http_error", `响应体超过上限 (${maxBytes} bytes)`)));
             return;
           }
           chunks.push(buf);
         });
         stream.on("error", (err) => {
+          destroyDecoder();
           done(() => reject(new WebHttpError("transport", `读取响应失败：${err.message}`, undefined, err)));
         });
         stream.on("end", () => {
@@ -146,16 +184,19 @@ function singleRequest(
 
     const onAbort = () => {
       req.destroy();
+      destroyDecoder();
       done(() => reject(new WebHttpError("aborted", "请求已取消")));
     };
     signal?.addEventListener("abort", onAbort, { once: true });
 
     const timer = setTimeout(() => {
       req.destroy();
+      destroyDecoder();
       done(() => reject(new WebHttpError("transport", `请求超时 (${timeoutMs}ms)`)));
     }, timeoutMs);
 
     req.on("error", (err) => {
+      destroyDecoder(err);
       done(() => reject(new WebHttpError("transport", `网络请求失败：${err.message}`, undefined, err)));
     });
 
