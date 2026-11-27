@@ -425,9 +425,9 @@ export class Ledger {
       if (q) {
         const pat = `%${q.replace(/[\\%_]/g, "\\$&")}%`;
         where.push(
-          `(LOWER(id) LIKE ? ESCAPE '\\' OR LOWER(ref) LIKE ? ESCAPE '\\' OR LOWER(CAST(COALESCE(json_extract(payload, '$.summary'), '') AS TEXT)) LIKE ? ESCAPE '\\')`,
+          `LOWER(CAST(COALESCE(json_extract(payload, '$.summary'), '') AS TEXT) || ' ' || ref || ' ' || id) LIKE ? ESCAPE '\\'`,
         );
-        args.push(pat, pat, pat);
+        args.push(pat);
       }
     }
     if (f.before) {

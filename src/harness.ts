@@ -544,6 +544,293 @@ export function applySanitizedNpmrcEnv(
   }
 }
 
+export interface StagedSanitizedGitConfig {
+  dir: string;
+  file: string;
+  homeMountDest: string;
+  cleanup: () => void;
+}
+
+const SAFE_GIT_CONFIG_EXACT_KEYS = new Set([
+  "user.name",
+  "user.email",
+  "user.useconfigonly",
+  "core.autocrlf",
+  "core.eol",
+  "core.filemode",
+  "core.ignorecase",
+  "core.quotepath",
+  "core.precomposeunicode",
+  "core.longpaths",
+  "core.safecrlf",
+  "core.editor",
+  "core.pager",
+  "init.defaultbranch",
+  "merge.conflictstyle",
+  "merge.ff",
+  "pull.rebase",
+  "pull.ff",
+  "push.default",
+  "push.autosetupremote",
+  "fetch.prune",
+  "branch.autosetuprebase",
+  "branch.sort",
+  "log.date",
+  "log.decorate",
+  "status.showuntrackedfiles",
+  "status.short",
+  "safe.directory",
+]);
+
+const SAFE_GIT_DIFF_KEYS = new Set([
+  "diff.algorithm",
+  "diff.colormoved",
+  "diff.colormovedws",
+  "diff.context",
+  "diff.mnemonicprefix",
+  "diff.noprefix",
+  "diff.renames",
+  "diff.renamelimit",
+  "diff.submodule",
+  "diff.wsErrorHighlight".toLowerCase(),
+]);
+
+function isSafeGitConfigKey(rawKey: string): boolean {
+  const lk = rawKey.trim().toLowerCase();
+  if (!lk) return false;
+  if (SAFE_GIT_CONFIG_EXACT_KEYS.has(lk)) return true;
+  if (SAFE_GIT_DIFF_KEYS.has(lk)) return true;
+  if (lk.startsWith("color.") || lk.startsWith("i18n.")) return true;
+  return false;
+}
+
+function isSafeGitConfigValue(rawValue: string): boolean {
+  if (/[\r\n\0]/.test(rawValue)) return false;
+  if (/:\/\/[^/\s@]+@/.test(rawValue)) return false;
+  if (/\b(?:authorization\s*:|bearer\s+\S|basic\s+[A-Za-z0-9+/=]{8,})/i.test(rawValue)) return false;
+  return true;
+}
+
+function escapeGitConfigValue(val: string): string {
+  const escaped = val.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return `"${escaped}"`;
+}
+
+/**
+ * 仅保留全局 Git 配置中的非敏感本地偏好（`user.name/email`、`core.autocrlf`、`color.*`、`init.defaultBranch`、`safe.directory` 等），
+ * 彻底剥离 `http.*`（含 `extraHeader`）、`credential.*`、`url.*`（可能含带令牌的 `insteadOf`）、`alias.*`、`core.sshCommand`、`include*` 等一切凭据或命令注入项。
+ */
+export function sanitizeGitConfigEntries(entries: { key: string; value: string }[]): string {
+  const bySection = new Map<string, { name: string; value: string }[]>();
+  for (const { key, value } of entries) {
+    const trimmedKey = key.trim();
+    if (!isSafeGitConfigKey(trimmedKey) || !isSafeGitConfigValue(value)) continue;
+    const firstDot = trimmedKey.indexOf(".");
+    const lastDot = trimmedKey.lastIndexOf(".");
+    if (firstDot <= 0 || lastDot <= firstDot) {
+      if (firstDot <= 0) continue;
+    }
+    const section = trimmedKey.slice(0, firstDot).toLowerCase();
+    const subsection = lastDot > firstDot ? trimmedKey.slice(firstDot + 1, lastDot) : "";
+    const varName = trimmedKey.slice(lastDot + 1);
+    if (!section || !varName || /[\r\n\0\[\]"]/.test(section) || /[\r\n\0"]/.test(subsection) || !/^[A-Za-z0-9-]+$/.test(varName)) {
+      continue;
+    }
+    const header = subsection ? `[${section} "${subsection.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"]` : `[${section}]`;
+    const list = bySection.get(header) ?? [];
+    list.push({ name: varName, value });
+    bySection.set(header, list);
+  }
+  if (bySection.size === 0) return "";
+  const lines: string[] = [];
+  for (const [header, items] of bySection) {
+    lines.push(header);
+    for (const item of items) {
+      lines.push(`\t${item.name} = ${escapeGitConfigValue(item.value)}`);
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function parseRawGitConfigEntries(filePath: string): { key: string; value: string }[] {
+  const entries: { key: string; value: string }[] = [];
+  let text: string;
+  try {
+    const st = fs.statSync(filePath);
+    if (!st.isFile() || st.size > 512 * 1024) return entries;
+    text = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return entries;
+  }
+  let curPrefix = "";
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+    const sec = line.match(/^\[([A-Za-z0-9.-]+)(?:\s+"((?:\\.|[^"\\])*)")?\]$/);
+    if (sec) {
+      const s = sec[1].toLowerCase();
+      const sub = sec[2] ? sec[2].replace(/\\(.)/g, "$1") : "";
+      curPrefix = sub ? `${s}.${sub}` : s;
+      continue;
+    }
+    if (!curPrefix) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const varName = line.slice(0, eq).trim();
+    let val = line.slice(eq + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1).replace(/\\(.)/g, "$1");
+    }
+    entries.push({ key: `${curPrefix}.${varName}`, value: val });
+  }
+  return entries;
+}
+
+/**
+ * 为不可信仓库工人、代码审查与校验命令投影严格脱敏的全局 Git 配置（绝不把含 `http.extraHeader`、带令牌 `url.*.insteadOf` 或 `credential.*` 的原始 `~/.gitconfig` / included 文件暴露进工人沙箱）。
+ */
+export function stageSanitizedGitConfig(
+  rawEnv: NodeJS.ProcessEnv = process.env,
+  dataDir?: string,
+  opts?: { cwd?: string },
+): StagedSanitizedGitConfig | undefined {
+  const rawHome = rawEnv.HOME?.trim() || os.homedir();
+  if (!rawHome) return undefined;
+  const resolvedHome = safeRealpath(rawHome);
+  const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
+  const rawXdgConfig = rawEnv.XDG_CONFIG_HOME?.trim();
+  const xdgConfigBase = rawXdgConfig ? safeRealpath(rawXdgConfig) : path.join(resolvedHome, ".config");
+
+  const entries: { key: string; value: string }[] = [];
+  const gitBin = resolveTrustedSystemBin("git");
+  let usedGit = false;
+  if (gitBin) {
+    try {
+      const gitEnv: NodeJS.ProcessEnv = {
+        PATH: TRUSTED_BOOTSTRAP_PATH,
+        LC_ALL: "C",
+        HOME: rawHome,
+        GIT_TERMINAL_PROMPT: "0",
+        ...(rawXdgConfig ? { XDG_CONFIG_HOME: rawXdgConfig } : {}),
+      };
+      const cwdArg = opts?.cwd && fs.existsSync(opts.cwd) ? ["-C", opts.cwd] : [];
+      const r = spawnSync(
+        gitBin,
+        [
+          ...cwdArg,
+          "-c",
+          "core.hooksPath=/dev/null",
+          "-c",
+          "core.fsmonitor=false",
+          "config",
+          "--includes",
+          "--show-scope",
+          "--show-origin",
+          "--null",
+          "--list",
+        ],
+        { env: gitEnv, timeout: 3_000, encoding: "utf8" },
+      );
+      if (r.status === 0 && r.stdout) {
+        usedGit = true;
+        const tokens = r.stdout.split("\0");
+        for (let i = 0; i + 2 < tokens.length; i += 3) {
+          const scope = tokens[i];
+          const origin = tokens[i + 1];
+          const rec = tokens[i + 2];
+          if (scope !== "global" || !rec) continue;
+          if (origin.startsWith("file:")) {
+            const rawOrigin = origin.slice("file:".length);
+            const absOrigin =
+              path.isAbsolute(rawOrigin) || !opts?.cwd ? path.resolve(rawOrigin) : path.resolve(opts.cwd, rawOrigin);
+            if (fs.existsSync(absOrigin) && !isSafeGitConfigIncludeTarget(safeRealpath(absOrigin), resolvedData)) {
+              continue;
+            }
+          }
+          const nl = rec.indexOf("\n");
+          if (nl <= 0) continue;
+          entries.push({ key: rec.slice(0, nl), value: rec.slice(nl + 1) });
+        }
+      }
+    } catch {
+      // 回退静态读取
+    }
+  }
+  if (!usedGit) {
+    for (const candidate of [path.join(resolvedHome, ".gitconfig"), path.join(xdgConfigBase, "git", "config")]) {
+      if (!fs.existsSync(candidate)) continue;
+      const real = safeRealpath(candidate);
+      if (!isSafeGitConfigIncludeTarget(real, resolvedData)) continue;
+      entries.push(...parseRawGitConfigEntries(real));
+    }
+  }
+
+  const sanitized = sanitizeGitConfigEntries(entries);
+  if (!sanitized) return undefined;
+  const scoped = createScopedSecretDir("pa-git-cfg-", rawEnv);
+  try {
+    const file = path.join(scoped.dir, "gitconfig");
+    fs.writeFileSync(file, sanitized, { mode: 0o600 });
+    return {
+      dir: scoped.dir,
+      file,
+      homeMountDest: path.join(resolvedHome, ".gitconfig"),
+      cleanup: scoped.cleanup,
+    };
+  } catch (err) {
+    scoped.cleanup();
+    throw err;
+  }
+}
+
+export function applySanitizedGitConfigEnv(
+  env: NodeJS.ProcessEnv,
+  staged: StagedSanitizedGitConfig | undefined,
+  isolated: boolean,
+): void {
+  if (!isolated) return;
+  if (staged) {
+    env.GIT_CONFIG_GLOBAL = staged.file;
+  } else {
+    env.GIT_CONFIG_GLOBAL = "/dev/null";
+  }
+}
+
+/** 仅收集全局只读 Git 辅助规则文件（`git/ignore` 与 `git/attributes`，绝不含任何配置或凭据，供不可信仓库工人与校验命令使用）。 */
+export function collectSafeGitIgnoreAndAttrMounts(
+  rawEnv: NodeJS.ProcessEnv = process.env,
+  dataDir?: string,
+): { readOnlyPaths: string[]; symlinks: { dest: string; target: string }[] } {
+  const readOnlyPaths: string[] = [];
+  const symlinks: { dest: string; target: string }[] = [];
+  const rawHome = rawEnv.HOME?.trim() || os.homedir();
+  if (!rawHome) return { readOnlyPaths, symlinks };
+  const resolvedHome = safeRealpath(rawHome);
+  const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
+  const rawXdgConfig = rawEnv.XDG_CONFIG_HOME?.trim();
+  const xdgConfigBase = rawXdgConfig ? safeRealpath(rawXdgConfig) : path.join(resolvedHome, ".config");
+  for (const logicalPath of [
+    path.join(xdgConfigBase, "git", "ignore"),
+    path.join(xdgConfigBase, "git", "attributes"),
+  ]) {
+    try {
+      const lst = fs.lstatSync(logicalPath);
+      const st = fs.statSync(logicalPath);
+      if (!st.isFile() || st.size > 512 * 1024) continue;
+      const real = fs.realpathSync(logicalPath);
+      if (!isSafeGitConfigIncludeTarget(real, resolvedData)) continue;
+      readOnlyPaths.push(real);
+      if (lst.isSymbolicLink()) {
+        const logicalDest = path.join(safeRealpath(path.dirname(logicalPath)), path.basename(logicalPath));
+        if (logicalDest !== real) symlinks.push({ dest: logicalDest, target: real });
+      }
+    } catch {
+      // ignore missing/broken file
+    }
+  }
+  return { readOnlyPaths, symlinks };
+}
+
 function isSafeGitConfigIncludeTarget(realPath: string, resolvedData: string): boolean {
   if (!realPath) return false;
   if (resolvedData && (isPathInsideOrEqual(realPath, resolvedData) || isPathInsideOrEqual(resolvedData, realPath))) {
@@ -753,19 +1040,39 @@ export interface StagedAcpxState {
   dir: string;
   mountDest: string;
   extraCmdPaths: string[];
+  /** `tools === "none"` 时提供的空 MCP 配置文件路径（用于 `--mcp-config`，屏蔽全局与项目 `.acpxrc.json` 中的全部 MCP Server） */
+  emptyMcpConfigFile?: string;
+  /** 同上，映射到沙箱挂载点下的路径 */
+  emptyMcpConfigMountedPath?: string;
   cleanup: () => void;
+}
+
+function extractFirstShellCommandToken(cmdStr: string): string {
+  const s = cmdStr.trim();
+  if (!s) return "";
+  if (s.startsWith('"')) {
+    const end = s.indexOf('"', 1);
+    return end > 1 ? s.slice(1, end) : s.slice(1);
+  }
+  if (s.startsWith("'")) {
+    const end = s.indexOf("'", 1);
+    return end > 1 ? s.slice(1, end) : s.slice(1);
+  }
+  return s.split(/\s+/)[0] || "";
 }
 
 /**
  * 为一次性 `acpx exec` 调用分配私有 `0700` 状态目录并绑定挂载到 `~/.acpx`：
  *   - 绝不暴露宿主机 `~/.acpx/sessions` 或 `~/.acpx/queues` 中的跨仓库历史会话；
- *   - 仅投影经过过滤的 `config.json`（保留全局选项与选定 agent/适配器条目）以及位于 `~/.acpx` 内且被选定 agent 显式引用的本地适配器文件。
+ *   - 当显式指定 `agentCommand` 时，省略 `config.json` 中全部无关 `agents` 定义，仅暂存该显式适配器命令（即使其位于 `~/.acpx` 内且未写入 `config.json`）；
+ *   - 当 `tools === "none"` 时强制剥离 `mcpServers` 并生成空 MCP 配置文件（`{"mcpServers":[]}`）供 `--mcp-config` 禁用全局与项目 MCP 服务器。
  */
 export function stageIsolatedAcpxState(
   h: Pick<Config["harnesses"][string], "agent" | "agentCommand">,
   hostHome: string,
   rawEnv: NodeJS.ProcessEnv = process.env,
   dataDir?: string,
+  opts?: { tools?: "none" | "read" | "write" },
 ): StagedAcpxState | undefined {
   if (!hostHome) return undefined;
   const resolvedHome = safeRealpath(hostHome);
@@ -773,13 +1080,22 @@ export function stageIsolatedAcpxState(
   const hostAcpxDir = path.join(resolvedHome, ".acpx");
   const realHostAcpxDir = fs.existsSync(hostAcpxDir) ? safeRealpath(hostAcpxDir) : hostAcpxDir;
   const selectedId = resolveSelectedAcpxAgentId(h);
+  const hasExplicitAgentCmd = !!(h.agentCommand && h.agentCommand.trim());
+  const disableMcp = opts?.tools === "none";
   const scoped = createScopedSecretDir("pa-acpx-state-", rawEnv);
   const extraCmdPaths: string[] = [];
 
   try {
     const stateDir = path.join(scoped.dir, "acpx");
     fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    const adapterCommands: string[] = [];
+    if (hasExplicitAgentCmd) {
+      const explicitToken = extractFirstShellCommandToken(h.agentCommand!);
+      if (explicitToken) adapterCommands.push(explicitToken);
+    }
+
     const hostCfgPath = path.join(hostAcpxDir, "config.json");
+    let wroteConfig = false;
     if (
       fs.existsSync(hostCfgPath) &&
       !(resolvedData && isPathInsideOrEqual(safeRealpath(hostCfgPath), resolvedData))
@@ -800,24 +1116,28 @@ export function stageIsolatedAcpxState(
               "queueMaxDepth",
               "format",
               "disableExec",
-              "mcpServers",
+              ...(disableMcp ? [] : ["mcpServers"]),
             ]) {
               if (Object.prototype.hasOwnProperty.call(parsed, key)) {
                 outCfg[key] = parsed[key];
               }
             }
-            const adapterCommands: string[] = [];
-            if (parsed.agents && typeof parsed.agents === "object" && !Array.isArray(parsed.agents)) {
+            if (disableMcp) {
+              outCfg.mcpServers = [];
+            }
+            // 仅在未指定显式 agentCommand 时从 config.json 投影选定的单一 named agent；显式 agentCommand 绝不带入其他无关适配器
+            if (!hasExplicitAgentCmd && parsed.agents && typeof parsed.agents === "object" && !Array.isArray(parsed.agents)) {
               const filteredAgents: Record<string, unknown> = {};
               const agentEntries = Object.entries(parsed.agents as Record<string, unknown>);
               for (const [name, def] of agentEntries) {
                 const lowerName = name.toLowerCase();
-                if (selectedId && !h.agentCommand?.trim() && lowerName !== selectedId) continue;
+                if (selectedId && lowerName !== selectedId) continue;
                 filteredAgents[name] = def;
                 if (def && typeof def === "object" && !Array.isArray(def)) {
                   const rec = def as Record<string, unknown>;
                   if (typeof rec.command === "string" && rec.command.trim()) {
-                    adapterCommands.push(rec.command.trim().split(/\s+/)[0]);
+                    const tok = extractFirstShellCommandToken(rec.command);
+                    if (tok) adapterCommands.push(tok);
                   } else if (Array.isArray(rec.argv) && typeof rec.argv[0] === "string" && rec.argv[0].trim()) {
                     adapterCommands.push(rec.argv[0].trim());
                   }
@@ -846,45 +1166,64 @@ export function stageIsolatedAcpxState(
             fs.writeFileSync(path.join(stateDir, "config.json"), `${JSON.stringify(outCfg, null, 2)}\n`, {
               mode: 0o600,
             });
-
-            // 仅复制被选定 agent 显式引用的 `~/.acpx` 内适配器文件（绝不触及 sessions/queues/logs/cache/history）
-            const forbiddenTopDirs = new Set(["sessions", "queues", "logs", "cache", "history"]);
-            for (const rawCmd of adapterCommands) {
-              const expanded = rawCmd.startsWith("~/") ? path.join(resolvedHome, rawCmd.slice(2)) : rawCmd;
-              if (!path.isAbsolute(expanded)) {
-                extraCmdPaths.push(rawCmd);
-                continue;
-              }
-              const realCmd = fs.existsSync(expanded) ? safeRealpath(expanded) : "";
-              if (!realCmd) continue;
-              if (fs.existsSync(hostAcpxDir) && isPathInsideOrEqual(realCmd, realHostAcpxDir)) {
-                const rel = path.relative(realHostAcpxDir, realCmd);
-                const top = rel.split(path.sep)[0];
-                if (!rel || rel.startsWith("..") || forbiddenTopDirs.has(top)) continue;
-                try {
-                  const cst = fs.statSync(realCmd);
-                  if (cst.isFile() && cst.size <= 4 * 1024 * 1024) {
-                    const dst = path.join(stateDir, rel);
-                    fs.mkdirSync(path.dirname(dst), { recursive: true, mode: 0o700 });
-                    fs.writeFileSync(dst, fs.readFileSync(realCmd), { mode: cst.mode & 0o700 ? 0o700 : 0o600 });
-                  }
-                } catch {
-                  // ignore unreadable adapter file
-                }
-              } else {
-                extraCmdPaths.push(realCmd);
-              }
-            }
+            wroteConfig = true;
           }
         }
       } catch {
         // 忽略损坏的 config.json，保持空白私有状态目录
       }
     }
+
+    if (disableMcp && !wroteConfig) {
+      fs.writeFileSync(path.join(stateDir, "config.json"), `${JSON.stringify({ mcpServers: [] }, null, 2)}\n`, {
+        mode: 0o600,
+      });
+    }
+
+    let emptyMcpConfigFile: string | undefined;
+    let emptyMcpConfigMountedPath: string | undefined;
+    if (disableMcp) {
+      emptyMcpConfigFile = path.join(stateDir, "no-mcp.json");
+      emptyMcpConfigMountedPath = path.join(hostAcpxDir, "no-mcp.json");
+      fs.writeFileSync(emptyMcpConfigFile, `${JSON.stringify({ mcpServers: [] }, null, 2)}\n`, {
+        mode: 0o600,
+      });
+    }
+
+    // 仅复制被选定 agent 或显式 agentCommand 引用的 `~/.acpx` 内适配器文件（绝不触及 sessions/queues/logs/cache/history）
+    const forbiddenTopDirs = new Set(["sessions", "queues", "logs", "cache", "history"]);
+    for (const rawCmd of adapterCommands) {
+      const expanded = rawCmd.startsWith("~/") ? path.join(resolvedHome, rawCmd.slice(2)) : rawCmd;
+      if (!path.isAbsolute(expanded)) {
+        extraCmdPaths.push(rawCmd);
+        continue;
+      }
+      const realCmd = fs.existsSync(expanded) ? safeRealpath(expanded) : "";
+      if (!realCmd) continue;
+      if (fs.existsSync(hostAcpxDir) && isPathInsideOrEqual(realCmd, realHostAcpxDir)) {
+        const rel = path.relative(realHostAcpxDir, realCmd);
+        const top = rel.split(path.sep)[0];
+        if (!rel || rel.startsWith("..") || forbiddenTopDirs.has(top)) continue;
+        try {
+          const cst = fs.statSync(realCmd);
+          if (cst.isFile() && cst.size <= 4 * 1024 * 1024) {
+            const dst = path.join(stateDir, rel);
+            fs.mkdirSync(path.dirname(dst), { recursive: true, mode: 0o700 });
+            fs.writeFileSync(dst, fs.readFileSync(realCmd), { mode: cst.mode & 0o111 ? 0o700 : 0o600 });
+          }
+        } catch {
+          // ignore unreadable adapter file
+        }
+      } else {
+        extraCmdPaths.push(realCmd);
+      }
+    }
+
     return {
       dir: stateDir,
       mountDest: hostAcpxDir,
       extraCmdPaths: [...new Set(extraCmdPaths)],
+      ...(emptyMcpConfigFile ? { emptyMcpConfigFile, emptyMcpConfigMountedPath } : {}),
       cleanup: scoped.cleanup,
     };
   } catch (err) {
@@ -894,15 +1233,16 @@ export function stageIsolatedAcpxState(
 }
 
 /**
- * 按 acpx 实际选中的 agent 仅暴露该单一提供方的配置目录（从合并展开后的子进程环境解析，
- * 绝不挂载整个 `~/.acpx` 或向 Claude 工人暴露 `~/.codex` 等其他提供方凭据）。
+ * 按 acpx 实际选中的 agent 仅暴露该单一提供方的配置目录（从单次合并展开后的子进程环境解析，
+ * 绝不重复展开 `${VAR}`、绝不挂载整个 `~/.acpx` 或向 Claude 工人暴露 `~/.codex` 等其他提供方凭据）。
  */
 export function selectAcpxAgentConfigPaths(
   h: Pick<Config["harnesses"][string], "agent" | "agentCommand" | "env">,
   hostHome: string,
   hostEnv: NodeJS.ProcessEnv = process.env,
+  opts?: { alreadyMerged?: boolean },
 ): string[] {
-  const effectiveEnv = mergeHarnessEnv(hostEnv, h.env);
+  const effectiveEnv = opts?.alreadyMerged ? hostEnv : mergeHarnessEnv(hostEnv, h.env);
   const resolvedHome = effectiveEnv.HOME?.trim() || hostHome || os.homedir();
   const xdgConfig = effectiveEnv.XDG_CONFIG_HOME?.trim() || (resolvedHome ? path.join(resolvedHome, ".config") : "");
   const xdgData = effectiveEnv.XDG_DATA_HOME?.trim() || (resolvedHome ? path.join(resolvedHome, ".local", "share") : "");
@@ -1314,12 +1654,19 @@ export function buildWorkspaceIsolation(
     }
   }
 
-  // 最小化允许的个人工具配置（严格只读、仅挂载单个安全 Git 配置文件及适用当前仓库的全局 include，绝不挂载 ~/.config/git 整目录或原始 ~/.npmrc，并保留 dotfiles 符号链接逻辑路径）
+  // 最小化允许的个人 Git 配置文件：
+  //   - 仅受信任 Git 传输（git-rw / git-ro）挂载完整全局配置与适用 include（保留 url.*.pushInsteadOf、credential.* 等交付设置）；
+  //   - 不可信仓库工人、审查与校验命令（verify / worker-write / worker-ro / codex-exec）只挂载无凭据的 git/ignore 与 git/attributes，
+  //     脱敏后的全局偏好由调用方通过 stageSanitizedGitConfig 单独投影，绝不把 ~/.gitconfig 中的 http.extraHeader 或带令牌 URL 暴露给工人。
   const extraSymlinks: { dest: string; target: string }[] = [];
-  if (opts.mode !== "llm-none") {
+  if (opts.mode === "git-rw" || opts.mode === "git-ro") {
     const gitCfgMounts = collectSafeGitConfigMounts(rawEnv, dataDir, { cwd: resolvedCwd });
     readOnlyPaths.push(...gitCfgMounts.readOnlyPaths);
     extraSymlinks.push(...gitCfgMounts.symlinks);
+  } else if (opts.mode !== "llm-none") {
+    const gitRuleMounts = collectSafeGitIgnoreAndAttrMounts(rawEnv, dataDir);
+    readOnlyPaths.push(...gitRuleMounts.readOnlyPaths);
+    extraSymlinks.push(...gitRuleMounts.symlinks);
   }
 
   for (const p of opts.extraWritablePaths ?? []) {
@@ -3669,11 +4016,9 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
   const args = ["--cwd", run.cwd, "--format", "quiet", "--timeout", String(run.timeoutSec)];
   args.push(run.tools === "write" ? "--approve-all" : run.tools === "read" ? "--approve-reads" : "--deny-all");
   args.push("--non-interactive-permissions", "deny");
-  if (run.tools === "none") args.push("--no-terminal");
+  if (run.tools === "none") args.push("--no-terminal", "--no-fs");
   if (h.model) args.push("--model", h.model);
   args.push(...h.extraArgs);
-  if (h.agentCommand) args.push("--agent", h.agentCommand, "exec", "--file", "-");
-  else args.push(h.agent!, "exec", "--file", "-");
 
   fs.mkdirSync(run.cwd, { recursive: true });
   // 先解析可执行路径再准备临时凭据环境，确保 resolveBin 异常不会泄漏易失目录
@@ -3683,25 +4028,91 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
   let stagedAcpx: StagedAcpxState | undefined;
   let stagedDoubao: StagedDoubaoDataDir | undefined;
   let stagedNpmrc: StagedSanitizedNpmrc | undefined;
+  let stagedGitCfg: StagedSanitizedGitConfig | undefined;
+  let stagedCodexHome: StagedCodexHome | undefined;
+  let stagedAws: StagedAwsProfile | undefined;
+  let oauthLease: CodexOAuthRefreshLease | undefined;
   let r: Awaited<ReturnType<typeof runProcess>>;
   try {
     const mode: WorkspaceIsolationMode =
       run.tools === "write" ? "worker-write" : run.tools === "read" ? "worker-ro" : "llm-none";
     const acpxIsolationEnv = mergeHarnessEnv(process.env, h.env);
+    const childMergedEnv = mergeHarnessEnv(baseEnv.env, h.env);
     const hostHome = acpxIsolationEnv.HOME?.trim() || os.homedir();
     const resolvedDataDir = cfg.dataDir && fs.existsSync(cfg.dataDir) ? safeRealpath(cfg.dataDir) : "";
     const selectedAgentId = resolveSelectedAcpxAgentId(h);
     const isDoubaoAcpx = selectedAgentId === "doubao" || selectedAgentId.startsWith("doubao-");
+    const isCodexAcpx = selectedAgentId === "codex" || selectedAgentId.startsWith("codex-");
+    const acpxTimeoutMs = (run.timeoutSec + 120) * 1000;
 
-    stagedAcpx = stageIsolatedAcpxState(h, hostHome, acpxIsolationEnv, cfg.dataDir);
+    stagedAcpx = stageIsolatedAcpxState(h, hostHome, acpxIsolationEnv, cfg.dataDir, { tools: run.tools });
     if (isDoubaoAcpx) {
       stagedDoubao = stageIsolatedDoubaoDataDir(acpxIsolationEnv, cfg.dataDir);
     }
     if (mode !== "llm-none") {
       stagedNpmrc = stageSanitizedNpmrc(acpxIsolationEnv, cfg.dataDir);
+      stagedGitCfg = stageSanitizedGitConfig(acpxIsolationEnv, cfg.dataDir, { cwd: run.cwd });
+    }
+
+    const basePlan = buildWorkspaceIsolation(
+      cfg,
+      {
+        mode,
+        cwd: run.cwd,
+        cmdPath: cfg.bins.acpx,
+        trustedRepoRoot: run.trustedRepoRoot,
+        disableGitWorktreeMounts: run.disableGitWorktreeMounts,
+        allowGuardLog: run.lark !== "none",
+      },
+      acpxIsolationEnv,
+    );
+    const willIsolate = willIsolateCommand(acpxIsolationEnv, basePlan);
+
+    // tools === "none" 时显式传入空 --mcp-config，阻断宿主机全局配置与项目 .acpxrc.json 注入 MCP 服务器
+    if (run.tools === "none" && stagedAcpx?.emptyMcpConfigFile) {
+      const mcpCfgArg = willIsolate
+        ? (stagedAcpx.emptyMcpConfigMountedPath ?? stagedAcpx.emptyMcpConfigFile)
+        : stagedAcpx.emptyMcpConfigFile;
+      args.push("--mcp-config", mcpCfgArg);
+    }
+    if (h.agentCommand) args.push("--agent", h.agentCommand, "exec", "--file", "-");
+    else args.push(h.agent!, "exec", "--file", "-");
+
+    // 对 Codex ACP 复用与 codex-exec 相同的私有可写 CODEX_HOME 暂存、AWS profile 投影与跨进程 OAuth 写回协调，
+    // 绝不把宿主机整个 ~/.codex（含跨仓库 sessions 历史）挂载给一次性 ACP 工人，且支持刷新后的文件凭据安全写回。
+    let codexHostHomeToSkip: string | undefined;
+    if (isCodexAcpx) {
+      const effectiveCredInfo = resolveEffectiveCodexCredentialStore(childMergedEnv, [], {
+        ignoreProfiles: run.tools === "none",
+      });
+      if (effectiveCredInfo.configError) {
+        throw new Error(`${effectiveCredInfo.configError}；为避免将私聊或代码误发往默认供应商，已中止执行`);
+      }
+      if (willIsolate) {
+        if (process.platform === "linux" && effectiveCredInfo.needsCredentialStore && effectiveCredInfo.store === "keyring") {
+          throw new Error(
+            `执行者 ${run.harness} 配置了 cli_auth_credentials_store="keyring"，但当前 Linux 隔离沙箱已屏蔽宿主机 D-Bus 会话总线与 XDG_RUNTIME_DIR，无法访问 Secret Service；请在 ~/.codex/config.toml 中改用 cli_auth_credentials_store="file" 并重新运行 codex login，或通过 OPENAI_API_KEY / CODEX_API_KEY / 供应商 env_key 提供 API 密钥`,
+          );
+        }
+        codexHostHomeToSkip = safeRealpath(effectiveCredInfo.codexHome);
+        oauthLease = await coordinateCodexOAuthRefresh(effectiveCredInfo.codexHome, {
+          needsCredentialStore: effectiveCredInfo.needsCredentialStore,
+          signal: run.signal,
+          runWindowMs: acpxTimeoutMs + 60_000,
+          maxWaitMs: Math.max(180_000, acpxTimeoutMs + 30_000),
+        });
+        stagedCodexHome = stageIsolatedCodexHome(effectiveCredInfo.codexHome, {
+          copyUserConfig: run.tools !== "none",
+          needsCredentialStore: effectiveCredInfo.needsCredentialStore,
+        });
+        if (effectiveCredInfo.awsProfile) {
+          stagedAws = stageIsolatedAwsProfile(effectiveCredInfo.awsProfile, childMergedEnv, cfg.dataDir);
+        }
+      }
     }
 
     const acpxExtraRo: string[] = [];
+    const acpxExtraRw: string[] = [];
     const acpxExtraBindMounts: { src: string; dest: string; mode: "ro" | "rw" }[] = [];
     if (baseEnv.env.CREDENTIALS_DIRECTORY) acpxExtraRo.push(baseEnv.env.CREDENTIALS_DIRECTORY);
     // 仅挂载 bin/guard/lark-cli 运行所需的 4 个精确文件，绝不挂载整个 ROOT（防暴露 ROOT/config.yaml 与 ROOT/.worktrees）
@@ -3717,14 +4128,28 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       acpxExtraRo.push(stagedNpmrc.dir);
       acpxExtraBindMounts.push({ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" });
     }
+    if (stagedGitCfg) {
+      acpxExtraRo.push(stagedGitCfg.dir);
+      acpxExtraBindMounts.push({ src: stagedGitCfg.file, dest: stagedGitCfg.homeMountDest, mode: "ro" });
+    }
+    if (stagedCodexHome) {
+      acpxExtraRw.push(stagedCodexHome.scratchDir);
+    }
+    if (stagedAws) {
+      acpxExtraRo.push(stagedAws.dir, ...stagedAws.extraReadOnlyPaths);
+    }
     const selectedConfigPaths = [
-      ...selectAcpxAgentConfigPaths(h, hostHome, acpxIsolationEnv),
+      // acpxIsolationEnv 已完成一次 mergeHarnessEnv 展开，绝不二次展开 ${VAR}
+      ...selectAcpxAgentConfigPaths(h, hostHome, acpxIsolationEnv, { alreadyMerged: true }),
       ...(run.lark !== "none" ? selectLarkCliAuthPaths(acpxIsolationEnv) : []),
     ];
     for (const p of selectedConfigPaths) {
       if (!fs.existsSync(p)) continue;
       const real = safeRealpath(p);
       if (stagedDoubao && isPathInsideOrEqual(real, stagedDoubao.hostDataDir)) {
+        continue;
+      }
+      if (codexHostHomeToSkip && isPathInsideOrEqual(real, codexHostHomeToSkip)) {
         continue;
       }
       if (resolvedDataDir && (isPathInsideOrEqual(real, resolvedDataDir) || isPathInsideOrEqual(resolvedDataDir, real))) {
@@ -3752,6 +4177,7 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
           trustedRepoRoot: run.trustedRepoRoot,
           disableGitWorktreeMounts: run.disableGitWorktreeMounts,
           allowGuardLog: run.lark !== "none",
+          extraWritablePaths: acpxExtraRw,
           extraReadOnlyPaths: acpxExtraRo,
           extraBindMounts: acpxExtraBindMounts,
         },
@@ -3759,26 +4185,43 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       ),
     );
     const env: NodeJS.ProcessEnv = {
-      ...mergeHarnessEnv(baseEnv.env, h.env),
+      ...childMergedEnv,
       PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${process.env.PATH ?? ""}`,
       PA_GUARD_PROFILE: run.lark,
       PA_OWNER_OPEN_ID: cfg.owner.open_id,
       PA_LARK_REAL: realLark,
       PA_GUARD_LOG: path.join(cfg.dataDir, "logs", "guard.log"),
       ...(wrapped.isolated ? isolatedSandboxTempEnv() : {}),
+      ...(stagedCodexHome ? { CODEX_HOME: stagedCodexHome.scratchDir } : {}),
+      ...(stagedAws
+        ? {
+            AWS_CONFIG_FILE: stagedAws.configFile,
+            AWS_SHARED_CREDENTIALS_FILE: stagedAws.credentialsFile,
+          }
+        : {}),
     };
-    if (mode !== "llm-none") applySanitizedNpmrcEnv(env, stagedNpmrc, wrapped.isolated);
+    if (mode !== "llm-none") {
+      applySanitizedNpmrcEnv(env, stagedNpmrc, wrapped.isolated);
+      applySanitizedGitConfigEnv(env, stagedGitCfg, wrapped.isolated);
+    }
     r = await runProcess(wrapped.cmd, wrapped.args, {
       cwd: run.cwd,
       env,
       input: run.prompt,
       // acpx 自己有 --timeout；这里多留 2 分钟兜底，防止进程卡死
-      timeoutMs: (run.timeoutSec + 120) * 1000,
+      timeoutMs: acpxTimeoutMs,
       group: true,
       signal: run.signal,
       onSpawn: run.onSpawn,
     });
+    if (stagedCodexHome) {
+      syncRefreshedCodexAuth(stagedCodexHome);
+    }
   } finally {
+    oauthLease?.release();
+    stagedCodexHome?.cleanup();
+    stagedAws?.cleanup();
+    stagedGitCfg?.cleanup();
     stagedNpmrc?.cleanup();
     stagedDoubao?.cleanup();
     stagedAcpx?.cleanup();
@@ -4706,6 +5149,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   let stagedCodexHome: StagedCodexHome | undefined;
   let stagedAws: StagedAwsProfile | undefined;
   let stagedNpmrc: StagedSanitizedNpmrc | undefined;
+  let stagedGitCfg: StagedSanitizedGitConfig | undefined;
   let oauthLease: CodexOAuthRefreshLease | undefined;
   let r: Awaited<ReturnType<typeof runProcess>>;
   let text = "";
@@ -4794,6 +5238,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       }
       if (run.tools !== "none") {
         stagedNpmrc = stageSanitizedNpmrc(codexIsolationEnv, cfg.dataDir);
+        stagedGitCfg = stageSanitizedGitConfig(codexIsolationEnv, cfg.dataDir, { cwd: execCwd });
       }
       finalEnv = {
         ...finalEnv,
@@ -4806,7 +5251,10 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
             }
           : {}),
       };
-      if (run.tools !== "none") applySanitizedNpmrcEnv(finalEnv, stagedNpmrc, true);
+      if (run.tools !== "none") {
+        applySanitizedNpmrcEnv(finalEnv, stagedNpmrc, true);
+        applySanitizedGitConfigEnv(finalEnv, stagedGitCfg, true);
+      }
     } else if (
       process.platform === "linux" &&
       effectiveCredInfo.needsCredentialStore &&
@@ -4825,15 +5273,17 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       ...(baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : []),
       ...(stagedAws ? [stagedAws.dir, ...stagedAws.extraReadOnlyPaths] : []),
       ...(stagedNpmrc ? [stagedNpmrc.dir] : []),
+      ...(stagedGitCfg ? [stagedGitCfg.dir] : []),
     ];
     const extraRw = [
       ...(isolatedTmp ? [isolatedTmp] : []),
       ...(readOutDir ? [readOutDir] : []),
       ...(stagedCodexHome ? [stagedCodexHome.scratchDir] : []),
     ];
-    const extraBindMounts = stagedNpmrc
-      ? [{ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" as const }]
-      : [];
+    const extraBindMounts = [
+      ...(stagedNpmrc ? [{ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" as const }] : []),
+      ...(stagedGitCfg ? [{ src: stagedGitCfg.file, dest: stagedGitCfg.homeMountDest, mode: "ro" as const }] : []),
+    ];
     const wrapped = wrapCredentialIsolatedCommand(
       cmd,
       args,
@@ -4874,6 +5324,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   } finally {
     oauthLease?.release();
     baseEnv.cleanup();
+    stagedGitCfg?.cleanup();
     stagedNpmrc?.cleanup();
     stagedCodexHome?.cleanup();
     stagedAws?.cleanup();
@@ -4924,6 +5375,7 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   const baseEnv = prepareHarnessEnv();
   let stagedDoubao: StagedDoubaoDataDir | undefined;
   let stagedNpmrc: StagedSanitizedNpmrc | undefined;
+  let stagedGitCfg: StagedSanitizedGitConfig | undefined;
   let r: Awaited<ReturnType<typeof runProcess>>;
   try {
     const mode: WorkspaceIsolationMode =
@@ -4933,6 +5385,7 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
     stagedDoubao = stageIsolatedDoubaoDataDir(doubaoIsolationEnv, cfg.dataDir);
     if (mode !== "llm-none") {
       stagedNpmrc = stageSanitizedNpmrc(doubaoIsolationEnv, cfg.dataDir);
+      stagedGitCfg = stageSanitizedGitConfig(doubaoIsolationEnv, cfg.dataDir, { cwd: run.cwd });
     }
     const doubaoExtraRo: string[] = [];
     const doubaoExtraBindMounts: { src: string; dest: string; mode: "ro" | "rw" }[] = [];
@@ -4945,6 +5398,10 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
     if (stagedNpmrc) {
       doubaoExtraRo.push(stagedNpmrc.dir);
       doubaoExtraBindMounts.push({ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" });
+    }
+    if (stagedGitCfg) {
+      doubaoExtraRo.push(stagedGitCfg.dir);
+      doubaoExtraBindMounts.push({ src: stagedGitCfg.file, dest: stagedGitCfg.homeMountDest, mode: "ro" });
     }
     const doubaoPaths = [
       ...selectDoubaoRuntimePaths(doubaoIsolationEnv),
@@ -4991,7 +5448,10 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       PA_GUARD_LOG: path.join(cfg.dataDir, "logs", "guard.log"),
       ...(wrapped.isolated ? isolatedSandboxTempEnv() : {}),
     };
-    if (mode !== "llm-none") applySanitizedNpmrcEnv(env, stagedNpmrc, wrapped.isolated);
+    if (mode !== "llm-none") {
+      applySanitizedNpmrcEnv(env, stagedNpmrc, wrapped.isolated);
+      applySanitizedGitConfigEnv(env, stagedGitCfg, wrapped.isolated);
+    }
     r = await runProcess(wrapped.cmd, wrapped.args, {
       cwd: run.cwd,
       env,
@@ -5002,6 +5462,7 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       onSpawn: run.onSpawn,
     });
   } finally {
+    stagedGitCfg?.cleanup();
     stagedNpmrc?.cleanup();
     stagedDoubao?.cleanup();
     baseEnv.cleanup();

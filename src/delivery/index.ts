@@ -24,6 +24,7 @@ import {
   pushBranch,
   remoteDefaultBranch,
   remoteUrl,
+  removeStaleWorktreeAdminRecord,
   revParse,
   tryGit,
 } from "./git.ts";
@@ -313,72 +314,6 @@ export function registerDelivery(app: App): void {
  * 严禁在隔离沙箱内执行全局 `git worktree prune`（沙箱遮蔽了 `/tmp` 与其他目录，会误删宿主机上其他正常未解锁 worktree 的记录）；
  * 同时尊重 `git worktree lock`：若存在 `locked` 标记文件则保留该管理记录并返回 `locked: true`，由调用方跳过分支删除。
  */
-async function removeStaleWorktreeAdminRecord(
-  repoPath: string,
-  missingWtDir: string,
-  gitOpts: { cfg: Config; trustedRepoRoot: string },
-): Promise<{ removed: boolean; locked: boolean }> {
-  const commonRes = await tryGit(repoPath, ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
-    ...gitOpts,
-    readOnly: true,
-  });
-  let commonGitDir = commonRes.code === 0 ? commonRes.stdout.trim() : "";
-  if (!commonGitDir) {
-    const fallbackRes = await tryGit(repoPath, ["rev-parse", "--git-common-dir"], { ...gitOpts, readOnly: true });
-    if (fallbackRes.code !== 0 || !fallbackRes.stdout.trim()) return { removed: false, locked: false };
-    commonGitDir = path.resolve(repoPath, fallbackRes.stdout.trim());
-  }
-  const wtAdminRoot = path.join(commonGitDir, "worktrees");
-  if (!fs.existsSync(wtAdminRoot)) return { removed: false, locked: false };
-
-  const normalizePath = (p: string): string => {
-    const abs = path.resolve(p);
-    if (fs.existsSync(abs)) {
-      try {
-        return fs.realpathSync(abs);
-      } catch {
-        return abs;
-      }
-    }
-    const parent = path.dirname(abs);
-    if (parent !== abs && fs.existsSync(parent)) {
-      try {
-        return path.join(fs.realpathSync(parent), path.basename(abs));
-      } catch {
-        return abs;
-      }
-    }
-    return abs;
-  };
-
-  const targetPaths = new Set([path.resolve(missingWtDir), normalizePath(missingWtDir)]);
-  let removedAny = false;
-  let lockedAny = false;
-  for (const ent of fs.readdirSync(wtAdminRoot, { withFileTypes: true })) {
-    if (!ent.isDirectory() || ent.isSymbolicLink()) continue;
-    const entryDir = path.join(wtAdminRoot, ent.name);
-    const gitdirFile = path.join(entryDir, "gitdir");
-    if (!fs.existsSync(gitdirFile)) continue;
-    try {
-      const raw = fs.readFileSync(gitdirFile, "utf8").trim();
-      if (!raw) continue;
-      const resolvedGitFile = path.resolve(entryDir, raw);
-      const wtDir = path.dirname(resolvedGitFile);
-      if (targetPaths.has(path.resolve(wtDir)) || targetPaths.has(normalizePath(wtDir))) {
-        if (fs.existsSync(path.join(entryDir, "locked"))) {
-          lockedAny = true;
-          continue;
-        }
-        fs.rmSync(entryDir, { recursive: true, force: true });
-        removedAny = true;
-      }
-    } catch {
-      // 忽略无法读取的无关记录
-    }
-  }
-  return { removed: removedAny, locked: lockedAny };
-}
-
   async function cleanup(item: Item): Promise<void> {
     const p = item.payload;
     const skip = (why: string) => finish(item, { ...p, message: why }, [], "cancelled");

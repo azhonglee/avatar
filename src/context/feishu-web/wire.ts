@@ -612,8 +612,11 @@ function decodeMessageInner(
       } else if (richBytes.length > 0) {
         const decoded = decodeRichText(richBytes);
         const cardTitle = content.str(6);
-        msg.text = cardTitle && decoded.text ? `${cardTitle}\n${decoded.text}` : cardTitle || decoded.text;
-        msg.mentions = decoded.mentions;
+        const prefix = cardTitle && decoded.text ? `${cardTitle}\n` : "";
+        msg.text = prefix ? prefix + decoded.text : cardTitle || decoded.text;
+        msg.mentions = prefix
+          ? decoded.mentions.map((m) => ({ ...m, start: m.start + prefix.length, end: m.end + prefix.length }))
+          : decoded.mentions;
         msg.partial = decoded.partial;
       } else {
         msg.unsupported = true;

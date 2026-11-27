@@ -686,17 +686,22 @@ export function stepLog(app: App, stepId: number, offset: number): LogChunk | un
   const s = app.ledger.step(stepId);
   if (!s) return undefined;
   const file = path.resolve(s.log || "");
-  if (isContextDerivedDispatchBlocked(app, s.work_id)) {
-    throw new CommandError("conflict", "该步骤日志属于旧工作区主人委派的上下文派单，已按主人隔离阻断读取");
+  if (isContextDerivedDispatchBlocked(app, s.work_id) || isWorkBlockedByOwner(app, s.work_id)) {
+    throw new CommandError("conflict", "该步骤日志属于旧工作区主人的工作上下文，已按主人隔离阻断读取");
   }
-  if (hasWorkspaceOwnerMismatch(app.store, app.cfg.owner.open_id)) {
+  const curOwner = app.cfg.owner.open_id.trim();
+  const prevOwnerOpenId = (app.store.get("owner.open_id") ?? "").trim();
+  const ownerSwitched =
+    hasWorkspaceOwnerMismatch(app.store, curOwner) ||
+    (!!prevOwnerOpenId && prevOwnerOpenId !== curOwner);
+  if (ownerSwitched) {
     const work = app.ledger.get(s.work_id);
     const isContextStep =
       work?.kind === "context" ||
       s.work_id.startsWith("context:") ||
       path.basename(file).startsWith("context-");
     if (isContextStep) {
-      throw new CommandError("conflict", "当前工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已阻断读取上下文运行日志以防跨账号泄漏");
+      throw new CommandError("conflict", "当前工作区 owner.open_id 与旧上下文主人不一致，已阻断读取上下文运行日志以防跨账号泄漏");
     }
   }
   // 只允许读取数据目录下的日志
@@ -732,8 +737,10 @@ function isContextHealthWork(w: WorkItem): boolean {
 
 function healthItem(app: App, w: WorkItem, ownerMismatch = false): HealthItem {
   if ((ownerMismatch && isContextHealthWork(w)) || isWorkBlockedByOwner(app, w)) {
+    // 隔离记录不含任何可操作按钮，使用哈希脱敏展示 ID，绝不经 ledger key 泄漏旧主人的原生群/私聊 ID 或消息 ID
+    const opaqueId = `isolated:${createHash("sha256").update(w.id).digest("hex").slice(0, 16)}`;
     return {
-      id: w.id,
+      id: opaqueId,
       kind: w.kind as HealthItem["kind"],
       ref: "context:isolated",
       state: w.state,

@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +10,7 @@ import {
   createScopedSecretDir,
   detectGitWorktreeDirs,
   prepareHarnessEnv,
+  resolveTrustedSystemBin,
   willIsolateCommand,
   workspaceRequiresIsolation,
   wrapCredentialIsolatedCommand,
@@ -257,18 +258,60 @@ function expandSshIncludePattern(
   return results;
 }
 
+function extractSshPublicKeyFingerprintLine(rawText: string): string | undefined {
+  for (const rawLine of rawText.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length >= 2 && parts[0] && parts[1]) {
+      return `${parts[0]} ${parts[1]}`;
+    }
+  }
+  return undefined;
+}
+
+function querySshAgentLoadedKeys(sshSock: string): Set<string> {
+  const keys = new Set<string>();
+  if (!sshSock) return keys;
+  const sshAddBin = resolveTrustedSystemBin("ssh-add");
+  if (!sshAddBin) return keys;
+  try {
+    const r = spawnSync(sshAddBin, ["-L"], {
+      env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin", LC_ALL: "C", SSH_AUTH_SOCK: sshSock },
+      timeout: 2_000,
+      encoding: "utf8",
+    });
+    if (r.status !== 0 || !r.stdout) return keys;
+    for (const rawLine of r.stdout.split(/\r?\n/)) {
+      const fp = extractSshPublicKeyFingerprintLine(rawLine);
+      if (fp) keys.add(fp);
+    }
+  } catch {
+    // 探测失败按未命中处理，允许回退到默认磁盘私钥
+  }
+  return keys;
+}
+
 /**
  * 仅为实际使用 SSH 传输的受信任远程 Git 操作收集最小化的只读 SSH 挂载（绝不整目录挂载 ~/.ssh）：
  *   - 仅挂载 `~/.ssh/config`、`~/.ssh/known_hosts*` 以及 `Include`（含 `config.d/*.conf` 等通配模式）中实际命中目标主机的配置片段；
  *   - 按目标 SSH 主机解析 `~/.ssh/config` 及匹配片段中生效的 Host 块，仅挂载该主机引用的 IdentityFile / CertificateFile / UserKnownHostsFile（及 .pub）；
- *   - 未命中显式 IdentityFile 时：有 SSH_AUTH_SOCK 代理仅挂载默认 .pub，无代理仅挂载标准默认密钥对（id_ed25519 / id_rsa / id_ecdsa / id_dsa），绝不暴露无关命名私钥。
+ *   - 未命中显式 IdentityFile 时：按 `ssh-add -L` 检查 SSH 代理是否实际已加载对应默认公钥——仅代理已加载该密钥时才省略磁盘私钥；
+ *     若代理为空或未持有该默认密钥，仍以只读方式挂载标准默认密钥对（id_ed25519 / id_rsa / id_ecdsa / id_dsa）以保留 OpenSSH 文件回退，绝不暴露无关命名私钥。
  */
 export function collectScopedSshMounts(
   sshHosts: string[],
   rawEnv: NodeJS.ProcessEnv = process.env,
   dataDir?: string,
-  hasSshAgent = false,
+  hasSshAgentOrSock: boolean | string = false,
 ): { readOnlyPaths: string[]; symlinks: { dest: string; target: string }[] } {
+  const sshSockPath =
+    typeof hasSshAgentOrSock === "string"
+      ? hasSshAgentOrSock.trim()
+      : hasSshAgentOrSock
+        ? (rawEnv.SSH_AUTH_SOCK?.trim() ?? "")
+        : "";
+  const hasSshAgent = Boolean(hasSshAgentOrSock);
   const readOnlyPaths: string[] = [];
   const symlinks: { dest: string; target: string }[] = [];
   const hostHome = rawEnv.HOME?.trim() || os.homedir();
@@ -405,10 +448,24 @@ export function collectScopedSshMounts(
       addSingleFile(`${idFile}.pub`);
     }
   } else {
+    const agentLoadedKeys = hasSshAgent && sshSockPath ? querySshAgentLoadedKeys(sshSockPath) : new Set<string>();
     for (const defKey of ["id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"]) {
       const full = path.join(sshDir, defKey);
-      if (!hasSshAgent) addSingleFile(full);
-      addSingleFile(`${full}.pub`);
+      const pubFile = `${full}.pub`;
+      addSingleFile(pubFile);
+      let loadedInAgent = false;
+      if (agentLoadedKeys.size > 0 && fs.existsSync(pubFile)) {
+        try {
+          const st = fs.statSync(pubFile);
+          if (st.isFile() && st.size <= 64 * 1024) {
+            const fp = extractSshPublicKeyFingerprintLine(fs.readFileSync(pubFile, "utf8"));
+            if (fp && agentLoadedKeys.has(fp)) loadedInAgent = true;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      if (!loadedInAgent) addSingleFile(full);
     }
   }
 
@@ -978,7 +1035,7 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
   try {
     const sshHosts = [...new Set(sshUrls.map((u) => extractSshHostname(u, cwd)).filter((h): h is string => !!h))];
     const sshMounts = usesSsh
-      ? collectScopedSshMounts(sshHosts, effectiveRawEnv, opts?.cfg?.dataDir, !!sshSock)
+      ? collectScopedSshMounts(sshHosts, effectiveRawEnv, opts?.cfg?.dataDir, sshSock ?? false)
       : undefined;
     const baseIsoPlan = buildGitIsolation(cwd, opts, baseEnv.env.CREDENTIALS_DIRECTORY, sshSock, sshMounts, effectiveRawEnv);
     const willIsolate = willIsolateCommand(effectiveRawEnv, baseIsoPlan);
@@ -1022,6 +1079,80 @@ export async function git(cwd: string, args: string[], opts?: GitRunOpts): Promi
   const r = await tryGit(cwd, args, opts);
   if (r.code !== 0) throw new Error(`git ${args.join(" ")} 失败：${(r.stderr || r.stdout).trim()}`);
   return r.stdout;
+}
+
+/**
+ * 仅在宿主机确认目标工作树缺失或尚未完成检出（不含 `.git`）且未被 `git worktree lock` 锁定时，
+ * 定向清理该单一目标路径对应的失效 `.git/worktrees/<name>` 管理记录；
+ * 绝不调用全局 `git worktree prune`，避免在隔离沙箱看不到同级派单目录时误删其他在途工作树的有效注册记录。
+ */
+export async function removeStaleWorktreeAdminRecord(
+  repoPath: string,
+  targetWtDir: string,
+  gitOpts: Pick<GitRunOpts, "cfg" | "trustedRepoRoot">,
+): Promise<{ removed: boolean; locked: boolean }> {
+  if (fs.existsSync(path.join(targetWtDir, ".git"))) {
+    return { removed: false, locked: false };
+  }
+  const commonRes = await tryGit(repoPath, ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+    ...gitOpts,
+    readOnly: true,
+  });
+  let commonGitDir = commonRes.code === 0 ? commonRes.stdout.trim() : "";
+  if (!commonGitDir) {
+    const fallbackRes = await tryGit(repoPath, ["rev-parse", "--git-common-dir"], { ...gitOpts, readOnly: true });
+    if (fallbackRes.code !== 0 || !fallbackRes.stdout.trim()) return { removed: false, locked: false };
+    commonGitDir = path.resolve(repoPath, fallbackRes.stdout.trim());
+  }
+  const wtAdminRoot = path.join(commonGitDir, "worktrees");
+  if (!fs.existsSync(wtAdminRoot)) return { removed: false, locked: false };
+
+  const normalizePath = (p: string): string => {
+    const abs = path.resolve(p);
+    if (fs.existsSync(abs)) {
+      try {
+        return fs.realpathSync(abs);
+      } catch {
+        return abs;
+      }
+    }
+    const parent = path.dirname(abs);
+    if (parent !== abs && fs.existsSync(parent)) {
+      try {
+        return path.join(fs.realpathSync(parent), path.basename(abs));
+      } catch {
+        return abs;
+      }
+    }
+    return abs;
+  };
+
+  const targetPaths = new Set([path.resolve(targetWtDir), normalizePath(targetWtDir)]);
+  let removedAny = false;
+  let lockedAny = false;
+  for (const ent of fs.readdirSync(wtAdminRoot, { withFileTypes: true })) {
+    if (!ent.isDirectory() || ent.isSymbolicLink()) continue;
+    const entryDir = path.join(wtAdminRoot, ent.name);
+    const gitdirFile = path.join(entryDir, "gitdir");
+    if (!fs.existsSync(gitdirFile)) continue;
+    try {
+      const raw = fs.readFileSync(gitdirFile, "utf8").trim();
+      if (!raw) continue;
+      const resolvedGitFile = path.resolve(entryDir, raw);
+      const wtDir = path.dirname(resolvedGitFile);
+      if (targetPaths.has(path.resolve(wtDir)) || targetPaths.has(normalizePath(wtDir))) {
+        if (fs.existsSync(path.join(entryDir, "locked"))) {
+          lockedAny = true;
+          continue;
+        }
+        fs.rmSync(entryDir, { recursive: true, force: true });
+        removedAny = true;
+      }
+    } catch {
+      // 忽略无法读取的无关记录
+    }
+  }
+  return { removed: removedAny, locked: lockedAny };
 }
 
 /** 有改动就提交（含新文件）；没有改动什么都不做。返回是否提交了。 */

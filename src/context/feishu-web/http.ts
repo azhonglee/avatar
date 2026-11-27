@@ -215,7 +215,6 @@ export async function fetchWithJar(jar: RecordingCookieJar, opts: HttpRequestOpt
   let method: "GET" | "POST" = opts.method;
   let body = opts.body === undefined ? undefined : Buffer.isBuffer(opts.body) ? opts.body : Buffer.from(opts.body, "utf8");
   let headers: Record<string, string> = { ...(opts.headers ?? {}) };
-  const hadCsrfHeader = Object.keys(headers).some((k) => k.toLowerCase() === "x-csrf-token");
   // 按请求暂存每一跳的 Set-Cookie，仅在最终非 401/403 响应时提交回共享活罐；
   // 鉴权拒绝响应（401/403）或异常重定向的 Cookie 变更一律丢弃，且绝不影响并发请求的无关 Cookie 轮换。
   const stagedCookies: { url: URL; headers: string[] | string; nowMs: number; snapshot: CookieSnapshot }[] = [];
@@ -232,8 +231,8 @@ export async function fetchWithJar(jar: RecordingCookieJar, opts: HttpRequestOpt
     const cookie = viewJar.cookieHeader(currentUrl);
     if (cookie) reqHeaders["Cookie"] = cookie;
     else delete reqHeaders["Cookie"];
-    // 每次重定向跳（含同主机 307/302 轮换 swp_csrf_token 或切路径）均按目标 URL 重新派生 x-csrf-token
-    if (hop > 0 && hadCsrfHeader) {
+    // 每次重定向跳（无论首跳是否已携带 x-csrf-token，含 307 首次下发 swp_csrf_token 或切路径生效）均按目标 URL 重新派生 x-csrf-token
+    if (hop > 0) {
       for (const k of Object.keys(reqHeaders)) {
         if (k.toLowerCase() === "x-csrf-token") delete reqHeaders[k];
       }

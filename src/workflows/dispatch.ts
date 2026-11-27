@@ -4,16 +4,18 @@ import { z } from "zod";
 import { isContextDerivedDispatchBlocked } from "../api/queries.ts";
 import type { Board, BoardTask } from "../board.ts";
 import { repoSpec, type Config } from "../config.ts";
-import { tryGit } from "../delivery/git.ts";
+import { removeStaleWorktreeAdminRecord, tryGit } from "../delivery/git.ts";
 import { comment, move } from "../effects.ts";
 import { checkpoint, type Ctx, type Handler } from "../engine.ts";
 import {
+  applySanitizedGitConfigEnv,
   applySanitizedNpmrcEnv,
   buildWorkspaceIsolation,
   isolatedSandboxTempEnv,
   loadPrompt,
   prepareHarnessEnv,
   runHarness,
+  stageSanitizedGitConfig,
   stageSanitizedNpmrc,
   wrapCredentialIsolatedCommand,
 } from "../harness.ts";
@@ -521,6 +523,7 @@ export class Dispatcher {
     const step = this.ledger.startStep({ work_id: it.id, name: `verify#${p.round}`, log: logFile });
     const baseEnv = prepareHarnessEnv();
     const stagedNpmrc = stageSanitizedNpmrc(process.env, this.cfg.dataDir);
+    const stagedGitCfg = stageSanitizedGitConfig(process.env, this.cfg.dataDir, { cwd: p.cwd });
     try {
       const wrapped = wrapCredentialIsolatedCommand(
         "bash",
@@ -533,16 +536,19 @@ export class Dispatcher {
           extraReadOnlyPaths: [
             ...(baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : []),
             ...(stagedNpmrc ? [stagedNpmrc.dir] : []),
+            ...(stagedGitCfg ? [stagedGitCfg.dir] : []),
           ],
-          extraBindMounts: stagedNpmrc
-            ? [{ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" }]
-            : [],
+          extraBindMounts: [
+            ...(stagedNpmrc ? [{ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" as const }] : []),
+            ...(stagedGitCfg ? [{ src: stagedGitCfg.file, dest: stagedGitCfg.homeMountDest, mode: "ro" as const }] : []),
+          ],
         }),
       );
       const verifyEnv: NodeJS.ProcessEnv = wrapped.isolated
         ? { ...baseEnv.env, ...isolatedSandboxTempEnv() }
         : { ...baseEnv.env };
       applySanitizedNpmrcEnv(verifyEnv, stagedNpmrc, wrapped.isolated);
+      applySanitizedGitConfigEnv(verifyEnv, stagedGitCfg, wrapped.isolated);
       const r = await runProcess(wrapped.cmd, wrapped.args, {
         cwd: p.cwd,
         env: verifyEnv,
@@ -563,6 +569,7 @@ export class Dispatcher {
       checkpoint(ctx);
       return { kind: "command", name, status: "error", detail: `无法运行：${String(e)}` };
     } finally {
+      stagedGitCfg?.cleanup();
       stagedNpmrc?.cleanup();
       baseEnv.cleanup();
     }
@@ -668,10 +675,17 @@ export class Dispatcher {
     }
 
     if (!ready) {
-      // 预先仅创建本次派单专属空目录并只将该目录开放给 git worktree add，绝不把包含其他在途派单的 worktrees/ 父目录设为可写
+      // 预先仅创建本次派单专属空目录并只将该目录开放给 git worktree add，绝不把包含其他在途派单的 worktrees/ 父目录设为可写；
+      // 若存在指向当前目标路径的失效 worktree 管理记录，仅在宿主机定向清理该单一目标记录，绝不执行全局 git worktree prune（防止沙箱看不到其他同级派单目录时误删其有效注册）。
       fs.mkdirSync(cwd, { recursive: true });
       try {
-        await tryGit(spec.path, ["worktree", "prune"], { cfg: this.cfg, trustedRepoRoot: spec.path });
+        const stale = await removeStaleWorktreeAdminRecord(spec.path, cwd, {
+          cfg: this.cfg,
+          trustedRepoRoot: spec.path,
+        });
+        if (stale.locked) {
+          throw new Error(`工作树 ${cwd} 存在已锁定的历史 worktree 管理记录，拒绝自动覆盖`);
+        }
         const head = await git(spec.path, ["rev-parse", "HEAD"], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path });
         const hasBranch = (await tryGit(spec.path, ["rev-parse", "--verify", "--quiet", branch], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path })).code === 0;
         await git(

@@ -114,6 +114,7 @@ import { registerDelivery } from "../src/delivery/index.ts";
 import { runDoctor } from "../src/doctor.ts";
 import { card as cardEffect, comment as commentEffect, effectHandler, move as moveEffect } from "../src/effects.ts";
 import {
+  applySanitizedGitConfigEnv,
   applySanitizedNpmrcEnv,
   buildWorkspaceIsolation,
   canonicalCodexLockFilePath,
@@ -133,6 +134,7 @@ import {
   resolveTrustedBwrapBin,
   resolveTrustedSystemBin,
   runHarness,
+  sanitizeGitConfigEntries,
   sanitizeNpmrcContent,
   selectAcpxAgentConfigPaths,
   selectDoubaoRuntimePaths,
@@ -140,6 +142,7 @@ import {
   stageIsolatedAcpxState,
   stageIsolatedAwsProfile,
   stageIsolatedDoubaoDataDir,
+  stageSanitizedGitConfig,
   stageSanitizedNpmrc,
   stageIsolatedCodexHome,
   syncRefreshedCodexAuth,
@@ -5817,14 +5820,15 @@ data_dir: ${dir}
     app.ledger.db.prepare("UPDATE work SET state = 'dead', terminal = 1, error = ? WHERE id = ?").run("发往机密群失败：原消息内容", "fx:r7-health-secret");
 
     app.cfg.owner.open_id = "ou_owner_b";
-    assert.throws(() => Q.stepLog(app!, stepId, 0), /owner\.open_id|不一致/, "主人变更后 Q.stepLog 必须阻断读取旧主人的上下文步骤日志");
+    assert.throws(() => Q.stepLog(app!, stepId, 0), /owner\.open_id|不一致|主人隔离/, "主人变更后 Q.stepLog 必须阻断读取旧主人的上下文步骤日志");
     const safeStatus = app.ext.context!.status();
     assert.ok(!safeStatus.last_error.includes("机密议题"), "主人变更后 status() 绝不能返回包含模型输出的原始 ctx.last_error");
     assert.equal(safeStatus.personal_web?.owner_name, "", "主人变更后 status() 不得暴露旧主人昵称");
     assert.equal(safeStatus.totals.open_items, 0, "主人变更后 status() 统计必须归零脱敏");
     const safeHealth = Q.health(app);
-    const ctxHealthRow = safeHealth.failed.find((x) => x.id === "fx:r7-health-secret");
+    const ctxHealthRow = safeHealth.failed.find((x) => x.isolated && x.kind === "effect");
     assert.ok(ctxHealthRow, "健康页可保留脱敏后的故障占位");
+    assert.ok(ctxHealthRow!.id.startsWith("isolated:") && !ctxHealthRow!.id.includes("r7-health-secret"), "隔离记录不得暴露原始账本 ID");
     assert.ok(!ctxHealthRow!.error.includes("机密群") && !ctxHealthRow!.summary.includes("秘密回复"), "主人变更后 health() 必须脱敏上下文 effect 的摘要与错误");
     app.cfg.owner.open_id = "ou_owner_a";
   } finally {
@@ -8495,10 +8499,11 @@ test("Codex 第十一轮回归：PID+挂载隔离、草稿终检防重插、晨�
       "runDispatchOnce 必须隐藏归属旧主人的隔离派单，不向 CLI 打印其 summary",
     );
     assert.equal(app.ledger.get<{ summary?: string }>(isoDispId)?.payload.summary, "主人A绝密CLI派单", "账本原始 summary 必须完整保留");
-    // 7d) HealthItem 标为 isolated 且 work.acknowledge 必须拒绝忽略旧主人的失败工作
+    // 7d) HealthItem 标为 isolated（含脱敏 ID）且 work.acknowledge 必须拒绝忽略旧主人的失败工作
     const healthB = Q.health(app);
-    const isoHealthRow = healthB.failed.find((x) => x.id === deadCtxFxId);
+    const isoHealthRow = healthB.failed.find((x) => x.isolated && x.kind === "effect");
     assert.equal(isoHealthRow?.isolated, true, "脱敏后的健康项必须标记 isolated=true 以便前端隐藏重试/忽略按钮");
+    assert.ok(isoHealthRow!.id.startsWith("isolated:") && !isoHealthRow!.id.includes(deadCtxFxId), "隔离健康项不得泄漏原始账本 ID");
     await assert.rejects(
       app.commands.exec("work.acknowledge", { id: deadCtxFxId }, { source: "web", actor: "owner" }),
       /主人隔离|阻断/,
@@ -16182,7 +16187,7 @@ test("Codex 第二十轮回归：剥离 ~/.config/git/credentials、保留符号
         const probeEnv: NodeJS.ProcessEnv = { ...process.env, HOME: fakeHome };
         const isoPlan = buildWorkspaceIsolation(
           { dataDir, context: { personal_web: { enabled: false } } } as never,
-          { mode: "worker-ro", cwd: workRepo },
+          { mode: "git-ro", cwd: workRepo },
           probeEnv,
         );
         const script = [
@@ -17220,14 +17225,20 @@ test("Codex 第二十一轮回归：脱敏 .npmrc、私有 ~/.acpx 状态隔离�
       assert.ok(hCur.actionable_failures >= 1, "耗尽快通道必须计入 actionable_failures");
       assert.equal(Q.overview(app).health.ok, false, "存在未确认快通道失败时 overview.health.ok 必须为 false");
 
-      // 主人切换到 ou_r21_other：旧主人的快通道失败必须被隔离脱敏，不得计入新主人 actionable_failures
+      // 主人切换到 ou_r21_other：旧主人的快通道失败必须被隔离脱敏（含不透明展示 ID），不得计入新主人 actionable_failures
       const appOther: ReturnType<typeof createApp> = {
         ...app,
         cfg: { ...app.cfg, owner: { ...app.cfg.owner, open_id: "ou_r21_other" } },
       };
       const hOther = Q.health(appOther);
-      const isoRow = hOther.failed.find((f) => f.id === fastItem.id);
+      const isoRow = hOther.failed.find((f) => f.isolated && f.kind === "context");
       assert.ok(isoRow?.isolated, "主人变更后快通道失败必须在 health() 中标记 isolated");
+      assert.ok(
+        isoRow!.id.startsWith("isolated:") &&
+          !isoRow!.id.includes("9990002") &&
+          !isoRow!.id.includes("om_r21_fast_fail"),
+        "隔离记录必须使用脱敏 ID，绝不泄漏原生群/消息 ID",
+      );
       assert.ok(!isoRow!.summary.includes("核心项目群") && !isoRow!.error.includes("模型超时"), "隔离记录必须脱敏群名与报错");
       assert.equal(hOther.actionable_failures, 0, "旧主人快通道失败不得计入新主人 actionable_failures");
     }
@@ -17517,6 +17528,510 @@ test("Codex 第二十一轮回归：脱敏 .npmrc、私有 ~/.acpx 状态隔离�
     if (httpSrv12) await new Promise<void>((resolve) => httpSrv12!.close(() => resolve()));
     if (httpSrv13) await new Promise<void>((resolve) => httpSrv13!.close(() => resolve()));
     app?.store.db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex 第二十二轮回归：派单不全局 prune 兄弟工作树、轮询模式 stepLog 主人校验、工人脱敏 Git 配置、Codex ACP 私有可写主目录与 OAuth 写回、无工具 ACP 禁用 MCP、显式 agentCommand 精确暂存、ACP 环境单次展开、隔离 Health 脱敏 ID、重定向首设 CSRF 派生、空 SSH 代理回退默认私钥、跨字段派单搜索与富卡片标题 mention 偏移", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-r22-"));
+  let csrfSrv: http.Server | undefined;
+  try {
+    // 1) [R22 #1 P1] 准备新派单工作树时只定向清理目标失效记录，绝不全局 `git worktree prune` 误删健康同级派单注册
+    {
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: "r22",
+        GIT_AUTHOR_EMAIL: "r22@test",
+        GIT_COMMITTER_NAME: "r22",
+        GIT_COMMITTER_EMAIL: "r22@test",
+      };
+      const repoDir = path.join(dir, "sibling-wt-repo");
+      fs.mkdirSync(repoDir, { recursive: true });
+      assert.equal((await runProcess("git", ["init", "-q", "-b", "main", repoDir], { env: gitEnv })).code, 0);
+      fs.writeFileSync(path.join(repoDir, "a.txt"), "hello\n");
+      assert.equal((await runProcess("git", ["-C", repoDir, "add", "-A"], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", repoDir, "commit", "-q", "-m", "init"], { env: gitEnv })).code, 0);
+
+      const wtData = path.join(dir, "wt-r22-data");
+      fs.mkdirSync(wtData, { recursive: true });
+      const wtCfgFile = path.join(dir, "wt-r22.yaml");
+      fs.writeFileSync(
+        wtCfgFile,
+        [
+          `data_dir: ${wtData}`,
+          "owner: { open_id: ou_owner }",
+          "harnesses: { codex: { agent: codex } }",
+          "roles: { brain: codex, reviewer: codex }",
+          "dispatch:",
+          "  repos:",
+          `    demo: ${JSON.stringify(repoDir)}`,
+        ].join("\n") + "\n",
+      );
+      const wtApp = createApp(loadConfig(wtCfgFile));
+      try {
+        const dispatcher = new Dispatcher(wtApp.cfg, wtApp.ledger, wtApp.store, wtApp.board);
+        const task1 = { guid: "11111111aaaa", summary: "派单1", description: "repo: demo", dueMs: null, url: "" };
+        const task2 = { guid: "22222222bbbb", summary: "派单2", description: "repo: demo", dueMs: null, url: "" };
+        const prep1 = await dispatcher.prepareWorkspace(task1);
+        // 准备第二个派单（其沙箱隔离视图看不到兄弟工作树 prep1.cwd！）
+        const prep2 = await dispatcher.prepareWorkspace(task2);
+        assert.ok(prep1.base && prep2.base);
+        const wtList = await runProcess("git", ["-C", repoDir, "worktree", "list", "--porcelain"], { env: gitEnv });
+        assert.equal(wtList.code, 0);
+        assert.ok(
+          wtList.stdout.includes(fs.realpathSync(prep1.cwd)),
+          "准备第二个派单绝不得 prune 掉第一个在途派单的工作树注册记录",
+        );
+        assert.ok(wtList.stdout.includes(fs.realpathSync(prep2.cwd)));
+        const st1 = await runProcess("git", ["-C", prep1.cwd, "status", "--short"], { env: gitEnv });
+        assert.equal(st1.code, 0, "第一个派单工作树在第二个派单启动后仍必须完整可用");
+      } finally {
+        wtApp.store.db.close();
+      }
+    }
+
+    // 2) [R22 #2 P1] & 8) [R22 #8 P2] & 11) [R22 #11 P3]
+    //    纯轮询工作区切换主人后 stepLog 阻断旧上下文步骤日志 + Health 隔离行脱敏原生 ID + 跨字段派单搜索
+    {
+      const pollData = path.join(dir, "poll-r22-data");
+      fs.mkdirSync(path.join(pollData, "logs"), { recursive: true });
+      const pollCfgFile = path.join(dir, "poll-r22.yaml");
+      fs.writeFileSync(
+        pollCfgFile,
+        [
+          `data_dir: ${pollData}`,
+          `bins: { lark: ${JSON.stringify(path.join(STUBS, "lark-cli"))}, acpx: ${JSON.stringify(path.join(STUBS, "acpx"))} }`,
+          "owner: { open_id: ou_poll_a }",
+          "harnesses: { codex: { agent: codex } }",
+          "roles: { brain: codex, reviewer: codex }",
+          "context:",
+          "  personal_web:",
+          "    enabled: false",
+        ].join("\n") + "\n",
+      );
+      const pollApp = createApp(loadConfig(pollCfgFile));
+      try {
+        const ctxSvc = new ContextService(pollApp);
+        ctxSvc.enqueue("fast:pw_chat:77665544:pw:om_secret_999:g0:abc", {
+          task: "fast",
+          conv: "pw_chat:77665544",
+          conv_name: "核心机密群",
+          trigger_obs_id: "pw:om_secret_999",
+        });
+        const work = pollApp.ledger.claim("context", 30_000)!;
+        const logFile = path.join(pollData, "logs", "ctx-secret-step.log");
+        fs.writeFileSync(logFile, "PROMPT: 主人A私聊绝密内容\n");
+        const stepId = pollApp.ledger.startStep({ work_id: work.id, name: "understand", log: logFile });
+        pollApp.ledger.endStep(stepId, "failed", "err");
+        pollApp.ledger.transition(work, { state: "errored", terminal: true, error: "超时" });
+
+        // 切换为 ou_poll_b（未绑定个人 Web，故 hasWorkspaceOwnerMismatch === false）
+        const pollAppB: ReturnType<typeof createApp> = {
+          ...pollApp,
+          cfg: { ...pollApp.cfg, owner: { ...pollApp.cfg.owner, open_id: "ou_poll_b" } },
+        };
+        assert.equal(hasWorkspaceOwnerMismatch(pollAppB.store, "ou_poll_b"), false);
+        assert.throws(
+          () => Q.stepLog(pollAppB, stepId, 0),
+          /主人隔离|阻断/,
+          "纯轮询工作区切换 owner.open_id 后，stepLog 必须校验 context 工作的归属并拒绝返回旧主人日志",
+        );
+        const hB = Q.health(pollAppB);
+        const iso = hB.failed.find((f) => f.isolated && f.kind === "context");
+        assert.ok(iso, "旧主人失败的 context 工作项应作为隔离占位出现");
+        assert.ok(
+          iso!.id.startsWith("isolated:") &&
+            !iso!.id.includes("77665544") &&
+            !iso!.id.includes("om_secret_999") &&
+            !iso!.id.includes("pw_chat"),
+          "隔离健康项 id 必须不透明脱敏，绝不暴露旧主人的原生会话 ID 或消息 ID",
+        );
+
+        // [R22 #11 P3] 跨字段派单搜索（summary="release" + ref="abc123" 应命中查询 "release abc"）
+        pollApp.ledger.enqueue({
+          id: "dispatch:abc123:1",
+          kind: "dispatch",
+          ref: "abc123",
+          state: "queued",
+          payload: { guid: "abc123", summary: "release", description: "" },
+        });
+        const crossHits = Q.listDispatches(pollApp, { filter: "all", q: "release abc" });
+        assert.equal(crossHits.length, 1, "SQL 预筛与 JS 搜索必须一致支持跨 summary/ref/id 字段的拼接匹配");
+        assert.equal(crossHits[0].task_guid, "abc123");
+      } finally {
+        pollApp.store.db.close();
+      }
+    }
+
+    // 3) [R22 #3 P1] 仓库工人与校验命令只能读取脱敏 Git 配置，绝不暴露 ~/.gitconfig 或 include 中的 http.extraHeader 与带令牌 URL
+    {
+      const gitSecHome = path.join(dir, "git-sec-home");
+      fs.mkdirSync(path.join(gitSecHome, ".config", "git"), { recursive: true });
+      fs.writeFileSync(
+        path.join(gitSecHome, ".config", "git", "auth.inc"),
+        [
+          "[http]",
+          "\textraHeader = Authorization: Bearer INC_GIT_SECRET_TOKEN",
+          '[url "https://bot:URL_EMBED_TOKEN@git.corp.example/"]',
+          "\tinsteadOf = https://git.corp.example/",
+        ].join("\n") + "\n",
+      );
+      fs.writeFileSync(
+        path.join(gitSecHome, ".gitconfig"),
+        [
+          "[user]",
+          "\tname = Safe Worker",
+          "\temail = worker@example.com",
+          "[http]",
+          "\textraHeader = Authorization: Basic ROOT_GIT_BASIC_SECRET",
+          "[include]",
+          "\tpath = ~/.config/git/auth.inc",
+        ].join("\n") + "\n",
+      );
+      const sanText = sanitizeGitConfigEntries([
+        { key: "user.name", value: "Safe Worker" },
+        { key: "http.extraHeader", value: "Authorization: Bearer TOP_SECRET" },
+        { key: "url.https://u:p@corp.example/.insteadOf", value: "https://corp.example/" },
+        { key: "credential.helper", value: "store" },
+      ]);
+      assert.match(sanText, /name = "Safe Worker"/);
+      assert.ok(!sanText.includes("TOP_SECRET") && !sanText.includes("u:p@") && !sanText.includes("credential"));
+
+      const stagedGit = stageSanitizedGitConfig({ HOME: gitSecHome }, path.join(dir, "git-sec-data"));
+      assert.ok(stagedGit);
+      try {
+        const content = fs.readFileSync(stagedGit!.file, "utf8");
+        assert.match(content, /Safe Worker/);
+        assert.ok(!content.includes("INC_GIT_SECRET_TOKEN") && !content.includes("ROOT_GIT_BASIC_SECRET") && !content.includes("URL_EMBED_TOKEN"));
+        if (process.platform === "linux" && hasCredentialMountIsolation()) {
+          const workCwd = path.join(dir, "git-sec-cwd");
+          fs.mkdirSync(workCwd, { recursive: true });
+          const cfgFile = path.join(dir, "git-sec-cfg.yaml");
+          fs.writeFileSync(
+            cfgFile,
+            `data_dir: ${path.join(dir, "git-sec-data")}\nowner: { open_id: ou_owner }\nharnesses: { codex: { agent: codex } }\nroles: { brain: codex, reviewer: codex }\n`,
+          );
+          const cfg = loadConfig(cfgFile);
+          const isoEnv: NodeJS.ProcessEnv = { ...process.env, HOME: gitSecHome };
+          const wrapped = wrapCredentialIsolatedCommand(
+            "sh",
+            ["-c", 'echo "NAME=$(git config --global --get user.name)"; git config --list --show-origin; cat "$HOME/.gitconfig"'],
+            isoEnv,
+            buildWorkspaceIsolation(
+              cfg,
+              {
+                mode: "verify",
+                cwd: workCwd,
+                extraReadOnlyPaths: [stagedGit!.dir],
+                extraBindMounts: [{ src: stagedGit!.file, dest: stagedGit!.homeMountDest, mode: "ro" }],
+              },
+              isoEnv,
+            ),
+          );
+          const childEnv: NodeJS.ProcessEnv = { ...isoEnv, ...isolatedSandboxTempEnv() };
+          applySanitizedGitConfigEnv(childEnv, stagedGit, wrapped.isolated);
+          const r = await runProcess(wrapped.cmd, wrapped.args, { cwd: workCwd, env: childEnv });
+          assert.equal(r.code, 0, r.stderr);
+          assert.match(r.stdout, /NAME=Safe Worker/);
+          assert.ok(
+            !r.stdout.includes("INC_GIT_SECRET_TOKEN") &&
+              !r.stdout.includes("ROOT_GIT_BASIC_SECRET") &&
+              !r.stdout.includes("URL_EMBED_TOKEN"),
+            "校验/工人沙箱绝不得看到 ~/.gitconfig 或 include 中的凭据头或带令牌 URL",
+          );
+        }
+      } finally {
+        stagedGit?.cleanup();
+      }
+    }
+
+    // 4) [R22 #4 P1], 5) [R22 #5 P1], 6) [R22 #6 P2], 7) [R22 #7 P2]
+    //    Codex ACP 私有可写主目录与 OAuth 写回 + 无工具 ACP 禁 MCP + 显式 agentCommand 精确暂存 + ACP 环境仅展开一次
+    {
+      const acpHome = path.join(dir, "acp-r22-home");
+      const hostCodexHome = path.join(acpHome, ".codex");
+      const baseClaudeDir = path.join(dir, "base-claude-r22");
+      const onceExpandedClaudeDir = path.join(baseClaudeDir, "worker");
+      fs.mkdirSync(path.join(hostCodexHome, "sessions"), { recursive: true });
+      fs.mkdirSync(path.join(acpHome, ".acpx", "adapters"), { recursive: true });
+      fs.mkdirSync(onceExpandedClaudeDir, { recursive: true });
+
+      fs.writeFileSync(path.join(hostCodexHome, "config.toml"), 'cli_auth_credentials_store = "file"\nmodel = "gpt-5"\n');
+      fs.writeFileSync(
+        path.join(hostCodexHome, "auth.json"),
+        JSON.stringify({
+          tokens: { access_token: "AT_OLD", refresh_token: "RT_OLD" },
+          last_refresh: "2026-11-20T00:00:00.000Z",
+        }),
+        { mode: 0o600 },
+      );
+      fs.writeFileSync(path.join(hostCodexHome, "sessions", "other-repo.jsonl"), '{"secret":"OTHER_REPO_CODEX_SESSION"}\n');
+      fs.writeFileSync(path.join(onceExpandedClaudeDir, "settings.json"), '{"claude_once":true}\n');
+      fs.writeFileSync(path.join(acpHome, ".acpx", "adapters", "other.sh"), "#!/bin/sh\necho OTHER_SECRET\n", { mode: 0o755 });
+      fs.writeFileSync(path.join(acpHome, ".acpx", "explicit-custom.sh"), "#!/bin/sh\necho EXPLICIT_OK\n", { mode: 0o755 });
+      fs.writeFileSync(
+        path.join(acpHome, ".acpx", "config.json"),
+        JSON.stringify({
+          mcpServers: [{ name: "corp-mcp", type: "http", url: "https://mcp.corp/sse", headers: { Authorization: "Bearer MCP_SECRET_TOKEN" } }],
+          agents: {
+            other: { command: "~/.acpx/adapters/other.sh" },
+          },
+        }),
+      );
+
+      // (5) 无工具模式 stageIsolatedAcpxState 剥离 mcpServers 并生成空 no-mcp.json
+      const stagedNoTool = stageIsolatedAcpxState({ agent: "claude" }, acpHome, { HOME: acpHome }, undefined, { tools: "none" });
+      assert.ok(stagedNoTool?.emptyMcpConfigFile);
+      try {
+        const cfgNoTool = JSON.parse(fs.readFileSync(path.join(stagedNoTool!.dir, "config.json"), "utf8"));
+        assert.deepEqual(cfgNoTool.mcpServers, [], "tools=none 暂存的 config.json 必须清空 mcpServers");
+        assert.ok(!fs.readFileSync(path.join(stagedNoTool!.dir, "config.json"), "utf8").includes("MCP_SECRET_TOKEN"));
+        const noMcpJson = JSON.parse(fs.readFileSync(stagedNoTool!.emptyMcpConfigFile!, "utf8"));
+        assert.deepEqual(noMcpJson, { mcpServers: [] });
+      } finally {
+        stagedNoTool?.cleanup();
+      }
+
+      // (6) 显式 agentCommand 仅暂存目标脚本，不复制 config.json 中无关适配器
+      const stagedExplicit = stageIsolatedAcpxState(
+        { agentCommand: "~/.acpx/explicit-custom.sh --flag" },
+        acpHome,
+        { HOME: acpHome },
+      );
+      assert.ok(stagedExplicit);
+      try {
+        const cfgExplicit = JSON.parse(fs.readFileSync(path.join(stagedExplicit!.dir, "config.json"), "utf8"));
+        assert.equal(cfgExplicit.agents, undefined, "显式 agentCommand 时不应暴露 config.json 中的无关 agents");
+        assert.ok(fs.existsSync(path.join(stagedExplicit!.dir, "explicit-custom.sh")), "位于 ~/.acpx 内的显式脚本必须暂存进私有目录");
+        assert.ok(!fs.existsSync(path.join(stagedExplicit!.dir, "adapters", "other.sh")), "无关适配器脚本绝不得进入暂存目录");
+      } finally {
+        stagedExplicit?.cleanup();
+      }
+
+      if (process.platform === "linux" && hasCredentialMountIsolation()) {
+        const probeAcpx22 = path.join(dir, "probe-acpx-r22");
+        fs.writeFileSync(
+          probeAcpx22,
+          [
+            "#!/bin/sh",
+            'echo "ARGS=$*"',
+            'echo "CODEX_HOME_VAL=$CODEX_HOME"',
+            'echo "CODEX_SESS=$(test -e "$HOME/.codex/sessions/other-repo.jsonl" && echo LEAK || echo HIDDEN)"',
+            'echo "CODEX_STAGED_SESS=$(test -e "$CODEX_HOME/sessions/other-repo.jsonl" && echo LEAK || echo HIDDEN)"',
+            'echo "CLAUDE_DIR_VAL=$CLAUDE_CONFIG_DIR"',
+            'echo "CLAUDE_SETTINGS=$(cat "$CLAUDE_CONFIG_DIR/settings.json" 2>/dev/null || echo MISSING)"',
+            'echo "EXPLICIT_SCRIPT=$(test -x "$HOME/.acpx/explicit-custom.sh" && echo OK || echo NO)"',
+            'echo "OTHER_ADAPTER=$(test -e "$HOME/.acpx/adapters/other.sh" && echo LEAK || echo HIDDEN)"',
+            'echo "ACPX_CFG=$(cat "$HOME/.acpx/config.json" 2>/dev/null | tr -d "\\n")"',
+            'if [ -n "$CODEX_HOME" ] && [ -f "$CODEX_HOME/auth.json" ]; then',
+            '  cat > "$CODEX_HOME/auth.json" <<\'EOF\'',
+            '{"tokens":{"access_token":"AT_NEW","refresh_token":"RT_ROTATED_ACP"},"last_refresh":"2026-11-27T12:00:00.000Z"}',
+            "EOF",
+            '  echo "CODEX_AUTH_ROTATED=YES"',
+            "fi",
+          ].join("\n"),
+          { mode: 0o755 },
+        );
+        const h22CfgFile = path.join(dir, "h22.yaml");
+        fs.writeFileSync(
+          h22CfgFile,
+          [
+            `data_dir: ${path.join(dir, "h22-data")}`,
+            `bins: { lark: ${JSON.stringify(path.join(STUBS, "lark-cli"))}, acpx: ${JSON.stringify(probeAcpx22)} }`,
+            "owner: { open_id: ou_owner }",
+            "context: { personal_web: { enabled: true } }",
+            "roles: { brain: codex_acp, reviewer: codex_acp }",
+            "harnesses:",
+            "  codex_acp:",
+            "    type: acpx",
+            "    agent: codex",
+            "    env:",
+            `      HOME: ${JSON.stringify(acpHome)}`,
+            `      CODEX_HOME: ${JSON.stringify(hostCodexHome)}`,
+            "  claude_once:",
+            "    type: acpx",
+            "    agent: claude",
+            "    env:",
+            `      HOME: ${JSON.stringify(acpHome)}`,
+            '      CLAUDE_CONFIG_DIR: "${CLAUDE_CONFIG_DIR}/worker"',
+            "  explicit_acp:",
+            "    type: acpx",
+            '    agentCommand: "~/.acpx/explicit-custom.sh"',
+            "    env:",
+            `      HOME: ${JSON.stringify(acpHome)}`,
+          ].join("\n") + "\n",
+        );
+        const h22Cfg = loadConfig(h22CfgFile);
+        const work22 = path.join(dir, "work-r22");
+        fs.mkdirSync(work22, { recursive: true });
+
+        // (4) Codex ACP：私有可写 CODEX_HOME、隐藏宿主机 sessions、OAuth 刷新安全写回宿主机 auth.json
+        const rCodex = await runHarness(h22Cfg, {
+          harness: "codex_acp",
+          prompt: "review",
+          cwd: work22,
+          tools: "read",
+          lark: "none",
+          timeoutSec: 15,
+          logFile: path.join(dir, "r22-codex.log"),
+        });
+        assert.equal(rCodex.ok, true, rCodex.text);
+        assert.match(rCodex.text, /CODEX_SESS=HIDDEN/, "Codex ACP 不得挂载宿主机 ~/.codex 暴露其他仓库 sessions");
+        assert.match(rCodex.text, /CODEX_STAGED_SESS=HIDDEN/, "暂存 CODEX_HOME 不得包含其他仓库 sessions");
+        assert.match(rCodex.text, /CODEX_AUTH_ROTATED=YES/, "Codex ACP 的私有 CODEX_HOME 必须可写以支持 OAuth 轮换");
+        const updatedHostAuth = JSON.parse(fs.readFileSync(path.join(hostCodexHome, "auth.json"), "utf8"));
+        assert.equal(updatedHostAuth.tokens.refresh_token, "RT_ROTATED_ACP", "Codex ACP 刷新后的 OAuth 令牌必须写回宿主机 auth.json");
+
+        // (5) tools === "none"：向 acpx 传 --mcp-config 空配置与 --no-fs，且 config.json 不含宿主机 MCP_SECRET_TOKEN
+        const rNoTool = await runHarness(h22Cfg, {
+          harness: "claude_once",
+          prompt: "understand",
+          cwd: work22,
+          tools: "none",
+          lark: "none",
+          timeoutSec: 15,
+          logFile: path.join(dir, "r22-notool.log"),
+        });
+        assert.equal(rNoTool.ok, true, rNoTool.text);
+        assert.match(rNoTool.text, /--mcp-config\s+\S+no-mcp\.json/, "tools=none 必须向 acpx 传入空 --mcp-config");
+        assert.match(rNoTool.text, /--no-fs/, "tools=none 必须禁用 ACP filesystem 能力");
+        assert.ok(!rNoTool.text.includes("MCP_SECRET_TOKEN"), "tools=none 绝不得把全局 MCP 服务器凭据带入沙箱");
+
+        // (7) 环境变量自引用 ${CLAUDE_CONFIG_DIR}/worker 仅展开一次（不变成 .../worker/worker）
+        const prevClaudeDir = process.env.CLAUDE_CONFIG_DIR;
+        process.env.CLAUDE_CONFIG_DIR = baseClaudeDir;
+        try {
+          const rOnce = await runHarness(h22Cfg, {
+            harness: "claude_once",
+            prompt: "hi",
+            cwd: work22,
+            tools: "read",
+            lark: "none",
+            timeoutSec: 15,
+            logFile: path.join(dir, "r22-once.log"),
+          });
+          assert.equal(rOnce.ok, true, rOnce.text);
+          assert.match(rOnce.text, new RegExp(`CLAUDE_DIR_VAL=${onceExpandedClaudeDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+          assert.match(rOnce.text, /CLAUDE_SETTINGS=\{"claude_once":true\}/, "单次展开后的 CLAUDE_CONFIG_DIR 必须准确挂载进沙箱");
+        } finally {
+          if (prevClaudeDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+          else process.env.CLAUDE_CONFIG_DIR = prevClaudeDir;
+        }
+
+        // (6) 显式 agentCommand 实跑：私有 ~/.acpx 中可见 explicit-custom.sh 且隐藏无关 adapters/other.sh
+        const rExp = await runHarness(h22Cfg, {
+          harness: "explicit_acp",
+          prompt: "hi",
+          cwd: work22,
+          tools: "read",
+          lark: "none",
+          timeoutSec: 15,
+          logFile: path.join(dir, "r22-exp.log"),
+        });
+        assert.equal(rExp.ok, true, rExp.text);
+        assert.match(rExp.text, /EXPLICIT_SCRIPT=OK/);
+        assert.match(rExp.text, /OTHER_ADAPTER=HIDDEN/);
+      }
+    }
+
+    // 9) [R22 #9 P2] 首跳无 x-csrf-token，307 重定向首次下发 swp_csrf_token 后，后续跳必须自动派生 x-csrf-token 且成功后提交 Cookie 轮换
+    {
+      let sawStep2Csrf = "";
+      csrfSrv = http.createServer((req, res) => {
+        if (req.url === "/step1") {
+          res.statusCode = 307;
+          res.setHeader("Location", "/step2");
+          res.setHeader("Set-Cookie", "swp_csrf_token=csrf_from_307_redirect; Path=/");
+          res.end();
+          return;
+        }
+        if (req.url === "/step2") {
+          sawStep2Csrf = String(req.headers["x-csrf-token"] ?? "");
+          if (sawStep2Csrf !== "csrf_from_307_redirect") {
+            res.statusCode = 403;
+            res.end("csrf missing");
+            return;
+          }
+          res.statusCode = 200;
+          res.end("ok");
+          return;
+        }
+        res.statusCode = 404;
+        res.end();
+      });
+      await new Promise<void>((resolve) => csrfSrv!.listen(0, "127.0.0.1", resolve));
+      const port = (csrfSrv.address() as { port: number }).port;
+      const jar = new RecordingCookieJar(["127.0.0.1"]);
+      const res = await fetchWithJar(jar, {
+        url: `http://127.0.0.1:${port}/step1`,
+        method: "POST",
+        body: "payload",
+        allowInsecureHttp: true,
+        extraAllowedHosts: ["127.0.0.1"],
+      });
+      assert.equal(res.status, 200, "307 重定向首次下发 swp_csrf_token 时，下一跳必须派生 x-csrf-token 并成功");
+      assert.equal(sawStep2Csrf, "csrf_from_307_redirect");
+      assert.equal(res.cookiesUpdated, true);
+      assert.equal(jar.cookieValue(new URL(`http://127.0.0.1:${port}/step2`), "swp_csrf_token"), "csrf_from_307_redirect");
+    }
+
+    // 10) [R22 #10 P2] SSH_AUTH_SOCK 存在但代理未加载该密钥时，必须保留默认磁盘私钥回退；已加载于代理时才省略私钥
+    {
+      const sshFbHome = path.join(dir, "ssh-fallback-home");
+      const sshDir = path.join(sshFbHome, ".ssh");
+      fs.mkdirSync(sshDir, { recursive: true });
+      fs.writeFileSync(path.join(sshDir, "id_ed25519"), "DISK_DEFAULT_PRIV", { mode: 0o600 });
+      fs.writeFileSync(path.join(sshDir, "id_ed25519.pub"), "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyBlob user@host\n");
+      fs.writeFileSync(path.join(sshDir, "id_unrelated_bastion"), "BASTION_PRIV_NO_LEAK", { mode: 0o600 });
+
+      const emptyAgentMounts = collectScopedSshMounts(
+        ["git.example.com"],
+        { HOME: sshFbHome, SSH_AUTH_SOCK: path.join(dir, "empty-or-missing.sock") },
+        undefined,
+        path.join(dir, "empty-or-missing.sock"),
+      );
+      assert.ok(
+        emptyAgentMounts.readOnlyPaths.some((p) => p.endsWith(`${path.sep}id_ed25519`)),
+        "SSH 代理未持有该默认密钥时，必须保留标准默认私钥 id_ed25519 的只读文件回退",
+      );
+      assert.ok(
+        !emptyAgentMounts.readOnlyPaths.some((p) => p.endsWith(`${path.sep}id_unrelated_bastion`)),
+        "保留默认私钥回退的同时绝不得暴露无关命名私钥",
+      );
+    }
+
+    // 12) [R22 #12 P3] 带标题的富文本卡片（MSG_CARD）拼接标题前缀后，mentions 的 start/end 必须同步偏移
+    {
+      const richBytes = encodeRichText([
+        { text: "@Alice", mentionId: "700999" },
+        { text: " 请查收" },
+      ]);
+      const cardContent = new ProtoWriter()
+        .uint(1, 1) // non-basic rich cardType (BASIC_CARD_TYPE === 2)
+        .bytes(2, richBytes)
+        .str(6, "发布通知")
+        .finish();
+      const rawMsg = new ProtoWriter()
+        .str(1, "7100001")
+        .uint(2, MSG_CARD)
+        .str(3, "700111")
+        .uint(4, 1730000000)
+        .bytes(5, cardContent)
+        .uint(7, USER_SENDER_TYPE)
+        .str(10, "8800001")
+        .uint(46, CHAT_KIND_GROUP)
+        .finish();
+      const decoded = decodeMessage(rawMsg, "700999");
+      assert.equal(decoded.text, "发布通知\n@Alice 请查收");
+      assert.equal(decoded.mentions.length, 1);
+      assert.equal(
+        decoded.text.slice(decoded.mentions[0].start, decoded.mentions[0].end),
+        "@Alice",
+        "带标题富卡片的 mention 偏移必须加上 `标题\\n` 前缀长度",
+      );
+    }
+  } finally {
+    if (csrfSrv) await new Promise<void>((resolve) => csrfSrv!.close(() => resolve()));
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
