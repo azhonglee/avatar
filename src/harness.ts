@@ -38,6 +38,8 @@ export interface IsolationOptions {
   cmdPath?: string;
   /** 除主命令外需要只读放行及其 npm 运行时依赖的辅助可执行文件（如 acpx 调用的底层 agent CLI 或 lark-cli） */
   extraCmdPaths?: string[];
+  /** 需要保留逻辑路径的只读文件符号链接（如 dotfiles 仓库中的 ~/.gitconfig -> ~/dotfiles/gitconfig，绝不暴露 dotfiles 其余文件） */
+  extraSymlinks?: { dest: string; target: string }[];
 }
 
 const BROAD_UNSAFE_AUTO_MOUNT_ROOTS = new Set([
@@ -59,18 +61,16 @@ const BROAD_UNSAFE_AUTO_MOUNT_ROOTS = new Set([
   "/home",
 ]);
 
+// 仅包含纯解释器/运行时版本管理根目录；严禁加入 .cargo（含 credentials.toml）、go（含 src/）等含凭据或私有源码的目录
 const USER_TOOLCHAIN_SUBDIRS = [
   ".nvm",
   ".fnm",
   ".volta",
   ".asdf",
   ".mise",
-  ".cargo",
   ".rustup",
   ".pyenv",
   ".rbenv",
-  ".bun",
-  ".deno",
   ".local/bin",
   ".local/share/fnm",
   ".local/share/mise",
@@ -80,7 +80,6 @@ const USER_TOOLCHAIN_SUBDIRS = [
   ".local/pipx",
   ".rye",
   ".uv",
-  "go",
 ];
 
 function resolveBinInPath(bin: string, pathEnv?: string): string | undefined {
@@ -246,10 +245,74 @@ export function collectLarkGuardReadOnlyFiles(): string[] {
   return candidates.filter((p) => fs.existsSync(p)).map((p) => safeRealpath(p));
 }
 
+/**
+ * 解析豆包 CLI 在隔离沙箱中运行所需的只读配置与运行时目录：
+ *   - `~/.doubao` 与 `${XDG_CONFIG_HOME:-~/.config}/doubao`
+ *   - Linux 上 npm 启动器 `@bytedance/doubao-cli` 校验并拉起的二进制目录 `${XDG_DATA_HOME:-~/.local/share}/doubao_cli/app/current`
+ */
+export function selectDoubaoRuntimePaths(hostEnv: NodeJS.ProcessEnv = process.env): string[] {
+  const hostHome = hostEnv.HOME?.trim() || os.homedir();
+  const xdgConfig = hostEnv.XDG_CONFIG_HOME?.trim() || (hostHome ? path.join(hostHome, ".config") : "");
+  const xdgData = hostEnv.XDG_DATA_HOME?.trim() || (hostHome ? path.join(hostHome, ".local", "share") : "");
+  const out: string[] = [];
+  if (hostHome) out.push(path.join(hostHome, ".doubao"));
+  if (xdgConfig) out.push(path.join(xdgConfig, "doubao"));
+  if (xdgData) out.push(path.join(xdgData, "doubao_cli", "app", "current"));
+  return [...new Set(out)];
+}
+
+/**
+ * 仅收集安全的 Git 只读配置文件（绝不挂载整个 ~/.config/git 目录或 ~/.config/git/credentials / ~/.git-credentials），
+ * 并为符号链接 dotfiles（如 ~/.gitconfig -> ~/dotfiles/gitconfig）保留逻辑路径符号链接，避免 Git 丢失配置且不暴露 dotfiles 其余文件。
+ */
+export function collectSafeGitConfigMounts(
+  rawEnv: NodeJS.ProcessEnv = process.env,
+  dataDir?: string,
+  opts?: { includeNpmrc?: boolean },
+): { readOnlyPaths: string[]; symlinks: { dest: string; target: string }[] } {
+  const readOnlyPaths: string[] = [];
+  const symlinks: { dest: string; target: string }[] = [];
+  const rawHome = rawEnv.HOME?.trim() || os.homedir();
+  if (!rawHome) return { readOnlyPaths, symlinks };
+  const resolvedHome = safeRealpath(rawHome);
+  const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
+  const rawXdgConfig = rawEnv.XDG_CONFIG_HOME?.trim();
+  const xdgConfigBase = rawXdgConfig ? safeRealpath(rawXdgConfig) : path.join(resolvedHome, ".config");
+
+  const addLogicalFile = (logicalPath: string) => {
+    try {
+      const lst = fs.lstatSync(logicalPath);
+      const st = fs.statSync(logicalPath);
+      if (!st.isFile()) return;
+      const real = fs.realpathSync(logicalPath);
+      if (resolvedData && (isPathInsideOrEqual(real, resolvedData) || isPathInsideOrEqual(resolvedData, real))) return;
+      readOnlyPaths.push(real);
+      if (lst.isSymbolicLink()) {
+        const logicalDest = path.join(safeRealpath(path.dirname(logicalPath)), path.basename(logicalPath));
+        if (logicalDest !== real) {
+          symlinks.push({ dest: logicalDest, target: real });
+        }
+      }
+    } catch {
+      // 文件不存在或符号链接损坏时忽略
+    }
+  };
+
+  addLogicalFile(path.join(resolvedHome, ".gitconfig"));
+  addLogicalFile(path.join(xdgConfigBase, "git", "config"));
+  addLogicalFile(path.join(xdgConfigBase, "git", "ignore"));
+  addLogicalFile(path.join(xdgConfigBase, "git", "attributes"));
+  if (opts?.includeNpmrc) {
+    addLogicalFile(path.join(resolvedHome, ".npmrc"));
+  }
+  return { readOnlyPaths, symlinks };
+}
+
 /** 按 acpx 实际选中的 agent 仅暴露该单一提供方的配置目录（以及 ~/.acpx），绝不向 Claude 工人暴露 ~/.codex 等其他提供方凭据 */
 export function selectAcpxAgentConfigPaths(
   h: Pick<Config["harnesses"][string], "agent" | "agentCommand" | "env">,
   hostHome: string,
+  hostEnv: NodeJS.ProcessEnv = process.env,
 ): string[] {
   const out: string[] = [];
   const addSub = (sub: string) => {
@@ -278,8 +341,8 @@ export function selectAcpxAgentConfigPaths(
     addSub(".gemini");
     addAbs(h.env?.GEMINI_CLI_HOME);
   } else if (id === "doubao" || id.startsWith("doubao-")) {
-    addSub(".doubao");
-    addSub(".config/doubao");
+    const mergedDoubaoEnv: NodeJS.ProcessEnv = { ...hostEnv, ...(h.env ?? {}), HOME: hostHome };
+    out.push(...selectDoubaoRuntimePaths(mergedDoubaoEnv));
   } else if (id === "opencode" || id.startsWith("opencode-")) {
     addSub(".config/opencode");
     addSub(".local/share/opencode");
@@ -661,24 +724,13 @@ export function buildWorkspaceIsolation(
     }
   }
 
-  // 最小化允许的个人工具配置（严格只读、按单文件/单子目录放行，绝不暴露整个 $HOME 或其他工作区目录）
+  // 最小化允许的个人工具配置（严格只读、仅挂载单个安全配置文件，绝不挂载 ~/.config/git 整目录以防暴露 credentials，并保留 dotfiles 符号链接逻辑路径）
+  const extraSymlinks: { dest: string; target: string }[] = [];
   if (opts.mode !== "llm-none") {
-    const rawHome = rawEnv.HOME?.trim() || os.homedir();
-    const resolvedHome = rawHome ? safeRealpath(rawHome) : "";
-    const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
-    const addHomeRo = (sub: string) => {
-      if (!resolvedHome) return;
-      const p = path.join(resolvedHome, sub);
-      if (!fs.existsSync(p)) return;
-      const real = safeRealpath(p);
-      if (resolvedData && (isPathInsideOrEqual(real, resolvedData) || isPathInsideOrEqual(resolvedData, real))) return;
-      readOnlyPaths.push(real);
-    };
-    addHomeRo(".gitconfig");
-    addHomeRo(".config/git");
-    if (opts.mode === "verify" || opts.mode === "worker-write" || opts.mode === "worker-ro") {
-      addHomeRo(".npmrc");
-    }
+    const includeNpmrc = opts.mode === "verify" || opts.mode === "worker-write" || opts.mode === "worker-ro";
+    const gitCfgMounts = collectSafeGitConfigMounts(rawEnv, dataDir, { includeNpmrc });
+    readOnlyPaths.push(...gitCfgMounts.readOnlyPaths);
+    extraSymlinks.push(...gitCfgMounts.symlinks);
   }
 
   for (const p of opts.extraWritablePaths ?? []) {
@@ -696,6 +748,7 @@ export function buildWorkspaceIsolation(
     readOnlyPaths,
     cmdPath: opts.cmdPath,
     extraCmdPaths: opts.extraCmdPaths,
+    ...(extraSymlinks.length ? { extraSymlinks } : {}),
   };
 }
 
@@ -1038,7 +1091,7 @@ export function isolatedSandboxTempEnv(): Record<string, string> {
   };
 }
 
-function willIsolateCommand(rawEnv: NodeJS.ProcessEnv, opts?: IsolationOptions): boolean {
+export function willIsolateCommand(rawEnv: NodeJS.ProcessEnv, opts?: IsolationOptions): boolean {
   const credDir = rawEnv.CREDENTIALS_DIRECTORY?.trim();
   const keyFile = credDir ? path.join(credDir, FEISHU_WEB_KEY_CRED) : "";
   const hasCredKeyFile = !!keyFile && fs.existsSync(keyFile);
@@ -1442,6 +1495,7 @@ export function wrapCredentialIsolatedCommand(
     ...extraCmdLogicalList,
     ...(opts?.writablePaths ?? []),
     ...(opts?.readOnlyPaths ?? []),
+    ...(opts?.extraSymlinks ?? []).map((s) => s.dest),
     ...pathEnv.split(path.delimiter).filter((d) => path.isAbsolute(d)),
   ];
   for (const [dest, target] of collectDirectorySymlinksAlongPaths(logicalCandidates)) {
@@ -1454,10 +1508,14 @@ export function wrapCredentialIsolatedCommand(
     .map(([dest, target]) => ({ dest, target }))
     .sort((a, b) => a.dest.length - b.dest.length || a.dest.localeCompare(b.dest));
 
-  // 补建未被挂载目录覆盖的可执行/依赖文件符号链接（如绝对路径调用 ~/.npm-global/bin/acpx -> ../lib/node_modules/acpx/dist/cli.js）；
+  // 补建未被挂载目录覆盖的可执行/依赖/配置文件符号链接（如绝对路径调用 npm 全局命令或 dotfiles ~/.gitconfig）；
   // 在 bwrap 中必须放在 --tmpfs /tmp 与 dataDir tmpfs 之后创建，防止 /tmp 下的文件符号链接被 --tmpfs /tmp 抹除。
   const fileSymlinkMap = new Map<string, string>();
-  for (const fsym of candidateFileSymlinks) {
+  const allFileSymlinkCandidates: { dest: string; target: string }[] = [
+    ...candidateFileSymlinks,
+    ...(opts?.extraSymlinks ?? []),
+  ];
+  for (const fsym of allFileSymlinkCandidates) {
     if (symlinkMap.has(fsym.dest) || fileSymlinkMap.has(fsym.dest)) continue;
     if (allRealMountTargets.some((mp) => isPathInsideOrEqual(fsym.dest, mp) || isPathInsideOrEqual(mp, fsym.dest))) {
       continue;
@@ -4185,14 +4243,14 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
     if (baseEnv.env.CREDENTIALS_DIRECTORY) doubaoExtraRo.push(baseEnv.env.CREDENTIALS_DIRECTORY);
     doubaoExtraRo.push(...collectLarkGuardReadOnlyFiles());
     if (run.lark !== "none" && fs.existsSync(realLark)) doubaoExtraRo.push(realLark);
-    const hostHome = h.env?.HOME?.trim() || process.env.HOME?.trim() || os.homedir();
+    const doubaoIsolationEnv = mergeHarnessEnv(process.env, h.env);
+    const hostHome = doubaoIsolationEnv.HOME?.trim() || os.homedir();
     const resolvedDataDir = cfg.dataDir && fs.existsSync(cfg.dataDir) ? safeRealpath(cfg.dataDir) : "";
-    for (const sub of [
-      ".doubao",
-      ".config/doubao",
-      ...(run.lark !== "none" ? [".lark-cli", ".config/lark-cli"] : []),
-    ]) {
-      const p = path.join(hostHome, sub);
+    const doubaoPaths = [
+      ...selectDoubaoRuntimePaths(doubaoIsolationEnv),
+      ...(run.lark !== "none" ? [path.join(hostHome, ".lark-cli"), path.join(hostHome, ".config", "lark-cli")] : []),
+    ];
+    for (const p of doubaoPaths) {
       if (!fs.existsSync(p)) continue;
       const real = safeRealpath(p);
       if (resolvedDataDir && (isPathInsideOrEqual(real, resolvedDataDir) || isPathInsideOrEqual(resolvedDataDir, real))) {
@@ -4203,17 +4261,21 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
     const wrapped = wrapCredentialIsolatedCommand(
       cmd,
       args,
-      process.env,
-      buildWorkspaceIsolation(cfg, {
-        mode,
-        cwd: run.cwd,
-        cmdPath: cmd,
-        extraCmdPaths: run.lark !== "none" ? [realLark] : [],
-        trustedRepoRoot: run.trustedRepoRoot,
-        disableGitWorktreeMounts: run.disableGitWorktreeMounts,
-        allowGuardLog: run.lark !== "none",
-        extraReadOnlyPaths: doubaoExtraRo,
-      }),
+      doubaoIsolationEnv,
+      buildWorkspaceIsolation(
+        cfg,
+        {
+          mode,
+          cwd: run.cwd,
+          cmdPath: cmd,
+          extraCmdPaths: run.lark !== "none" ? [realLark] : [],
+          trustedRepoRoot: run.trustedRepoRoot,
+          disableGitWorktreeMounts: run.disableGitWorktreeMounts,
+          allowGuardLog: run.lark !== "none",
+          extraReadOnlyPaths: doubaoExtraRo,
+        },
+        doubaoIsolationEnv,
+      ),
     );
     const env: NodeJS.ProcessEnv = {
       ...mergeHarnessEnv(baseEnv.env, h.env),

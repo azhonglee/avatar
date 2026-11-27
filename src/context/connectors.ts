@@ -526,9 +526,10 @@ export class Connectors {
       .sort()
       .join("|");
     const deny = [...this.cfg.context.groups_deny].map((s) => s.trim()).sort().join("|");
-    // 保留 groups_allow 顺序：在 max_groups 截断下，白名单顺序变化同样改变选中群集合；包含 lookback_days 以感知 spoken 回看窗口变化
+    // 保留 groups_allow 顺序：在 max_groups 截断下，白名单顺序变化同样改变选中群集合；包含 lookback_days 与 bot_allow 以感知热重载变更
     const allow = this.cfg.context.groups_allow.map((s) => s.trim()).join("|");
-    return `${this.cfg.context.sources.im ? 1 : 0};${this.cfg.context.groups};${this.cfg.context.max_groups};${this.cfg.context.lookback_days};${allow};${deny};${mutes}`;
+    const bots = [...this.cfg.context.bot_allow].map((s) => s.trim()).sort().join("|");
+    return `${this.cfg.context.sources.im ? 1 : 0};${this.cfg.context.groups};${this.cfg.context.max_groups};${this.cfg.context.lookback_days};${allow};${deny};${mutes};${bots}`;
   }
 
   private async resolveCurrentChatMeta(chatId: string): Promise<{ name: string; chatType: "p2p" | "group" | "" } | undefined> {
@@ -942,21 +943,25 @@ export class Connectors {
       const rowCounter = parseEditCounter(row.m);
       const rowTimeMs = parseEditTimeMs(row.m, this.cfg.owner.timezone);
       const rowText = textOf(row.m.content ?? row.m.text ?? "");
+      const rowDeleted = row.m.deleted === true || row.m.is_deleted === true;
+      const rowAtMe = rowEffectiveAtMe(row.m, row.kind);
+      const rowEffKind = rowAtMe ? "at_me" : row.kind;
       const existing = mergedById.get(id);
       if (!existing) {
         mergedById.set(id, {
           m: { ...row.m },
-          kind: row.kind,
+          kind: rowEffKind,
+          deleted: rowDeleted,
           editCounter: rowCounter,
           editTimeMs: rowTimeMs,
           streams: new Set([row.stream]),
           fallbackGroupName: row.fallbackGroupName ?? "",
           needsVerify: false,
-          candidates: [{ text: rowText, kind: row.kind, atMe: rowEffectiveAtMe(row.m, row.kind) }],
+          candidates: [{ text: rowText, kind: rowEffKind, atMe: rowAtMe }],
         });
       } else {
         existing.streams.add(row.stream);
-        existing.candidates.push({ text: rowText, kind: row.kind, atMe: rowEffectiveAtMe(row.m, row.kind) });
+        existing.candidates.push({ text: rowText, kind: rowEffKind, atMe: rowAtMe });
         const cmp = compareRowRevisions(
           { editCounter: rowCounter, editTimeMs: rowTimeMs },
           { editCounter: existing.editCounter, editTimeMs: existing.editTimeMs },
@@ -985,8 +990,8 @@ export class Connectors {
           };
           if (rowCounter !== undefined) existing.editCounter = rowCounter;
           if (rowTimeMs !== undefined) existing.editTimeMs = rowTimeMs;
-          const explicitAtMe = rowMentionsMe(row.m);
-          existing.kind = row.kind === "at_me" || explicitAtMe === true ? "at_me" : row.kind;
+          existing.kind = rowEffKind;
+          existing.deleted = rowDeleted;
           existing.needsVerify = false;
         } else if (cmp === "b_newer") {
           if (mergedChatId) existing.m.chat_id = mergedChatId;
@@ -1005,7 +1010,7 @@ export class Connectors {
           if (!String(existing.m.chat_type ?? "").trim() && String(row.m.chat_type ?? "").trim()) {
             existing.m.chat_type = row.m.chat_type;
           }
-          if (rowBodyConflict(existing.m, existing.kind, row.m, row.kind)) {
+          if ((existing.deleted === true) !== rowDeleted || rowBodyConflict(existing.m, existing.kind, row.m, rowEffKind)) {
             existing.needsVerify = true;
           } else {
             if (existing.editCounter === undefined && rowCounter !== undefined) {
@@ -1017,8 +1022,8 @@ export class Connectors {
               if (row.m.update_time !== undefined) existing.m.update_time = row.m.update_time;
               if (row.m.edit_time !== undefined) existing.m.edit_time = row.m.edit_time;
             }
-            if ((kindRank[row.kind] ?? 0) > (kindRank[existing.kind] ?? 0)) {
-              existing.kind = row.kind;
+            if ((kindRank[rowEffKind] ?? 0) > (kindRank[existing.kind] ?? 0)) {
+              existing.kind = rowEffKind;
             }
           }
         }
@@ -1185,7 +1190,7 @@ export class Connectors {
       for (const entry of mergedById.values()) {
         const msgId = String(entry.m.message_id ?? entry.m.id ?? "");
         const rawChatId = String(entry.m.chat_id ?? "");
-        if (entry.deleted) {
+        if (entry.deleted || entry.m.deleted === true || entry.m.is_deleted === true) {
           if (msgId) retiredIds.push(`im:${msgId}`);
           dropped++;
           continue;

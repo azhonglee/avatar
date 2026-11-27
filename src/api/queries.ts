@@ -456,11 +456,20 @@ export function isWorkBlockedByOwner(
 export function listDispatches(app: App, f: { filter?: DispatchFilter; q?: string; limit?: number }): DispatchSummary[] {
   const maxItems = Math.min(Math.max(0, f.limit ?? 200), 500);
   if (maxItems === 0) return [];
-  const q = f.q?.trim().toLowerCase();
-  // SQLite LOWER() 仅折叠 ASCII 字母，对于全 ASCII 或无大小写差异字符（如中文/数字）直接下推 SQL 过滤；
-  // 含非 ASCII 大小写字母（如德语/俄语）时保留内存端完整匹配。
+  const rawQ = f.q?.trim();
+  const q = rawQ?.toLowerCase();
+  // SQLite LOWER() 仅折叠 ASCII；在全部 Unicode 码点中，仅 'i'（来自 İ U+0130）与 'k'（来自 K U+212A）
+  // 会由非 ASCII 字符经 JS .toLowerCase() 折叠进 ASCII。因此检查原始查询：仅当不含 i/k 且不含具大小写映射的非 ASCII 字符时才下推 SQL 预筛。
   const canPushSearch =
-    !!q && [...q].every((ch) => ch.charCodeAt(0) < 128 || ch.toLowerCase() === ch.toUpperCase());
+    !!rawQ &&
+    [...rawQ].every((ch) => {
+      const code = ch.charCodeAt(0);
+      if (code < 128) {
+        const lo = ch.toLowerCase();
+        return lo !== "i" && lo !== "k";
+      }
+      return ch.toLowerCase() === ch && ch.toUpperCase() === ch;
+    });
   let states: string[] | undefined;
   let terminal: boolean | undefined;
   switch (f.filter ?? "all") {

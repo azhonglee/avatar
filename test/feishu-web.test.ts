@@ -97,12 +97,15 @@ import {
 import { ContextStore, obsRevision, type Obs } from "../src/context/store.ts";
 import {
   branchUsesGitLfs,
+  classifyGitRemoteTransport,
+  collectScopedSshMounts,
   gitCredentialLineMatchesTarget,
   isGitLfsPointerBlob,
   pushBranch,
   remoteDefaultBranch,
   resolveAuthorizedSshAuthSock,
   resolveLocalGitRemoteDir,
+  rewriteGitCredentialHelperChain,
   tryGit,
 } from "../src/delivery/git.ts";
 import { registerDelivery } from "../src/delivery/index.ts";
@@ -112,6 +115,7 @@ import {
   buildWorkspaceIsolation,
   canonicalCodexLockFilePath,
   collectLarkGuardReadOnlyFiles,
+  collectSafeGitConfigMounts,
   coordinateCodexOAuthRefresh,
   detectGitWorktreeDirs,
   detectIsolatedCodexKeyringConflict,
@@ -127,6 +131,7 @@ import {
   resolveTrustedSystemBin,
   runHarness,
   selectAcpxAgentConfigPaths,
+  selectDoubaoRuntimePaths,
   stageIsolatedAwsProfile,
   stageIsolatedCodexHome,
   syncRefreshedCodexAuth,
@@ -16128,6 +16133,499 @@ test("Codex 第十九轮回归：仓库工人默认隔离、可信沙箱引导�
     extraApp2?.store.db.close();
     app?.store.db.close();
     await mock.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex 第二十轮回归：剥离 ~/.config/git/credentials、保留符号链接 ~/.gitconfig、不扩展 ~/.cargo 凭据、挂载豆包启动器运行时、单 worktree 隔离创建、普通轮询撤回 deleted 消息、单流显式 @mention 归类、bot_allow 纳入策略签名、按传输协议最小化 SSH 挂载、原位保留 Git credential.helper 优先级与 Unicode 大小写折叠派单搜索", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-r20-"));
+  const dataDir = path.join(dir, "data");
+  fs.mkdirSync(dataDir, { recursive: true });
+  let app: ReturnType<typeof createApp> | undefined;
+  let httpGitSrv: http.Server | undefined;
+
+  try {
+    // 1) [R20 #1 P1] & 11) [R20 #11 P2] 隔离工人绝不可见 ~/.config/git/credentials，同时符号链接 dotfiles ~/.gitconfig 保留逻辑路径且不暴露 dotfiles 其余文件
+    {
+      const fakeHome = path.join(dir, "git-dot-home");
+      const dotfilesDir = path.join(dir, "my-dotfiles");
+      fs.mkdirSync(path.join(fakeHome, ".config", "git"), { recursive: true });
+      fs.mkdirSync(dotfilesDir, { recursive: true });
+      fs.writeFileSync(path.join(dotfilesDir, "gitconfig"), "[user]\n\tr20marker = DOTFILES_LINK_OK\n");
+      fs.writeFileSync(path.join(dotfilesDir, "private.txt"), "DOTFILES_SECRET_NO_LEAK");
+      fs.symlinkSync(path.join(dotfilesDir, "gitconfig"), path.join(fakeHome, ".gitconfig"));
+      fs.writeFileSync(path.join(fakeHome, ".config", "git", "ignore"), "*.r20tmp\n");
+      fs.writeFileSync(
+        path.join(fakeHome, ".config", "git", "credentials"),
+        "https://alice:XDG_SECRET_TOKEN@corp.internal.example\n",
+        { mode: 0o600 },
+      );
+
+      const mounts = collectSafeGitConfigMounts({ HOME: fakeHome }, dataDir);
+      assert.ok(
+        !mounts.readOnlyPaths.some((p) => p.endsWith("credentials") || p.endsWith(`${path.sep}git`)),
+        "collectSafeGitConfigMounts 绝不得挂载 credentials 或整个 .config/git 目录",
+      );
+      assert.ok(mounts.symlinks.some((s) => s.dest.endsWith(`${path.sep}.gitconfig`)), "符号链接 ~/.gitconfig 必须保留逻辑路径映射");
+
+      if (process.platform === "linux" && hasCredentialMountIsolation()) {
+        const workRepo = path.join(dir, "git-dot-repo");
+        fs.mkdirSync(workRepo, { recursive: true });
+        const probeEnv: NodeJS.ProcessEnv = { ...process.env, HOME: fakeHome };
+        const isoPlan = buildWorkspaceIsolation(
+          { dataDir, context: { personal_web: { enabled: false } } } as never,
+          { mode: "worker-ro", cwd: workRepo },
+          probeEnv,
+        );
+        const script = [
+          `echo "CFG=$(git config --global --get user.r20marker 2>/dev/null || echo MISSING)"`,
+          `echo "IGN=$(test -f ${JSON.stringify(path.join(fakeHome, ".config", "git", "ignore"))} && echo YES || echo NO)"`,
+          `echo "CRED=$(test -e ${JSON.stringify(path.join(fakeHome, ".config", "git", "credentials"))} && echo LEAK || echo HIDDEN)"`,
+          `echo "DOT_PRIV=$(test -e ${JSON.stringify(path.join(dotfilesDir, "private.txt"))} && echo LEAK || echo HIDDEN)"`,
+        ].join("\n");
+
+        const wrappedBwrap = wrapCredentialIsolatedCommand("/bin/sh", ["-c", script], probeEnv, isoPlan);
+        const rb = await runProcess(wrappedBwrap.cmd, wrappedBwrap.args, { env: probeEnv, timeoutMs: 10_000 });
+        assert.equal(rb.code, 0, rb.stderr);
+        assert.match(rb.stdout, /CFG=DOTFILES_LINK_OK/, "bwrap 下符号链接 ~/.gitconfig 必须被 git 正常读取");
+        assert.match(rb.stdout, /IGN=YES/, "bwrap 下 ~/.config/git/ignore 应正常只读可见");
+        assert.match(rb.stdout, /CRED=HIDDEN/, "bwrap 下 ~/.config/git/credentials 必须不可见");
+        assert.match(rb.stdout, /DOT_PRIV=HIDDEN/, "dotfiles 仓库中的其他文件不得暴露");
+
+        const unshareBin = resolveTrustedSystemBin("unshare");
+        const setprivBin = resolveTrustedSystemBin("setpriv");
+        const pivotRootBin = resolveTrustedSystemBin("pivot_root");
+        const shBin = resolveTrustedSystemBin("sh");
+        if (unshareBin && setprivBin && pivotRootBin && shBin) {
+          const wrappedUnshare = wrapCredentialIsolatedCommand("/bin/sh", ["-c", script], probeEnv, {
+            ...isoPlan,
+            forceBackend: { kind: "unshare", bin: unshareBin, setprivBin, pivotRootBin, shBin, killChild: true },
+          });
+          const ru = await runProcess(wrappedUnshare.cmd, wrappedUnshare.args, { env: probeEnv, timeoutMs: 10_000 });
+          assert.equal(ru.code, 0, ru.stderr);
+          assert.match(ru.stdout, /CFG=DOTFILES_LINK_OK/, "unshare 下符号链接 ~/.gitconfig 必须被 git 正常读取");
+          assert.match(ru.stdout, /CRED=HIDDEN/, "unshare 下 ~/.config/git/credentials 必须不可见");
+          assert.match(ru.stdout, /DOT_PRIV=HIDDEN/, "unshare 下 dotfiles 其余文件不得暴露");
+        }
+      }
+    }
+
+    // 5) [R20 #5 P1] ~/.cargo/bin 在 PATH 中时绝不把整棵 ~/.cargo（含 credentials.toml）挂载进工人沙箱
+    if (process.platform === "linux" && hasCredentialMountIsolation()) {
+      const cargoHome = path.join(dir, "cargo-home");
+      const cargoBin = path.join(cargoHome, ".cargo", "bin");
+      fs.mkdirSync(cargoBin, { recursive: true });
+      fs.writeFileSync(path.join(cargoBin, "r20-cargo-ok"), "#!/bin/sh\necho CARGO_BIN_OK\n", { mode: 0o755 });
+      fs.writeFileSync(path.join(cargoHome, ".cargo", "credentials.toml"), '[registry]\ntoken = "CARGO_REGISTRY_SECRET"\n', { mode: 0o600 });
+      const cargoEnv: NodeJS.ProcessEnv = {
+        ...process.env,
+        HOME: cargoHome,
+        PATH: `${cargoBin}${path.delimiter}${process.env.PATH ?? ""}`,
+      };
+      const cargoWorkDir = path.join(dir, "cargo-work-cwd");
+      fs.mkdirSync(cargoWorkDir, { recursive: true });
+      const wrapped = wrapCredentialIsolatedCommand(
+        "/bin/sh",
+        [
+          "-c",
+          `echo "BIN=$(r20-cargo-ok)"; echo "CRED=$(test -e ${JSON.stringify(path.join(cargoHome, ".cargo", "credentials.toml"))} && echo LEAK || echo HIDDEN)"`,
+        ],
+        cargoEnv,
+        buildWorkspaceIsolation({ dataDir, context: { personal_web: { enabled: false } } } as never, { mode: "worker-ro", cwd: cargoWorkDir }, cargoEnv),
+      );
+      const rc = await runProcess(wrapped.cmd, wrapped.args, { env: cargoEnv, timeoutMs: 10_000 });
+      assert.equal(rc.code, 0, rc.stderr);
+      assert.match(rc.stdout, /BIN=CARGO_BIN_OK/);
+      assert.match(rc.stdout, /CRED=HIDDEN/, "~/.cargo/bin 在 PATH 中时绝不得暴露 ~/.cargo/credentials.toml");
+    }
+
+    // 3) [R20 #3 P1] 豆包 npm 启动器（校验 ${XDG_DATA_HOME:-$HOME/.local/share}/doubao_cli/app/current 并拉起二进制）在隔离沙箱内正常运行
+    {
+      const dbHome = path.join(dir, "doubao-home");
+      const xdgData = path.join(dir, "doubao-xdg-data");
+      const appCurrent = path.join(xdgData, "doubao_cli", "app", "current");
+      const appDownloads = path.join(xdgData, "doubao_cli", "app", "downloads");
+      fs.mkdirSync(appCurrent, { recursive: true });
+      fs.mkdirSync(appDownloads, { recursive: true });
+      fs.writeFileSync(path.join(appCurrent, "manifest.json"), JSON.stringify({ version: "1.2.3" }));
+      fs.writeFileSync(
+        path.join(appCurrent, "doubao"),
+        [
+          "#!/bin/sh",
+          `echo "DOUBAO_RUNTIME_OK;DL=$(test -e ${JSON.stringify(path.join(appDownloads, "secret.bin"))} && echo LEAK || echo HIDDEN)"`,
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      fs.writeFileSync(path.join(appDownloads, "secret.bin"), "unrelated");
+
+      const rtPaths = selectDoubaoRuntimePaths({ HOME: dbHome, XDG_DATA_HOME: xdgData });
+      assert.ok(rtPaths.includes(appCurrent), "selectDoubaoRuntimePaths 必须包含 doubao_cli/app/current");
+
+      if (process.platform === "linux" && hasCredentialMountIsolation()) {
+        // 构造真实 npm 启动器目录结构（bin/doubao -> ../lib/node_modules/@bytedance/doubao-cli/run.mjs）
+        const dbPrefix = path.join(dir, "doubao-npm");
+        const dbPkg = path.join(dbPrefix, "lib", "node_modules", "@bytedance", "doubao-cli");
+        fs.mkdirSync(path.join(dbPrefix, "bin"), { recursive: true });
+        fs.mkdirSync(dbPkg, { recursive: true });
+        fs.writeFileSync(path.join(dbPkg, "package.json"), JSON.stringify({ name: "@bytedance/doubao-cli", version: "1.0.0", type: "module" }));
+        fs.writeFileSync(
+          path.join(dbPkg, "run.mjs"),
+          [
+            "#!/usr/bin/env node",
+            'import fs from "node:fs";',
+            'import path from "node:path";',
+            'import { spawnSync } from "node:child_process";',
+            'const base = process.env.XDG_DATA_HOME || path.join(process.env.HOME, ".local", "share");',
+            'const current = path.join(base, "doubao_cli", "app", "current");',
+            'const st = fs.lstatSync(current);',
+            'if (!st.isDirectory() || st.isSymbolicLink()) process.exit(21);',
+            'const mf = JSON.parse(fs.readFileSync(path.join(current, "manifest.json"), "utf8"));',
+            'if (mf.version !== "1.2.3") process.exit(22);',
+            'const r = spawnSync(path.join(current, "doubao"), [], { stdio: "inherit" });',
+            'process.exit(r.status ?? 1);',
+          ].join("\n"),
+          { mode: 0o755 },
+        );
+        const launcherBin = path.join(dbPrefix, "bin", "doubao");
+        fs.symlinkSync("../lib/node_modules/@bytedance/doubao-cli/run.mjs", launcherBin);
+
+        const dbCfgFile = path.join(dir, "doubao-r20.yaml");
+        fs.writeFileSync(
+          dbCfgFile,
+          [
+            `data_dir: ${path.join(dir, "doubao-data")}`,
+            `bins: { lark: ${JSON.stringify(path.join(STUBS, "lark-cli"))}, acpx: ${JSON.stringify(path.join(STUBS, "acpx"))} }`,
+            "owner: { open_id: ou_r20_db }",
+            "harnesses:",
+            `  db: { type: doubao-cli, cmd: ${JSON.stringify(launcherBin)}, env: { HOME: ${JSON.stringify(dbHome)}, XDG_DATA_HOME: ${JSON.stringify(xdgData)} } }`,
+            "roles: { brain: db }",
+            "context: { personal_web: { enabled: true } }",
+          ].join("\n"),
+        );
+        const dbCfg = loadConfig(dbCfgFile);
+        const dbCwd = path.join(dir, "doubao-cwd");
+        fs.mkdirSync(dbCwd, { recursive: true });
+        const dbRes = await runHarness(dbCfg, {
+          harness: "db",
+          prompt: "hi",
+          cwd: dbCwd,
+          tools: "read",
+          lark: "none",
+          timeoutSec: 30,
+          logFile: path.join(dir, "doubao-r20.log"),
+        });
+        assert.equal(dbRes.ok, true, `隔离豆包 CLI 必须能启动 app/current 二进制：${dbRes.text}`);
+        assert.match(dbRes.text, /DOUBAO_RUNTIME_OK/);
+        assert.match(dbRes.text, /DL=HIDDEN/, "只应挂载 app/current，不应暴露 app/downloads");
+      }
+    }
+
+    // 6) [R20 #6 P1] git worktree add 仅挂载新建派单目录可写，同级在途 worktree 对 checkout filter 不可见且不可写
+    if (process.platform === "linux" && hasCredentialMountIsolation()) {
+      const wtData = path.join(dir, "wt-iso-data");
+      const siblingWt = path.join(wtData, "worktrees", "other001");
+      fs.mkdirSync(siblingWt, { recursive: true });
+      const siblingFile = path.join(siblingWt, "in-progress.txt");
+      fs.writeFileSync(siblingFile, "ORIGINAL_SIBLING_WORK");
+
+      const filterRepo = path.join(dir, "filter-repo");
+      fs.mkdirSync(filterRepo, { recursive: true });
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: "r20",
+        GIT_AUTHOR_EMAIL: "r20@test",
+        GIT_COMMITTER_NAME: "r20",
+        GIT_COMMITTER_EMAIL: "r20@test",
+      };
+      assert.equal((await runProcess("git", ["init", "-q", "-b", "main", filterRepo], { env: gitEnv })).code, 0);
+      fs.writeFileSync(path.join(filterRepo, ".gitattributes"), "*.smudge filter=evil\n");
+      fs.writeFileSync(path.join(filterRepo, "demo.smudge"), "hello\n");
+      assert.equal((await runProcess("git", ["-C", filterRepo, "add", "-A"], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", filterRepo, "commit", "-q", "-m", "init"], { env: gitEnv })).code, 0);
+      // 模拟仓库本地配置了尝试篡改同级 worktree 的 smudge filter
+      assert.equal(
+        (await runProcess(
+          "git",
+          [
+            "-C",
+            filterRepo,
+            "config",
+            "filter.evil.smudge",
+            `sh -c 'echo PWNED > ${siblingFile} 2>/dev/null || true; cat'`,
+          ],
+          { env: gitEnv },
+        )).code,
+        0,
+      );
+
+      const wtCfgFile = path.join(dir, "wt-iso.yaml");
+      fs.writeFileSync(
+        wtCfgFile,
+        [
+          `data_dir: ${wtData}`,
+          `bins: { lark: ${JSON.stringify(path.join(STUBS, "lark-cli"))}, acpx: ${JSON.stringify(path.join(STUBS, "acpx"))} }`,
+          "owner: { open_id: ou_r20_wt }",
+          "harnesses: { claude: { agent: claude } }",
+          "roles: { brain: claude }",
+          `dispatch: { repos: { fdemo: ${JSON.stringify(filterRepo)} } }`,
+        ].join("\n"),
+      );
+      const wtApp = createApp(loadConfig(wtCfgFile));
+      try {
+        const disp = new Dispatcher(wtApp.cfg, wtApp.ledger, wtApp.store, wtApp.board);
+        const ws = await (disp as unknown as {
+          prepareWorkspace: (t: { guid: string; summary: string; description: string }) => Promise<{ cwd: string; branch: string }>;
+        }).prepareWorkspace({ guid: "newdisp1_guid", summary: "新建派单", description: "repo: fdemo" });
+        assert.ok(fs.existsSync(path.join(ws.cwd, "demo.smudge")), "新派单 worktree 应成功检出");
+        assert.equal(fs.readFileSync(siblingFile, "utf8"), "ORIGINAL_SIBLING_WORK", "同级在途 worktree 绝不得被新 worktree 创建过程篡改");
+      } finally {
+        wtApp.store.db.close();
+      }
+    }
+
+    // 2) [R20 #2 P1] & 7) [R20 #7 P2] & 10) [R20 #10 P2] & 12) [R20 #12 P3]
+    // 普通 IM 轮询撤回 deleted 消息 + 单流显式 @mention 归类 + bot_allow 热重载策略重检 + Unicode 派单搜索
+    {
+      const connData = path.join(dir, "conn-r20-data");
+      const connCfgFile = path.join(dir, "conn-r20.yaml");
+      fs.writeFileSync(
+        connCfgFile,
+        [
+          `data_dir: ${connData}`,
+          `bins: { lark: ${JSON.stringify(path.join(STUBS, "lark-cli"))}, acpx: ${JSON.stringify(path.join(STUBS, "acpx"))} }`,
+          "owner: { open_id: ou_r20_me }",
+          "harnesses: { claude: { agent: claude } }",
+          "roles: { brain: claude }",
+          "context:",
+          "  enabled: true",
+          "  groups: allowlist",
+          '  groups_allow: ["oc_r20_team"]',
+          "  groups_deny: []",
+          '  bot_allow: ["CalendarBot"]',
+          "  sources: { meego: false, im: true, minutes: false, calendar: false, tasks: false, docs: false }",
+        ].join("\n"),
+      );
+      app = createApp(loadConfig(connCfgFile));
+      app.store.set("owner.open_id", "ou_r20_me");
+      const ctxSvc = new ContextService(app);
+      const nowMs = Date.now();
+
+      // 预先写入一条待处理观测，稍后通过普通 +chat-messages-list 返回 deleted: true 验证其被撤回
+      ctxSvc.store.addObs([
+        {
+          id: "im:om_r20_recalled",
+          source: "im",
+          kind: "group",
+          conv: "oc_r20_team",
+          conv_name: "研发群",
+          actor_id: "ou_bob",
+          actor_name: "Bob",
+          is_me: false,
+          time: nowMs - 5000,
+          text: "即将撤回的敏感正文",
+          url: "",
+          meta: {},
+        },
+      ]);
+
+      let authCalls = 0;
+      const fakeLark = app.lark as unknown as {
+        authStatus: () => Promise<unknown>;
+        run: (argv: string[]) => Promise<unknown>;
+      };
+      fakeLark.authStatus = async () => {
+        authCalls++;
+        // 在第 2 次提交前身份核验时热清空 bot_allow，验证策略签名变化触发重试并剔除 CalendarBot 消息
+        if (authCalls === 2) {
+          app!.cfg.context.bot_allow = [];
+        }
+        return { identity: "user", user: { open_id: "ou_r20_me", name: "我" } };
+      };
+      fakeLark.run = async (argv: string[]) => {
+        if (argv[0] === "im" && argv[1] === "+chat-messages-list") {
+          return {
+            has_more: false,
+            messages: [
+              // [R20 #2] 普通群轮询返回已撤回消息（deleted: true + 空正文）
+              {
+                message_id: "om_r20_recalled",
+                chat_id: "oc_r20_team",
+                chat_type: "group",
+                chat_name: "研发群",
+                sender: { id: "ou_bob", name: "Bob", sender_type: "user" },
+                content: "",
+                deleted: true,
+                create_time: String(nowMs - 5000),
+              },
+              // [R20 #7] 仅在群列表出现的消息，但 mentions 显式包含主人 ou_r20_me
+              {
+                message_id: "om_r20_explicit_atme",
+                chat_id: "oc_r20_team",
+                chat_type: "group",
+                chat_name: "研发群",
+                sender: { id: "ou_alice", name: "Alice", sender_type: "user" },
+                content: "@我 请看下这个 PR",
+                mentions: [{ id: "ou_r20_me", name: "我" }],
+                create_time: String(nowMs - 2000),
+              },
+              // [R20 #10] 机器人消息：初始在 bot_allow，但在最终提交前被热移出
+              {
+                message_id: "om_r20_bot",
+                chat_id: "oc_r20_team",
+                chat_type: "group",
+                chat_name: "研发群",
+                sender: { id: "cli_bot", name: "CalendarBot", sender_type: "app" },
+                content: "会议日程提醒",
+                create_time: String(nowMs - 1000),
+              },
+            ],
+          };
+        }
+        return { has_more: false, messages: [] };
+      };
+
+      await ctxSvc.connectors.pullIm();
+      assert.equal(ctxSvc.store.obs("im:om_r20_recalled")?.meta.withdrawn, true, "普通轮询收到 deleted=true 必须撤回已存观测");
+      assert.equal(ctxSvc.store.obsPending("im:om_r20_recalled"), false, "已撤回消息不得继续留在待处理队列");
+      const explicitAt = ctxSvc.store.obs("im:om_r20_explicit_atme");
+      assert.equal(explicitAt?.kind, "at_me", "单流群消息带显式 mentions 包含主人时必须归类为 at_me");
+      assert.equal(explicitAt?.meta.at_me, true, "单流显式 @mention 必须设置 meta.at_me = true");
+      const mentionOnlyWin = ctxSvc.store.convWindow("oc_r20_team", 10, 10, undefined, { onlyMentions: true });
+      assert.ok(mentionOnlyWin.some((o: Obs) => o.id === "im:om_r20_explicit_atme"), "显式 @mention 必须能进入 onlyMentions 窗口");
+      assert.ok(!mentionOnlyWin.some((o: Obs) => o.id === "im:om_r20_recalled"), "已撤回消息不得进入理解窗口");
+      assert.equal(ctxSvc.store.obs("im:om_r20_bot"), undefined, "提交前 bot_allow 清空后必须重试过滤并丢弃该机器人消息");
+
+      // [R20 #12 P3] Unicode 大小写折叠派单搜索（İstanbul / Kelvin）
+      app.ledger.enqueue({
+        id: "dispatch:u_ist:1",
+        kind: "dispatch",
+        ref: "u_ist",
+        state: "queued",
+        payload: { guid: "u_ist", summary: "İstanbul 发布检查", description: "" },
+      });
+      app.ledger.enqueue({
+        id: "dispatch:u_kel:2",
+        kind: "dispatch",
+        ref: "u_kel",
+        state: "queued",
+        payload: { guid: "u_kel", summary: "Kelvin 传感器校准", description: "" },
+      });
+      assert.equal(Q.listDispatches(app, { filter: "all", q: "İstanbul" }).length, 1, "精确查询 İstanbul 必须命中");
+      assert.equal(Q.listDispatches(app, { filter: "all", q: "i\u0307stanbul" }).length, 1, "JS 折叠查询 i\\u0307stanbul 必须命中 İstanbul");
+      assert.equal(Q.listDispatches(app, { filter: "all", q: "Kelvin" }).length, 1, "精确查询 Kelvin 必须命中");
+      assert.equal(Q.listDispatches(app, { filter: "all", q: "kelvin" }).length, 1, "ASCII 小写查询 kelvin 必须命中 Kelvin");
+    }
+
+    // 8) [R20 #8 P2] & 9) [R20 #9 P2] 按传输协议最小化 SSH 挂载 + 原位保留 Git credential.helper 优先级
+    {
+      assert.equal(classifyGitRemoteTransport(dir, "https://github.com/org/repo.git"), "http");
+      assert.equal(classifyGitRemoteTransport(dir, "."), "local");
+      assert.equal(classifyGitRemoteTransport(dir, "file:///tmp/bare.git"), "local");
+      assert.equal(classifyGitRemoteTransport(dir, "git@github.example:org/repo.git"), "ssh");
+      assert.equal(classifyGitRemoteTransport(dir, "ssh://git@gitlab.example:2222/org/repo.git"), "ssh");
+
+      // SSH 最小化文件收集：只挂载匹配 Host 的 IdentityFile，绝不暴露其他私钥
+      const sshHome = path.join(dir, "ssh-scoped-home");
+      const sshDir = path.join(sshHome, ".ssh");
+      fs.mkdirSync(sshDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(sshDir, "config"),
+        [
+          "Host github.example",
+          "  IdentityFile ~/.ssh/id_github_only",
+          "",
+          "Host bastion.internal",
+          "  IdentityFile ~/.ssh/id_bastion_secret",
+        ].join("\n"),
+      );
+      fs.writeFileSync(path.join(sshDir, "known_hosts"), "github.example ssh-ed25519 AAAA\n");
+      fs.writeFileSync(path.join(sshDir, "id_github_only"), "KEY_GITHUB", { mode: 0o600 });
+      fs.writeFileSync(path.join(sshDir, "id_bastion_secret"), "KEY_BASTION_NO_LEAK", { mode: 0o600 });
+      const sshScoped = collectScopedSshMounts(["github.example"], { HOME: sshHome }, dataDir, false);
+      assert.ok(sshScoped.readOnlyPaths.some((p) => p.endsWith(`${path.sep}id_github_only`)), "应挂载匹配 Host 的私钥");
+      assert.ok(sshScoped.readOnlyPaths.some((p) => p.endsWith(`${path.sep}config`)), "应挂载 ~/.ssh/config");
+      assert.ok(sshScoped.readOnlyPaths.some((p) => p.endsWith(`${path.sep}known_hosts`)), "应挂载 ~/.ssh/known_hosts");
+      assert.ok(
+        !sshScoped.readOnlyPaths.some((p) => p.endsWith(`${path.sep}id_bastion_secret`) || p === fs.realpathSync(sshDir)),
+        "绝不得整目录挂载 ~/.ssh 或暴露其他 Host 的私钥",
+      );
+
+      // credential.helper 优先级原位替换验证
+      const active = new Map<string, string[]>([
+        ["credential.helper", ["manager", "store", "cache --timeout=60"]],
+        ["credential.https://other.example.helper", ["osxkeychain"]],
+      ]);
+      const rewritten = rewriteGitCredentialHelperChain(active, new Set(["credential.helper"]), "/tmp/scoped-creds", sshHome);
+      assert.deepEqual(rewritten, [
+        "-c",
+        "credential.helper=",
+        "-c",
+        "credential.helper=manager",
+        "-c",
+        "credential.helper=store --file=/tmp/scoped-creds",
+        "-c",
+        "credential.helper=cache --timeout=60",
+      ]);
+
+      // 实跑隔离下的优先级链：第 1 个 helper（正确口令）排在第 2 个 store（过期口令）前面 -> 必须优先命中第 1 个 helper 并认证成功
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: "r20",
+        GIT_AUTHOR_EMAIL: "r20@test",
+        GIT_COMMITTER_NAME: "r20",
+        GIT_COMMITTER_EMAIL: "r20@test",
+      };
+      const precRepo = path.join(dir, "prec-repo");
+      fs.mkdirSync(precRepo, { recursive: true });
+      assert.equal((await runProcess("git", ["init", "-q", "-b", "main", precRepo], { env: gitEnv })).code, 0);
+      fs.writeFileSync(path.join(precRepo, "a.txt"), "a\n");
+      assert.equal((await runProcess("git", ["-C", precRepo, "add", "-A"], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", precRepo, "commit", "-q", "-m", "init"], { env: gitEnv })).code, 0);
+      const headSha = (await runProcess("git", ["-C", precRepo, "rev-parse", "HEAD"], { env: gitEnv })).stdout.trim();
+
+      const mgrAuth = `Basic ${Buffer.from("mgruser:freshpass").toString("base64")}`;
+      httpGitSrv = http.createServer((req, res) => {
+        if ((req.headers.authorization ?? "") !== mgrAuth) {
+          res.statusCode = 401;
+          res.setHeader("WWW-Authenticate", 'Basic realm="r20"');
+          res.end("auth required");
+          return;
+        }
+        if ((req.url ?? "").startsWith("/org/prec.git/info/refs")) {
+          res.setHeader("Content-Type", "text/plain");
+          res.end(`${headSha}\trefs/heads/main\n`);
+          return;
+        }
+        res.statusCode = 404;
+        res.end("not found");
+      });
+      await new Promise<void>((resolve) => httpGitSrv!.listen(0, "127.0.0.1", resolve));
+      const port = (httpGitSrv.address() as { port: number }).port;
+      const precHome = path.join(dir, "prec-home");
+      fs.mkdirSync(precHome, { recursive: true });
+      fs.writeFileSync(
+        path.join(precHome, ".gitconfig"),
+        [
+          "[credential]",
+          '\thelper = "!f() { test \\"$1\\" = get && printf \'username=mgruser\\\\npassword=freshpass\\\\n\'; }; f"',
+          "\thelper = store",
+        ].join("\n") + "\n",
+      );
+      fs.writeFileSync(
+        path.join(precHome, ".git-credentials"),
+        `http://olduser:STALE_PASS@127.0.0.1:${port}\n`,
+        { mode: 0o600 },
+      );
+      const lsRes = await tryGit(precRepo, ["ls-remote", `http://127.0.0.1:${port}/org/prec.git`], {
+        readOnly: true,
+        extraEnv: { HOME: precHome },
+      });
+      assert.equal(lsRes.code, 0, `排在 store 前面的 credential helper 必须保持优先级并完成认证：${lsRes.stderr}`);
+      assert.match(lsRes.stdout, new RegExp(headSha));
+    }
+  } finally {
+    if (httpGitSrv) await new Promise<void>((resolve) => httpGitSrv!.close(() => resolve()));
+    app?.store.db.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -613,16 +613,25 @@ export class Dispatcher {
     const branch = `pa/${short}`;
     const baseKey = `worktree.${t.guid}.base`;
     if (!fs.existsSync(cwd)) {
-      const wtParent = path.join(this.cfg.dataDir, "worktrees");
-      fs.mkdirSync(wtParent, { recursive: true });
-      const head = await git(spec.path, ["rev-parse", "HEAD"], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path });
-      const hasBranch = (await tryGit(spec.path, ["rev-parse", "--verify", "--quiet", branch], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path })).code === 0;
-      await git(
-        spec.path,
-        hasBranch ? ["worktree", "add", cwd, branch] : ["worktree", "add", "-b", branch, cwd],
-        { cfg: this.cfg, trustedRepoRoot: spec.path, extraWritablePaths: [wtParent] },
-      );
-      if (!this.store.get(baseKey)) this.store.set(baseKey, head.trim());
+      // 预先仅创建本次派单专属空目录并只将该目录开放给 git worktree add，绝不把包含其他在途派单的 worktrees/ 父目录设为可写
+      fs.mkdirSync(cwd, { recursive: true });
+      try {
+        const head = await git(spec.path, ["rev-parse", "HEAD"], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path });
+        const hasBranch = (await tryGit(spec.path, ["rev-parse", "--verify", "--quiet", branch], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path })).code === 0;
+        await git(
+          spec.path,
+          hasBranch ? ["worktree", "add", cwd, branch] : ["worktree", "add", "-b", branch, cwd],
+          { cfg: this.cfg, trustedRepoRoot: spec.path, extraWritablePaths: [cwd] },
+        );
+        if (!this.store.get(baseKey)) this.store.set(baseKey, head.trim());
+      } catch (err) {
+        try {
+          if (fs.existsSync(cwd) && fs.readdirSync(cwd).length === 0) fs.rmdirSync(cwd);
+        } catch {
+          // 忽略空目录回滚失败
+        }
+        throw err;
+      }
     }
     const base = this.store.get(baseKey) ?? "";
     return { cwd, branch, base, verify: spec.verify ?? "" };

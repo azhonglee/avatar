@@ -4,6 +4,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -16,6 +17,11 @@ import { hasCredentialMountIsolation } from "../src/harness.ts";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const STUBS = path.join(ROOT, "test", "stubs");
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pa-e2e-"));
+const HANG_MARKERS: Record<string, string> = {
+  crash: path.join(tmp, "hang"),
+  cancel: path.join(tmp, "hang-cancel"),
+};
+const RPC_TOKEN = crypto.randomBytes(24).toString("hex");
 let stubRpcWorker: Worker | undefined;
 const env = {
   ...process.env,
@@ -25,6 +31,7 @@ const env = {
   STUB_ACPX_LOG: path.join(tmp, "acpx-calls.ndjson"),
   STUB_EVENTS_DIR: path.join(tmp, "events"),
   STUB_RPC_URL: "",
+  STUB_RPC_TOKEN: RPC_TOKEN,
 };
 const state = () => JSON.parse(fs.readFileSync(env.STUB_STATE!, "utf8"));
 const pa = (...args: string[]) => execFileSync(path.join(ROOT, "bin", "pa"), args, { env, encoding: "utf8", cwd: tmp });
@@ -60,7 +67,8 @@ const latestStepPid = (ref: string): number => {
 };
 
 before(async () => {
-  // 在独立 Worker 线程运行本地测试桩 RPC 服务，避免主线程 execFileSync 阻塞事件循环
+  // 在独立 Worker 线程运行本地测试桩 RPC 服务，避免主线程 execFileSync 阻塞事件循环；
+  // 严格校验每轮随机令牌且仅允许通过固定 marker ID 读写白名单挂起标记，绝不接受调用方传入任意宿主机路径
   const workerSrc = `
     const http = require("node:http");
     const fs = require("node:fs");
@@ -70,20 +78,27 @@ before(async () => {
       req.on("data", (c) => chunks.push(c));
       req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     });
+    const resolveMarker = (id) => (id && Object.prototype.hasOwnProperty.call(workerData.markers, id) ? workerData.markers[id] : "");
     const srv = http.createServer(async (req, res) => {
+      if (req.headers["x-stub-token"] !== workerData.token) {
+        res.statusCode = 403;
+        return res.end("forbidden");
+      }
       const u = new URL(req.url || "/", "http://127.0.0.1");
       if (req.method === "POST" && u.pathname === "/acpx-log") {
         fs.appendFileSync(workerData.acpxLog, await readBody(req));
         return res.end("ok");
       }
       if (req.method === "GET" && u.pathname === "/hang-check") {
-        const f = u.searchParams.get("file") || "";
-        return res.end(f && fs.existsSync(f) ? fs.readFileSync(f, "utf8") : "");
+        const f = resolveMarker(u.searchParams.get("id") || "");
+        if (!f) { res.statusCode = 400; return res.end("unknown marker"); }
+        return res.end(fs.existsSync(f) ? fs.readFileSync(f, "utf8") : "");
       }
       if (req.method === "POST" && u.pathname === "/hang-mark") {
-        const f = u.searchParams.get("file") || "";
+        const f = resolveMarker(u.searchParams.get("id") || "");
+        if (!f) { res.statusCode = 400; return res.end("unknown marker"); }
         const body = await readBody(req);
-        if (f) fs.writeFileSync(f, body || "started");
+        fs.writeFileSync(f, body || "started");
         return res.end("ok");
       }
       if (req.method === "GET" && u.pathname === "/lark-state") {
@@ -107,7 +122,13 @@ before(async () => {
   `;
   stubRpcWorker = new Worker(workerSrc, {
     eval: true,
-    workerData: { acpxLog: env.STUB_ACPX_LOG, statePath: env.STUB_STATE, larkLog: env.STUB_LOG },
+    workerData: {
+      acpxLog: env.STUB_ACPX_LOG,
+      statePath: env.STUB_STATE,
+      larkLog: env.STUB_LOG,
+      markers: HANG_MARKERS,
+      token: RPC_TOKEN,
+    },
   });
   const port = await new Promise<number>((resolve, reject) => {
     stubRpcWorker!.once("message", (msg: { port: number }) => resolve(msg.port));
@@ -145,7 +166,15 @@ after(async () => {
   fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 });
 
-test("init：记录主人 open_id，建看板分组和知识库节点", () => {
+test("init：记录主人 open_id，建看板分组和知识库节点", async () => {
+  // 校验测试桩 RPC 严格鉴权且拒绝非白名单 marker ID（绝不读写任意宿主机路径）
+  const unauth = await fetch(`${env.STUB_RPC_URL}/hang-check?id=crash`);
+  assert.equal(unauth.status, 403);
+  const badMarker = await fetch(`${env.STUB_RPC_URL}/hang-check?id=${encodeURIComponent("/etc/passwd")}`, {
+    headers: { "x-stub-token": RPC_TOKEN },
+  });
+  assert.equal(badMarker.status, 400);
+
   const out = pa("init");
   assert.match(out, /ou_owner/);
   const s = state();
@@ -224,10 +253,10 @@ test("验收关卡：审查一直打回 → 返工一轮后进“需人工介入
 });
 
 test("崩溃恢复：执行中 kill -9 常驻进程，再次运行时结束遗留进程、回到检查点重跑并完成", async () => {
-  const hangFile = path.join(tmp, "hang");
+  const hangFile = HANG_MARKERS.crash;
   fs.writeFileSync(hangFile, "armed");
   addCard("task_crash_1", "[codex] 崩溃恢复", "repo: demo");
-  const env2 = { ...env, STUB_HANG_FILE: hangFile };
+  const env2 = { ...env, STUB_HANG_FILE: hangFile, STUB_HANG_ID: "crash" };
   const daemon = spawn(path.join(ROOT, "bin", "pa"), ["run"], { env: env2, cwd: tmp, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
   daemon.stdout.on("data", (d) => (output += d));
@@ -288,10 +317,10 @@ test("崩溃恢复：执行中 kill -9 常驻进程，再次运行时结束遗�
 });
 
 test("取消：执行中把卡片拖回 Inbox，对账按 ID 核实后取消，结束正在跑的 harness", async () => {
-  const hangFile = path.join(tmp, "hang-cancel");
+  const hangFile = HANG_MARKERS.cancel;
   fs.writeFileSync(hangFile, "armed");
   addCard("task_cancel_1", "[codex] 取消测试", "repo: demo");
-  const env2 = { ...env, STUB_HANG_FILE: hangFile };
+  const env2 = { ...env, STUB_HANG_FILE: hangFile, STUB_HANG_ID: "cancel" };
   const daemon = spawn(path.join(ROOT, "bin", "pa"), ["run"], { env: env2, cwd: tmp, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
   daemon.stdout.on("data", (d) => (output += d));

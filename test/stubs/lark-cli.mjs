@@ -5,6 +5,7 @@ import path from "node:path";
 const argv = process.argv.slice(2);
 const statePath = process.env.STUB_STATE;
 const rpcUrl = process.env.STUB_RPC_URL;
+const rpcHeaders = process.env.STUB_RPC_TOKEN ? { "x-stub-token": process.env.STUB_RPC_TOKEN } : {};
 const useRpc = !!rpcUrl && !!statePath && !fs.existsSync(statePath);
 // 多个桩进程会并发运行（常驻进程里事件和定时任务并行），读-改-写状态文件前先拿文件锁
 const lockPath = !useRpc && statePath && `${statePath}.lock`;
@@ -25,7 +26,7 @@ if (lockPath && !(argv[0] === "event" && argv[1] === "consume")) {
 }
 let state = { tasks: {}, messages: [], seq: 0, sections: [] };
 if (useRpc) {
-  const r = await fetch(`${rpcUrl}/lark-state`);
+  const r = await fetch(`${rpcUrl}/lark-state`, { headers: rpcHeaders });
   if (r.ok) state = await r.json();
 } else if (statePath && fs.existsSync(statePath)) {
   state = JSON.parse(fs.readFileSync(statePath, "utf8"));
@@ -44,7 +45,7 @@ const readStdin = () => {
 // 原子写：测试会在任意时刻读取状态文件
 const save = async () => {
   if (useRpc) {
-    await fetch(`${rpcUrl}/lark-state`, { method: "POST", body: JSON.stringify(state) });
+    await fetch(`${rpcUrl}/lark-state`, { method: "POST", headers: rpcHeaders, body: JSON.stringify(state) });
     return;
   }
   if (!statePath) return;
@@ -63,7 +64,7 @@ const fail = (message, code = 1) => {
 const log = async (extra = {}) => {
   const line = JSON.stringify({ argv, ...extra }) + "\n";
   if (useRpc) {
-    await fetch(`${rpcUrl}/lark-log`, { method: "POST", body: line });
+    await fetch(`${rpcUrl}/lark-log`, { method: "POST", headers: rpcHeaders, body: line });
     return;
   }
   if (process.env.STUB_LOG) fs.appendFileSync(process.env.STUB_LOG, line);

@@ -17,11 +17,12 @@ const cwd = flag("--cwd");
 const agent = argv[argv.indexOf("exec") - 1];
 const perm = argv.find((a) => ["--approve-all", "--approve-reads", "--deny-all"].includes(a));
 const rpcUrl = process.env.STUB_RPC_URL;
+const rpcHeaders = process.env.STUB_RPC_TOKEN ? { "x-stub-token": process.env.STUB_RPC_TOKEN } : {};
 const logAcpx = async (entry) => {
   const line = JSON.stringify(entry) + "\n";
   if (rpcUrl) {
     try {
-      const res = await fetch(`${rpcUrl}/acpx-log`, { method: "POST", body: line });
+      const res = await fetch(`${rpcUrl}/acpx-log`, { method: "POST", headers: rpcHeaders, body: line });
       if (res.ok) return;
     } catch {
       // fall back to local file
@@ -51,31 +52,30 @@ if (prompt.includes("<signal id=")) {
     process.stdout.write('```json\n{"verdict":"changes","summary":"还不够好","issues":[{"severity":"high","location":"hello.txt","problem":"内容不对","suggestion":"重写"}]}\n```\n');
   else process.stdout.write('改动符合要求，没有发现问题。\n```json\n{"verdict":"approve","summary":"改动符合要求","issues":[]}\n```\n');
 } else if (prompt.includes("你是一名执行者")) {
-  // 崩溃测试：STUB_HANG_FILE 内容为 armed 时，先留下一个未提交的半成品，再记下自己的 pid 并卡住
+  // 崩溃测试：STUB_HANG_ID / STUB_HANG_FILE 内容为 armed 时，先留下一个未提交的半成品，再记下自己的 pid 并卡住
   const hang = process.env.STUB_HANG_FILE;
+  const hangId = process.env.STUB_HANG_ID;
   let hangArmed = false;
   let hangViaRpc = false;
-  if (hang) {
-    if (rpcUrl) {
-      try {
-        const res = await fetch(`${rpcUrl}/hang-check?file=${encodeURIComponent(hang)}`);
-        if (res.ok) {
-          hangArmed = (await res.text()) === "armed";
-          hangViaRpc = true;
-        }
-      } catch {
-        // fall back to disk
+  if (rpcUrl && hangId) {
+    try {
+      const res = await fetch(`${rpcUrl}/hang-check?id=${encodeURIComponent(hangId)}`, { headers: rpcHeaders });
+      if (res.ok) {
+        hangArmed = (await res.text()) === "armed";
+        hangViaRpc = true;
       }
-    }
-    if (!hangViaRpc && fs.existsSync(hang)) {
-      hangArmed = fs.readFileSync(hang, "utf8") === "armed";
+    } catch {
+      // fall back to disk
     }
   }
-  if (hang && hangArmed) {
+  if (!hangViaRpc && hang && fs.existsSync(hang)) {
+    hangArmed = fs.readFileSync(hang, "utf8") === "armed";
+  }
+  if (hangArmed) {
     fs.writeFileSync(path.join(cwd, "partial.txt"), "half done\n");
-    if (hangViaRpc && rpcUrl) {
-      await fetch(`${rpcUrl}/hang-mark?file=${encodeURIComponent(hang)}`, { method: "POST", body: String(process.pid) });
-    } else {
+    if (hangViaRpc && rpcUrl && hangId) {
+      await fetch(`${rpcUrl}/hang-mark?id=${encodeURIComponent(hangId)}`, { method: "POST", headers: rpcHeaders, body: String(process.pid) });
+    } else if (hang) {
       fs.writeFileSync(hang, String(process.pid));
     }
     setInterval(() => undefined, 1 << 30);
