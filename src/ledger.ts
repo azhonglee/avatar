@@ -398,6 +398,7 @@ export class Ledger {
     terminal?: boolean;
     ref?: string;
     search?: string;
+    updatedSince?: number;
     limit?: number;
     before?: number;
   }): WorkItem<P>[] {
@@ -414,6 +415,10 @@ export class Ledger {
     if (f.ref) {
       where.push("ref = ?");
       args.push(f.ref);
+    }
+    if (f.updatedSince !== undefined) {
+      where.push("updated > ?");
+      args.push(f.updatedSince);
     }
     if (f.search) {
       const q = f.search.trim().toLowerCase();

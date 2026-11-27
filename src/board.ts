@@ -52,11 +52,19 @@ export class Board {
         if (!tasklist) throw new Error(`创建任务清单失败：${JSON.stringify(created)}`);
         log("info", "已创建任务清单", { name: this.cfg.board.name, guid: tasklist });
       }
+      // 搜索/创建清单后、原子落盘前再次核验活跃 lark-cli 用户与配置主人一致，
+      // 防止调用期间切号导致把他人账号的任务清单 GUID 绑定成当前主人
+      const { openId: postOwner } = await verifyActiveLarkUser(this.lark, authedOwner, "绑定任务看板");
+      if (postOwner !== authedOwner || postOwner !== this.cfg.owner.open_id.trim()) {
+        throw new Error(
+          `初始化任务看板期间活跃 lark-cli 用户发生变更 (${authedOwner} -> ${postOwner})，拒绝持久化看板绑定以防跨账号混用`,
+        );
+      }
       // 将看板 ID 与已核验主人原子落盘，防止初始化中途崩溃导致遗留无主 board.tasklist
       this.store.db.exec("BEGIN IMMEDIATE");
       try {
         this.store.set("board.tasklist", tasklist);
-        this.store.set("board.owner_open_id", authedOwner);
+        this.store.set("board.owner_open_id", postOwner);
         this.store.db.exec("COMMIT");
       } catch (err) {
         try {

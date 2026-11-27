@@ -310,13 +310,14 @@ export function registerDelivery(app: App): void {
 
 /**
  * 当已放弃派单的 worktree 目录已被外部手动删除时，仅在宿主机定向清理指向该路径的单个 `.git/worktrees/<name>` 管理记录；
- * 严禁在隔离沙箱内执行全局 `git worktree prune`（沙箱遮蔽了 `/tmp` 与其他目录，会误删宿主机上其他正常未解锁 worktree 的记录）。
+ * 严禁在隔离沙箱内执行全局 `git worktree prune`（沙箱遮蔽了 `/tmp` 与其他目录，会误删宿主机上其他正常未解锁 worktree 的记录）；
+ * 同时尊重 `git worktree lock`：若存在 `locked` 标记文件则保留该管理记录并返回 `locked: true`，由调用方跳过分支删除。
  */
 async function removeStaleWorktreeAdminRecord(
   repoPath: string,
   missingWtDir: string,
   gitOpts: { cfg: Config; trustedRepoRoot: string },
-): Promise<boolean> {
+): Promise<{ removed: boolean; locked: boolean }> {
   const commonRes = await tryGit(repoPath, ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
     ...gitOpts,
     readOnly: true,
@@ -324,11 +325,11 @@ async function removeStaleWorktreeAdminRecord(
   let commonGitDir = commonRes.code === 0 ? commonRes.stdout.trim() : "";
   if (!commonGitDir) {
     const fallbackRes = await tryGit(repoPath, ["rev-parse", "--git-common-dir"], { ...gitOpts, readOnly: true });
-    if (fallbackRes.code !== 0 || !fallbackRes.stdout.trim()) return false;
+    if (fallbackRes.code !== 0 || !fallbackRes.stdout.trim()) return { removed: false, locked: false };
     commonGitDir = path.resolve(repoPath, fallbackRes.stdout.trim());
   }
   const wtAdminRoot = path.join(commonGitDir, "worktrees");
-  if (!fs.existsSync(wtAdminRoot)) return false;
+  if (!fs.existsSync(wtAdminRoot)) return { removed: false, locked: false };
 
   const normalizePath = (p: string): string => {
     const abs = path.resolve(p);
@@ -352,6 +353,7 @@ async function removeStaleWorktreeAdminRecord(
 
   const targetPaths = new Set([path.resolve(missingWtDir), normalizePath(missingWtDir)]);
   let removedAny = false;
+  let lockedAny = false;
   for (const ent of fs.readdirSync(wtAdminRoot, { withFileTypes: true })) {
     if (!ent.isDirectory() || ent.isSymbolicLink()) continue;
     const entryDir = path.join(wtAdminRoot, ent.name);
@@ -363,6 +365,10 @@ async function removeStaleWorktreeAdminRecord(
       const resolvedGitFile = path.resolve(entryDir, raw);
       const wtDir = path.dirname(resolvedGitFile);
       if (targetPaths.has(path.resolve(wtDir)) || targetPaths.has(normalizePath(wtDir))) {
+        if (fs.existsSync(path.join(entryDir, "locked"))) {
+          lockedAny = true;
+          continue;
+        }
         fs.rmSync(entryDir, { recursive: true, force: true });
         removedAny = true;
       }
@@ -370,7 +376,7 @@ async function removeStaleWorktreeAdminRecord(
       // 忽略无法读取的无关记录
     }
   }
-  return removedAny;
+  return { removed: removedAny, locked: lockedAny };
 }
 
   async function cleanup(item: Item): Promise<void> {
@@ -386,6 +392,7 @@ async function removeStaleWorktreeAdminRecord(
     const d = w.payload;
     const spec = repoOf(cfg, d);
     const removed: string[] = [];
+    let lockedWorktree = false;
     if (spec && fs.existsSync(spec.path)) {
       const wtParent = path.join(cfg.dataDir, "worktrees");
       const gitOpts = { cfg, trustedRepoRoot: spec.path };
@@ -393,18 +400,26 @@ async function removeStaleWorktreeAdminRecord(
         await git(spec.path, ["worktree", "remove", "--force", d.cwd], { ...gitOpts, extraWritablePaths: [wtParent] });
         removed.push(`worktree ${d.cwd}`);
       } else if (d.cwd) {
-        if (await removeStaleWorktreeAdminRecord(spec.path, d.cwd, gitOpts)) {
+        const stale = await removeStaleWorktreeAdminRecord(spec.path, d.cwd, gitOpts);
+        if (stale.locked) {
+          lockedWorktree = true;
+          log("warn", "保留已锁定的 worktree 管理记录并跳过关联分支清理", { worktree: d.cwd, branch: d.branch });
+        } else if (stale.removed) {
           removed.push(`失效 worktree 记录 ${d.cwd}`);
         }
       }
-      if (d.branch.startsWith("pa/") && (await branchExists(spec.path, d.branch, gitOpts))) {
+      if (!lockedWorktree && d.branch.startsWith("pa/") && (await branchExists(spec.path, d.branch, gitOpts))) {
         await git(spec.path, ["branch", "-D", d.branch], gitOpts);
         removed.push(`本地分支 ${d.branch}`);
       }
     }
-    // 之后再派这张卡片时重新记录基线
-    if (w.ref) app.store.set(`worktree.${w.ref}.base`, "");
-    const message = removed.length ? `已清理放弃的派单：删除${removed.join("、")}` : "放弃的派单没有需要清理的 worktree 或分支";
+    // 之后再派这张卡片时重新记录基线（锁定 worktree 保留原记录）
+    if (!lockedWorktree && w.ref) app.store.set(`worktree.${w.ref}.base`, "");
+    const message = lockedWorktree
+      ? `该派单关联的 worktree 已被 git worktree lock 锁定，已保留管理记录与分支 ${d.branch || ""}`.trim()
+      : removed.length
+        ? `已清理放弃的派单：删除${removed.join("、")}`
+        : "放弃的派单没有需要清理的 worktree 或分支";
     finish(item, { ...p, message }, removed.length ? say(p.guid, `🧹 ${message}`) : []);
   }
 

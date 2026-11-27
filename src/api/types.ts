@@ -188,6 +188,8 @@ export interface Health {
   daemon: { owner: string | null; last_heartbeat: number | null };
   retrying: HealthItem[];
   failed: HealthItem[];
+  /** 14 天报告窗口内归属当前主人且未确认的待处理失败总数（独立于 failed 列表展示上限） */
+  actionable_failures: number;
   guard: { at: string; profile: string; allow: boolean; reason: string; argv: string[] }[];
 }
 

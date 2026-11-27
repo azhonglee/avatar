@@ -320,6 +320,8 @@ export class ContextStore {
           const wasWithdrawn = curMeta.withdrawn === true;
           const curVer = typeof curMeta.edit_version === "number" && Number.isFinite(curMeta.edit_version) ? curMeta.edit_version : undefined;
           const nextVer = typeof o.meta?.edit_version === "number" && Number.isFinite(o.meta.edit_version) ? o.meta.edit_version : undefined;
+          const curEditTime = typeof curMeta.edit_time === "number" && Number.isFinite(curMeta.edit_time) ? curMeta.edit_time : undefined;
+          const nextEditTime = typeof o.meta?.edit_time === "number" && Number.isFinite(o.meta.edit_time) ? o.meta.edit_time : undefined;
           const curPollAt =
             typeof curMeta.poll_observed_at === "number" && Number.isFinite(curMeta.poll_observed_at)
               ? curMeta.poll_observed_at
@@ -328,9 +330,13 @@ export class ContextStore {
             typeof o.meta?.poll_observed_at === "number" && Number.isFinite(o.meta.poll_observed_at)
               ? o.meta.poll_observed_at
               : undefined;
+          // 仅在同一时钟标尺下判陈旧：修订计数对修订计数，归一化编辑时间戳对编辑时间戳，绝不混比
           if (curVer !== undefined && nextVer !== undefined && nextVer < curVer) continue;
-          const hasNewerEditVer = curVer !== undefined && nextVer !== undefined && nextVer > curVer;
-          if (!hasNewerEditVer && curPollAt !== undefined && nextPollAt !== undefined && nextPollAt < curPollAt) {
+          if (curEditTime !== undefined && nextEditTime !== undefined && nextEditTime < curEditTime) continue;
+          const hasNewerRevision =
+            (curVer !== undefined && nextVer !== undefined && nextVer > curVer) ||
+            (curEditTime !== undefined && nextEditTime !== undefined && nextEditTime > curEditTime);
+          if (!hasNewerRevision && curPollAt !== undefined && nextPollAt !== undefined && nextPollAt < curPollAt) {
             continue;
           }
           const curEffectiveMeta =
@@ -338,6 +344,7 @@ export class ContextStore {
           const incomingMeta = o.meta ?? {};
           const nextMeta: Record<string, unknown> = { ...curEffectiveMeta, ...incomingMeta };
           if (curVer !== undefined && nextVer !== undefined) nextMeta.edit_version = Math.max(curVer, nextVer);
+          if (curEditTime !== undefined && nextEditTime !== undefined) nextMeta.edit_time = Math.max(curEditTime, nextEditTime);
           if (curPollAt !== undefined && nextPollAt !== undefined) nextMeta.poll_observed_at = Math.max(curPollAt, nextPollAt);
           delete nextMeta.background_only;
           delete nextMeta.withdrawn;
@@ -359,14 +366,16 @@ export class ContextStore {
             );
             n++;
           } else {
-            // 内容与 @mention 均未变化但收到更高的排序水位（edit_version / poll_observed_at）：
+            // 内容与 @mention 均未变化但收到更高的排序水位（edit_version / edit_time / poll_observed_at）：
             // 仅推进水位元数据，不重置 processed 也不递增 edit_gen，防止后续乱序到达的中间旧版本覆写当前状态
             const advancedVer = nextVer !== undefined && (curVer === undefined || nextVer > curVer);
+            const advancedEditTime = nextEditTime !== undefined && (curEditTime === undefined || nextEditTime > curEditTime);
             const advancedPollAt = nextPollAt !== undefined && (curPollAt === undefined || nextPollAt > curPollAt);
-            if (advancedVer || advancedPollAt) {
+            if (advancedVer || advancedEditTime || advancedPollAt) {
               const watermarkMeta: Record<string, unknown> = {
                 ...curMeta,
                 ...(advancedVer ? { edit_version: nextVer } : {}),
+                ...(advancedEditTime ? { edit_time: nextEditTime } : {}),
                 ...(advancedPollAt ? { poll_observed_at: nextPollAt } : {}),
               };
               updMetaOnly.run(JSON.stringify(watermarkMeta), o.id);

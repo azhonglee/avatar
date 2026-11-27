@@ -83,14 +83,33 @@ function buildGitIsolation(
   opts: GitRunOpts | undefined,
   filteredCredDir?: string,
   authorizedSshSock?: string,
+  allowSshConfig = false,
 ): IsolationOptions {
   const extraRw = [
     ...(opts?.extraWritablePaths ?? []),
     ...(authorizedSshSock ? [authorizedSshSock] : []),
   ];
+  const sshRo: string[] = [];
+  if (allowSshConfig) {
+    const sshDir = path.join(process.env.HOME?.trim() || os.homedir(), ".ssh");
+    if (fs.existsSync(sshDir)) {
+      try {
+        const realSsh = fs.realpathSync(sshDir);
+        const dataDir = opts?.cfg?.dataDir;
+        const realData = dataDir && fs.existsSync(dataDir) ? fs.realpathSync(dataDir) : "";
+        const rel = realData ? path.relative(realData, realSsh) : "..";
+        if (!realData || (rel !== "" && (rel.startsWith("..") || path.isAbsolute(rel)))) {
+          sshRo.push(realSsh);
+        }
+      } catch {
+        // ignore unreadable ~/.ssh
+      }
+    }
+  }
   const extraRo = [
     ...(opts?.extraReadOnlyPaths ?? []),
     ...(filteredCredDir ? [filteredCredDir] : []),
+    ...sshRo,
   ];
   if (opts?.cfg) {
     return buildWorkspaceIsolation(opts.cfg, {
@@ -116,6 +135,7 @@ function buildGitIsolation(
 }
 
 export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Promise<ProcResult> {
+  const isRemote = REMOTE_GIT_SUBCMDS.has(args[0] ?? "");
   const sshSock = resolveAuthorizedSshAuthSock(args, process.env, opts?.cfg?.dataDir);
   const baseEnv = prepareHarnessEnv(process.env, { preserveSshAgent: !!sshSock });
   try {
@@ -131,7 +151,7 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
       "git",
       ["-C", cwd, ...GIT_SAFE_ARGS, ...safeSubArgs],
       process.env,
-      buildGitIsolation(cwd, opts, baseEnv.env.CREDENTIALS_DIRECTORY, sshSock),
+      buildGitIsolation(cwd, opts, baseEnv.env.CREDENTIALS_DIRECTORY, sshSock, isRemote),
     );
     return await runProcess(wrapped.cmd, wrapped.args, {
       env: childEnv,

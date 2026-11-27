@@ -90,6 +90,54 @@ function arr(o: any, key: string): any[] {
   return [];
 }
 
+/** 仅解析显式整数修订版本号（edit_version），绝不与 epoch 时间戳混用同一标尺 */
+function parseEditCounter(m: Raw): number | undefined {
+  const raw = m.edit_version;
+  if (typeof raw === "number" && Number.isFinite(raw) && Number.isInteger(raw) && raw > 0) return raw;
+  if (typeof raw === "string" && /^\d+$/.test(raw.trim())) {
+    const n = Number(raw.trim());
+    return Number.isSafeInteger(n) && n > 0 ? n : undefined;
+  }
+  return undefined;
+}
+
+/** 仅解析并归一化编辑/更新时间戳（update_time / edit_time → epoch 毫秒），绝不与 edit_version 计数混比 */
+function parseEditTimeMs(m: Raw, tz: string): number | undefined {
+  const vals = [m.update_time, m.edit_time]
+    .map((v) => parseTime(v, tz))
+    .filter((t) => Number.isFinite(t) && t > 0);
+  if (!vals.length) return undefined;
+  return Math.max(...vals);
+}
+
+/** 仅在同一时钟标尺下比较两条消息修订：计数对计数、归一化毫秒时间戳对时间戳；跨时钟返回 incomparable */
+function compareRowRevisions(
+  a: { editCounter?: number; editTimeMs?: number },
+  b: { editCounter?: number; editTimeMs?: number },
+): "a_newer" | "b_newer" | "equal" | "incomparable" {
+  let comparedAny = false;
+  let aNewer = false;
+  let bNewer = false;
+  if (a.editCounter !== undefined && b.editCounter !== undefined) {
+    comparedAny = true;
+    if (a.editCounter > b.editCounter) aNewer = true;
+    else if (b.editCounter > a.editCounter) bNewer = true;
+  }
+  if (a.editTimeMs !== undefined && b.editTimeMs !== undefined) {
+    comparedAny = true;
+    if (a.editTimeMs > b.editTimeMs) aNewer = true;
+    else if (b.editTimeMs > a.editTimeMs) bNewer = true;
+  }
+  if (aNewer && bNewer) return "incomparable";
+  if (aNewer) return "a_newer";
+  if (bNewer) return "b_newer";
+  if (comparedAny) return "equal";
+  const aHasAny = a.editCounter !== undefined || a.editTimeMs !== undefined;
+  const bHasAny = b.editCounter !== undefined || b.editTimeMs !== undefined;
+  if (!aHasAny && !bHasAny) return "equal";
+  return "incomparable";
+}
+
 export interface NativePollingExclusions {
   /** 已确认排除的群名（norm 后） */
   confirmedGroupNames: Set<string>;
@@ -557,15 +605,8 @@ export class Connectors {
     const text = textOf(m.content ?? m.text ?? "");
     if (!text) return undefined;
     const msgTime = parseTime(m.create_time ?? m.time, this.cfg.owner.timezone);
-    const rawEditVer = m.edit_version ?? m.update_time ?? m.edit_time;
-    const editVersion =
-      typeof rawEditVer === "number" && Number.isFinite(rawEditVer) && rawEditVer > 0
-        ? rawEditVer
-        : typeof rawEditVer === "string" && rawEditVer.trim()
-          ? /^\d+$/.test(rawEditVer.trim())
-            ? Number(rawEditVer.trim())
-            : parseTime(rawEditVer, this.cfg.owner.timezone) || undefined
-          : undefined;
+    const editCounter = parseEditCounter(m);
+    const editTimeMs = parseEditTimeMs(m, this.cfg.owner.timezone);
     // 独立记录 @我 判定状态：
     //   - 命中 --is-at-me 时记 at_me: true（确保白名单机器人 kind="bot" 也被识别为真实 @我）；
     //   - 落在本次 --is-at-me 查询窗口内但未命中时，明确记 at_me: false（用于覆盖已被编辑移除的旧 @我 标记）；
@@ -594,7 +635,8 @@ export class Connectors {
         thread_id: m.thread_id ?? "",
         parent_id: m.parent_id ?? m.root_id ?? "",
         sender_type: senderType,
-        ...(editVersion !== undefined ? { edit_version: editVersion } : {}),
+        ...(editCounter !== undefined ? { edit_version: editCounter } : {}),
+        ...(editTimeMs !== undefined ? { edit_time: editTimeMs } : {}),
         ...(pollObservedAt !== undefined ? { poll_observed_at: pollObservedAt } : {}),
         ...atMeMeta,
       },
@@ -854,15 +896,9 @@ export class Connectors {
     //   - 合并稳定的会话元数据（chat_id / chat_name / chat_type / fallbackGroupName）；
     //   - 当多路拉取返回不同修订版本（例如先跑 --is-at-me 搜索、再跑群拉取期间消息被编辑）时，
     //     以更高 edit_version/update_time 的行作为正文、可变字段与 @mention 分类的权威来源，避免陈旧版本覆盖新编辑。
-    const parseRowEditVer = (m: Raw): number | undefined => {
-      const rawEditVer = m.edit_version ?? m.update_time ?? m.edit_time;
-      if (typeof rawEditVer === "number" && Number.isFinite(rawEditVer) && rawEditVer > 0) return rawEditVer;
-      if (typeof rawEditVer === "string" && rawEditVer.trim()) {
-        const t = rawEditVer.trim();
-        return /^\d+$/.test(t) ? Number(t) : parseTime(t, this.cfg.owner.timezone) || undefined;
-      }
-      return undefined;
-    };
+    // 严格区分整数修订计数（edit_version）与归一化毫秒时间戳（update_time / edit_time），仅在同一时钟标尺下比较新旧；
+    // 若同一消息在多路拉取中内容或 @mention 状态不同、且两行没有可比时钟（例如一行仅含 update_time、另一行仅含 edit_version），
+    // 标记 needsVerify 并通过 `im +messages-mget` 权威回读最新版本，绝不拿时间戳原值压过修订计数。
     const rowMentionsMe = (m: Raw): boolean | undefined => {
       if (!Array.isArray(m.mentions)) return undefined;
       return m.mentions.some((x) => {
@@ -872,29 +908,59 @@ export class Connectors {
         return r.id === me || r.open_id === me || r.user_id === me;
       });
     };
+    const rowEffectiveAtMe = (m: Raw, k: string): boolean => k === "at_me" || rowMentionsMe(m) === true;
+    const rowBodyConflict = (aM: Raw, aKind: string, bM: Raw, bKind: string): boolean => {
+      const aText = textOf(aM.content ?? aM.text ?? "");
+      const bText = textOf(bM.content ?? bM.text ?? "");
+      if (aText !== bText) return true;
+      const aMent = rowMentionsMe(aM);
+      const bMent = rowMentionsMe(bM);
+      if (aMent !== undefined && bMent !== undefined && aMent !== bMent) return true;
+      if (aKind === "at_me" && bMent === false) return true;
+      if (bKind === "at_me" && aMent === false) return true;
+      return false;
+    };
     const kindRank: Record<string, number> = { at_me: 4, p2p: 3, mine: 2, group: 1 };
     const mergedById = new Map<
       string,
-      { m: Raw; kind: string; editVer?: number; streams: Set<StreamKind>; fallbackGroupName: string }
+      {
+        m: Raw;
+        kind: string;
+        editCounter?: number;
+        editTimeMs?: number;
+        streams: Set<StreamKind>;
+        fallbackGroupName: string;
+        needsVerify: boolean;
+        verifyFailed?: boolean;
+        deleted?: boolean;
+        candidates: { text: string; kind: string; atMe: boolean }[];
+      }
     >();
     for (const row of raws) {
       const id = String(row.m.message_id ?? row.m.id ?? "");
       if (!id) continue;
-      const rowVer = parseRowEditVer(row.m);
+      const rowCounter = parseEditCounter(row.m);
+      const rowTimeMs = parseEditTimeMs(row.m, this.cfg.owner.timezone);
+      const rowText = textOf(row.m.content ?? row.m.text ?? "");
       const existing = mergedById.get(id);
       if (!existing) {
         mergedById.set(id, {
           m: { ...row.m },
           kind: row.kind,
-          editVer: rowVer,
+          editCounter: rowCounter,
+          editTimeMs: rowTimeMs,
           streams: new Set([row.stream]),
           fallbackGroupName: row.fallbackGroupName ?? "",
+          needsVerify: false,
+          candidates: [{ text: rowText, kind: row.kind, atMe: rowEffectiveAtMe(row.m, row.kind) }],
         });
       } else {
         existing.streams.add(row.stream);
-        const existingVer = existing.editVer;
-        const rowIsNewer = rowVer !== undefined && (existingVer === undefined || rowVer > existingVer);
-        const existingIsNewer = existingVer !== undefined && (rowVer === undefined || existingVer > rowVer);
+        existing.candidates.push({ text: rowText, kind: row.kind, atMe: rowEffectiveAtMe(row.m, row.kind) });
+        const cmp = compareRowRevisions(
+          { editCounter: rowCounter, editTimeMs: rowTimeMs },
+          { editCounter: existing.editCounter, editTimeMs: existing.editTimeMs },
+        );
 
         const mergedChatId = existing.m.chat_id || row.m.chat_id;
         const mergedChatName = String(row.m.chat_name ?? "").trim() || String(existing.m.chat_name ?? "").trim();
@@ -906,7 +972,7 @@ export class Connectors {
           existing.fallbackGroupName = row.fallbackGroupName;
         }
 
-        if (rowIsNewer) {
+        if (cmp === "a_newer") {
           existing.m = {
             ...existing.m,
             ...row.m,
@@ -917,10 +983,12 @@ export class Connectors {
             ...(mergedParentId ? { parent_id: mergedParentId } : {}),
             ...(mergedRootId ? { root_id: mergedRootId } : {}),
           };
-          existing.editVer = rowVer;
+          if (rowCounter !== undefined) existing.editCounter = rowCounter;
+          if (rowTimeMs !== undefined) existing.editTimeMs = rowTimeMs;
           const explicitAtMe = rowMentionsMe(row.m);
           existing.kind = row.kind === "at_me" || explicitAtMe === true ? "at_me" : row.kind;
-        } else {
+          existing.needsVerify = false;
+        } else if (cmp === "b_newer") {
           if (mergedChatId) existing.m.chat_id = mergedChatId;
           if (!String(existing.m.chat_name ?? "").trim() && String(row.m.chat_name ?? "").trim()) {
             existing.m.chat_name = row.m.chat_name;
@@ -928,10 +996,106 @@ export class Connectors {
           if (!String(existing.m.chat_type ?? "").trim() && String(row.m.chat_type ?? "").trim()) {
             existing.m.chat_type = row.m.chat_type;
           }
-          if (!existingIsNewer && (kindRank[row.kind] ?? 0) > (kindRank[existing.kind] ?? 0)) {
-            existing.kind = row.kind;
+        } else {
+          // 同修订（equal）或跨时钟不可比（incomparable）：若正文或 @mention 冲突则标记权威回读，否则安全合并稳定元数据与互补时钟
+          if (mergedChatId) existing.m.chat_id = mergedChatId;
+          if (!String(existing.m.chat_name ?? "").trim() && String(row.m.chat_name ?? "").trim()) {
+            existing.m.chat_name = row.m.chat_name;
+          }
+          if (!String(existing.m.chat_type ?? "").trim() && String(row.m.chat_type ?? "").trim()) {
+            existing.m.chat_type = row.m.chat_type;
+          }
+          if (rowBodyConflict(existing.m, existing.kind, row.m, row.kind)) {
+            existing.needsVerify = true;
+          } else {
+            if (existing.editCounter === undefined && rowCounter !== undefined) {
+              existing.editCounter = rowCounter;
+              existing.m.edit_version = row.m.edit_version;
+            }
+            if (existing.editTimeMs === undefined && rowTimeMs !== undefined) {
+              existing.editTimeMs = rowTimeMs;
+              if (row.m.update_time !== undefined) existing.m.update_time = row.m.update_time;
+              if (row.m.edit_time !== undefined) existing.m.edit_time = row.m.edit_time;
+            }
+            if ((kindRank[row.kind] ?? 0) > (kindRank[existing.kind] ?? 0)) {
+              existing.kind = row.kind;
+            }
           }
         }
+      }
+    }
+
+    // 对跨时钟或内容冲突的重复消息批量调用 `im +messages-mget` 权威回读最新版本
+    const verifyIds = [...mergedById.entries()].filter(([, e]) => e.needsVerify).map(([id]) => id);
+    if (verifyIds.length > 0) {
+      const freshById = new Map<string, Raw>();
+      for (let i = 0; i < verifyIds.length; i += 50) {
+        const chunk = verifyIds.slice(i, i + 50);
+        try {
+          const data = await this.lark(
+            ["im", "+messages-mget", "--message-ids", chunk.join(","), "--no-reactions"],
+            15_000,
+          );
+          const list = arr(data, "messages").length ? arr(data, "messages") : arr(data, "items");
+          for (const fm of list) {
+            const fid = String(fm.message_id ?? fm.id ?? "");
+            if (fid) freshById.set(fid, fm);
+          }
+        } catch {
+          // 回读失败时保留 verifyFailed，下方将阻止提交陈旧副本并保留游标
+        }
+      }
+      for (const id of verifyIds) {
+        const entry = mergedById.get(id);
+        if (!entry) continue;
+        const fresh = freshById.get(id);
+        if (!fresh) {
+          entry.verifyFailed = true;
+          continue;
+        }
+        const mergedChatId = entry.m.chat_id || fresh.chat_id;
+        const mergedChatName = String(fresh.chat_name ?? "").trim() || String(entry.m.chat_name ?? "").trim();
+        const mergedChatType = String(fresh.chat_type ?? "").trim() || String(entry.m.chat_type ?? "").trim();
+        const mergedThreadId = fresh.thread_id || entry.m.thread_id;
+        const mergedParentId = fresh.parent_id || entry.m.parent_id;
+        const mergedRootId = fresh.root_id || entry.m.root_id;
+        const freshText = textOf(fresh.content ?? fresh.text ?? "");
+        if (fresh.deleted === true || !freshText) {
+          entry.deleted = true;
+          entry.needsVerify = false;
+          continue;
+        }
+        entry.m = {
+          ...entry.m,
+          ...fresh,
+          ...(mergedChatId ? { chat_id: mergedChatId } : {}),
+          ...(mergedChatName ? { chat_name: mergedChatName } : {}),
+          ...(mergedChatType ? { chat_type: mergedChatType } : {}),
+          ...(mergedThreadId ? { thread_id: mergedThreadId } : {}),
+          ...(mergedParentId ? { parent_id: mergedParentId } : {}),
+          ...(mergedRootId ? { root_id: mergedRootId } : {}),
+        };
+        entry.editCounter = parseEditCounter(fresh);
+        entry.editTimeMs = parseEditTimeMs(fresh, this.cfg.owner.timezone);
+        const sender = fresh.sender ?? entry.m.sender ?? {};
+        const senderId = String(sender.id ?? sender.open_id ?? fresh.sender_id ?? "");
+        const explicitAtMe = rowMentionsMe(fresh);
+        if (explicitAtMe === true) {
+          entry.kind = "at_me";
+        } else if (explicitAtMe === false) {
+          entry.kind =
+            mergedChatType.toLowerCase() === "p2p" ? "p2p" : senderId === me ? "mine" : "group";
+        } else {
+          // 若 +messages-mget 未返回 mentions 字段，依据权威正文与候选版本的匹配关系推断 kind
+          const matchingCand = entry.candidates.find((c) => c.text === freshText);
+          if (matchingCand) {
+            entry.kind = matchingCand.atMe ? "at_me" : matchingCand.kind;
+          } else {
+            entry.kind =
+              mergedChatType.toLowerCase() === "p2p" ? "p2p" : senderId === me ? "mine" : "group";
+          }
+        }
+        entry.needsVerify = false;
       }
     }
 
@@ -1009,8 +1173,29 @@ export class Connectors {
 
       let dropped = 0;
       const obs: Obs[] = [];
+      const retiredIds: string[] = [];
 
       for (const entry of mergedById.values()) {
+        const msgId = String(entry.m.message_id ?? entry.m.id ?? "");
+        const rawChatId = String(entry.m.chat_id ?? "");
+        if (entry.deleted) {
+          if (msgId) retiredIds.push(`im:${msgId}`);
+          dropped++;
+          continue;
+        }
+        if (entry.verifyFailed) {
+          for (const s of entry.streams) {
+            if (s === "p2p") p2pBlocked = true;
+            else if (s === "at_me") atMeBlocked = true;
+            else if (s === "mine") mineBlocked = true;
+            else if (s === "group") {
+              const st = chatPollState.get(rawChatId);
+              if (st) st.hadInconclusiveRow = true;
+              else groupsBlocked = true;
+            }
+          }
+          continue;
+        }
         const m = { ...entry.m };
         const senderType = String(m.sender?.sender_type ?? m.sender?.type ?? m.sender_type ?? "");
         if (senderType === "app" && !this.botAllowed(m)) {
@@ -1157,6 +1342,7 @@ export class Connectors {
           return { committed: true as const, lostLease: false as const, count: 0 };
         }
         const n = this.store.addObs(obs);
+        for (const rid of retiredIds) this.store.retirePendingObs(rid);
         this.setKv("spoken_groups", JSON.stringify(spoken));
         mergeKnownOpenGroupNames(this.app.store, learnedNames);
         for (const [chatId, st] of chatPollState) {

@@ -98,6 +98,8 @@ interface ParsedSetCookie {
   expires?: number;
 }
 
+const MAX_COOKIE_DATE_MS = 8_640_000_000_000_000;
+
 export function parseSetCookieHeader(header: string): ParsedSetCookie | undefined {
   const parts = header.split(";");
   const first = parts[0]?.trim();
@@ -213,9 +215,14 @@ export class RecordingCookieJar {
       const scopePath = parsed.path && parsed.path.startsWith("/") ? parsed.path : defaultCookiePath(requestUrl.pathname);
       let expiresMs: number | undefined;
       if (parsed.maxAge !== undefined) {
-        expiresMs = parsed.maxAge <= 0 ? 0 : nowMs + parsed.maxAge * 1000;
-      } else if (parsed.expires !== undefined) {
-        expiresMs = parsed.expires;
+        if (parsed.maxAge <= 0) {
+          expiresMs = 0;
+        } else {
+          const rawExp = nowMs + parsed.maxAge * 1000;
+          expiresMs = Number.isFinite(rawExp) ? Math.min(rawExp, MAX_COOKIE_DATE_MS) : MAX_COOKIE_DATE_MS;
+        }
+      } else if (parsed.expires !== undefined && Number.isFinite(parsed.expires)) {
+        expiresMs = parsed.expires <= 0 ? 0 : Math.min(parsed.expires, MAX_COOKIE_DATE_MS);
       }
       const remove = (parsed.maxAge !== undefined && parsed.maxAge <= 0) || (expiresMs !== undefined && expiresMs <= nowMs);
       const record: CookieRecord = {

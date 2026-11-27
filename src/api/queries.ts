@@ -148,14 +148,15 @@ export function overview(app: App): Overview {
   const today = recent.filter((w) => w.created >= dayStart);
   const count = (s: string) => today.filter((w) => w.state === s).length;
   const h = health(app);
-  // 已按旧主人隔离的失败项对当前主人不可操作，不计入当前主人的待处理失败计数或健康异常状态（原主人的确认状态保持不变）
-  const actionableFailures = h.failed.filter((f) => !f.acknowledged && !f.isolated);
+  // 使用 health() 在全 14 天报告窗口内分页统计出的当前主人未确认可操作失败总数，
+  // 避免最新 200 条失败被旧主人隔离记录占满时把当前主人的待处理失败挤出概览或误判为健康
+  const actionableCount = h.actionable_failures;
   return {
     attention: {
       needs_human: needs.filter((s) => !(s.delivery === "discarded")),
       to_review: review,
       candidates: app.ext.candidates?.pendingCount() ?? 0,
-      failures: actionableFailures.length,
+      failures: actionableCount,
     },
     running,
     today: {
@@ -167,10 +168,10 @@ export function overview(app: App): Overview {
       budget_usd: cfg.budget.daily_usd,
     },
     health: {
-      ok: !!h.daemon.last_heartbeat && Date.now() - h.daemon.last_heartbeat < 60_000 && actionableFailures.length === 0,
+      ok: !!h.daemon.last_heartbeat && Date.now() - h.daemon.last_heartbeat < 60_000 && actionableCount === 0,
       pending_events: ledger.active("event").length,
       pending_effects: ledger.active("effect").length,
-      dead: actionableFailures.length,
+      dead: actionableCount,
       daemon_owner: h.daemon.owner,
     },
   };
@@ -732,10 +733,43 @@ export function health(app: App): Health {
   const ownerMismatch = hasWorkspaceOwnerMismatch(store, cfg.owner.open_id);
   const kinds = ["event", "effect", "job", "delivery"] as const;
   const retrying = kinds.flatMap((k) => ledger.active(k)).filter((w) => w.attempts > 1 || !!w.error).map((w) => healthItem(app, w, ownerMismatch));
-  const failed = ledger
-    .list({ kinds: [...kinds], states: ["dead", "errored"], limit: 200 })
-    .filter((w) => w.updated > Date.now() - 14 * DAY)
-    .map((w) => healthItem(app, w, ownerMismatch));
+
+  // 在 14 天报告窗口内分页扫描全部失败项：
+  //   1. 精确累计当前主人未确认的可操作失败总数（actionable_failures），不受 200 条展示上限截断；
+  //   2. 展示列表（最多 200 条）优先保留当前主人的失败项，剩余配额再填充旧主人隔离记录，避免旧记录把当前故障挤出界面。
+  const cutoff = Date.now() - 14 * DAY;
+  const DISPLAY_LIMIT = 200;
+  const PAGE_SIZE = 500;
+  const ownFailed: HealthItem[] = [];
+  const isolatedFailed: HealthItem[] = [];
+  let actionableFailures = 0;
+  let before: number | undefined;
+  for (;;) {
+    const page = ledger.list({
+      kinds: [...kinds],
+      states: ["dead", "errored"],
+      updatedSince: cutoff,
+      limit: PAGE_SIZE,
+      before,
+    });
+    if (!page.length) break;
+    for (const w of page) {
+      const item = healthItem(app, w, ownerMismatch);
+      if (item.isolated) {
+        if (isolatedFailed.length < DISPLAY_LIMIT) isolatedFailed.push(item);
+      } else {
+        if (!item.acknowledged) actionableFailures++;
+        if (ownFailed.length < DISPLAY_LIMIT) ownFailed.push(item);
+      }
+    }
+    if (page.length < PAGE_SIZE) break;
+    before = page[page.length - 1].seq;
+  }
+  const failed =
+    ownFailed.length >= DISPLAY_LIMIT
+      ? ownFailed.slice(0, DISPLAY_LIMIT)
+      : [...ownFailed, ...isolatedFailed.slice(0, DISPLAY_LIMIT - ownFailed.length)];
+
   const hb = store.get("daemon.heartbeat");
   const [owner, at] = hb ? hb.split("|") : [null, null];
   let guard: Health["guard"] = [];
@@ -756,7 +790,13 @@ export function health(app: App): Health {
         }
       });
   }
-  return { daemon: { owner: owner ?? null, last_heartbeat: at ? Number(at) : null }, retrying, failed, guard };
+  return {
+    daemon: { owner: owner ?? null, last_heartbeat: at ? Number(at) : null },
+    retrying,
+    failed,
+    actionable_failures: actionableFailures,
+    guard,
+  };
 }
 
 export function jobs(app: App): JobView[] {

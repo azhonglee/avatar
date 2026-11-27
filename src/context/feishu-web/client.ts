@@ -82,6 +82,8 @@ export interface FeishuWebClientOptions {
   sessionHealthyAfterMs?: number;
   chatCacheTtlMs?: number;
   maxQueueBytes?: number;
+  verifyOwnerMaxAttempts?: number;
+  verifyOwnerRetryMs?: number;
 }
 
 export interface VerifiedReplyInput {
@@ -239,7 +241,11 @@ export class FeishuWebClient {
     const ep = resolveEndpoints(options.endpoints);
     const jar = RecordingCookieJar.fromRecords(login.cookies, ep.extraAllowedHosts);
     const client = new FeishuWebClient(jar, login, options);
-    await client.verifyOwner(signal);
+    // 首次建连的 verifyOwner 若在返回瞬时 5xx / 不可解析响应 / 传输抖动前已轮换 Set-Cookie，
+    // 保留同一本地 jar 进行有界重试（但仍不落盘直至 owner 身份核验成功），避免丢弃新 Cookie 后下次重连触发 needs_login。
+    const maxAttempts = Math.max(1, options.verifyOwnerMaxAttempts ?? 3);
+    const retryBaseMs = Math.max(0, options.verifyOwnerRetryMs ?? 250);
+    await client.verifyOwnerWithTransientRetry(maxAttempts, retryBaseMs, signal);
     if (!client.notifySessionConfirmed()) {
       throw new WebHttpError("aborted", "本地凭据已被登出或更新");
     }
@@ -358,15 +364,43 @@ export class FeishuWebClient {
   }
 
   async verifyOwner(signal?: AbortSignal): Promise<void> {
+    await this.verifyOwnerOnce(signal);
+    if (this.hasPendingCookieDelta()) {
+      if (!this.notifySessionConfirmed()) {
+        throw new WebHttpError("aborted", "本地凭据已被登出或更新");
+      }
+    }
+  }
+
+  private async verifyOwnerOnce(signal?: AbortSignal): Promise<void> {
     const profile = await readNativeProfile(this.jar, this.endpoints, { signal });
     if (profile.id !== this.ownerId) {
       throw new WebHttpError("credential_denied", "当前个人 Web 账号与已授权账号不一致");
     }
     if (profile.name) this.ownerName = profile.name;
     if (profile.openId) this.ownerOpenId = profile.openId;
-    if (this.hasPendingCookieDelta()) {
-      if (!this.notifySessionConfirmed()) {
-        throw new WebHttpError("aborted", "本地凭据已被登出或更新");
+  }
+
+  private async verifyOwnerWithTransientRetry(
+    maxAttempts: number,
+    retryBaseMs: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this.verifyOwnerOnce(signal);
+        return;
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        const isTransient =
+          !(err instanceof WebHttpError) ||
+          (err.code !== "credential_denied" && err.code !== "aborted");
+        if (!isTransient || attempt >= maxAttempts) {
+          throw err;
+        }
+        if (retryBaseMs > 0) {
+          await sleep(retryBaseMs * attempt, signal);
+        }
       }
     }
   }
@@ -620,7 +654,7 @@ export class FeishuWebClient {
   async sendVerifiedReply(
     input: VerifiedReplyInput & { requireMentionOwnerId?: string },
     hooks?: {
-      onBeforeSend?: (meta: { rootId: string; parentId: string; threaded: boolean; original: WebMessage; chat: ChatMeta }) => void;
+      onBeforeSend?: (meta: { rootId: string; parentId: string; threaded: boolean; original: WebMessage; chat: ChatMeta }) => Promise<void> | void;
       onCreated?: (meta: { replyId: string; rootId: string; parentId: string; threaded: boolean }) => void;
     },
   ): Promise<VerifiedReplyResult> {
@@ -652,7 +686,7 @@ export class FeishuWebClient {
     }
     const inThread = replyInThread(chat.kind, chat.mode);
     const threaded = group || inThread;
-    hooks?.onBeforeSend?.({ rootId: actualRoot, parentId: actualParent, threaded, original, chat });
+    await hooks?.onBeforeSend?.({ rootId: actualRoot, parentId: actualParent, threaded, original, chat });
     // 发包响应可能同时携带新消息 ID 与 Cookie 轮换：先让 onCreated 把 replyId 持久化为 created，
     // 再尝试刷盘轮换后的 Cookie，确保即使 Cookie 落盘报错也不会让已发送消息滞留在 sending 态而无法回读恢复。
     const created = await this.sendReply(input.chatId, actualRoot, input.cid, [{ text }], inThread, input.signal, actualParent, {
@@ -757,6 +791,7 @@ export class FeishuWebClient {
   async listen(params: {
     signal: AbortSignal;
     onMessage: (msg: WebMessage) => Promise<void> | void;
+    shouldDeliverInvalid?: (msg: WebMessage) => boolean;
     onState?: (state: ListenerState, detail?: string) => void;
     onWarn?: (message: string) => void;
   }): Promise<void> {
@@ -783,7 +818,7 @@ export class FeishuWebClient {
       };
 
       try {
-        await this.listenOnce(params.signal, params.onMessage, observeState, params.onWarn);
+        await this.listenOnce(params.signal, params.onMessage, observeState, params.onWarn, params.shouldDeliverInvalid);
         if (params.signal.aborted) break;
       } catch (err) {
         if (params.signal.aborted || isAborted(err)) break;
@@ -811,6 +846,7 @@ export class FeishuWebClient {
     onMessage: (msg: WebMessage) => Promise<void> | void,
     onState: (state: ListenerState, detail?: string) => void,
     onWarn?: (message: string) => void,
+    shouldDeliverInvalid?: (msg: WebMessage) => boolean,
   ): Promise<void> {
     await this.verifyOwner(outerSignal);
     if (!this.notifySessionConfirmed()) {
@@ -899,7 +935,13 @@ export class FeishuWebClient {
         malformedReported = false;
 
         if (packet.uint(3) === CMD_PUSH_PACKET) {
-          const delivered = await this.handlePush(packet.bytes(5), loopCtrl.signal, onMessage, onWarn);
+          const delivered = await this.handlePush(
+            packet.bytes(5),
+            loopCtrl.signal,
+            onMessage,
+            onWarn,
+            shouldDeliverInvalid,
+          );
           if (!delivered) {
             if (!publicationBlocked) {
               publicationBlocked = true;
@@ -937,6 +979,7 @@ export class FeishuWebClient {
     signal: AbortSignal,
     onMessage: (msg: WebMessage) => Promise<void> | void,
     onWarn?: (message: string) => void,
+    shouldDeliverInvalid?: (msg: WebMessage) => boolean,
   ): Promise<boolean> {
     let push: ReturnType<typeof parseProto>;
     try {
@@ -958,7 +1001,10 @@ export class FeishuWebClient {
         onWarn?.(`跳过无法解码的个人消息：${err instanceof Error ? err.message : String(err)}`);
         continue;
       }
-      if (msg.unsupported || (!msg.text.trim() && msg.resources.length === 0)) continue;
+      if (msg.unsupported || (!msg.text.trim() && msg.resources.length === 0)) {
+        // 允许已知活跃消息的空正文/不支持类型编辑推送透传给上层以撤回本地旧正文，同时继续过滤全新无效推送
+        if (!shouldDeliverInvalid?.(msg)) continue;
+      }
       try {
         await onMessage(msg);
       } catch (err) {

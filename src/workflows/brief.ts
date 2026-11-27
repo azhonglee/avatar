@@ -57,7 +57,7 @@ export async function buildBrief(
   board: Board,
   mode: "morning" | "evening",
 ): Promise<string> {
-  await assertBriefDataOwner(cfg, lark, store);
+  const preOwner = await assertBriefDataOwner(cfg, lark, store);
   const now = Date.now();
   const tz = cfg.owner.timezone;
   const dayEnd = endOfLocalDay(now, tz);
@@ -75,6 +75,14 @@ export async function buildBrief(
   const pending = (await board.listSection("pending")).filter(isTaskVisible);
   const review = (await board.listSection("review")).filter(isTaskVisible);
   const attention = (await board.listSection("attention")).filter(isTaskVisible);
+  // 所有 --as user 读取完成后再次核验活跃 lark-cli 登录身份与配置主人一致，
+  // 防止拉取期间 CLI 切号导致把他人任务打包发给当前主人
+  const postOwner = await assertBriefDataOwner(cfg, lark, store);
+  if (postOwner !== preOwner) {
+    throw new Error(
+      `生成概览期间工作区主人发生变更 (${preOwner} -> ${postOwner})，已丢弃本轮数据以防跨账号泄漏`,
+    );
+  }
   const since = now - 86_400_000;
   // 派单统计按验收结果（outcome）算，而不是按执行者退出码；按主人隔离过滤旧主人上下文委派的派单
   const dispatches = ledger

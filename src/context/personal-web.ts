@@ -875,6 +875,11 @@ export class PersonalWebBridge {
         await client.listen({
           signal: sessionCtrl.signal,
           onMessage: (msg) => this.handleMessage(msg, client, sessionCtrl.signal),
+          shouldDeliverInvalid: (msg) => {
+            if (!msg.id) return false;
+            const existing = this.store.obs(`pw:${msg.id}`);
+            return !!existing && existing.meta.background_only !== true && existing.meta.withdrawn !== true;
+          },
           onState: (s, d) => handleState(s, d, true),
           onWarn: (m) => log("warn", m),
         });
@@ -961,9 +966,9 @@ export class PersonalWebBridge {
     }
   }
 
-  private collectOpenChatExclusions(): Map<string, string> {
+  private collectOpenChatExclusions(groupsDeny: string[] = this.cfg.context.groups_deny): Map<string, string> {
     const map = new Map<string, string>();
-    for (const raw of this.cfg.context.groups_deny) {
+    for (const raw of groupsDeny) {
       const d = raw.trim();
       if (d.startsWith("oc_")) map.set(d, "");
     }
@@ -977,14 +982,19 @@ export class PersonalWebBridge {
     return [...this.collectOpenChatExclusions().keys()].sort().join(",");
   }
 
-  /** 原生推送入库期间需监测的完整排除策略快照（含 oc_* 排除规则与全部 groups_deny 关键词/ID 规则） */
-  private nativeExclusionPolicyKey(): string {
-    const oc = [...this.collectOpenChatExclusions().entries()]
+  /** 原生推送入库/发送期间需监测的完整排除策略快照（含 oc_* 排除规则、本地静音集合与全部 groups_deny 关键词/ID 规则） */
+  private nativeExclusionPolicyKey(groupsDeny: string[] = this.cfg.context.groups_deny): string {
+    const oc = [...this.collectOpenChatExclusions(groupsDeny).entries()]
       .sort((a, b) => a[0].localeCompare(b[0]))
       .map(([id, name]) => `${id}=${name}`)
       .join("|");
-    const deny = [...this.cfg.context.groups_deny].map((s) => s.trim()).sort().join("|");
-    return `${oc};${deny}`;
+    const mutes = this.store
+      .mutedConvs()
+      .map((m) => `${m.conv}=${m.name}`)
+      .sort()
+      .join("|");
+    const deny = [...groupsDeny].map((s) => s.trim()).sort().join("|");
+    return `${oc};${mutes};${deny}`;
   }
 
   /** 仅收集显式 `pw_chat:<id>` 原生排除/静音规则（纯数字如 "2024" 保持既有群名关键词语义，避免误把老配置当原生 ID） */
@@ -1003,20 +1013,20 @@ export class PersonalWebBridge {
     return map;
   }
 
-  private nameDenyPatterns(): string[] {
-    return this.cfg.context.groups_deny
+  private nameDenyPatterns(groupsDeny: string[] = this.cfg.context.groups_deny): string[] {
+    return groupsDeny
       .map((d) => d.trim())
       .filter((d) => d && !d.startsWith("oc_") && !d.startsWith("pw_chat:"));
   }
 
-  private matchesDirectNativeIdDeny(pwConv: string): boolean {
-    return this.cfg.context.groups_deny.some((raw) => raw.trim() === pwConv);
+  private matchesDirectNativeIdDeny(pwConv: string, groupsDeny: string[] = this.cfg.context.groups_deny): boolean {
+    return groupsDeny.some((raw) => raw.trim() === pwConv);
   }
 
   /** 收集已确认的开放平台群排除名称（来自 ocExclusionCache、ctx_mute_conv 标签、open_group_names 与 spoken_groups），供原生群排位截断前剔除 */
-  private confirmedOpenGroupDenyNames(): Set<string> {
+  private confirmedOpenGroupDenyNames(groupsDeny: string[] = this.cfg.context.groups_deny): Set<string> {
     const out = new Set<string>();
-    const ocRules = this.collectOpenChatExclusions();
+    const ocRules = this.collectOpenChatExclusions(groupsDeny);
     if (ocRules.size === 0) return out;
     const now = Date.now();
     const knownNames = loadKnownOpenGroupNames(this.app.store);
@@ -1054,13 +1064,18 @@ export class PersonalWebBridge {
     chatName: string,
     confirmedOcDenyNames?: Set<string>,
     kind: "group" | "dm" = "group",
+    groupsDeny: string[] = this.cfg.context.groups_deny,
   ): boolean {
     const rawId = pwConv.startsWith("pw_chat:") ? pwConv.slice("pw_chat:".length) : pwConv;
     if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(rawId)) return true;
-    if (this.matchesDirectNativeIdDeny(pwConv)) return true;
-    if (chatName && this.nameDenyPatterns().some((d) => chatName.includes(d))) return true;
+    if (this.matchesDirectNativeIdDeny(pwConv, groupsDeny)) return true;
+    if (chatName) {
+      const patterns = this.nameDenyPatterns(groupsDeny);
+      const dmFormatted = kind === "dm" && !chatName.startsWith("私聊：") ? `私聊：${chatName}` : chatName;
+      if (patterns.some((d) => chatName.includes(d) || dmFormatted.includes(d))) return true;
+    }
     if (kind !== "dm" && chatName) {
-      const ocDeny = confirmedOcDenyNames ?? this.confirmedOpenGroupDenyNames();
+      const ocDeny = confirmedOcDenyNames ?? this.confirmedOpenGroupDenyNames(groupsDeny);
       if (ocDeny.has(norm(chatName))) return true;
     }
     return false;
@@ -1083,15 +1098,17 @@ export class PersonalWebBridge {
     activeClient?: FeishuWebClient;
     chatNameFromCache?: boolean;
     signal?: AbortSignal;
+    groupsDeny?: string[];
   }): Promise<{ excluded: boolean; verifiedChatName: string }> {
     const { chatId, pwConv, kind, convName, activeClient, signal } = params;
+    const groupsDeny = params.groupsDeny ?? this.cfg.context.groups_deny;
     let chatName = params.chatName;
     let chatNameRefreshed = !params.chatNameFromCache;
 
     if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(chatId)) {
       return { excluded: true, verifiedChatName: chatName };
     }
-    if (this.matchesDirectNativeIdDeny(pwConv)) {
+    if (this.matchesDirectNativeIdDeny(pwConv, groupsDeny)) {
       return { excluded: true, verifiedChatName: chatName };
     }
 
@@ -1118,7 +1135,7 @@ export class PersonalWebBridge {
       }
     };
 
-    const nameRules = this.nameDenyPatterns();
+    const nameRules = this.nameDenyPatterns(groupsDeny);
     if (nameRules.length > 0) {
       if (kind === "group") {
         const staleMatched = !!chatName && nameRules.some((d) => chatName.includes(d));
@@ -1161,7 +1178,7 @@ export class PersonalWebBridge {
       }
     }
 
-    const ocRules = this.collectOpenChatExclusions();
+    const ocRules = this.collectOpenChatExclusions(groupsDeny);
     if (ocRules.size === 0) return { excluded: false, verifiedChatName: chatName };
     for (const [ocId, staleLabel] of ocRules) {
       let resolved = await this.resolveOpenChatMeta(ocId);
@@ -1601,16 +1618,65 @@ export class PersonalWebBridge {
   async handleMessage(msg: WebMessage, client?: FeishuWebClient, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) return;
     if (!this.cfg.context.sources.im) return;
-    if (!msg.id || !msg.conversationId || msg.unsupported) return;
-    if (msg.conversationKind !== "group" && msg.conversationKind !== "dm") return;
-    if (msg.senderType !== USER_SENDER_TYPE) return;
-    if (!msg.text.trim()) return;
+    if (!msg.id) return;
 
     const activeClient = client ?? this.client;
     const ownerId = msg.ownerId || activeClient?.owner().id || this.loginStore.load()?.owner_id || "";
     const capturedSessionId = activeClient?.currentSessionId() ?? "";
+    const hasUsableBody = (m: WebMessage): boolean =>
+      !!m.id &&
+      !!m.conversationId &&
+      !m.unsupported &&
+      (m.conversationKind === "group" || m.conversationKind === "dm") &&
+      m.senderType === USER_SENDER_TYPE &&
+      !!m.text.trim();
 
+    const assertSessionActiveForStoreMutation = (): void => {
+      if (signal?.aborted) {
+        throw new WebHttpError("aborted", "会话已中止，放弃修改本地观测");
+      }
+      if ((this.app.store.get(REVOKED_AT_KV_KEY) ?? "").trim()) {
+        throw new WebHttpError("aborted", "个人 Web 会话已被 web-logout 吊销，放弃修改本地观测");
+      }
+      if (capturedSessionId && loadRevokedSessionIds(this.app.store).has(capturedSessionId)) {
+        throw new WebHttpError("aborted", "个人 Web 会话代际已被吊销，放弃修改本地观测");
+      }
+      const activeSession = (this.app.store.get(ACTIVE_SESSION_KV_KEY) ?? "").trim();
+      if (activeSession && (capturedSessionId || activeClient) && capturedSessionId !== activeSession) {
+        throw new WebHttpError("aborted", "个人 Web 会话已被更新的登录取代，放弃修改本地观测");
+      }
+      if (hasWorkspaceOwnerMismatch(this.app.store, this.cfg.owner.open_id)) {
+        throw new WebHttpError("aborted", "工作区主人已变更，放弃修改本地观测");
+      }
+      const boundNative = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
+      if (boundNative && ownerId && boundNative !== ownerId) {
+        throw new WebHttpError("aborted", "个人 Web 账号绑定已变更，放弃修改本地观测");
+      }
+    };
+
+    const existing = this.store.obs(`pw:${msg.id}`);
     let effectiveMsg = msg;
+    let authoritativeRead = false;
+
+    if (!hasUsableBody(effectiveMsg)) {
+      // 全新空正文/不支持消息直接丢弃；若该 ID 此前已作为活跃观测入库（如原 @我 消息被编辑清空或改为不支持类型），
+      // 必须权威回读确认并撤回旧待处理文本，防止旧正文与 at_me 标记继续触发提醒或起草
+      if (!existing || existing.meta.background_only === true || existing.meta.withdrawn === true) return;
+      if (activeClient) {
+        effectiveMsg = await activeClient.readMessage(msg.id, signal);
+        authoritativeRead = true;
+        assertSessionActiveForStoreMutation();
+        if (!hasUsableBody(effectiveMsg)) {
+          this.store.retirePendingObs(`pw:${msg.id}`);
+          return;
+        }
+      } else {
+        assertSessionActiveForStoreMutation();
+        this.store.retirePendingObs(`pw:${msg.id}`);
+        return;
+      }
+    }
+
     const derive = (m: WebMessage) => {
       const t = m.text.trim();
       const clipped = t.slice(0, 2000);
@@ -1626,7 +1692,6 @@ export class PersonalWebBridge {
 
     // 2) 若同 ID 非背景观测已存在且本次推送与之冲突（文本/@mention 变化、已撤回或触发范围外撤回），
     //    先向服务端权威回读 readMessage(id)，避免未 ACK 旧推送包重放回滚更新后的编辑或错误复活已撤回消息
-    const existing = this.store.obs(`pw:${effectiveMsg.id}`);
     if (existing && existing.meta.background_only !== true) {
       const existingWithdrawn = existing.meta.withdrawn === true;
       const incomingRev = obsRevision({ text: clippedText, meta: { at_me: isAtMe, mentions: effectiveMsg.mentions } });
@@ -1638,18 +1703,15 @@ export class PersonalWebBridge {
         !this.isGroupInScope(effectiveMsg.conversationId, pwConv, ownerId);
       if (revDiffers || existingWithdrawn || incomingOutOfScope) {
         if (activeClient) {
-          effectiveMsg = await activeClient.readMessage(effectiveMsg.id, signal);
-          if (signal?.aborted) {
-            throw new WebHttpError("aborted", "会话已中止，放弃提交推送观测");
+          if (!authoritativeRead) {
+            effectiveMsg = await activeClient.readMessage(effectiveMsg.id, signal);
+            authoritativeRead = true;
           }
-          if (
-            !effectiveMsg.id ||
-            !effectiveMsg.conversationId ||
-            effectiveMsg.unsupported ||
-            (effectiveMsg.conversationKind !== "group" && effectiveMsg.conversationKind !== "dm") ||
-            effectiveMsg.senderType !== USER_SENDER_TYPE ||
-            !effectiveMsg.text.trim()
-          ) {
+          assertSessionActiveForStoreMutation();
+          if (!hasUsableBody(effectiveMsg)) {
+            if (!existingWithdrawn) {
+              this.store.retirePendingObs(`pw:${msg.id}`);
+            }
             return;
           }
           ({ text, clippedText, isMe, isAtMe, pwConv } = derive(effectiveMsg));
@@ -2173,14 +2235,15 @@ export class PersonalWebBridge {
   }
 
   /**
-   * 核验共享的 send_replies 发送权限：
+   * 核验共享的 send_replies 发送权限并读取当前生效的 groups_deny 排除规则：
    * 先查本进程配置；若配置来自磁盘文件且文件消失/不可 stat，按 fail-closed 中止新发送；
-   * 若磁盘 config.yaml 被另一进程（如 Web 控制台）修改过，同步读取磁盘最新配置防止跨进程陈旧放行。
+   * 若磁盘 config.yaml 被另一进程（如 Web 控制台）修改过，同步读取磁盘最新 send_replies 与 groups_deny 防止跨进程陈旧放行。
    */
-  private assertSendEnabled(): void {
+  private assertSendEnabled(): { groupsDeny: string[] } {
     if (!this.cfg.context.personal_web.send_replies) {
       throw new Error("未开启个人 Web 回复（需在配置中设置 context.personal_web.send_replies: true）");
     }
+    let groupsDeny = this.cfg.context.groups_deny;
     const cfgFile = this.cfg.file;
     if (cfgFile) {
       const curSig = statSignature(cfgFile);
@@ -2190,17 +2253,28 @@ export class PersonalWebBridge {
       if (curSig !== this.initialCfgStat) {
         try {
           const parsed = YAML.parse(fs.readFileSync(cfgFile, "utf8")) as {
-            context?: { personal_web?: { send_replies?: boolean } };
+            context?: { personal_web?: { send_replies?: boolean }; groups_deny?: unknown };
           };
           if (parsed?.context?.personal_web?.send_replies !== true) {
             throw new Error("检测到配置文件已关闭 context.personal_web.send_replies，已中止发送");
           }
+          if (parsed?.context?.groups_deny !== undefined) {
+            if (!Array.isArray(parsed.context.groups_deny)) {
+              throw new Error("检测到配置文件中的 context.groups_deny 格式非法，已中止发送");
+            }
+            groupsDeny = parsed.context.groups_deny.map((x) => String(x));
+          } else {
+            groupsDeny = [];
+          }
         } catch (err) {
-          if (err instanceof Error && err.message.includes("send_replies")) throw err;
+          if (err instanceof Error && (err.message.includes("send_replies") || err.message.includes("groups_deny"))) {
+            throw err;
+          }
           throw new Error("无法核验配置文件中的 context.personal_web.send_replies 开关，按安全原则中止发送");
         }
       }
     }
+    return { groupsDeny };
   }
 
   private assertSessionOwner(expectedOwnerId: string, expectedSessionId = ""): WebLogin {
@@ -2258,16 +2332,28 @@ export class PersonalWebBridge {
     }
 
     const readbackOnly = prev?.state === "created" && !!prev.reply_id;
+    const pwConv = `pw_chat:${args.chat_id}`;
     const assertTargetNotWithdrawn = () => {
       const targetObs = this.store.obs(`pw:${args.message_id}`);
       if (targetObs?.meta.withdrawn === true) {
         throw new Error("发送前检测到原个人 Web 消息已被编辑移出触发范围或撤回，已中止发送");
       }
     };
-    // 只有需要发起新发送时才要求 send_replies=true 且目标消息未撤回；已创建待回读只读核验无需重新开启开关也不受后续撤回阻断
+    const assertNotHardExcludedByIdSync = (groupsDeny: string[]) => {
+      if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(args.chat_id)) {
+        throw new Error("目标个人 Web 会话已被静音，已中止发送");
+      }
+      if (this.matchesDirectNativeIdDeny(pwConv, groupsDeny)) {
+        throw new Error("目标个人 Web 会话在 groups_deny 排除列表中，已中止发送");
+      }
+    };
+    // 只有需要发起新发送时才要求 send_replies=true、目标消息未撤回且会话未被硬排除；
+    // 已创建待回读只读核验无需重新开启开关也不受后续撤回/排除阻断
+    let entryGroupsDeny: string[] = this.cfg.context.groups_deny;
     if (!readbackOnly) {
-      this.assertSendEnabled();
+      ({ groupsDeny: entryGroupsDeny } = this.assertSendEnabled());
       assertTargetNotWithdrawn();
+      assertNotHardExcludedByIdSync(entryGroupsDeny);
     }
     const diskLogin = this.assertSessionOwner(args.owner_id);
     const initialSessionId = diskLogin.session_id ?? "";
@@ -2307,6 +2393,36 @@ export class PersonalWebBridge {
       return verified;
     }
 
+    // 发起任何原消息读取（readMessage）之前，若存在名称关键词或跨通道 oc_* 排除规则，
+    // 先按实时会话元数据核验全部硬排除规则（静音与原生 ID 排除已在入口同步拦截，群聊与私聊同等生效）
+    const hasPreReadNameOrOcRules =
+      this.nameDenyPatterns(entryGroupsDeny).length > 0 ||
+      this.collectOpenChatExclusions(entryGroupsDeny).size > 0;
+    if (hasPreReadNameOrOcRules) {
+      const latestConvObs = this.store.latestConvObs(pwConv);
+      const preChat = await client.readChat(args.chat_id, { force: true });
+      const preKind: "group" | "dm" = isGroupChat(preChat.kind)
+        ? "group"
+        : preChat.kind === CHAT_KIND_P2P
+          ? "dm"
+          : (() => {
+              throw new Error(`不支持的个人会话类型：${preChat.kind}`);
+            })();
+      const preExcl = await this.evaluateChatExclusion({
+        chatId: args.chat_id,
+        pwConv,
+        kind: preKind,
+        chatName: preChat.name.trim(),
+        convName: latestConvObs?.conv_name || preChat.name.trim(),
+        activeClient: client,
+        chatNameFromCache: false,
+        groupsDeny: entryGroupsDeny,
+      });
+      if (preExcl.excluded) {
+        throw new Error("目标个人 Web 会话已被静音或命中排除规则（groups_deny），已中止读取与发送");
+      }
+    }
+
     let enteredSend = false;
     let createdOnServer = false;
     let sendMeta: { rootId: string; parentId: string; threaded: boolean } | undefined;
@@ -2321,12 +2437,32 @@ export class PersonalWebBridge {
           cid: args.cid,
         },
         {
-          onBeforeSend: ({ rootId, parentId, threaded, original, chat }) => {
-            // 若目标属于当前采集范围外的群聊（仅因 @本人 而进入草稿），发包认领前必须依据刚回读的权威原消息复核仍存在 @本人，
-            // 防止监听离线期间对方编辑移除了 @mention，导致确认草稿仍向范围外群发出回复
+          onBeforeSend: async ({ rootId, parentId, threaded, original, chat }) => {
+            // 1) 发包认领前再次按实时会话元数据执行全部硬排除规则（静音 / groups_deny / oc_* 排除，DM 与 @我 群均无豁免）
+            const { groupsDeny: liveGroupsDeny } = this.assertSendEnabled();
+            const livePolicyKey = this.nativeExclusionPolicyKey(liveGroupsDeny);
+            const liveKind: "group" | "dm" = isGroupChat(chat.kind) ? "group" : "dm";
+            const liveLatest = this.store.latestConvObs(pwConv);
+            const liveExcl = await this.evaluateChatExclusion({
+              chatId: args.chat_id,
+              pwConv,
+              kind: liveKind,
+              chatName: chat.name.trim(),
+              convName: liveLatest?.conv_name || chat.name.trim(),
+              activeClient: client,
+              chatNameFromCache: false,
+              groupsDeny: liveGroupsDeny,
+            });
+            if (liveExcl.excluded) {
+              throw new Error("发送前实时核验发现目标个人 Web 会话已被静音或命中排除规则，已中止发送");
+            }
+            const verifiedName = liveExcl.verifiedChatName || chat.name.trim() || liveLatest?.conv_name || "";
+
+            // 2) @本人 豁免仅适用于未被硬排除、仅仅在白名单/发言群范围之外的群聊：
+            //    发包认领前必须依据刚回读的权威原消息复核仍存在 @本人，防止监听离线期间对方编辑移除了 @mention
             const targetIsOutOfScopeGroup =
-              isGroupChat(chat.kind) &&
-              !this.isGroupInScope(args.chat_id, `pw_chat:${args.chat_id}`, args.owner_id);
+              liveKind === "group" &&
+              !this.isGroupInScope(args.chat_id, pwConv, args.owner_id);
             if (targetIsOutOfScopeGroup) {
               const liveAtMe =
                 original.actorId !== args.owner_id &&
@@ -2350,10 +2486,17 @@ export class PersonalWebBridge {
                 updated_at: Date.now(),
               },
               () => {
-                // 在写入 sending 状态的同一 SQLite BEGIN IMMEDIATE 写事务锁内重检授权、吊销与撤回，
-                // 彻底消除跨进程 web-logout 或消息撤回在读后锁前提交导致的误发竞态
-                this.assertSendEnabled();
+                // 在写入 sending 状态的同一 SQLite BEGIN IMMEDIATE 写事务锁内重检授权、硬排除、吊销与撤回，
+                // 彻底消除跨进程 web-logout、muteConv、新增 groups_deny 或消息撤回在读后锁前提交导致的误发竞态
+                const { groupsDeny: lockGroupsDeny } = this.assertSendEnabled();
                 assertTargetNotWithdrawn();
+                assertNotHardExcludedByIdSync(lockGroupsDeny);
+                if (this.isDirectlyDenied(pwConv, verifiedName, undefined, liveKind, lockGroupsDeny)) {
+                  throw new Error("认领发送时检测到目标个人 Web 会话已被静音或命中排除规则，已中止发送");
+                }
+                if (this.nativeExclusionPolicyKey(lockGroupsDeny) !== livePolicyKey) {
+                  throw new Error("认领发送期间会话静音或排除规则发生变更，已按安全策略中止发送");
+                }
                 this.assertSessionOwner(args.owner_id, initialSessionId);
                 if (client.owner().id !== args.owner_id) {
                   throw new Error("发送前检测到客户端账号不匹配，已中止发送");

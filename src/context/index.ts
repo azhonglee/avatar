@@ -174,6 +174,7 @@ export class ContextService {
         await this.ensureOwnerName();
       }
       const created: ItemRow[] = [];
+      const touched: ItemRow[] = [];
       const ctxHarnessName = this.cfg.context.harness || this.cfg.roles.brain;
       const keyringConflict = this.cfg.context.understand
         ? detectIsolatedCodexKeyringConflict(this.cfg, process.env, ctxHarnessName)
@@ -377,6 +378,7 @@ export class ContextService {
               rep.conflicts += r.conflicts;
               rep.rejected += r.rejected;
               created.push(...r.created);
+              touched.push(...r.touched);
               for (const c of r.convs) kv.db.prepare("DELETE FROM kv WHERE k = ?").run(`ctx.fail.${c}`);
               return;
             }
@@ -394,9 +396,9 @@ export class ContextService {
       this.syncDrafts();
       rep.nudged = this.nudge(created);
       this.autonomy(created);
-      // 若周期理解在快通道防抖窗口内抢先消费了原生私聊或 @本人 触发消息并产出高优 ask_me 事项，
-      // 直接以与快通道相同的幂等作业 ID 补入自动预起草（无需二次理解，也绝不丢失预起草）
-      this.enqueueAutoPreDrafts(created, true);
+      // 若周期理解在快通道防抖窗口内抢先消费了原生私聊或 @本人 触发消息，无论是新建高优 ask_me 事项还是把原生证据补充到已有事项上，
+      // 均以与快通道相同的幂等作业 ID 补入自动预起草（无需二次理解，也绝不丢失预起草）
+      this.enqueueAutoPreDrafts([...created, ...touched], true);
       kv.set("ctx.last_cycle", String(Date.now()));
       kv.set("ctx.last_error", rep.errors.join("\n").slice(0, 1000));
       kv.set("ctx.last_report", JSON.stringify(rep));
@@ -621,8 +623,12 @@ export class ContextService {
       const nudged = this.nudge(r.created);
       this.autonomy(r.created);
 
-      // 可选：为高优先级「别人在等你」自动预起草回复草稿（标记 auto: true，入队与执行复用同一资格判据；永远不自动发送）
-      const preDrafted = this.enqueueAutoPreDrafts(r.created, false);
+      // 可选：为高优先级「别人在等你」自动预起草回复草稿（标记 auto: true，入队与执行复用同一资格判据；永远不自动发送）；
+      // 除本批新建事项外，对被新原生私聊/@本人 证据更新的已有 open 事项同样以幂等 ID 补入预起草
+      const createdIds = new Set(r.created.map((c) => c.id));
+      const updatedTouched = r.touched.filter((t) => !createdIds.has(t.id));
+      const preDrafted =
+        this.enqueueAutoPreDrafts(r.created, false) + this.enqueueAutoPreDrafts(updatedTouched, true);
       return { fresh: r.fresh, created: r.created.length, nudged, pre_drafted: preDrafted };
     } finally {
       signal?.removeEventListener("abort", onParentAbort);
@@ -631,17 +637,24 @@ export class ContextService {
     }
   }
 
-  /** 为刚产出的高优 ask_me 事项以幂等 ID 入队自动预起草；从周期理解调用时要求事项确实关联当前绑定账号的原生私聊或 @本人 触发证据 */
+  /** 为刚产出或被新原生证据更新的高优 ask_me 事项以幂等 ID 入队自动预起草；requireNativeTriggerEvidence=true 时要求事项确实关联当前绑定账号的原生私聊或 @本人 触发证据 */
   private enqueueAutoPreDrafts(items: ItemRow[], requireNativeTriggerEvidence: boolean): number {
     if (!items.length) return 0;
     const activeNativeOwner = requireNativeTriggerEvidence ? this.personalWeb.activeBoundNativeOwner() : null;
     if (requireNativeTriggerEvidence && !activeNativeOwner) return 0;
+    const seen = new Set<string>();
+    const pwEvStmt = requireNativeTriggerEvidence
+      ? this.store.db.prepare("SELECT obs_id FROM ctx_evidence WHERE entity = 'item' AND entity_id = ? AND obs_id LIKE 'pw:%'")
+      : undefined;
     let count = 0;
     for (const c of items) {
+      if (seen.has(c.id)) continue;
+      seen.add(c.id);
       const it = this.store.item(c.id);
       if (!this.canAutoPreDraft(it)) continue;
-      if (requireNativeTriggerEvidence) {
-        const hasNativeTrigger = this.store.evidence("item", it.id, 20).some((e) => {
+      if (requireNativeTriggerEvidence && pwEvStmt) {
+        const pwRows = pwEvStmt.all(it.id) as { obs_id: string }[];
+        const hasNativeTrigger = pwRows.some((e) => {
           const o = this.store.obs(e.obs_id);
           if (!o || !o.id.startsWith("pw:") || o.is_me || o.meta.withdrawn === true) return false;
           if (String(o.meta.native_owner_id ?? "").trim() !== activeNativeOwner) return false;
