@@ -128,9 +128,11 @@ const fmt = (ms: number, tz: string) =>
 export class Understander {
   app: App;
   store: ContextStore;
-  constructor(app: App, store: ContextStore) {
+  runner: typeof runHarness;
+  constructor(app: App, store: ContextStore, runner: typeof runHarness = runHarness) {
     this.app = app;
     this.store = store;
+    this.runner = runner;
   }
 
   private get cfg() {
@@ -264,7 +266,7 @@ export class Understander {
     const logFile = path.join(this.cfg.dataDir, "runs", `context-${Date.now()}.log`);
     const step = this.app.ledger.startStep({ work_id: workId, name: "understand", harness, log: logFile });
     try {
-      const r = await runHarness(this.cfg, {
+      const r = await this.runner(this.cfg, {
         harness,
         prompt: batch.prompt,
         cwd: path.join(this.cfg.dataDir, "workspace", "context"),

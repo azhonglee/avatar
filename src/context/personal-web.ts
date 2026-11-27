@@ -15,6 +15,7 @@ import {
 } from "./connectors.ts";
 import {
   CHAT_KIND_P2P,
+  clearPendingCommitMarkerIfMatches,
   FeishuWebClient,
   GatewayError,
   isGroupChat,
@@ -426,6 +427,14 @@ function statSignature(file: string): string {
   }
 }
 
+/** 判断常驻进程心跳是否在 60 秒内活跃 */
+export function isLiveDaemonHeartbeat(store: Pick<Store, "get">, now = Date.now()): boolean {
+  const hb = store.get("daemon.heartbeat");
+  if (!hb) return false;
+  const ms = Number(hb.slice(hb.lastIndexOf("|") + 1));
+  return Number.isFinite(ms) && now - ms < 60_000;
+}
+
 export class PersonalWebBridge {
   private readonly app: App;
   private readonly store: ContextStore;
@@ -540,10 +549,25 @@ export class PersonalWebBridge {
   /** 判断常驻监听当前是否真实在线（本进程在跑，或 daemon.heartbeat 在 60 秒内活跃） */
   private isDaemonLive(now = Date.now()): boolean {
     if (this.stopCtrl && !this.stopCtrl.signal.aborted) return true;
-    const hb = this.app.store.get("daemon.heartbeat");
-    if (!hb) return false;
-    const ms = Number(hb.slice(hb.lastIndexOf("|") + 1));
-    return Number.isFinite(ms) && now - ms < 60_000;
+    return isLiveDaemonHeartbeat(this.app.store, now);
+  }
+
+  /**
+   * 判断非常驻进程（如交互式 `pa brief` / `pa job` / `pa dispatch`）是否应将 `pw.reply` 留给持钥常驻进程执行：
+   *   - 若该回复已完成 `verified` 投递，无需凭据即可幂等完结，返回 false；
+   *   - 若本进程已有在线 Web 客户端或能直接解密本地凭据，返回 false（可本地执行）；
+   *   - 若本地缺少解密密钥（`missing_key`）或默认路径缺失文件但常驻进程在线（`missing` + 活跃心跳），
+   *     返回 true，避免无密钥的交互式命令误领并消耗重试次数。
+   */
+  shouldDeferReplyToCredentialedConsumer(cid?: string): boolean {
+    if (cid && this.loadDelivery(cid)?.state === "verified") return false;
+    if (this.client) return false;
+    this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
+    const inspected = this.loginStore.inspect();
+    if (inspected.status === "ok") return false;
+    if (inspected.status === "missing_key") return true;
+    if (inspected.status === "missing" && isLiveDaemonHeartbeat(this.app.store)) return true;
+    return false;
   }
 
   status(now = Date.now()): CtxPersonalWebStatus {
@@ -669,14 +693,16 @@ export class PersonalWebBridge {
     return `${login.owner_id}:${login.session_id ?? ""}`;
   }
 
-  /** 阻塞等待直到磁盘凭据（含同会话 Cookie 修订）或工作区账号绑定发生变化，或收到中止信号 */
+  /** 阻塞等待直到磁盘凭据（含同会话 Cookie 修订与未完成暂存提交恢复）或工作区账号绑定发生变化，或收到中止信号 */
   private async waitForCredentialChange(lastFailedStateKey: string, signal: AbortSignal): Promise<void> {
     const interval = this.hooks.credentialWatchIntervalMs ?? 5_000;
+    this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
     const immediate = this.loginStore.load();
     if (immediate && this.credentialWatchKey(immediate) !== lastFailedStateKey) return;
     while (!signal.aborted) {
       await waitAbortable(interval, signal);
       if (signal.aborted) return;
+      this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
       const cur = this.loginStore.load();
       if (cur && this.credentialWatchKey(cur) !== lastFailedStateKey) return;
     }
@@ -715,6 +741,7 @@ export class PersonalWebBridge {
     };
 
     while (!signal.aborted) {
+      this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
       const inspected = this.loginStore.inspect();
       const login = inspected.status === "ok" ? inspected.login : undefined;
       if (!login) {
@@ -754,6 +781,7 @@ export class PersonalWebBridge {
       signal.addEventListener("abort", onOuterAbort, { once: true });
       let invalidatedByDisk = false;
       const credWatcher = setInterval(() => {
+        this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
         const latest = this.loginStore.load();
         if (!latest || this.sessionKeyOf(latest) !== activeSessionKey) {
           invalidatedByDisk = true;
@@ -1276,9 +1304,17 @@ export class PersonalWebBridge {
       if (!fresh) return staleNameExcluded ? "excluded" : "uncertain";
       if (fresh.meta.chatType === "p2p") recordedType = "dm";
       else if (fresh.meta.chatType === "group") recordedType = "group";
-      effectiveName = fresh.meta.name;
+      // 开放平台 p2p 会话的 im chats get 通常返回空 name：保留已记录的私聊展示名，避免覆盖导致关键词排除漏检
+      effectiveName = recordedType === "dm" ? fresh.meta.name || effectiveName : fresh.meta.name;
     }
-    if (recordedType === "dm") return nativeExcl.dmsInconclusive ? "uncertain" : "allowed";
+    if (recordedType === "dm") {
+      // 对已知私聊先应用主人显式配置的 groups_deny 关键词匹配；跨通道原生群名（confirmedGroupNames）仍与私聊隔离
+      const dmLabels = [effectiveName, convName, latest?.conv_name ?? ""].filter(Boolean);
+      if (nameRules.length > 0 && dmLabels.some((lbl) => nameRules.some((d) => lbl.includes(d)))) {
+        return "excluded";
+      }
+      return nativeExcl.dmsInconclusive ? "uncertain" : "allowed";
+    }
     if (recordedType === "unknown") {
       if (effectiveName && nativeExcl.confirmedGroupNames.has(norm(effectiveName))) return "excluded";
       if (effectiveName && nameRules.some((d) => effectiveName.includes(d))) return "excluded";
@@ -1447,19 +1483,20 @@ export class PersonalWebBridge {
    */
   filterWindowByCurrentScope(conv: string, window: Obs[], nativeExcl?: NativePollingExclusions): Obs[] {
     if (!window.length) return window;
-    if (!conv.startsWith("pw_chat:") && !conv.startsWith("oc_")) return window;
+    const active = window.filter((o) => o.meta.withdrawn !== true);
+    if (!active.length) return active;
+    if (!conv.startsWith("pw_chat:") && !conv.startsWith("oc_")) return active;
     const isDm =
-      window.some((o) => String(o.meta.chat_type ?? "").trim().toLowerCase() === "p2p" || o.kind === "p2p") ||
+      active.some((o) => String(o.meta.chat_type ?? "").trim().toLowerCase() === "p2p" || o.kind === "p2p") ||
       this.store.isDmConv(conv);
-    if (isDm) return window;
+    if (isDm) return active;
 
-    if (this.isGroupConvInCurrentScope(conv, nativeExcl)) return window;
-    return window.filter(
+    if (this.isGroupConvInCurrentScope(conv, nativeExcl)) return active;
+    return active.filter(
       (o) =>
         (o.kind === "at_me" || o.meta.at_me === true) &&
         o.meta.at_me !== false &&
-        o.meta.is_mention_me !== false &&
-        o.meta.withdrawn !== true,
+        o.meta.is_mention_me !== false,
     );
   }
 
@@ -2447,16 +2484,14 @@ export function commitWorkspaceLogin(
       saveWorkspaceBinding(app.store, saved.owner_id, configuredOpenId);
       app.store.set(REVOKED_AT_KV_KEY, "");
       app.store.set(ACTIVE_SESSION_KV_KEY, saved.session_id ?? "");
-      app.store.set(
-        PENDING_CRED_COMMIT_KV_KEY,
-        JSON.stringify({
-          file: loginStore.file,
-          staged_file: loginStore.stagedFile,
-          owner_id: saved.owner_id,
-          session_id: saved.session_id ?? "",
-          at: Date.now(),
-        }),
-      );
+      const pendingMarker = JSON.stringify({
+        file: loginStore.file,
+        staged_file: loginStore.stagedFile,
+        owner_id: saved.owner_id,
+        session_id: saved.session_id ?? "",
+        at: Date.now(),
+      });
+      app.store.set(PENDING_CRED_COMMIT_KV_KEY, pendingMarker);
       app.store.set(
         STATE_KV_KEY,
         JSON.stringify({
@@ -2477,7 +2512,11 @@ export function commitWorkspaceLogin(
 
       staged.commitFile();
       try {
-        app.store.set(PENDING_CRED_COMMIT_KV_KEY, "");
+        clearPendingCommitMarkerIfMatches(app.store, PENDING_CRED_COMMIT_KV_KEY, {
+          file: loginStore.file,
+          sessionId: saved.session_id ?? "",
+          rawMarker: pendingMarker,
+        });
       } catch {
         // 凭据文件已切换完成；下次 reconcilePendingCommit 会自动清除冗余标记
       }

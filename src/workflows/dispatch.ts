@@ -7,7 +7,7 @@ import { repoSpec, type Config } from "../config.ts";
 import { tryGit } from "../delivery/git.ts";
 import { comment, move } from "../effects.ts";
 import { checkpoint, type Ctx, type Handler } from "../engine.ts";
-import { loadPrompt, prepareHarnessEnv, runHarness, wrapCredentialIsolatedCommand } from "../harness.ts";
+import { buildWorkspaceIsolation, loadPrompt, prepareHarnessEnv, runHarness, wrapCredentialIsolatedCommand } from "../harness.ts";
 import type { Effect, Ledger, WorkItem } from "../ledger.ts";
 import type { Store } from "../store.ts";
 import { errMsg, log, render, runProcess, truncate } from "../util.ts";
@@ -410,14 +410,15 @@ export class Dispatcher {
     const round = String(p.round);
     if (p.base) {
       const cp = p.checkpoints[round];
+      const gitOpts = { cfg: this.cfg };
       if (cp) {
         // 重入（崩溃 / 失败重试）：丢弃上次没跑完的半成品，回到本轮起点
-        await git(p.cwd, ["reset", "--hard", cp]);
-        await git(p.cwd, ["clean", "-fd"]);
+        await git(p.cwd, ["reset", "--hard", cp], gitOpts);
+        await git(p.cwd, ["clean", "-fd"], gitOpts);
         log("info", "回到本轮检查点后重跑", { task: p.summary, round: p.round, checkpoint: cp.slice(0, 8) });
       } else {
-        await autoCommit(p.cwd, `pa: 第 ${round} 轮开始前的快照`);
-        p = { ...p, checkpoints: { ...p.checkpoints, [round]: (await git(p.cwd, ["rev-parse", "HEAD"])).trim() } };
+        await autoCommit(p.cwd, `pa: 第 ${round} 轮开始前的快照`, gitOpts);
+        p = { ...p, checkpoints: { ...p.checkpoints, [round]: (await git(p.cwd, ["rev-parse", "HEAD"], { ...gitOpts, readOnly: true })).trim() } };
         it = this.ledger.transition(it, { payload: p }); // 先落检查点，再动手
       }
     }
@@ -446,7 +447,7 @@ export class Dispatcher {
       checkpoint(ctx);
       throw new Error(`${p.harness} 执行失败（exit ${r.exitCode}${r.timedOut ? "，超时" : ""}）：${truncate(report, 800)}`);
     }
-    if (p.base) await autoCommit(p.cwd, `pa: 第 ${round} 轮（${p.harness}）`);
+    if (p.base) await autoCommit(p.cwd, `pa: 第 ${round} 轮（${p.harness}）`, { cfg: this.cfg });
     this.ledger.endStep(step, "ok", truncate(report, 500));
     return this.ledger.transition(it, { state: "verifying", payload: { ...p, report } });
   }
@@ -469,7 +470,7 @@ export class Dispatcher {
       const feedback = checks.filter((c) => c.status === "fail").map((c) => `### ${c.name}\n${c.detail}`).join("\n\n");
       return this.ledger.transition(it, { state: "executing", payload: { ...p, history, round: p.round + 1, feedback } }, effects);
     }
-    const stat = p.base ? await gitDiffStat(p.cwd, p.base) : "";
+    const stat = p.base ? await gitDiffStat(p.cwd, p.base, { cfg: this.cfg, readOnly: true }) : "";
     const tail = [truncate(p.report, 1800), stat ? `\n变更：\n${stat}` : "", p.branch ? `分支：${p.branch}（worktree：${p.cwd}）` : ""].filter(Boolean).join("\n");
     const final = { ...p, history };
     if (d.next === "accept") {
@@ -494,7 +495,16 @@ export class Dispatcher {
     const step = this.ledger.startStep({ work_id: it.id, name: `verify#${p.round}`, log: logFile });
     const baseEnv = prepareHarnessEnv();
     try {
-      const wrapped = wrapCredentialIsolatedCommand("bash", ["-lc", p.verify]);
+      const wrapped = wrapCredentialIsolatedCommand(
+        "bash",
+        ["-lc", p.verify],
+        process.env,
+        buildWorkspaceIsolation(this.cfg, {
+          mode: "verify",
+          cwd: p.cwd,
+          extraReadOnlyPaths: baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : [],
+        }),
+      );
       const r = await runProcess(wrapped.cmd, wrapped.args, {
         cwd: p.cwd,
         env: baseEnv.env,
@@ -523,7 +533,7 @@ export class Dispatcher {
   private async runReview(it: Item, ctx: Ctx): Promise<CheckResult> {
     const p = it.payload;
     const name = `${p.reviewer} 审查`;
-    const diff = p.base ? await gitDiff(p.cwd, p.base) : "";
+    const diff = p.base ? await gitDiff(p.cwd, p.base, { cfg: this.cfg, readOnly: true }) : "";
     let lastErr = "";
     for (let i = 0; i <= this.cfg.acceptance.review_retries; i++) {
       checkpoint(ctx);
@@ -573,9 +583,15 @@ export class Dispatcher {
     const branch = `pa/${short}`;
     const baseKey = `worktree.${t.guid}.base`;
     if (!fs.existsSync(cwd)) {
-      const head = await git(spec.path, ["rev-parse", "HEAD"]);
-      const hasBranch = (await tryGit(spec.path, ["rev-parse", "--verify", "--quiet", branch])).code === 0;
-      await git(spec.path, hasBranch ? ["worktree", "add", cwd, branch] : ["worktree", "add", "-b", branch, cwd]);
+      const wtParent = path.join(this.cfg.dataDir, "worktrees");
+      fs.mkdirSync(wtParent, { recursive: true });
+      const head = await git(spec.path, ["rev-parse", "HEAD"], { cfg: this.cfg, readOnly: true });
+      const hasBranch = (await tryGit(spec.path, ["rev-parse", "--verify", "--quiet", branch], { cfg: this.cfg, readOnly: true })).code === 0;
+      await git(
+        spec.path,
+        hasBranch ? ["worktree", "add", cwd, branch] : ["worktree", "add", "-b", branch, cwd],
+        { cfg: this.cfg, extraWritablePaths: [wtParent] },
+      );
       if (!this.store.get(baseKey)) this.store.set(baseKey, head.trim());
     }
     const base = this.store.get(baseKey) ?? "";
@@ -596,24 +612,24 @@ export function formatReview(r: Review): string {
   return [r.summary, ...issues].filter(Boolean).join("\n") || (r.verdict === "approve" ? "没有发现问题" : "需修改");
 }
 
-async function git(cwd: string, args: string[]): Promise<string> {
-  const r = await tryGit(cwd, args);
+async function git(cwd: string, args: string[], opts?: import("../delivery/git.ts").GitRunOpts): Promise<string> {
+  const r = await tryGit(cwd, args, opts);
   if (r.code !== 0) throw new Error(`git ${args.join(" ")} 失败：${r.stderr.trim()}`);
   return r.stdout;
 }
 
 /** 有改动就提交（含新文件）；没有改动什么都不做。 */
-async function autoCommit(cwd: string, message: string): Promise<void> {
-  await git(cwd, ["add", "-A"]);
-  const dirty = (await tryGit(cwd, ["diff", "--cached", "--quiet"])).code !== 0;
-  if (dirty) await git(cwd, ["commit", "-q", "--no-verify", "-m", message]);
+async function autoCommit(cwd: string, message: string, opts?: import("../delivery/git.ts").GitRunOpts): Promise<void> {
+  await git(cwd, ["add", "-A"], opts);
+  const dirty = (await tryGit(cwd, ["diff", "--cached", "--quiet"], { ...opts, readOnly: true })).code !== 0;
+  if (dirty) await git(cwd, ["commit", "-q", "--no-verify", "-m", message], opts);
 }
 
 /** 相对创建 worktree 时的基线（每轮结束都已自动提交，所以比较到 HEAD 即可）。 */
-async function gitDiff(cwd: string, base: string): Promise<string> {
-  return (await tryGit(cwd, ["diff", base, "HEAD"])).stdout;
+async function gitDiff(cwd: string, base: string, opts?: import("../delivery/git.ts").GitRunOpts): Promise<string> {
+  return (await tryGit(cwd, ["diff", base, "HEAD"], { ...opts, readOnly: true })).stdout;
 }
 
-async function gitDiffStat(cwd: string, base: string): Promise<string> {
-  return (await tryGit(cwd, ["diff", "--stat", base, "HEAD"])).stdout.trim();
+async function gitDiffStat(cwd: string, base: string, opts?: import("../delivery/git.ts").GitRunOpts): Promise<string> {
+  return (await tryGit(cwd, ["diff", "--stat", base, "HEAD"], { ...opts, readOnly: true })).stdout.trim();
 }

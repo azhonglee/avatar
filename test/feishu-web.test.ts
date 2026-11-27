@@ -32,6 +32,7 @@ import {
   CHAT_KIND_TOPIC,
   CHAT_MODE_TOPIC,
   CHAT_MODE_TOPIC_THREAD,
+  clearPendingCommitMarkerIfMatches,
   CMD_CHAT_MODE,
   CMD_HEARTBEAT,
   CMD_HISTORY,
@@ -97,12 +98,16 @@ import { branchUsesGitLfs, isGitLfsPointerBlob, pushBranch, tryGit } from "../sr
 import { runDoctor } from "../src/doctor.ts";
 import { card as cardEffect, effectHandler } from "../src/effects.ts";
 import {
+  buildWorkspaceIsolation,
   extractSafeCodexProviderArgs,
   extractSafeCodexProviderConfig,
   hasCredentialMountIsolation,
   mergeHarnessEnv,
   prepareHarnessEnv,
+  runHarness,
+  workspaceRequiresIsolation,
   wrapCredentialIsolatedCommand,
+  type HarnessRun,
 } from "../src/harness.ts";
 import { SettingsService } from "../src/settings.ts";
 import { parseToml } from "../src/toml.ts";
@@ -116,11 +121,92 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const STUBS = path.join(ROOT, "test/stubs");
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-// [R5 P1-1] 在构造任何 WebLoginStore 或派生 CLI 子进程前，彻底剥离宿主环境中的真实凭据路径与密钥，避免测试覆盖或删除真实登录态
+// [R5 P1-1 + R12 P2] 在构造任何 WebLoginStore 或派生 CLI 子进程前，彻底剥离宿主环境中的真实凭据路径与密钥；
+// 且绝不在文件级全局注入 PA_FEISHU_WEB_KEY，避免无关 Git/协议/工作流用例被迫依赖 Linux 内核命名空间。
 delete process.env.PA_FEISHU_WEB_CRED_FILE;
 delete process.env.CREDENTIALS_DIRECTORY;
+delete process.env.PA_FEISHU_WEB_KEY;
 const TEST_WEB_KEY = `pa-test-feishu-web-key-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
-process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
+
+async function withTestWebKey<T>(fn: () => Promise<T> | T, key = TEST_WEB_KEY): Promise<T> {
+  const prevKey = process.env.PA_FEISHU_WEB_KEY;
+  process.env.PA_FEISHU_WEB_KEY = key;
+  try {
+    return await fn();
+  } finally {
+    if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevKey;
+  }
+}
+
+async function withoutTestWebKey<T>(fn: () => Promise<T> | T): Promise<T> {
+  const prevKey = process.env.PA_FEISHU_WEB_KEY;
+  const prevCredDir = process.env.CREDENTIALS_DIRECTORY;
+  const prevCredFile = process.env.PA_FEISHU_WEB_CRED_FILE;
+  delete process.env.PA_FEISHU_WEB_KEY;
+  delete process.env.CREDENTIALS_DIRECTORY;
+  delete process.env.PA_FEISHU_WEB_CRED_FILE;
+  try {
+    return await fn();
+  } finally {
+    if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevKey;
+    if (prevCredDir === undefined) delete process.env.CREDENTIALS_DIRECTORY;
+    else process.env.CREDENTIALS_DIRECTORY = prevCredDir;
+    if (prevCredFile === undefined) delete process.env.PA_FEISHU_WEB_CRED_FILE;
+    else process.env.PA_FEISHU_WEB_CRED_FILE = prevCredFile;
+  }
+}
+
+/** 进程内上下文模型桩：让工作流/协议单测不依赖 Linux 内核命名空间，也能与真实内核隔离单测清晰解耦 */
+function installCtxDirStubLlm(svc: ContextService, ctxDir: string): void {
+  const runner: typeof runHarness = async (_cfg, run: HarnessRun) => {
+    const prompt = run.prompt;
+    const kind = prompt.includes("维护个人工作上下文") ? "understand" : prompt.includes("整理工作上下文里的项目结构") ? "split" : "draft";
+    fs.appendFileSync(path.join(ctxDir, "calls.log"), JSON.stringify({ role: "codex", argv: [], kind, prompt }) + "\n");
+    let text: string;
+    if (kind === "draft") {
+      const p = path.join(ctxDir, "draft.txt");
+      text = fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "好的，我这边已跟进处理，稍后同步最新进展。";
+    } else if (kind === "split") {
+      const p = path.join(ctxDir, "split.json");
+      text = fs.existsSync(p) ? fs.readFileSync(p, "utf8") : JSON.stringify({ subprojects: [], items: [], knowledge: [], updates: [] });
+    } else {
+      const txtPath = path.join(ctxDir, "understand.txt");
+      if (fs.existsSync(txtPath)) {
+        text = fs.readFileSync(txtPath, "utf8");
+      } else {
+        const jsonPath = path.join(ctxDir, "understand.json");
+        text = fs.existsSync(jsonPath)
+          ? fs.readFileSync(jsonPath, "utf8")
+          : JSON.stringify({ projects: [], items: [], knowledge: [], updates: [], people: [], conflicts: [] });
+      }
+    }
+    if (run.logFile) {
+      fs.mkdirSync(path.dirname(run.logFile), { recursive: true });
+      fs.writeFileSync(run.logFile, `# stub-llm\n## prompt\n${prompt}\n## reply\n${text.trim()}\n`);
+    }
+    return { ok: true, exitCode: 0, text: text.trim(), timedOut: false, aborted: false };
+  };
+  svc.understander.runner = runner;
+  svc.drafter.runner = runner;
+}
+
+function installCallbackLlm(
+  svc: ContextService,
+  handler: (prompt: string, run: HarnessRun) => Promise<string> | string,
+): void {
+  const runner: typeof runHarness = async (_cfg, run: HarnessRun) => {
+    const text = await handler(run.prompt, run);
+    if (run.logFile) {
+      fs.mkdirSync(path.dirname(run.logFile), { recursive: true });
+      fs.writeFileSync(run.logFile, `# stub-llm\n## prompt\n${run.prompt}\n## reply\n${text.trim()}\n`);
+    }
+    return { ok: true, exitCode: 0, text: text.trim(), timedOut: false, aborted: false };
+  };
+  svc.understander.runner = runner;
+  svc.drafter.runner = runner;
+}
 
 const tmpDirs: string[] = [];
 const makeTmp = (prefix: string) => {
@@ -295,7 +381,7 @@ test("Protobuf wire 编解码：varint / bytes / repeated / 64 位时间戳 / �
 
 // ───────── 2. Cookie Jar & 0600 凭据存储 ─────────
 
-test("Cookie Jar：域名白名单、RFC 6265 匹配、轮换与删除、0600 原子落盘", () => {
+test("Cookie Jar：域名白名单、RFC 6265 匹配、轮换与删除、0600 原子落盘", async () => {
   assert.equal(isAllowedFeishuHost("feishu.cn"), true);
   assert.equal(isAllowedFeishuHost("open-dev.feishu.cn"), true);
   assert.equal(isAllowedFeishuHost("internal-api-lark-api.feishu.cn"), true);
@@ -323,17 +409,19 @@ test("Cookie Jar：域名白名单、RFC 6265 匹配、轮换与删除、0600 �
   assert.equal(jar.cookieValue(new URL("https://accounts.feishu.cn/"), "swp_csrf_token"), "");
 
   // 0600 原子持久化
-  const dir = makeTmp("pa-pw-store-");
-  const store = new WebLoginStore(dir);
-  store.save({ owner_id: "7001", owner_name: "张三", cookies: jar.records() });
-  const stat = fs.statSync(store.file);
-  assert.equal(stat.mode & 0o777, 0o600, "凭据文件权限必须为 0600");
-  const loaded = store.load()!;
-  assert.equal(loaded.owner_id, "7001");
-  assert.equal(loaded.owner_name, "张三");
-  assert.ok(loaded.cookies.some((c) => c.name === "session" && c.value === "s2"));
-  store.clear();
-  assert.equal(store.load(), undefined);
+  await withTestWebKey(() => {
+    const dir = makeTmp("pa-pw-store-");
+    const store = new WebLoginStore(dir);
+    store.save({ owner_id: "7001", owner_name: "张三", cookies: jar.records() });
+    const stat = fs.statSync(store.file);
+    assert.equal(stat.mode & 0o777, 0o600, "凭据文件权限必须为 0600");
+    const loaded = store.load()!;
+    assert.equal(loaded.owner_id, "7001");
+    assert.equal(loaded.owner_name, "张三");
+    assert.ok(loaded.cookies.some((c) => c.name === "session" && c.value === "s2"));
+    store.clear();
+    assert.equal(store.load(), undefined);
+  });
 });
 
 // ───────── 3. 纯 TypeScript QR 编码器 ─────────
@@ -460,7 +548,10 @@ interface MockWebServer {
   setProfileStatuses: (seq: number[]) => void;
   setProfileUser: (id: string, name: string) => void;
   setMessengerStatus: (status: number) => void;
+  setMessengerErrorCookie: (cookie: string) => void;
   setTicketStatus: (status: number) => void;
+  setTicketRotateDidOnce: (did: string) => void;
+  ticketDeviceIds: string[];
   setWsUpgradeStatus: (status: number) => void;
   setChatModeFail: (fail: boolean) => void;
   setOnChatMode: (fn: (() => void) | undefined) => void;
@@ -484,7 +575,11 @@ async function startMockFeishuWebServer(): Promise<MockWebServer> {
   let profileStatusSeq: number[] = [];
   let profileUser = { id: "7001", name: "张三" };
   let messengerStatus = 200;
+  let messengerErrorCookie = "";
   let ticketStatus = 200;
+  let ticketRotateDidOnce = "";
+  let ticketBindDid = false;
+  const ticketDeviceIds: string[] = [];
   let wsUpgradeStatus = 101;
   let chatModeFail = false;
   let onChatMode: (() => void) | undefined;
@@ -522,7 +617,9 @@ async function startMockFeishuWebServer(): Promise<MockWebServer> {
         return;
       }
       if (messengerStatus !== 200) {
-        res.writeHead(messengerStatus);
+        const hdrs: Record<string, string> = {};
+        if (messengerErrorCookie) hdrs["Set-Cookie"] = messengerErrorCookie;
+        res.writeHead(messengerStatus, hdrs);
         res.end("service unavailable");
         return;
       }
@@ -587,13 +684,20 @@ async function startMockFeishuWebServer(): Promise<MockWebServer> {
     }
 
     if (url.pathname === "/suite/passport/frontier_ticket/") {
+      const localDid = url.searchParams.get("local_device_id") ?? "";
+      ticketDeviceIds.push(localDid);
       if (ticketStatus !== 200) {
         res.writeHead(ticketStatus, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ code: ticketStatus }));
         return;
       }
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ code: 0, ticket: "ticket_live_42" }));
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (ticketRotateDidOnce) {
+        headers["Set-Cookie"] = `passport_web_did=${ticketRotateDidOnce}; Path=/; Max-Age=86400`;
+        ticketRotateDidOnce = "";
+      }
+      res.writeHead(200, headers);
+      res.end(JSON.stringify({ code: 0, ticket: ticketBindDid ? `ticket_for_${localDid}` : "ticket_live_42" }));
       return;
     }
 
@@ -805,9 +909,17 @@ async function startMockFeishuWebServer(): Promise<MockWebServer> {
     setMessengerStatus: (s) => {
       messengerStatus = s;
     },
+    setMessengerErrorCookie: (c) => {
+      messengerErrorCookie = c;
+    },
     setTicketStatus: (s) => {
       ticketStatus = s;
     },
+    setTicketRotateDidOnce: (d) => {
+      ticketRotateDidOnce = d;
+      ticketBindDid = !!d;
+    },
+    ticketDeviceIds,
     setWsUpgradeStatus: (s) => {
       wsUpgradeStatus = s;
     },
@@ -1048,6 +1160,8 @@ test("客户端全链路：连接签名、gzip 推送 + 背压 ACK、心跳、re
 // ───────── 6. Working Context 集成：快通道、跨通道去重、确认后 pw.reply、pa doctor ─────────
 
 test("Working Context 集成：个人 Web @我 秒级快通道 + 预起草不自动发 + 跨通道指纹去重 + 确认经 pw.reply 投递 + doctor", async () => {
+  const prevKey = process.env.PA_FEISHU_WEB_KEY;
+  process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
   const mock = await startMockFeishuWebServer();
   const dir = makeTmp("pa-pw-ctx-");
   const ctxDir = path.join(dir, "ctx");
@@ -1099,6 +1213,8 @@ test("Working Context 集成：个人 Web @我 秒级快通道 + 预起草不自
 
     // 2) 建立带 mock endpoints 的 live client 并模拟 @我 推送进入快通道
     const svc = new ContextService(app);
+    installCtxDirStubLlm(svc, ctxDir);
+    app.engine.register(svc.handler());
     // 用带 mock endpoints 的 bridge 覆盖 effectHooks 以便测试 pw.reply
     const client = await FeishuWebClient.connect(loginStore.load()!, { endpoints: mock.endpoints });
     app.effectHooks.pwReply = async (args) => {
@@ -1265,6 +1381,8 @@ test("Working Context 集成：个人 Web @我 秒级快通道 + 预起草不自
     assert.equal(app.ledger.list({ kinds: ["context"], ref: "fast", limit: 50 }).length, fastBefore + 1, "对方私聊立即触发快通道");
   } finally {
     app?.store.db.close();
+    if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevKey;
     if (prevCtxDir === undefined) delete process.env.CTX_DIR;
     else process.env.CTX_DIR = prevCtxDir;
     await mock.close();
@@ -1417,6 +1535,8 @@ test("协议加固回归：64 位无损账号 ID、跨主机剥离 x-csrf-token�
 });
 
 test("存储、范围、并发、草稿解耦、登出/绑定、热加载与离线状态回归", async () => {
+  const prevKey = process.env.PA_FEISHU_WEB_KEY;
+  process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
   const mock = await startMockFeishuWebServer();
   const dir = makeTmp("pa-pw-reg-");
   const ctxDir = path.join(dir, "ctx");
@@ -1457,6 +1577,7 @@ test("存储、范围、并发、草稿解耦、登出/绑定、热加载与离�
   try {
     app = createApp(loadConfig(cfgFile));
     const svc = new ContextService(app);
+    installCtxDirStubLlm(svc, ctxDir);
     const now = Date.now();
 
     // 1) [P1-1] 不同群两条相同的「收到」绝不能跨群误合并或误绑定 open_message_id
@@ -1782,6 +1903,8 @@ test("存储、范围、并发、草稿解耦、登出/绑定、热加载与离�
     assert.equal(app.cfg.context.personal_web.fast_lane, false, "热字段立即生效");
   } finally {
     app?.store.db.close();
+    if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevKey;
     if (prevCtxDir === undefined) delete process.env.CTX_DIR;
     else process.env.CTX_DIR = prevCtxDir;
     await mock.close();
@@ -1791,6 +1914,8 @@ test("存储、范围、并发、草稿解耦、登出/绑定、热加载与离�
 // ───────── 8. Codex Review 第二轮专项回归测试 ─────────
 
 test("Codex 第二轮回归：PK 索引查询、同名群静音隔离、话题锚点补读、编辑防吞、账号绑定与发包前复核、明确拒绝可重试、非连续 401、分片 WS、关闭模块登出", async () => {
+  const prevKey = process.env.PA_FEISHU_WEB_KEY;
+  process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
   const mock = await startMockFeishuWebServer();
   const dir = makeTmp("pa-pw-r2-");
   const ctxDir = path.join(dir, "ctx");
@@ -1823,6 +1948,7 @@ test("Codex 第二轮回归：PK 索引查询、同名群静音隔离、话题�
   try {
     app = createApp(loadConfig(cfgFile));
     const svc = new ContextService(app);
+    installCtxDirStubLlm(svc, ctxDir);
     const now = Date.now();
     const nowSec = Math.floor(now / 1000);
 
@@ -2220,6 +2346,8 @@ test("Codex 第二轮回归：PK 索引查询、同名群静音隔离、话题�
     assert.equal(disStore.exists(), false, "web-logout 必须删除磁盘凭据文件");
   } finally {
     app?.store.db.close();
+    if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevKey;
     if (prevCtxDir === undefined) delete process.env.CTX_DIR;
     else process.env.CTX_DIR = prevCtxDir;
     await mock.close();
@@ -2229,6 +2357,8 @@ test("Codex 第二轮回归：PK 索引查询、同名群静音隔离、话题�
 // ───────── 9. Codex Review 第三轮专项回归测试 ─────────
 
 test("Codex 第三轮回归：空载荷发送保护、稳定 ID 首次绑定、静音改名 fail-closed、跨通道原生排除、快通道二次校验、补读换号隔离、强制刷新群模式、Cookie 版本合并、CSRF 域名作用域、@mention 编辑、近邻背景窗口、帧数上限与状态清理", async () => {
+  const prevKey = process.env.PA_FEISHU_WEB_KEY;
+  process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
   const mock = await startMockFeishuWebServer();
   const dir = makeTmp("pa-pw-r3-");
   const ctxDir = path.join(dir, "ctx");
@@ -2262,6 +2392,7 @@ test("Codex 第三轮回归：空载荷发送保护、稳定 ID 首次绑定、�
   try {
     app = createApp(loadConfig(cfgFile));
     const svc = new ContextService(app);
+    installCtxDirStubLlm(svc, ctxDir);
     const loginStore = new WebLoginStore(app.cfg.dataDir);
     const now = Date.now();
     const nowSec = Math.floor(now / 1000);
@@ -2694,6 +2825,8 @@ test("Codex 第三轮回归：空载荷发送保护、稳定 ID 首次绑定、�
     wsFrag.close();
   } finally {
     app?.store.db.close();
+    if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevKey;
     if (prevCtxDir === undefined) delete process.env.CTX_DIR;
     else process.env.CTX_DIR = prevCtxDir;
     await mock.close();
@@ -2758,6 +2891,7 @@ test("Codex 第四轮回归：凭据加密与 harness 隔离、工作区主人�
 
     app = createApp(loadConfig(cfgFile));
     const svc = new ContextService(app);
+    installCtxDirStubLlm(svc, ctxDir);
     const loginStore = new WebLoginStore(app.cfg.dataDir);
     const now = Date.now();
     const nowSec = Math.floor(now / 1000);
@@ -3354,6 +3488,7 @@ test("Codex 第五轮回归：加密防降级、显式绑定、主人变更全�
     );
     app = createApp(loadConfig(cfgFile));
     const svc = new ContextService(app);
+    installCtxDirStubLlm(svc, ctxDir);
     const now = Date.now();
     const nowSec = Math.floor(now / 1000);
     const loginStore = new WebLoginStore(app.cfg.dataDir);
@@ -3363,6 +3498,50 @@ test("Codex 第五轮回归：加密防降级、显式绑定、主人变更全�
     (svc.personalWeb as unknown as { client?: FeishuWebClient }).client = client;
 
     // 7) [R5 P1-5] codex-exec tools="none" 传入 --ignore-user-config / --ignore-rules / 禁用 MCP 与内置工具
+    // 在无个人 Web 密钥/配置的独立临时目录中实跑 runHarness，既验证真实 codex-exec 参数又可在无 Linux userns 的宿主机执行
+    await withoutTestWebKey(async () => {
+      const probeDir = makeTmp("pa-r5-codex-argv-");
+      const probeBin = path.join(probeDir, "echo-argv.mjs");
+      fs.writeFileSync(
+        probeBin,
+        `#!/usr/bin/env node
+import fs from "node:fs";
+const argv = process.argv.slice(2);
+const outIdx = argv.indexOf("-o");
+const outPath = outIdx >= 0 ? argv[outIdx + 1] : "";
+const payload = JSON.stringify({ argv });
+if (outPath) fs.writeFileSync(outPath, payload, "utf8");
+else process.stdout.write(payload);
+`,
+        { mode: 0o755 },
+      );
+      const probeCfgFile = path.join(probeDir, "config.yaml");
+      fs.writeFileSync(
+        probeCfgFile,
+        JSON.stringify({
+          data_dir: path.join(probeDir, "data"),
+          harnesses: { cx_probe: { type: "codex-exec", cmd: probeBin } },
+          roles: { brain: "cx_probe" },
+          owner: { open_id: "ou_owner_a" },
+          context: { enabled: true, personal_web: { enabled: false } },
+        }),
+      );
+      const probeCfg = loadConfig(probeCfgFile);
+      const res = await runHarness(probeCfg, {
+        harness: "cx_probe",
+        prompt: "测试无工具无 MCP 隔离参数",
+        cwd: path.join(probeDir, "work"),
+        tools: "none",
+        lark: "none",
+        timeoutSec: 30,
+        logFile: path.join(probeDir, "run.log"),
+      });
+      assert.equal(res.ok, true);
+      const lastCodexArgv = (JSON.parse(res.text) as { argv: string[] }).argv;
+      assert.ok(lastCodexArgv.includes("--ignore-user-config"), "tools=none 必须禁用 ~/.codex/config.toml 防止加载用户 MCP Server");
+      assert.ok(lastCodexArgv.includes("--ignore-rules"), "tools=none 必须禁用 execpolicy rules");
+      assert.ok(lastCodexArgv.includes("code_mode") && lastCodexArgv.includes("plugins") && lastCodexArgv.includes("shell_tool"));
+    });
     const callsLog = path.join(ctxDir, "calls.log");
     fs.writeFileSync(callsLog, "");
     fs.writeFileSync(path.join(ctxDir, "understand.json"), JSON.stringify({ projects: [], items: [] }));
@@ -3383,18 +3562,7 @@ test("Codex 第五轮回归：加密防降级、显式绑定、主人变更全�
       },
     ]);
     await svc.fastCycle("context:fast:mcp-check", { conv: "pw_chat:dm_mcp", conv_name: "私聊：7002", trigger_obs_id: "pw:mcp_check_1" });
-    const codexCalls = fs
-      .readFileSync(callsLog, "utf8")
-      .trim()
-      .split("\n")
-      .filter(Boolean)
-      .map((l) => JSON.parse(l) as { role: string; argv: string[] })
-      .filter((c) => c.role === "codex");
-    assert.ok(codexCalls.length >= 1);
-    const lastCodexArgv = codexCalls[codexCalls.length - 1].argv;
-    assert.ok(lastCodexArgv.includes("--ignore-user-config"), "tools=none 必须禁用 ~/.codex/config.toml 防止加载用户 MCP Server");
-    assert.ok(lastCodexArgv.includes("--ignore-rules"), "tools=none 必须禁用 execpolicy rules");
-    assert.ok(lastCodexArgv.includes("code_mode") && lastCodexArgv.includes("plugins") && lastCodexArgv.includes("shell_tool"));
+    assert.ok(fs.readFileSync(callsLog, "utf8").trim().length > 0);
 
     // 8) [R5 P1-3] 工作区 owner.open_id 从 A 变更为 B 后，A 的待处理私聊观测必须被常规 cycle 与快通道彻底阻断
     svc.store.addObs([
@@ -3966,21 +4134,25 @@ test("Codex 第六轮回归：派生上下文主人隔离、Codex 供应商保�
       assert.equal(fs.existsSync(prepMixed.env.CREDENTIALS_DIRECTORY), false, "cleanup 必须删除 tmpfs 临时目录");
     }
 
-    // 3) [R6 P1-3] Dispatcher.runVerifyCommand 与 delivery/git.ts 剥离 PA_FEISHU_WEB_KEY 与含 feishu-web-key 的 CREDENTIALS_DIRECTORY
+    // 3) [R6 P1-3 + R12 P2] delivery/git.ts 剥离环境变量；内核挂载隔离测试仅在宿主机支持时启用 PA_FEISHU_WEB_KEY/CREDENTIALS_DIRECTORY
     const gitRepo = makeTmp("pa-r6-git-");
     await runProcess("git", ["init", "-q", gitRepo]);
     if (hasCredentialMountIsolation()) {
       process.env.CREDENTIALS_DIRECTORY = mixedCredDir;
-    }
-    try {
-      const gitEnvOut = await tryGit(gitRepo, ["-c", "alias.envdump=!env", "envdump"]);
-      assert.equal(gitEnvOut.code, 0);
-      assert.ok(!gitEnvOut.stdout.includes("PA_FEISHU_WEB_KEY="), "git 子进程不得继承 PA_FEISHU_WEB_KEY");
-      if (hasCredentialMountIsolation()) {
+      try {
+        const gitEnvOut = await tryGit(gitRepo, ["-c", "alias.envdump=!env", "envdump"]);
+        assert.equal(gitEnvOut.code, 0, gitEnvOut.stderr);
+        assert.ok(!gitEnvOut.stdout.includes("PA_FEISHU_WEB_KEY="), "git 子进程不得继承 PA_FEISHU_WEB_KEY");
         assert.ok(!gitEnvOut.stdout.includes(`CREDENTIALS_DIRECTORY=${mixedCredDir}`), "git 子进程不得继承原始混合 CREDENTIALS_DIRECTORY");
+      } finally {
+        delete process.env.CREDENTIALS_DIRECTORY;
       }
-    } finally {
-      delete process.env.CREDENTIALS_DIRECTORY;
+    } else {
+      await withoutTestWebKey(async () => {
+        const gitEnvOut = await tryGit(gitRepo, ["-c", "alias.envdump=!env", "envdump"]);
+        assert.equal(gitEnvOut.code, 0, gitEnvOut.stderr);
+        assert.ok(!gitEnvOut.stdout.includes("PA_FEISHU_WEB_KEY="), "git 子进程不得继承 PA_FEISHU_WEB_KEY");
+      });
     }
 
     // 4) [R6 P2-18] syncFromRecords(preservePendingDelta=true) 保留未冲突的待落盘 Cookie 轮换
@@ -4174,49 +4346,64 @@ data_dir: ${dir}
     const { registerContext } = await import("../src/context/index.ts");
     const regSvc = registerContext(app)!;
     const svc = regSvc;
+    installCallbackLlm(svc, async (prompt) => {
+      fs.appendFileSync(callsLog, JSON.stringify({ at: Date.now(), len: prompt.length }) + "\n");
+      const modeFile = path.join(dir, "harness-mode.json");
+      const mode = fs.existsSync(modeFile) ? (JSON.parse(fs.readFileSync(modeFile, "utf8")) as Record<string, unknown>) : {};
+      if (typeof mode.onRunHookFile === "string") fs.writeFileSync(mode.onRunHookFile, "ran");
+      if (typeof mode.resumeFile === "string") {
+        const deadline = Date.now() + 3000;
+        while (!fs.existsSync(mode.resumeFile) && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 15));
+        }
+      }
+      const delayMs = mode.delayMs;
+      if (typeof delayMs === "number" && delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+      return mode.output !== undefined
+        ? JSON.stringify(mode.output)
+        : JSON.stringify({ projects: [], items: [], knowledge: [], updates: [], conflicts: [] });
+    });
     (svc.personalWeb as unknown as { hooks: { clientOptions?: unknown } }).hooks.clientOptions = { endpoints: mock.endpoints };
     const now = Date.now();
     const nowSec = Math.floor(now / 1000);
 
-    // 先验证 Dispatcher.runVerifyCommand 剥离 PA_FEISHU_WEB_KEY 与（宿主机支持挂载隔离时的）CREDENTIALS_DIRECTORY
+    // 先验证 Dispatcher.runVerifyCommand 在支持内核挂载隔离的宿主机上剥离 PA_FEISHU_WEB_KEY 与 CREDENTIALS_DIRECTORY
     if (hasCredentialMountIsolation()) {
       process.env.CREDENTIALS_DIRECTORY = mixedCredDir;
-    }
-    fs.mkdirSync(path.join(dir, "runs", "g_r6_ver"), { recursive: true });
-    const dispatcher = new Dispatcher(app.cfg, app.ledger, app.store, app.board);
-    app.ledger.enqueue({
-      id: "dispatch:r6-verify",
-      kind: "dispatch",
-      ref: "r6-verify",
-      state: "verifying",
-      payload: {
-        guid: "g_r6_ver",
-        summary: "verify env isolation",
-        description: "",
-        harness: "codex",
-        repo: "demo",
-        cwd: gitRepo,
-        branch: "pa/r6",
-        base: "",
-        verify: "env",
-        round: 1,
-      },
-    });
-    const verifyWork = app.ledger.get("dispatch:r6-verify")!;
-    let checkRes: { status: string; detail: string };
-    try {
-      checkRes = await (
-        dispatcher as unknown as {
-          runVerifyCommand(it: typeof verifyWork, ctx: { attempt: number; signal: AbortSignal }): Promise<{ status: string; detail: string }>;
-        }
-      ).runVerifyCommand(verifyWork, { attempt: 1, signal: new AbortController().signal });
-    } finally {
-      delete process.env.CREDENTIALS_DIRECTORY;
-    }
-    assert.equal(checkRes.status, "pass", checkRes.detail);
-    const verifyLog = fs.readFileSync(path.join(dir, "runs", "g_r6_ver", "verify-1-1.log"), "utf8");
-    assert.ok(!verifyLog.includes("PA_FEISHU_WEB_KEY="), "verify 命令日志绝不能包含 PA_FEISHU_WEB_KEY");
-    if (hasCredentialMountIsolation()) {
+      fs.mkdirSync(path.join(dir, "runs", "g_r6_ver"), { recursive: true });
+      const dispatcher = new Dispatcher(app.cfg, app.ledger, app.store, app.board);
+      app.ledger.enqueue({
+        id: "dispatch:r6-verify",
+        kind: "dispatch",
+        ref: "r6-verify",
+        state: "verifying",
+        payload: {
+          guid: "g_r6_ver",
+          summary: "verify env isolation",
+          description: "",
+          harness: "codex",
+          repo: "demo",
+          cwd: gitRepo,
+          branch: "pa/r6",
+          base: "",
+          verify: "env",
+          round: 1,
+        },
+      });
+      const verifyWork = app.ledger.get("dispatch:r6-verify")!;
+      let checkRes: { status: string; detail: string };
+      try {
+        checkRes = await (
+          dispatcher as unknown as {
+            runVerifyCommand(it: typeof verifyWork, ctx: { attempt: number; signal: AbortSignal }): Promise<{ status: string; detail: string }>;
+          }
+        ).runVerifyCommand(verifyWork, { attempt: 1, signal: new AbortController().signal });
+      } finally {
+        delete process.env.CREDENTIALS_DIRECTORY;
+      }
+      assert.equal(checkRes.status, "pass", checkRes.detail);
+      const verifyLog = fs.readFileSync(path.join(dir, "runs", "g_r6_ver", "verify-1-1.log"), "utf8");
+      assert.ok(!verifyLog.includes("PA_FEISHU_WEB_KEY="), "verify 命令日志绝不能包含 PA_FEISHU_WEB_KEY");
       assert.ok(!verifyLog.includes(`CREDENTIALS_DIRECTORY=${mixedCredDir}`), "verify 命令不得继承原始混合 CREDENTIALS_DIRECTORY");
     }
 
@@ -5004,6 +5191,14 @@ data_dir: ${dir}
     app = createApp(loadConfig(cfgPath));
     const { registerContext } = await import("../src/context/index.ts");
     const svc = registerContext(app)!;
+    installCallbackLlm(svc, async (prompt) => {
+      fs.appendFileSync(callsLog, JSON.stringify({ at: Date.now(), prompt }) + "\n");
+      const modeFile = path.join(dir, "harness-mode.json");
+      const mode = fs.existsSync(modeFile) ? (JSON.parse(fs.readFileSync(modeFile, "utf8")) as Record<string, unknown>) : {};
+      return mode.output !== undefined
+        ? JSON.stringify(mode.output)
+        : JSON.stringify({ projects: [], items: [], knowledge: [], updates: [], people: [], conflicts: [] });
+    });
     (svc.personalWeb as unknown as { hooks: { clientOptions?: unknown } }).hooks.clientOptions = { endpoints: mock.endpoints };
     const now = Date.now();
     const nowSec = Math.floor(now / 1000);
@@ -5613,30 +5808,38 @@ test("Codex 第八轮回归：挂载命名空间密钥隔离、草稿范围过�
       "无挂载命名空间后端时必须 fail-closed 拒绝启动子进程",
     );
     assert.throws(
-      () => wrapCredentialIsolatedCommand("sh", ["-c", "true"], { CREDENTIALS_DIRECTORY: isoCredDir }, { forceBackend: { kind: "unshare", bin: "unshare", setprivBin: "" } }),
-      /setpriv|拒绝执行/,
+      () => wrapCredentialIsolatedCommand("sh", ["-c", "true"], { CREDENTIALS_DIRECTORY: isoCredDir }, { forceBackend: { kind: "unshare", bin: "unshare", setprivBin: "", pivotRootBin: "/sbin/pivot_root" } }),
+      /setpriv|pivot_root|拒绝执行/,
       "unshare 回退缺少 setpriv 时必须拒绝执行",
+    );
+    assert.throws(
+      () => wrapCredentialIsolatedCommand("sh", ["-c", "true"], { CREDENTIALS_DIRECTORY: isoCredDir }, { forceBackend: { kind: "unshare", bin: "unshare", setprivBin: "/usr/bin/setpriv", pivotRootBin: "" } }),
+      /setpriv|pivot_root|拒绝执行/,
+      "unshare 回退缺少 pivot_root 时必须拒绝执行",
     );
     const unshareWrapped = wrapCredentialIsolatedCommand(
       "sh",
       ["-c", "true"],
       { CREDENTIALS_DIRECTORY: isoCredDir },
-      { forceBackend: { kind: "unshare", bin: "unshare", setprivBin: "/usr/bin/setpriv" } },
+      { forceBackend: { kind: "unshare", bin: "unshare", setprivBin: "/usr/bin/setpriv", pivotRootBin: "/sbin/pivot_root" } },
     );
     assert.equal(unshareWrapped.isolated, true);
     assert.ok(unshareWrapped.args.some((a) => a.includes("--bounding-set -all") && a.includes("--no-new-privs")), "unshare 回退必须通过 setpriv 永久剥离全部 capabilities");
     assert.ok(unshareWrapped.args.includes("/usr/bin/setpriv"));
+    assert.ok(unshareWrapped.args.includes("/sbin/pivot_root"));
 
-    // tryGit 禁用仓库 hooks / external diff 同时保留正常内部 diff（实际挂载命名空间集成测试已拆至下方按宿主机能力条件执行）
-    const testRepo = makeTmp("pa-r8-git-");
-    assert.equal((await tryGit(testRepo, ["init", "-q"])).code, 0);
-    fs.writeFileSync(path.join(testRepo, "a.txt"), "line1\n");
-    assert.equal((await tryGit(testRepo, ["add", "a.txt"])).code, 0);
-    assert.equal((await tryGit(testRepo, ["commit", "-qm", "init"])).code, 0);
-    fs.writeFileSync(path.join(testRepo, "a.txt"), "line1\nline2\n");
-    const diffRes = await tryGit(testRepo, ["diff", "--no-color"]);
-    assert.equal(diffRes.code, 0, diffRes.stderr);
-    assert.match(diffRes.stdout, /\+line2/, "禁用 diff.external 后内部 diff 必须正常输出");
+    // tryGit 禁用仓库 hooks / external diff 同时保留正常内部 diff（脱离测试密钥作用域以兼容无 Linux userns 宿主机）
+    await withoutTestWebKey(async () => {
+      const testRepo = makeTmp("pa-r8-git-");
+      assert.equal((await tryGit(testRepo, ["init", "-q"])).code, 0);
+      fs.writeFileSync(path.join(testRepo, "a.txt"), "line1\n");
+      assert.equal((await tryGit(testRepo, ["add", "a.txt"])).code, 0);
+      assert.equal((await tryGit(testRepo, ["commit", "-qm", "init"])).code, 0);
+      fs.writeFileSync(path.join(testRepo, "a.txt"), "line1\nline2\n");
+      const diffRes = await tryGit(testRepo, ["diff", "--no-color"]);
+      assert.equal(diffRes.code, 0, diffRes.stderr);
+      assert.match(diffRes.stdout, /\+line2/, "禁用 diff.external 后内部 diff 必须正常输出");
+    });
 
     // 2) [R8 P1-6, P1-7, P2-12, P2-13, P2-14] TOML 重复键拒绝、错误不含原始值、URL 含凭据拒绝、保留 cli_auth_credentials_store、点号供应商内联表编码
     assert.throws(
@@ -5811,6 +6014,20 @@ context:
     );
     app = createApp(loadConfig(recAppCfgFile));
     const svc = new ContextService(app);
+    installCallbackLlm(svc, async (prompt) => {
+      fs.appendFileSync(callsLog, JSON.stringify({ prompt }) + "\n");
+      if (fs.existsSync(gateFlagFile)) {
+        fs.writeFileSync(enteredFlagFile, "1");
+        const deadline = Date.now() + 8000;
+        while (fs.existsSync(gateFlagFile) && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+      }
+      if (prompt.includes("草稿") || prompt.includes("答复或进展")) {
+        return "收到，我这边马上处理。";
+      }
+      return fs.readFileSync(responseJsonFile, "utf8");
+    });
     const daemonCredStore = new WebLoginStore(recDir, customCredPath);
     const defaultCredStore = new WebLoginStore(recDir);
     daemonCredStore.stageWithLock((stage) => {
@@ -6368,14 +6585,21 @@ test(
       assert.equal(keyOut, "", "子进程即使尝试 umount 后按绝对路径 cat feishu-web-key 也绝不能读出密钥");
       assert.equal(otherOut, "KEEP_OTHER_TOKEN_R9", "同目录无关凭据保持可读");
 
-      // 2) 若宿主机同时具备 unshare + setpriv：验证回退路径同样彻底剥离挂载权限（CapEff=0, 无法 umount）
-      const probeSetpriv = await runProcess("unshare", ["-r", "-m", "--", "setpriv", "--bounding-set", "-all", "--inh-caps", "-all", "--ambient-caps", "-all", "--no-new-privs", "true"], { timeoutMs: 5_000 });
-      if (probeSetpriv.code === 0) {
+      // 2) 若宿主机同时具备 unshare + pivot_root + setpriv：验证回退路径同样彻底剥离挂载权限（CapEff=0, 无法 umount）
+      const pivotBin = fs.existsSync("/sbin/pivot_root")
+        ? "/sbin/pivot_root"
+        : fs.existsSync("/usr/sbin/pivot_root")
+          ? "/usr/sbin/pivot_root"
+          : "";
+      const probeSetpriv = pivotBin
+        ? await runProcess("unshare", ["-r", "-m", "--", "setpriv", "--bounding-set", "-all", "--inh-caps", "-all", "--ambient-caps", "-all", "--no-new-privs", "true"], { timeoutMs: 5_000 })
+        : { code: 1, stdout: "", stderr: "", timedOut: false };
+      if (probeSetpriv.code === 0 && pivotBin) {
         const wrappedUnshare = wrapCredentialIsolatedCommand(
           "sh",
           ["-c", `umount "$1" 2>/dev/null || true; cat "$1" 2>/dev/null || true; printf "|"; grep -E "^CapEff:" /proc/self/status`, "_", isoKeyFile],
           { CREDENTIALS_DIRECTORY: isoCredDir },
-          { forceBackend: { kind: "unshare", bin: "unshare", setprivBin: "setpriv" } },
+          { forceBackend: { kind: "unshare", bin: "unshare", setprivBin: "setpriv", pivotRootBin: pivotBin } },
         );
         const rUnshare = await runProcess(wrappedUnshare.cmd, wrappedUnshare.args, { timeoutMs: 15_000 });
         assert.equal(rUnshare.code, 0, rUnshare.stderr);
@@ -6391,6 +6615,111 @@ test(
       fs.writeFileSync(path.join(gitRepo, "f.txt"), "v1\n");
       assert.equal((await tryGit(gitRepo, ["add", "f.txt"])).code, 0);
       assert.equal((await tryGit(gitRepo, ["commit", "-qm", "init"])).code, 0);
+      delete process.env.CREDENTIALS_DIRECTORY;
+
+      // 4) [R12 P1-1 & P1-2] 即使交互式 shell 既无 PA_FEISHU_WEB_KEY 也无 CREDENTIALS_DIRECTORY，
+      //    只要工作区启用了 personal_web 或 state.db 含敏感状态，Dispatcher.runVerifyCommand 与 unshare+pivot_root+setpriv
+      //    都必须隐藏 dataDir/state.db、feishu-web.json、/proc/<parent-pid> 且锁定只读根，仅开放当前 worktree 与私有 /tmp 写入
+      await withoutTestWebKey(async () => {
+        const wsDir = makeTmp("pa-r12-iso-ws-");
+        const dataDir = path.join(wsDir, "data");
+        const wtDir = path.join(dataDir, "worktrees", "wt_r12");
+        fs.mkdirSync(wtDir, { recursive: true });
+        fs.mkdirSync(path.join(dataDir, "runs", "g_r12"), { recursive: true });
+        const extCred = path.join(wsDir, "ext-feishu-web.json");
+        fs.writeFileSync(extCred, '{"v":1,"secret":"SHOULD_NOT_READ"}\n', { mode: 0o600 });
+        const cfgFile = path.join(wsDir, "config.yaml");
+        fs.writeFileSync(
+          cfgFile,
+          JSON.stringify({
+            data_dir: dataDir,
+            bins: { lark: path.join(STUBS, "ctx-lark"), acpx: path.join(STUBS, "acpx"), bytedcli: path.join(STUBS, "ctx-bytedcli") },
+            harnesses: { claude: { agent: "claude" } },
+            roles: { brain: "claude" },
+            owner: { open_id: "ou_owner_r12" },
+            context: { enabled: true, personal_web: { enabled: true } },
+          }),
+        );
+        const isoApp = createApp(loadConfig(cfgFile));
+        try {
+          isoApp.store.set("ctx.personal_web.bound_owner_id", "7001");
+          isoApp.store.set("daemon.holds_web_key", "1");
+          fs.writeFileSync(path.join(dataDir, "feishu-web.json"), '{"v":1,"enc":"hidden"}\n', { mode: 0o600 });
+          const stateDbPath = path.join(dataDir, "state.db");
+          const wtProbeFile = path.join(wtDir, "verify-wrote.txt");
+          // 确认壳内完全没有密钥环境变量
+          assert.equal(process.env.PA_FEISHU_WEB_KEY, undefined);
+          assert.equal(process.env.CREDENTIALS_DIRECTORY, undefined);
+
+          const dispatcher = new Dispatcher(isoApp.cfg, isoApp.ledger, isoApp.store, isoApp.board);
+          const verifyCmd = [
+            `test ! -e ${JSON.stringify(stateDbPath)}`,
+            `test ! -e ${JSON.stringify(path.join(dataDir, "feishu-web.json"))}`,
+            `test ! -e /proc/${process.pid}/environ`,
+            `! touch ${JSON.stringify(path.join(ROOT, ".pa-r12-ro-probe"))} 2>/dev/null`,
+            `echo ok-worktree > ${JSON.stringify(wtProbeFile)}`,
+            `echo ok-tmp > /tmp/r12-scratch.txt`,
+          ].join(" && ");
+          isoApp.ledger.enqueue({
+            id: "dispatch:r12-verify-iso",
+            kind: "dispatch",
+            ref: "r12-verify-iso",
+            state: "verifying",
+            payload: {
+              guid: "g_r12",
+              summary: "r12 verify fs isolation",
+              description: "",
+              harness: "claude",
+              repo: "",
+              cwd: wtDir,
+              branch: "",
+              base: "",
+              verify: verifyCmd,
+              round: 1,
+            },
+          });
+          const work = isoApp.ledger.get("dispatch:r12-verify-iso")!;
+          const vRes = await (
+            dispatcher as unknown as {
+              runVerifyCommand(it: typeof work, ctx: { attempt: number; signal: AbortSignal }): Promise<{ status: string; detail: string }>;
+            }
+          ).runVerifyCommand(work, { attempt: 1, signal: new AbortController().signal });
+          assert.equal(vRes.status, "pass", `无密钥 shell 下 Dispatcher.runVerifyCommand 必须隐藏 state.db/凭据/宿主机 /proc 并锁定只读根：${vRes.detail}`);
+          assert.equal(fs.readFileSync(wtProbeFile, "utf8").trim(), "ok-worktree", "worktree 自身必须保持可写");
+          assert.equal(fs.existsSync(stateDbPath), true, "宿主机 state.db 完好无损");
+
+          // 同样验证 unshare + pivot_root + setpriv 回退对 dataDir/state.db、只读根与 worktree 边界完全一致
+          if (probeSetpriv.code === 0 && pivotBin) {
+            const wtUnshareOut = path.join(wtDir, "unshare-wrote.txt");
+            const unshareIso = wrapCredentialIsolatedCommand(
+              "sh",
+              [
+                "-c",
+                [
+                  `test ! -e ${JSON.stringify(stateDbPath)}`,
+                  `! touch ${JSON.stringify(path.join(dataDir, "tamper.db"))} 2>/dev/null`,
+                  `test ! -e /proc/${process.pid}/environ`,
+                  `! touch ${JSON.stringify(path.join(ROOT, ".pa-r12-unshare-ro"))} 2>/dev/null`,
+                  `echo unshare-ok > ${JSON.stringify(wtUnshareOut)}`,
+                  `echo scratch > /tmp/r12-unshare-tmp.txt`,
+                  `grep -q "0000000000000000" /proc/self/status`,
+                ].join(" && "),
+              ],
+              {},
+              {
+                ...buildWorkspaceIsolation(isoApp.cfg, { mode: "verify", cwd: wtDir }, {}),
+                forceBackend: { kind: "unshare", bin: "unshare", setprivBin: "setpriv", pivotRootBin: pivotBin },
+              },
+            );
+            assert.equal(unshareIso.isolated, true);
+            const rU = await runProcess(unshareIso.cmd, unshareIso.args, { timeoutMs: 15_000 });
+            assert.equal(rU.code, 0, `unshare+pivot_root+setpriv 必须同样隐藏 state.db 并锁定只读根：${rU.stderr}`);
+            assert.equal(fs.readFileSync(wtUnshareOut, "utf8").trim(), "unshare-ok");
+          }
+        } finally {
+          isoApp.store.db.close();
+        }
+      });
     } finally {
       if (prevCredDir === undefined) delete process.env.CREDENTIALS_DIRECTORY;
       else process.env.CREDENTIALS_DIRECTORY = prevCredDir;
@@ -6444,39 +6773,52 @@ test("Codex 第九轮回归：跨路径 web-logout 吊销、换主人全库干�
     assert.ok(Object.values(mlCfg.extraEnv).includes("Bearer ml-secret-r9"));
     assert.ok(!mlCfg.args.some((a) => a.includes("ml-secret-r9")));
 
-    // 2) [R9 P2-15] Git LFS 交付保护：禁用仓库 hooks 仍能识别 filter=lfs，且在 git-lfs 不可用/失败时中止推送而非推悬空指针
-    const lfsRepo = makeTmp("pa-r9-lfs-");
-    const lfsBare = makeTmp("pa-r9-lfs-bare-");
-    assert.equal((await tryGit(lfsBare, ["init", "--bare", "-q"])).code, 0);
-    assert.equal((await tryGit(lfsRepo, ["init", "-q"])).code, 0);
-    assert.equal((await tryGit(lfsRepo, ["checkout", "-qb", "pa/r9-lfs"])).code, 0);
-    fs.writeFileSync(path.join(lfsRepo, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
-    fs.writeFileSync(path.join(lfsRepo, "weights.bin"), "fake-lfs-pointer-content\n");
-    assert.equal((await tryGit(lfsRepo, ["add", ".gitattributes", "weights.bin"])).code, 0);
-    assert.equal((await tryGit(lfsRepo, ["commit", "-qm", "add lfs file"])).code, 0);
-    assert.equal((await tryGit(lfsRepo, ["remote", "add", "origin", lfsBare])).code, 0);
-    assert.equal(await branchUsesGitLfs(lfsRepo, "pa/r9-lfs"), true, "必须通过 git check-attr 识别 LFS 跟踪文件");
-    // 放一个会写标志文件的恶意 pre-push hook，验证它绝不被执行；同时先验证 LFS 上传失败时阻断推送（不推悬空指针），再验证可用 LFS 端点时受信任上传成功
-    const hookMarker = path.join(lfsRepo, "hook-ran.txt");
-    fs.writeFileSync(path.join(lfsRepo, ".git", "hooks", "pre-push"), `#!/bin/sh\necho pwned > ${JSON.stringify(hookMarker)}\nexit 0\n`, { mode: 0o755 });
-    assert.equal((await tryGit(lfsRepo, ["config", "lfs.url", "http://127.0.0.1:1/unreachable-lfs"])).code, 0);
-    const lfsFailRes = await pushBranch(lfsRepo, "origin", "pa/r9-lfs");
-    assert.equal(fs.existsSync(hookMarker), false, "仓库 pre-push hook 绝不能被执行");
-    assert.equal(lfsFailRes.ok, false, "LFS 上传失败时必须阻止普通 git push");
-    if (!lfsFailRes.ok) {
-      assert.match(lfsFailRes.message, /Git LFS/, "错误信息应明确提示 Git LFS 上传失败");
-    }
-    const bareRefsAfterFail = (await tryGit(lfsBare, ["branch", "-a"])).stdout.trim();
-    assert.equal(bareRefsAfterFail, "", "LFS 上传失败后绝不能把悬空分支推上远端");
-    // 撤销失效 lfs.url：若宿主机装有 git-lfs，验证受信任的 git lfs push + git push 完整成功且仓库 hook 依然未执行
-    assert.equal((await tryGit(lfsRepo, ["config", "--unset", "lfs.url"])).code, 0);
-    const hasGitLfs = (await runProcess("git", ["lfs", "version"], { timeoutMs: 3_000 })).code === 0;
-    if (hasGitLfs) {
-      const lfsOkRes = await pushBranch(lfsRepo, "origin", "pa/r9-lfs");
-      assert.equal(lfsOkRes.ok, true, `宿主机具备 git-lfs 时应在不跑仓库 hooks 的前提下完成 LFS 上传并推送：${!lfsOkRes.ok ? lfsOkRes.message : ""}`);
-      assert.equal(fs.existsSync(hookMarker), false, "LFS 推送成功期间仓库 pre-push hook 依然绝不被执行");
-      assert.match((await tryGit(lfsBare, ["branch", "-a"])).stdout, /pa\/r9-lfs/);
-    }
+    // 2) [R9 P2-15 + R12 P2] Git LFS 交付保护：自包含真实 LFS 指针与本地对象（不依赖全局 clean filter），在无密钥作用域下执行以兼容非 Linux userns 宿主机
+    await withoutTestWebKey(async () => {
+      const lfsRepo = makeTmp("pa-r9-lfs-");
+      const lfsBare = makeTmp("pa-r9-lfs-bare-");
+      assert.equal((await tryGit(lfsBare, ["init", "--bare", "-q"])).code, 0);
+      assert.equal((await tryGit(lfsRepo, ["init", "-q"])).code, 0);
+      assert.equal((await tryGit(lfsRepo, ["checkout", "-qb", "pa/r9-lfs"])).code, 0);
+      fs.writeFileSync(path.join(lfsRepo, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+      const r9Payload = Buffer.from("self-contained-r9-lfs-payload\n", "utf8");
+      const r9Oid = crypto.createHash("sha256").update(r9Payload).digest("hex");
+      const r9ObjDir = path.join(lfsRepo, ".git", "lfs", "objects", r9Oid.slice(0, 2), r9Oid.slice(2, 4));
+      fs.mkdirSync(r9ObjDir, { recursive: true });
+      fs.writeFileSync(path.join(r9ObjDir, r9Oid), r9Payload);
+      const r9Ptr = `version https://git-lfs.github.com/spec/v1\noid sha256:${r9Oid}\nsize ${r9Payload.length}\n`;
+      fs.writeFileSync(path.join(lfsRepo, "weights.bin"), r9Ptr);
+      assert.equal((await tryGit(lfsRepo, ["add", ".gitattributes", "weights.bin"])).code, 0);
+      assert.equal((await tryGit(lfsRepo, ["commit", "-qm", "add lfs file"])).code, 0);
+      assert.equal((await tryGit(lfsRepo, ["remote", "add", "origin", lfsBare])).code, 0);
+      assert.equal(await branchUsesGitLfs(lfsRepo, "pa/r9-lfs"), true, "必须通过 git check-attr 识别 LFS 跟踪文件");
+      // 放一个会写标志文件的恶意 pre-push hook，验证它绝不被执行；同时先验证 LFS 上传失败时阻断推送（不推悬空指针），再验证可用 LFS 端点时受信任上传成功
+      const hookMarker = path.join(lfsRepo, "hook-ran.txt");
+      fs.writeFileSync(path.join(lfsRepo, ".git", "hooks", "pre-push"), `#!/bin/sh\necho pwned > ${JSON.stringify(hookMarker)}\nexit 0\n`, { mode: 0o755 });
+      assert.equal((await tryGit(lfsRepo, ["config", "lfs.url", "http://127.0.0.1:1/unreachable-lfs"])).code, 0);
+      const lfsFailRes = await pushBranch(lfsRepo, "origin", "pa/r9-lfs");
+      assert.equal(fs.existsSync(hookMarker), false, "仓库 pre-push hook 绝不能被执行");
+      assert.equal(lfsFailRes.ok, false, "LFS 上传失败时必须阻止普通 git push");
+      if (!lfsFailRes.ok) {
+        assert.match(lfsFailRes.message, /Git LFS/, "错误信息应明确提示 Git LFS 上传失败");
+      }
+      const bareRefsAfterFail = (await tryGit(lfsBare, ["branch", "-a"])).stdout.trim();
+      assert.equal(bareRefsAfterFail, "", "LFS 上传失败后绝不能把悬空分支推上远端");
+      // 撤销失效 lfs.url：若宿主机装有 git-lfs，验证受信任的 git lfs pre-push + git push 完整成功且对象真实上传到 bare 远端
+      assert.equal((await tryGit(lfsRepo, ["config", "--unset", "lfs.url"])).code, 0);
+      const hasGitLfs = (await runProcess("git", ["lfs", "version"], { timeoutMs: 3_000 })).code === 0;
+      if (hasGitLfs) {
+        const lfsOkRes = await pushBranch(lfsRepo, "origin", "pa/r9-lfs");
+        assert.equal(lfsOkRes.ok, true, `宿主机具备 git-lfs 时应在不跑仓库 hooks 的前提下完成 LFS 上传并推送：${!lfsOkRes.ok ? lfsOkRes.message : ""}`);
+        assert.equal(fs.existsSync(hookMarker), false, "LFS 推送成功期间仓库 pre-push hook 依然绝不被执行");
+        assert.match((await tryGit(lfsBare, ["branch", "-a"])).stdout, /pa\/r9-lfs/);
+        assert.equal(
+          fs.existsSync(path.join(lfsBare, "lfs", "objects", r9Oid.slice(0, 2), r9Oid.slice(2, 4), r9Oid)),
+          true,
+          "真实 LFS 对象必须完整上传到 bare 远端 LFS 存储",
+        );
+      }
+    });
 
     // 3) 搭建完整 Working Context 测试环境
     const dir = makeTmp("pa-r9-ctx-");
@@ -6552,6 +6894,20 @@ context:
     );
     app = createApp(loadConfig(cfgFile));
     const svc = new ContextService(app);
+    installCallbackLlm(svc, async (prompt) => {
+      fs.appendFileSync(callsLog, JSON.stringify({ prompt }) + "\n");
+      if (fs.existsSync(gateFlagFile)) {
+        fs.writeFileSync(enteredFlagFile, "1");
+        const deadline = Date.now() + 8000;
+        while (fs.existsSync(gateFlagFile) && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+      }
+      if (prompt.includes("草稿") || prompt.includes("答复或进展")) {
+        return "收到，我这边处理。";
+      }
+      return fs.readFileSync(responseJsonFile, "utf8");
+    });
     const now = Date.now();
     const nowSec = Math.floor(now / 1000);
     fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner_a", user_name: "张三" }));
@@ -7056,63 +7412,68 @@ test("Codex 第十轮回归：服务文件凭据隔离、失败卡片/委派落�
     const gcpCfg = extractSafeCodexProviderConfig({ CODEX_HOME: codexHome2 }, [], false);
     assert.ok(gcpCfg.args.includes('model_provider="gcp"'), "内置 gcp 供应商无需自定义 model_providers 表即可通过");
 
-    // 3) [R10 P2] Git LFS 历史提交检测：提交 1 添加 LFS 文件、提交 2 删除该文件（tip 无 LFS 文件），branchUsesGitLfs 仍返回 true 且 pushBranch 走 git lfs pre-push
-    const lfsRemote = path.join(dir, "lfs-hist-remote.git");
-    const lfsRepo = path.join(dir, "lfs-hist-repo");
-    fs.mkdirSync(lfsRemote, { recursive: true });
-    fs.mkdirSync(lfsRepo, { recursive: true });
-    await tryGit(lfsRemote, ["init", "--bare"]);
-    await tryGit(lfsRepo, ["init", "-b", "main"]);
-    await tryGit(lfsRepo, ["config", "user.name", "Tester"]);
-    await tryGit(lfsRepo, ["config", "user.email", "tester@example.com"]);
-    await tryGit(lfsRepo, ["remote", "add", "origin", lfsRemote]);
-    fs.writeFileSync(path.join(lfsRepo, "README.md"), "base\n");
-    await tryGit(lfsRepo, ["add", "README.md"]);
-    await tryGit(lfsRepo, ["commit", "-m", "base"]);
-    await tryGit(lfsRepo, ["push", "-u", "origin", "main"]);
-    const baseSha = (await tryGit(lfsRepo, ["rev-parse", "HEAD"])).stdout.trim();
+    // 3) [R10 P2 + R12 P2] Git LFS 历史提交检测：提交 1 添加 LFS 文件、提交 2 删除该文件（tip 无 LFS 文件），脱离密钥作用域且仅在安装 git-lfs 时断言真实上传成功
+    await withoutTestWebKey(async () => {
+      const lfsRemote = path.join(dir, "lfs-hist-remote.git");
+      const lfsRepo = path.join(dir, "lfs-hist-repo");
+      fs.mkdirSync(lfsRemote, { recursive: true });
+      fs.mkdirSync(lfsRepo, { recursive: true });
+      await tryGit(lfsRemote, ["init", "--bare"]);
+      await tryGit(lfsRepo, ["init", "-b", "main"]);
+      await tryGit(lfsRepo, ["config", "user.name", "Tester"]);
+      await tryGit(lfsRepo, ["config", "user.email", "tester@example.com"]);
+      await tryGit(lfsRepo, ["remote", "add", "origin", lfsRemote]);
+      fs.writeFileSync(path.join(lfsRepo, "README.md"), "base\n");
+      await tryGit(lfsRepo, ["add", "README.md"]);
+      await tryGit(lfsRepo, ["commit", "-m", "base"]);
+      await tryGit(lfsRepo, ["push", "-u", "origin", "main"]);
+      const baseSha = (await tryGit(lfsRepo, ["rev-parse", "HEAD"])).stdout.trim();
 
-    await tryGit(lfsRepo, ["checkout", "-b", "feat/lfs-deleted"]);
-    fs.writeFileSync(path.join(lfsRepo, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
-    const lfsBody = Buffer.from("historical-lfs-payload-r10\n", "utf8");
-    const lfsOid = crypto.createHash("sha256").update(lfsBody).digest("hex");
-    const lfsObjDir = path.join(lfsRepo, ".git", "lfs", "objects", lfsOid.slice(0, 2), lfsOid.slice(2, 4));
-    fs.mkdirSync(lfsObjDir, { recursive: true });
-    fs.writeFileSync(path.join(lfsObjDir, lfsOid), lfsBody);
-    const lfsPtr = [
-      "version https://git-lfs.github.com/spec/v1",
-      `oid sha256:${lfsOid}`,
-      `size ${lfsBody.length}`,
-      "",
-    ].join("\n");
-    fs.writeFileSync(path.join(lfsRepo, "ephemeral.bin"), lfsPtr);
-    await tryGit(lfsRepo, ["add", ".gitattributes", "ephemeral.bin"]);
-    await tryGit(lfsRepo, ["commit", "-m", "add lfs object"]);
-    await tryGit(lfsRepo, ["rm", "ephemeral.bin"]);
-    await tryGit(lfsRepo, ["commit", "-m", "delete lfs object before tip"]);
-    assert.equal(
-      await branchUsesGitLfs(lfsRepo, "feat/lfs-deleted", baseSha),
-      true,
-      "仅在早期 outgoing commit 出现并在 tip 删除的 LFS 对象仍必须被检测到",
-    );
-    await tryGit(lfsRepo, ["config", "lfs.url", "http://127.0.0.1:1/invalid-lfs-history"]);
-    const lfsFail = await pushBranch(lfsRepo, "origin", "feat/lfs-deleted");
-    assert.equal(lfsFail.ok, false, "LFS 历史对象上传失败时必须中止 git push");
-    assert.match(lfsFail.message, /Git LFS/);
-    assert.equal(
-      (await tryGit(lfsRemote, ["rev-parse", "--verify", "refs/heads/feat/lfs-deleted"])).code !== 0,
-      true,
-      "LFS 历史对象上传失败时远端绝不能出现悬空分支",
-    );
-    // 恢复正常本地 bare 远端：git lfs pre-push 必须把早期提交添加但 tip 已删除的历史 LFS 对象真正上传到远端
-    await tryGit(lfsRepo, ["config", "--unset", "lfs.url"]);
-    const lfsOk = await pushBranch(lfsRepo, "origin", "feat/lfs-deleted");
-    assert.equal(lfsOk.ok, true, "有效远端下历史 LFS 对象必须由 git lfs pre-push 上传并完成分支推送");
-    assert.equal(
-      fs.existsSync(path.join(lfsRemote, "lfs", "objects", lfsOid.slice(0, 2), lfsOid.slice(2, 4), lfsOid)),
-      true,
-      "仅存在于早期提交的历史 LFS 对象必须完整落盘到远端 LFS 存储",
-    );
+      await tryGit(lfsRepo, ["checkout", "-b", "feat/lfs-deleted"]);
+      fs.writeFileSync(path.join(lfsRepo, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+      const lfsBody = Buffer.from("historical-lfs-payload-r10\n", "utf8");
+      const lfsOid = crypto.createHash("sha256").update(lfsBody).digest("hex");
+      const lfsObjDir = path.join(lfsRepo, ".git", "lfs", "objects", lfsOid.slice(0, 2), lfsOid.slice(2, 4));
+      fs.mkdirSync(lfsObjDir, { recursive: true });
+      fs.writeFileSync(path.join(lfsObjDir, lfsOid), lfsBody);
+      const lfsPtr = [
+        "version https://git-lfs.github.com/spec/v1",
+        `oid sha256:${lfsOid}`,
+        `size ${lfsBody.length}`,
+        "",
+      ].join("\n");
+      fs.writeFileSync(path.join(lfsRepo, "ephemeral.bin"), lfsPtr);
+      await tryGit(lfsRepo, ["add", ".gitattributes", "ephemeral.bin"]);
+      await tryGit(lfsRepo, ["commit", "-m", "add lfs object"]);
+      await tryGit(lfsRepo, ["rm", "ephemeral.bin"]);
+      await tryGit(lfsRepo, ["commit", "-m", "delete lfs object before tip"]);
+      assert.equal(
+        await branchUsesGitLfs(lfsRepo, "feat/lfs-deleted", baseSha),
+        true,
+        "仅在早期 outgoing commit 出现并在 tip 删除的 LFS 对象仍必须被检测到",
+      );
+      await tryGit(lfsRepo, ["config", "lfs.url", "http://127.0.0.1:1/invalid-lfs-history"]);
+      const lfsFail = await pushBranch(lfsRepo, "origin", "feat/lfs-deleted");
+      assert.equal(lfsFail.ok, false, "LFS 历史对象上传失败时必须中止 git push");
+      assert.match(lfsFail.message, /Git LFS/);
+      assert.equal(
+        (await tryGit(lfsRemote, ["rev-parse", "--verify", "refs/heads/feat/lfs-deleted"])).code !== 0,
+        true,
+        "LFS 历史对象上传失败时远端绝不能出现悬空分支",
+      );
+      // 恢复正常本地 bare 远端：宿主机具备 git-lfs 时验证历史 LFS 对象被完整上传
+      await tryGit(lfsRepo, ["config", "--unset", "lfs.url"]);
+      const hasGitLfs = (await runProcess("git", ["lfs", "version"], { timeoutMs: 3_000 })).code === 0;
+      if (hasGitLfs) {
+        const lfsOk = await pushBranch(lfsRepo, "origin", "feat/lfs-deleted");
+        assert.equal(lfsOk.ok, true, "有效远端下历史 LFS 对象必须由 git lfs pre-push 上传并完成分支推送");
+        assert.equal(
+          fs.existsSync(path.join(lfsRemote, "lfs", "objects", lfsOid.slice(0, 2), lfsOid.slice(2, 4), lfsOid)),
+          true,
+          "仅存在于早期提交的历史 LFS 对象必须完整落盘到远端 LFS 存储",
+        );
+      }
+    });
 
     // ───────── 初始化共享测试 App ─────────
     const cfgFile = path.join(dir, "config.yaml");
@@ -7140,6 +7501,7 @@ test("Codex 第十轮回归：服务文件凭据隔离、失败卡片/委派落�
     );
     app = createApp(loadConfig(cfgFile));
     const svc = new ContextService(app);
+    installCtxDirStubLlm(svc, ctxDir);
     const cards = new CardService(app, { debounceMs: 5 });
     cards.register();
     const now = Date.now();
@@ -7887,32 +8249,34 @@ test("Codex 第十一轮回归：PID+挂载隔离、草稿终检防重插、晨�
       assert.equal(pidOut.stdout.trim(), "HIDDEN", "独立 PID+/proc 命名空间内绝不能读取宿主常驻进程的 /proc/<daemon-pid>/environ");
     }
 
-    // 5) [R11 P2] Git LFS 严格指针校验（源代码提及 spec URL 不误判）+ 扫描失败中止推送
+    // 5) [R11 P2] Git LFS 严格指针校验（源代码提及 spec URL 不误判）+ 扫描失败中止推送（脱离密钥作用域以兼容非 Linux userns 宿主机）
     assert.equal(isGitLfsPointerBlob('const x = "version https://git-lfs.github.com/spec/v1";\n'), false);
     assert.equal(
       isGitLfsPointerBlob(`version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 42\n`),
       true,
     );
-    const nonLfsRemote = path.join(dir, "non-lfs-remote.git");
-    const nonLfsRepo = path.join(dir, "non-lfs-repo");
-    fs.mkdirSync(nonLfsRemote, { recursive: true });
-    fs.mkdirSync(nonLfsRepo, { recursive: true });
-    await tryGit(nonLfsRemote, ["init", "--bare"]);
-    await tryGit(nonLfsRepo, ["init", "-b", "main"]);
-    await tryGit(nonLfsRepo, ["config", "user.name", "Tester"]);
-    await tryGit(nonLfsRepo, ["config", "user.email", "tester@example.com"]);
-    await tryGit(nonLfsRepo, ["remote", "add", "origin", nonLfsRemote]);
-    fs.writeFileSync(path.join(nonLfsRepo, "base.txt"), "base\n");
-    await tryGit(nonLfsRepo, ["add", "base.txt"]);
-    await tryGit(nonLfsRepo, ["commit", "-m", "base"]);
-    await tryGit(nonLfsRepo, ["push", "-u", "origin", "main"]);
-    await tryGit(nonLfsRepo, ["checkout", "-b", "feat/mentions-lfs-url"]);
-    // 小于 1024 字节的普通源码文件里包含 LFS spec URL 字面量，绝不能误判为 LFS 指针
-    fs.writeFileSync(path.join(nonLfsRepo, "doc.ts"), 'export const SPEC = "version https://git-lfs.github.com/spec/v1";\n');
-    await tryGit(nonLfsRepo, ["add", "doc.ts"]);
-    await tryGit(nonLfsRepo, ["commit", "-m", "mention lfs spec in source"]);
-    assert.equal(await branchUsesGitLfs(nonLfsRepo, "feat/mentions-lfs-url"), false, "包含 LFS URL 字面量的普通源码文件不得误判为 Git LFS 指针");
-    await assert.rejects(branchUsesGitLfs(nonLfsRepo, "refs/does-not-exist-r11"), /失败/, "LFS 扫描命令失败时必须抛错而非静默返回 false");
+    await withoutTestWebKey(async () => {
+      const nonLfsRemote = path.join(dir, "non-lfs-remote.git");
+      const nonLfsRepo = path.join(dir, "non-lfs-repo");
+      fs.mkdirSync(nonLfsRemote, { recursive: true });
+      fs.mkdirSync(nonLfsRepo, { recursive: true });
+      await tryGit(nonLfsRemote, ["init", "--bare"]);
+      await tryGit(nonLfsRepo, ["init", "-b", "main"]);
+      await tryGit(nonLfsRepo, ["config", "user.name", "Tester"]);
+      await tryGit(nonLfsRepo, ["config", "user.email", "tester@example.com"]);
+      await tryGit(nonLfsRepo, ["remote", "add", "origin", nonLfsRemote]);
+      fs.writeFileSync(path.join(nonLfsRepo, "base.txt"), "base\n");
+      await tryGit(nonLfsRepo, ["add", "base.txt"]);
+      await tryGit(nonLfsRepo, ["commit", "-m", "base"]);
+      await tryGit(nonLfsRepo, ["push", "-u", "origin", "main"]);
+      await tryGit(nonLfsRepo, ["checkout", "-b", "feat/mentions-lfs-url"]);
+      // 小于 1024 字节的普通源码文件里包含 LFS spec URL 字面量，绝不能误判为 LFS 指针
+      fs.writeFileSync(path.join(nonLfsRepo, "doc.ts"), 'export const SPEC = "version https://git-lfs.github.com/spec/v1";\n');
+      await tryGit(nonLfsRepo, ["add", "doc.ts"]);
+      await tryGit(nonLfsRepo, ["commit", "-m", "mention lfs spec in source"]);
+      assert.equal(await branchUsesGitLfs(nonLfsRepo, "feat/mentions-lfs-url"), false, "包含 LFS URL 字面量的普通源码文件不得误判为 Git LFS 指针");
+      await assert.rejects(branchUsesGitLfs(nonLfsRepo, "refs/does-not-exist-r11"), /失败/, "LFS 扫描命令失败时必须抛错而非静默返回 false");
+    });
 
     // ───────── 初始化共享测试 App ─────────
     const cfgFile = path.join(dir, "config.yaml");
@@ -7940,6 +8304,7 @@ test("Codex 第十一轮回归：PID+挂载隔离、草稿终检防重插、晨�
     );
     app = createApp(loadConfig(cfgFile));
     const svc = new ContextService(app);
+    installCtxDirStubLlm(svc, ctxDir);
     const now = Date.now();
     const nowSec = Math.floor(now / 1000);
     const baseCookies = [{ name: "session", value: "r11_sess", domain: "internal-api-lark-api.feishu.cn", path: "/" }];
@@ -8392,6 +8757,634 @@ test("Codex 第十一轮回归：PID+挂载隔离、草稿终检防重插、晨�
       "created",
       "已发出的回复仍必须持久化为 created 回执以便重登录后只读回读恢复",
     );
+  } finally {
+    if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevKey;
+    if (prevCredFile === undefined) delete process.env.PA_FEISHU_WEB_CRED_FILE;
+    else process.env.PA_FEISHU_WEB_CRED_FILE = prevCredFile;
+    if (prevCredDir === undefined) delete process.env.CREDENTIALS_DIRECTORY;
+    else process.env.CREDENTIALS_DIRECTORY = prevCredDir;
+    if (prevCtxDir === undefined) delete process.env.CTX_DIR;
+    else process.env.CTX_DIR = prevCtxDir;
+    app?.store.db.close();
+    await mock.close();
+  }
+});
+
+// ───────── 18. Codex Review 第十二轮专项回归测试 ─────────
+
+test("Codex 第十二轮回归：无密钥壳工作区隔离判定、Codex 账号/工作区限制保留、轮询防旧名覆盖、草稿推理前隐私与修订复核、开放平台私聊关键词排除、LFS pushurl/不可变提交/hawser/分块扫描/EPIPE、非持钥CLI让出pw.reply、当前主人作用域晨报、元数据失败落盘轮换、票据设备ID一致、等待态恢复暂存凭据与原子条件清标记", async () => {
+  const prevKey = process.env.PA_FEISHU_WEB_KEY;
+  const prevCredFile = process.env.PA_FEISHU_WEB_CRED_FILE;
+  const prevCredDir = process.env.CREDENTIALS_DIRECTORY;
+  const prevCtxDir = process.env.CTX_DIR;
+  delete process.env.PA_FEISHU_WEB_KEY;
+  delete process.env.PA_FEISHU_WEB_CRED_FILE;
+  delete process.env.CREDENTIALS_DIRECTORY;
+
+  const mock = await startMockFeishuWebServer();
+  const dir = makeTmp("pa-r12-");
+  const ctxDir = makeTmp("pa-r12-ctx-");
+  process.env.CTX_DIR = ctxDir;
+  let app: ReturnType<typeof createApp> | undefined;
+
+  try {
+    // 1) [R12 P1-2] 无密钥交互式 shell 仍按工作区配置/状态强制触发隔离（并在无后端时 fail-closed）
+    const wsOnlyDir = makeTmp("pa-r12-ws-check-");
+    assert.equal(workspaceRequiresIsolation({ dataDir: wsOnlyDir, context: { personal_web: { enabled: false } } as never }, {}), false);
+    assert.equal(workspaceRequiresIsolation({ dataDir: wsOnlyDir, context: { personal_web: { enabled: true } } as never }, {}), true);
+    fs.writeFileSync(path.join(wsOnlyDir, "feishu-web.json"), "{}", { mode: 0o600 });
+    assert.equal(workspaceRequiresIsolation({ dataDir: wsOnlyDir, context: { personal_web: { enabled: false } } as never }, {}), true);
+    assert.throws(
+      () =>
+        wrapCredentialIsolatedCommand(
+          "sh",
+          ["-c", "true"],
+          {},
+          { dataDir: wsOnlyDir, requireIsolation: true, forceBackend: { kind: "none" } },
+        ),
+      /拒绝执行/,
+      "无密钥 shell 在启用个人 Web 工作区且缺少隔离后端时必须 fail-closed",
+    );
+
+    // 2) [R12 P1-3] Codex tools=none 保留并校验 forced_login_method 与 forced_chatgpt_workspace_id（标量与列表）
+    const cxHome1 = path.join(dir, "codex-forced-list");
+    fs.mkdirSync(cxHome1, { recursive: true });
+    fs.writeFileSync(
+      path.join(cxHome1, "config.toml"),
+      [
+        'model = "gpt-5-work"',
+        'forced_login_method = "chatgpt"',
+        'forced_chatgpt_workspace_id = ["ws_corp_a", "ws_corp_b"]',
+      ].join("\n") + "\n",
+    );
+    const forcedListCfg = extractSafeCodexProviderConfig({ CODEX_HOME: cxHome1 }, [], false);
+    assert.ok(forcedListCfg.args.includes('forced_login_method="chatgpt"'), "必须保留 forced_login_method");
+    assert.ok(
+      forcedListCfg.args.includes('forced_chatgpt_workspace_id=["ws_corp_a","ws_corp_b"]'),
+      "必须保留列表形式 forced_chatgpt_workspace_id",
+    );
+
+    const cxHome2 = path.join(dir, "codex-forced-scalar");
+    fs.mkdirSync(cxHome2, { recursive: true });
+    fs.writeFileSync(
+      path.join(cxHome2, "config.toml"),
+      ['forced_login_method = "api"', 'forced_chatgpt_workspace_id = "ws_single"'].join("\n") + "\n",
+    );
+    const forcedScalarCfg = extractSafeCodexProviderConfig({ CODEX_HOME: cxHome2 }, [], false);
+    assert.ok(forcedScalarCfg.args.includes('forced_login_method="api"'));
+    assert.ok(forcedScalarCfg.args.includes('forced_chatgpt_workspace_id="ws_single"'));
+
+    const cxHomeBadLogin = path.join(dir, "codex-bad-login");
+    fs.mkdirSync(cxHomeBadLogin, { recursive: true });
+    fs.writeFileSync(path.join(cxHomeBadLogin, "config.toml"), 'forced_login_method = "bogus"\n');
+    assert.throws(
+      () => extractSafeCodexProviderConfig({ CODEX_HOME: cxHomeBadLogin }, [], false),
+      /forced_login_method/,
+      "非法 forced_login_method 必须拒绝执行",
+    );
+
+    const cxHomeBadWs = path.join(dir, "codex-bad-ws");
+    fs.mkdirSync(cxHomeBadWs, { recursive: true });
+    fs.writeFileSync(path.join(cxHomeBadWs, "config.toml"), 'forced_chatgpt_workspace_id = ["ws_ok", ""]\n');
+    assert.throws(
+      () => extractSafeCodexProviderConfig({ CODEX_HOME: cxHomeBadWs }, [], false),
+      /forced_chatgpt_workspace_id/,
+      "含空元素的 forced_chatgpt_workspace_id 必须拒绝执行",
+    );
+    // extraArgs 中的 forced_login_method / forced_chatgpt_workspace_id 同样保留与校验
+    const forcedExtraCfg = extractSafeCodexProviderConfig(
+      { CODEX_HOME: path.join(dir, "codex-empty") },
+      ["-c", 'forced_login_method="chatgpt"', "-c", 'forced_chatgpt_workspace_id=["ws_x"]'],
+      false,
+    );
+    assert.ok(forcedExtraCfg.sanitizedExtraArgs.includes('forced_login_method="chatgpt"'));
+    assert.ok(forcedExtraCfg.sanitizedExtraArgs.includes('forced_chatgpt_workspace_id=["ws_x"]'));
+
+    // 3) [R12 P1-7 & P2-14/15/16/17] Git LFS：独立 pushurl 预检、不可变提交推送、历史 hawser spec/v1 指针、分块扫描 (>260 blobs)
+    const hawserOid = "b".repeat(64);
+    const hawserPtr = `version https://hawser.github.com/spec/v1\noid sha256:${hawserOid}\nsize 128\n`;
+    assert.equal(isGitLfsPointerBlob(hawserPtr), true, "必须识别历史 hawser spec/v1 LFS 指针");
+
+    // 3a) pushurl 与 fetch URL 分离：fetch 远端（upstream）已含历史提交，但 pushurl（fork）为空且缺历史 LFS 对象 -> 必须针对 pushurl 扫描并触发 LFS 上传
+    const upstreamBare = path.join(dir, "r12-upstream.git");
+    const forkBare = path.join(dir, "r12-fork.git");
+    const splitRepo = path.join(dir, "r12-split-repo");
+    fs.mkdirSync(upstreamBare, { recursive: true });
+    fs.mkdirSync(forkBare, { recursive: true });
+    fs.mkdirSync(splitRepo, { recursive: true });
+    await tryGit(upstreamBare, ["init", "--bare"]);
+    await tryGit(forkBare, ["init", "--bare"]);
+    await tryGit(splitRepo, ["init", "-b", "main"]);
+    await tryGit(splitRepo, ["config", "user.name", "Tester"]);
+    await tryGit(splitRepo, ["config", "user.email", "tester@example.com"]);
+    await tryGit(splitRepo, ["remote", "add", "origin", upstreamBare]);
+
+    const histPayload = Buffer.from("r12-hawser-split-pushurl-payload\n", "utf8");
+    const histOid = crypto.createHash("sha256").update(histPayload).digest("hex");
+    const histObjDir = path.join(splitRepo, ".git", "lfs", "objects", histOid.slice(0, 2), histOid.slice(2, 4));
+    fs.mkdirSync(histObjDir, { recursive: true });
+    fs.writeFileSync(path.join(histObjDir, histOid), histPayload);
+    const histHawserPtr = `version https://hawser.github.com/spec/v1\noid sha256:${histOid}\nsize ${histPayload.length}\n`;
+    fs.writeFileSync(path.join(splitRepo, "legacy.dat"), histHawserPtr);
+    await tryGit(splitRepo, ["add", "legacy.dat"]);
+    await tryGit(splitRepo, ["commit", "-m", "add legacy hawser lfs object"]);
+    await tryGit(splitRepo, ["rm", "legacy.dat"]);
+    // 再加 >260 个小非 LFS 文件，跨过 256-blob 分块边界验证有界分块扫描仍能检出历史指针
+    for (let k = 0; k < 270; k++) {
+      fs.writeFileSync(path.join(splitRepo, `note_${k}.txt`), `small non-lfs file payload number ${k} padding to exceed eighty bytes easily 0123456789abcdef\n`);
+    }
+    await tryGit(splitRepo, ["add", "."]);
+    await tryGit(splitRepo, ["commit", "-m", "delete legacy lfs and add 270 small blobs"]);
+    // 先把分支推到 upstream（不含 fork），然后把 origin 的 pushurl 指向空的 forkBare
+    await tryGit(splitRepo, ["push", "origin", "refs/heads/main:refs/heads/main"]);
+    await tryGit(splitRepo, ["remote", "set-url", "--push", "origin", forkBare]);
+    // 如果扫描错误地读取了 fetch URL (upstreamBare)，会误以为无 outgoing 对象；读取 pushurl (forkBare) 则能检出历史 hawser LFS 指针！
+    await tryGit(splitRepo, ["config", "lfs.url", "http://127.0.0.1:1/fail-fork-pushurl"]);
+    const splitFail = await pushBranch(splitRepo, "origin", "main");
+    assert.equal(splitFail.ok, false, "存在独立 pushurl 时必须按 pushurl 的远端引用扫描历史 LFS 对象并阻止缺对象的推送");
+    assert.match(splitFail.message, /Git LFS/);
+    assert.equal(
+      (await tryGit(forkBare, ["rev-parse", "--verify", "refs/heads/main"])).code !== 0,
+      true,
+      "pushurl LFS 上传失败时 fork 远端绝不能出现悬空分支",
+    );
+    await tryGit(splitRepo, ["config", "--unset", "lfs.url"]);
+    const hasGitLfs = (await runProcess("git", ["lfs", "version"], { timeoutMs: 3_000 })).code === 0;
+    if (hasGitLfs) {
+      const splitOk = await pushBranch(splitRepo, "origin", "main");
+      assert.equal(splitOk.ok, true, `pushurl 可用时必须完成历史 hawser LFS 上传并推送：${!splitOk.ok ? splitOk.message : ""}`);
+      assert.equal(
+        fs.existsSync(path.join(forkBare, "lfs", "objects", histOid.slice(0, 2), histOid.slice(2, 4), histOid)),
+        true,
+        "历史 hawser LFS 对象必须上传到 pushurl 对应的 fork 远端 LFS 存储",
+      );
+    }
+
+    // ───────── 初始化共享测试 App（作用域内开启 TEST_WEB_KEY） ─────────
+    process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
+    const cfgFile = path.join(dir, "config.yaml");
+    fs.writeFileSync(
+      cfgFile,
+      JSON.stringify({
+        data_dir: path.join(dir, "data"),
+        bins: { lark: path.join(STUBS, "ctx-lark"), acpx: path.join(STUBS, "acpx"), bytedcli: path.join(STUBS, "ctx-bytedcli") },
+        harnesses: { claude: { agent: "claude" }, cx: { type: "codex-exec", cmd: path.join(STUBS, "ctx-codex") } },
+        roles: { brain: "claude" },
+        owner: { open_id: "ou_owner_a" },
+        cards: { enabled: true },
+        engine: { retry_base_ms: 20, retry_max_ms: 50, tick_ms: 50, effect_attempts: 1 },
+        context: {
+          enabled: true,
+          harness: "cx",
+          groups: "allowlist",
+          max_groups: 1,
+          lookback_days: 7,
+          groups_allow: ["oc_r12_grp_a", "oc_r12_grp_b"],
+          groups_deny: ["保密"],
+          sources: { meego: false, tasks: false, im: true, minutes: false, calendar: false, docs: false },
+          personal_web: { enabled: true, fast_lane: true, debounce_ms: 0, pre_draft: false, send_replies: true },
+        },
+      }),
+    );
+    app = createApp(loadConfig(cfgFile));
+    const svc = new ContextService(app);
+    installCtxDirStubLlm(svc, ctxDir);
+    const cards = new CardService(app, { debounceMs: 5 });
+    cards.register();
+    const now = Date.now();
+    const baseCookies = [
+      { name: "session", value: "sess_r12_v1", domain: "127.0.0.1", path: "/" },
+      { name: "passport_web_did", value: "did_r12_old", domain: "127.0.0.1", path: "/" },
+    ];
+    commitWorkspaceLogin(
+      app,
+      { owner_id: "7001", owner_name: "主人A", session_id: "sess_r12_a", cookies: baseCookies },
+      { allowUnverifiedOwner: true },
+    );
+
+    // 4) [R12 P1-4] 轮询 pullIm：首白名单群改名命中 deny 且 --sender 行缺失 chat_name 时，绝不用旧 spoken_groups 覆盖新学群名导致死循环卡死
+    app.store.set("ctx.spoken_groups", JSON.stringify({ oc_r12_grp_a: { name: "老研发群", at: now - 10_000 } }));
+    const r12T = new Date(now - 2_000).toISOString();
+    fs.writeFileSync(
+      path.join(ctxDir, "lark.json"),
+      JSON.stringify({
+        user_open_id: "ou_owner_a",
+        user_name: "主人A",
+        at_me: [],
+        p2p: [
+          {
+            message_id: "om_r12_dm_ok",
+            chat_id: "oc_r12_dm_ok",
+            chat_type: "p2p",
+            sender: { id: "ou_colleague", name: "同事甲", sender_type: "user" },
+            create_time: r12T,
+            content: "无关私聊必须正常落库",
+          },
+        ],
+        // --sender 行故意省略 chat_name，复现旧 spoken_groups 回退覆盖已知改名缓存的回归场景
+        mine: [
+          {
+            message_id: "om_r12_mine_a",
+            chat_id: "oc_r12_grp_a",
+            chat_type: "group",
+            sender: { id: "ou_owner_a", name: "主人A", sender_type: "user" },
+            create_time: r12T,
+            content: "我发的一句话",
+          },
+        ],
+        chat_meta: {
+          oc_r12_grp_a: { name: "绝密保密群", chat_mode: "group", chat_type: "group" },
+          oc_r12_grp_b: { name: "接替群B", chat_mode: "group", chat_type: "group" },
+        },
+        chats: {
+          oc_r12_grp_a: [
+            {
+              message_id: "om_r12_a_msg",
+              chat_id: "oc_r12_grp_a",
+              chat_type: "group",
+              chat_name: "绝密保密群",
+              sender: { id: "ou_other", name: "其他人", sender_type: "user" },
+              create_time: r12T,
+              content: "保密内容绝不能落库",
+            },
+          ],
+          oc_r12_grp_b: [
+            {
+              message_id: "om_r12_b_msg",
+              chat_id: "oc_r12_grp_b",
+              chat_type: "group",
+              chat_name: "接替群B",
+              sender: { id: "ou_other", name: "其他人", sender_type: "user" },
+              create_time: r12T,
+              content: "接替群B的合法消息必须被补采",
+            },
+          ],
+        },
+      }),
+    );
+    const pullRes = await svc.connectors.pullIm();
+    assert.ok(pullRes.count >= 2, `改名重排后必须提交接替群B与无关私聊并推进游标，实际 count=${pullRes.count}`);
+    assert.equal(svc.store.obs("im:om_r12_a_msg"), undefined, "改名命中 deny 的群A消息不得入库");
+    assert.ok(svc.store.obs("im:om_r12_b_msg"), "接替群B消息必须成功入库");
+    assert.ok(svc.store.obs("im:om_r12_dm_ok"), "无关私聊必须成功入库");
+    assert.ok(Number(app.store.get("ctx.cursor.im.p2p") ?? 0) > 0, "私聊游标必须正常推进");
+
+    // 5) [R12 P1-6] 开放平台待处理私聊（p2p）必须应用显式 groups_deny 关键词，同时不受跨通道同名静音群误伤
+    svc.store.addObs([
+      {
+        id: "im:om_r12_dm_kw",
+        source: "im",
+        kind: "p2p",
+        conv: "oc_r12_dm_kw",
+        conv_name: "私聊：保密项目顾问",
+        actor_id: "ou_adv",
+        actor_name: "保密项目顾问",
+        is_me: false,
+        time: now,
+        text: "敏感私聊",
+        url: "",
+        meta: { chat_type: "p2p" },
+      },
+      {
+        id: "im:om_r12_dm_alice",
+        source: "im",
+        kind: "p2p",
+        conv: "oc_r12_dm_alice",
+        conv_name: "私聊：Alice",
+        actor_id: "ou_alice",
+        actor_name: "Alice",
+        is_me: false,
+        time: now,
+        text: "普通私聊",
+        url: "",
+        meta: { chat_type: "p2p" },
+      },
+    ]);
+    assert.equal(
+      await svc.personalWeb.checkConvAllowedForUnderstand("oc_r12_dm_kw", "私聊：保密项目顾问"),
+      "excluded",
+      "匹配 groups_deny 关键词的开放平台待处理私聊必须被排除",
+    );
+    assert.equal(
+      await svc.personalWeb.checkConvAllowedForUnderstand("oc_r12_dm_alice", "私聊：Alice", {
+        confirmedGroupNames: new Set(["私聊：alice", "alice"]),
+        groupsInconclusive: false,
+        dmsInconclusive: false,
+      }),
+      "allowed",
+      "跨通道静音群名不得误伤开放平台私聊",
+    );
+
+    // 6) [R12 P1-5] 草稿推理前复核目标与窗口隐私（静音/撤回/正文编辑）：异步校验期间变更绝不把旧文本或已静音/撤回内容送模型
+    svc.store.addObs([
+      {
+        id: "im:om_r12_draft_dm",
+        source: "im",
+        kind: "p2p",
+        conv: "oc_r12_draft_dm",
+        conv_name: "私聊：小王",
+        actor_id: "ou_wang",
+        actor_name: "小王",
+        is_me: false,
+        time: now - 1000,
+        text: "原始机密文本_OLD",
+        url: "",
+        meta: { chat_type: "p2p" },
+      },
+    ]);
+    const { item: draftItem } = svc.store.upsertItem({
+      title: "回复小王",
+      kind: "ask_me",
+      source: "im",
+    });
+    svc.store.addEvidence("item", draftItem.id, "im:om_r12_draft_dm", "原始机密文本_OLD", now - 1000);
+    const draftPrompts: string[] = [];
+    installCallbackLlm(svc, async (prompt) => {
+      draftPrompts.push(prompt);
+      return "好的，已按最新消息处理。";
+    });
+    // 6a) filterObs 异步期间目标正文被编辑：必须自动重读最新修订，绝不发送旧文本
+    let editedOnce = false;
+    const origFilterObs = svc.drafter.filterObs;
+    svc.drafter.filterObs = async (conv, obs) => {
+      const out = origFilterObs ? await origFilterObs(conv, obs) : obs;
+      if (!editedOnce && conv === "oc_r12_draft_dm") {
+        editedOnce = true;
+        svc.store.db.prepare("UPDATE ctx_obs SET text = ? WHERE id = ?").run("编辑后安全文本_NEW", "im:om_r12_draft_dm");
+      }
+      return out;
+    };
+    await svc.drafter.forItem(draftItem.id, "reply");
+    assert.equal(draftPrompts.length, 1);
+    assert.ok(draftPrompts[0].includes("编辑后安全文本_NEW"), "推理提示词必须使用最新编辑后的正文");
+    assert.ok(!draftPrompts[0].includes("原始机密文本_OLD"), "绝不能把已被编辑覆盖的旧文本送给模型");
+
+    // 6b) filterObs 异步期间该私聊被静音：必须立即停止，绝不调用模型
+    draftPrompts.length = 0;
+    svc.drafter.filterObs = async (conv, obs) => {
+      const out = origFilterObs ? await origFilterObs(conv, obs) : obs;
+      if (conv === "oc_r12_draft_dm") {
+        svc.store.muteConv("oc_r12_draft_dm", "私聊：小王", true);
+      }
+      return out;
+    };
+    await assert.rejects(
+      svc.drafter.forItem(draftItem.id, "reply"),
+      /静音|排除|范围|变更/,
+      "异步过滤期间私聊被静音时必须停止起草",
+    );
+    assert.equal(draftPrompts.length, 0, "私聊被静音后绝不能调用模型");
+    svc.store.muteConv("oc_r12_draft_dm", "私聊：小王", false);
+
+    // 6c) filterObs 异步期间目标消息被撤回：绝不能补回旧快照送模型
+    svc.drafter.filterObs = async (conv, obs) => {
+      const out = origFilterObs ? await origFilterObs(conv, obs) : obs;
+      if (conv === "oc_r12_draft_dm") {
+        svc.store.retirePendingObs("im:om_r12_draft_dm");
+      }
+      return out;
+    };
+    await assert.rejects(
+      svc.drafter.forItem(draftItem.id, "reply"),
+      /范围|撤回|找不到|变更/,
+      "目标消息在异步期间被撤回时必须停止起草",
+    );
+    assert.equal(draftPrompts.length, 0, "目标撤回后绝不能调用模型");
+    svc.drafter.filterObs = origFilterObs;
+
+    // 7) [R12 P2-8] 非持钥交互式 CLI drain(["effect"]) 必须跳过/让出 pw.reply（不消耗重试次数、不标死草稿），持钥消费者接手后正常发送
+    const pwReplyDraft = svc.store.addDraft({
+      item_id: draftItem.id,
+      project_id: "",
+      kind: "reply",
+      target: {
+        transport: "personal_web",
+        obs_id: "pw:r12_defer_m",
+        native_owner_id: "7001",
+        native_message_id: "r12_defer_m",
+        native_chat_id: "9920",
+        native_root_id: "r12_defer_m",
+      },
+      target_label: "回复 7002（个人 Web）",
+      content: "待持钥常驻进程发送的回复",
+    });
+    svc.store.setDraft(pwReplyDraft.id, { status: "approved" });
+    app.ledger.emit(
+      `ctx-draft:${pwReplyDraft.id}`,
+      [
+        {
+          op: "pw.reply",
+          args: {
+            owner_id: "7001",
+            chat_id: "9920",
+            message_id: "r12_defer_m",
+            root_id: "r12_defer_m",
+            text: "待持钥常驻进程发送的回复",
+            draft_id: pwReplyDraft.id,
+          },
+        },
+      ],
+      `r12-defer-${pwReplyDraft.id}`,
+    );
+    app.ledger.emit("non-pw-test", [{ op: "notify", args: { markdown: "普通通知" } }], "r12-normal-notify");
+    const origNotifyOwner = app.lark.notifyOwner.bind(app.lark);
+    const deliveredNotifies: string[] = [];
+    app.lark.notifyOwner = async (md) => {
+      deliveredNotifies.push(md);
+    };
+    // 模拟交互式 CLI（无 PA_FEISHU_WEB_KEY，磁盘是加密凭据 -> missing_key）执行 drain(["effect"])
+    await withoutTestWebKey(async () => {
+      await app!.engine.drain(["effect"]);
+    });
+    assert.ok(deliveredNotifies.includes("普通通知"), "无密钥 CLI 仍须正常投递其他普通 effect");
+    const deferredFx = app.ledger.get(`fx:r12-defer-${pwReplyDraft.id}`)!;
+    assert.equal(deferredFx.terminal, false, "无密钥 CLI 绝不能把 pw.reply 标为 dead");
+    assert.equal(deferredFx.attempts, 0, "无密钥 CLI 绝不能消耗 pw.reply 的重试次数");
+    assert.equal(svc.store.draft(pwReplyDraft.id)?.status, "approved", "草稿仍保持 approved 等待持钥常驻进程");
+    // 换作持钥消费者（且提供 mock pwReply）后立即成功投递
+    let pwSentByCredConsumer = false;
+    const prevPwReplyHook = app.effectHooks.pwReply;
+    const prevDeferHook = app.effectHooks.shouldDeferPwReply;
+    app.effectHooks.pwReply = async () => {
+      pwSentByCredConsumer = true;
+    };
+    app.effectHooks.shouldDeferPwReply = () => false;
+    await app.engine.drain(["effect"]);
+    assert.equal(pwSentByCredConsumer, true, "持钥消费者必须能正常领取并完成 pw.reply");
+    assert.equal(app.ledger.get(`fx:r12-defer-${pwReplyDraft.id}`)?.state, "done");
+    app.effectHooks.pwReply = prevPwReplyHook;
+    app.effectHooks.shouldDeferPwReply = prevDeferHook;
+
+    // 8) [R12 P2-9] 换主人后：旧主人与未绑定历史 brief 仍阻断，但为当前新主人重新渲染并绑定的 brief（卡片与去重键均按主人隔离）可正常投递
+    const origLarkRun = app.lark.run.bind(app.lark);
+    const sentCardPayloads: { to: string; key: string }[] = [];
+    app.lark.run = async (argv, opts) => {
+      if (argv[0] === "task" && (argv[1] === "+get-my-tasks" || argv[1] === "+tasklist-tasks" || argv[1] === "sections")) return { items: [] };
+      if (argv[0] === "im" && argv[1] === "+messages-send") {
+        const uidIdx = argv.indexOf("--user-id");
+        const idemIdx = argv.indexOf("--idempotency-key");
+        sentCardPayloads.push({
+          to: uidIdx >= 0 ? argv[uidIdx + 1] ?? "" : "",
+          key: idemIdx >= 0 ? argv[idemIdx + 1] ?? "" : "",
+        });
+        return { message_id: `om_card_${sentCardPayloads.length}` };
+      }
+      return origLarkRun(argv, opts);
+    };
+    app.store.set("board.tasklist", "tl_r12");
+    app.store.set("board.section.pending", "sec_p");
+    app.store.set("board.section.review", "sec_r");
+    app.store.set("board.section.attention", "sec_a");
+    // 先由主人 A 排队一份 morning brief + 一份未绑定历史 brief
+    await sendBrief(app, "morning");
+    app.ledger.emit("brief", [{ op: "notify", args: { markdown: "旧版未绑定晨报", kind: "brief" } }], "r12-legacy-unbound-brief");
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const briefAId = `fx:brief-morning-${dateStr}-${Q.briefOwnerTag("ou_owner_a")}`;
+    // 切换工作区主人到 B
+    app.cfg.owner.open_id = "ou_owner_b";
+    assert.equal(Q.isWorkBlockedByOwner(app, briefAId), true, "旧主人 A 的待发晨报仍必须阻断");
+    assert.equal(Q.isWorkBlockedByOwner(app, "fx:r12-legacy-unbound-brief"), true, "未绑定主人的旧版晨报仍必须阻断");
+    // 主人 B 同一天再次调用 sendBrief：去重键与卡片键均按主人 B 隔离，能正常入队并投递给 B
+    await sendBrief(app, "morning");
+    const briefBId = `fx:brief-morning-${dateStr}-${Q.briefOwnerTag("ou_owner_b")}`;
+    assert.ok(app.ledger.get(briefBId), "主人 B 的晨报必须使用独立去重键入队而不与 A 冲突");
+    assert.equal(Q.isWorkBlockedByOwner(app, briefBId), false, "为主人 B 重新渲染并绑定的晨报必须允许投递");
+    await app.engine.drain(["effect"]);
+    assert.equal(app.ledger.get(briefBId)?.state, "done", "主人 B 的晨报卡片必须成功投递");
+    assert.equal(app.ledger.get(briefAId)?.state, "dead", "主人 A 的旧晨报必须被阻断");
+    assert.equal(app.ledger.get("fx:r12-legacy-unbound-brief")?.state, "dead", "未绑定旧晨报必须被阻断");
+    assert.ok(sentCardPayloads.some((c) => c.to === "ou_owner_b"), "投递目标必须是主人 B");
+    // 恢复主人 A
+    app.cfg.owner.open_id = "ou_owner_a";
+    app.lark.run = origLarkRun;
+    app.lark.notifyOwner = origNotifyOwner;
+
+    // 9) [R12 P2-10] verifyOwner 成功后，loadWebMetadata 在 503 失败前下发了 Set-Cookie 轮换：connect 抛错前必须先落盘该已验证会话的 Cookie 增量
+    let persistedOnMetaFail: string | undefined;
+    mock.setMessengerStatus(503);
+    mock.setMessengerErrorCookie("session=sess_rotated_on_503; Path=/; Max-Age=86400");
+    await assert.rejects(
+      FeishuWebClient.connect(
+        { owner_id: "7001", owner_name: "主人A", session_id: "sess_r12_meta", cookies: baseCookies },
+        {
+          endpoints: mock.endpoints,
+          onSessionConfirmed: (updated) => {
+            const s = updated.cookies.find((c) => c.name === "session")?.value;
+            if (s) persistedOnMetaFail = s;
+            return updated;
+          },
+        },
+      ),
+      /503|元数据/,
+    );
+    mock.setMessengerStatus(200);
+    mock.setMessengerErrorCookie("");
+    assert.equal(
+      persistedOnMetaFail,
+      "sess_rotated_on_503",
+      "loadWebMetadata 失败前收到的已验证会话 Cookie 轮换必须立即持久化",
+    );
+
+    // 10) [R12 P2-11] buildSocketUrl：票据响应轮换 passport_web_did 时必须以新 device_id 重拉匹配票据，保持 ticket / device_id / access_key 严格一致
+    const ticketClient = await FeishuWebClient.connect(
+      { owner_id: "7001", owner_name: "主人A", session_id: "sess_r12_did", cookies: baseCookies },
+      { endpoints: mock.endpoints },
+    );
+    mock.ticketDeviceIds.length = 0;
+    mock.setTicketRotateDidOnce("did_r12_rotated_999");
+    const wsUrlStr = await ticketClient.buildSocketUrl();
+    const wsParsed = new URL(wsUrlStr);
+    const finalDid = wsParsed.searchParams.get("device_id")!;
+    const finalTicket = wsParsed.searchParams.get("ticket")!;
+    const finalAccessKey = wsParsed.searchParams.get("access_key")!;
+    const expectedAccessKey = crypto.createHash("md5").update(`2appkey_xyz${finalDid}${ACCESS_KEY_SALT}`).digest("hex");
+    assert.equal(finalDid, "did_r12_rotated_999", "轮换后的新 passport_web_did 必须生效");
+    assert.equal(finalTicket, "ticket_for_did_r12_rotated_999", "票据必须是用同一新 device_id 重新申请的匹配票据");
+    assert.equal(finalAccessKey, expectedAccessKey, "access_key 必须与同一 device_id 严格匹配");
+    assert.ok(mock.ticketDeviceIds.includes("did_r12_rotated_999"), "应针对轮换后的新 device_id 发起重拉票据请求");
+    mock.setTicketRotateDidOnce("");
+
+    // 11) [R12 P2-13] 原子条件清除 pending_cred_commit 标记：路径 A 完成安装绝不能抹掉路径 B 刚刚提交的未完成标记
+    const pathA = path.join(dir, "cred-path-a.json");
+    const pathB = path.join(dir, "cred-path-b.json");
+    const storeB = new WebLoginStore(dir, "cred-path-b.json");
+    storeB.stageWithLock((stage) => {
+      stage({ owner_id: "7001", owner_name: "主人A", session_id: "sess_r12_b", cookies: baseCookies });
+    });
+    const markerB = JSON.stringify({
+      file: pathB,
+      staged_file: storeB.stagedFile,
+      owner_id: "7001",
+      session_id: "sess_r12_b",
+      at: Date.now(),
+    });
+    app.store.set(PENDING_CRED_COMMIT_KV_KEY, markerB);
+    // 模拟先提交的路径 A 稍后完成 rename 并尝试清除自己的 marker -> 必须返回 false 且完整保留路径 B 的 marker
+    const clearedWrong = clearPendingCommitMarkerIfMatches(app.store, PENDING_CRED_COMMIT_KV_KEY, {
+      file: pathA,
+      sessionId: "sess_r12_a",
+    });
+    assert.equal(clearedWrong, false, "路径 A 绝不能清除属于路径 B 的 pending 标记");
+    assert.equal(app.store.get(PENDING_CRED_COMMIT_KV_KEY), markerB, "路径 B 的 pending 标记必须完好保留");
+    // 随后路径 B 恢复暂存提交：正确完成 rename 并清除路径 B 的标记
+    storeB.reconcilePendingCommit(app.store, PENDING_CRED_COMMIT_KV_KEY);
+    assert.equal(storeB.load()?.session_id, "sess_r12_b", "路径 B 的暂存凭据必须成功恢复");
+    assert.equal(app.store.get(PENDING_CRED_COMMIT_KV_KEY), "", "路径 B 恢复完成后才清除其自身标记");
+
+    // 12) [R12 P2-12] 常驻进程处于 needs_login 等待登录期间（waitForCredentialChange），自动恢复外部遗留的 .staged 暂存提交并上线
+    const waitDir = makeTmp("pa-r12-wait-staged-");
+    const waitCfg = path.join(waitDir, "config.yaml");
+    fs.writeFileSync(
+      waitCfg,
+      JSON.stringify({
+        data_dir: waitDir,
+        bins: { lark: path.join(STUBS, "ctx-lark"), acpx: path.join(STUBS, "acpx"), bytedcli: path.join(STUBS, "ctx-bytedcli") },
+        harnesses: { claude: { agent: "claude" } },
+        roles: { brain: "claude" },
+        owner: { open_id: "ou_owner_a" },
+        context: { enabled: true, personal_web: { enabled: true, fast_lane: true, debounce_ms: 0 } },
+      }),
+    );
+    const waitApp = createApp(loadConfig(waitCfg));
+    const waitCtx = new ContextService(waitApp);
+    const waitBridge = new PersonalWebBridge(waitApp, waitCtx.store, {
+      onFastTrigger: () => undefined,
+      onReconnect: () => undefined,
+      onNeedsLogin: () => undefined,
+      credentialWatchIntervalMs: 30,
+      clientOptions: { endpoints: mock.endpoints },
+    });
+    const waitHandle = waitBridge.start();
+    try {
+      await waitUntil(() => waitBridge.status().state === "needs_login", 3_000);
+      // 模拟首次 web-login 已提交 SQLite 绑定与 .staged 文件后、rename 前退出
+      const waitStore = new WebLoginStore(waitDir);
+      const stagedLogin = waitStore.stageWithLock((stage) => {
+        const s = stage({ owner_id: "7001", owner_name: "主人A", session_id: "sess_r12_wait_recover", cookies: baseCookies });
+        return s.payload;
+      });
+      saveWorkspaceBinding(waitApp.store, "7001", "ou_owner_a");
+      waitApp.store.set(ACTIVE_SESSION_KV_KEY, stagedLogin.session_id ?? "");
+      waitApp.store.set(
+        PENDING_CRED_COMMIT_KV_KEY,
+        JSON.stringify({
+          file: waitStore.file,
+          staged_file: waitStore.stagedFile,
+          owner_id: "7001",
+          session_id: stagedLogin.session_id ?? "",
+          at: Date.now(),
+        }),
+      );
+      assert.equal(fs.existsSync(waitStore.file), false, "模拟崩溃时尚未 rename 到现网路径");
+      // 运行中的常驻进程必须自动在 waitForCredentialChange 中恢复 .staged 并进入 listening
+      await waitUntil(() => waitBridge.status().state === "listening", 4_000);
+      assert.equal(fs.existsSync(waitStore.file), true, "等待中的常驻进程必须自动补全 .staged -> file 重命名");
+      assert.equal(waitApp.store.get(PENDING_CRED_COMMIT_KV_KEY), "", "恢复完成后 pending 标记必须清除");
+    } finally {
+      waitHandle.stop();
+      waitApp.store.db.close();
+    }
   } finally {
     if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
     else process.env.PA_FEISHU_WEB_KEY = prevKey;

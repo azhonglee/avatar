@@ -630,9 +630,19 @@ export class Connectors {
       if (m.chat_type === "group" || m.chat_type === "topic_group") {
         const at = parseTime(m.create_time, this.cfg.owner.timezone);
         const cur = spoken[m.chat_id];
-        const cname = String(m.chat_name ?? cur?.name ?? "").trim();
-        if (!cur || at > cur.at) spoken[m.chat_id] = { name: cname, at };
-        if (cname && m.chat_id) recordLearnedName(m.chat_id, cname);
+        const suppliedName = String(m.chat_name ?? "").trim();
+        const existingKnown = m.chat_id ? knownNames[m.chat_id] ?? "" : "";
+        const effectiveName = suppliedName || existingKnown || cur?.name || "";
+        if (!cur || at > cur.at) spoken[m.chat_id] = { name: effectiveName, at };
+        // 仅记录响应实际返回的群名，绝不把旧 spoken_groups 回退值写回 knownNames，
+        // 也绝不让旧搜索行覆盖已核实的改名/排除群名（避免选群重试死循环）
+        if (suppliedName && m.chat_id) {
+          const keepExistingKnown =
+            !!existingKnown &&
+            existingKnown !== suppliedName &&
+            (isOpenGroupDirectlyDenied(this.cfg, this.store, m.chat_id, existingKnown, nativeExcl) || (!!cur && at <= cur.at));
+          if (!keepExistingKnown) recordLearnedName(m.chat_id, suppliedName);
+        }
       }
     }
     for (const [id, v] of Object.entries(spoken)) if (v.at < now - lookback) delete spoken[id];
@@ -842,6 +852,7 @@ export class Connectors {
         const chatId = String(m.chat_id ?? "");
         let chatType = String(m.chat_type ?? "").trim();
         let chatName = String(m.chat_name ?? "").trim();
+        let nameSupplied = !!chatName;
 
         // 对缺失 chat_name（有名称/原生静音规则）或缺失 chat_type（受限状态）的命中实时查一次 im chats get，不凭陈旧 spoken_groups 放行
         const shouldLookupMeta =
@@ -851,14 +862,17 @@ export class Connectors {
         if (shouldLookupMeta) {
           const fresh = await getChatMeta(chatId);
           if (fresh) {
-            if (!chatName && fresh.name) chatName = fresh.name;
+            if (!chatName && fresh.name) {
+              chatName = fresh.name;
+              nameSupplied = true;
+            }
             if (!chatType && fresh.chatType) chatType = fresh.chatType;
           }
         }
         if (!chatName && !needsCurrentName && entry.fallbackGroupName) {
           chatName = entry.fallbackGroupName;
         }
-        if (chatName && chatId) {
+        if (nameSupplied && chatName && chatId) {
           if (spoken[chatId]) spoken[chatId].name = chatName;
           if (chatId.startsWith("oc_") && chatType.toLowerCase() !== "p2p") {
             recordLearnedName(chatId, chatName);

@@ -6,7 +6,7 @@ import type { App } from "./app.ts";
 import type { DoctorCheck, DoctorReport } from "./api/types.ts";
 import { repoSpec } from "./config.ts";
 import { WebLoginStore } from "./context/feishu-web/index.ts";
-import { prepareHarnessEnv, resolveBin, wrapCredentialIsolatedCommand } from "./harness.ts";
+import { buildWorkspaceIsolation, prepareHarnessEnv, resolveBin, wrapCredentialIsolatedCommand } from "./harness.ts";
 import { consoleBaseUrl, isLoopbackHost } from "./server/index.ts";
 import { validateConfig } from "./settings.ts";
 import { deepFind, errMsg, runProcess, truncate } from "./util.ts";
@@ -297,16 +297,25 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
       const baseEnv = prepareHarnessEnv();
       let r: Awaited<ReturnType<typeof runProcess>>;
       try {
-        const wrapped = wrapCredentialIsolatedCommand(resolveBin("git"), [
-          "-C",
-          spec.path,
-          "-c",
-          "core.hooksPath=/dev/null",
-          "-c",
-          "core.fsmonitor=false",
-          "rev-parse",
-          "--is-inside-work-tree",
-        ]);
+        const wrapped = wrapCredentialIsolatedCommand(
+          resolveBin("git"),
+          [
+            "-C",
+            spec.path,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "rev-parse",
+            "--is-inside-work-tree",
+          ],
+          process.env,
+          buildWorkspaceIsolation(cfg, {
+            mode: "git-ro",
+            cwd: spec.path,
+            extraReadOnlyPaths: baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : [],
+          }),
+        );
         r = await runProcess(wrapped.cmd, wrapped.args, { env: baseEnv.env, timeoutMs: cmdTimeout });
       } finally {
         baseEnv.cleanup();

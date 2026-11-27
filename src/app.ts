@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import { Cron } from "croner";
-import { isContextDerivedDispatchBlocked } from "./api/queries.ts";
+import { briefOwnerTag, isContextDerivedDispatchBlocked } from "./api/queries.ts";
 import { Board, KnowledgeBase } from "./board.ts";
 import { Bus } from "./bus.ts";
 import { Commands } from "./commands.ts";
+import { WebLoginStore } from "./context/feishu-web/index.ts";
 import { registerCoreCommands } from "./core-commands.ts";
 import type { EffectHooks } from "./effects.ts";
 import type { Extensions } from "./ext.ts";
@@ -58,7 +59,9 @@ export function createApp(cfg: Config) {
   // 账本每次变更（含 transition/enqueue 附带的 outbox 副作用）都立刻唤醒引擎，不必等下一个 tick_ms
   bus.on("work.changed", () => engine.kick());
   const ext: Extensions = {};
-  const effectHooks: EffectHooks = {};
+  const effectHooks: EffectHooks = {
+    isDaemonRunning: () => engine.isDaemonRunning(),
+  };
   const app = { cfg, store, ledger, lark, board, kb, capture, dispatcher, engine, bot, hooks, bus, commands, ext, effectHooks };
   engine.register(effectHandler(cfg, ledger, board, lark, store, effectHooks));
   engine.register(dispatcher.handler());
@@ -134,14 +137,18 @@ export async function initApp(app: App): Promise<void> {
   await app.kb.init();
 }
 
-/** 生成概览并经 outbox 私信（同一天同一种只发一次）。启用卡片时以卡片发送；绑定渲染时的目标主人 open_id 防换主人后错投。 */
+/** 生成概览并经 outbox 私信（同一天同一种对同一主人只发一次）。卡片与去重键均按目标主人隔离，防换主人后错投或误更新旧主人卡片。 */
 export async function sendBrief(app: App, mode: "morning" | "evening"): Promise<void> {
   const ownerOpenId = app.cfg.owner.open_id.trim();
   const text = await buildBrief(app.cfg, app.lark, app.store, app.ledger, app.board, mode);
   const date = new Date().toISOString().slice(0, 10);
+  const ownerTag = briefOwnerTag(ownerOpenId);
+  const suffix = ownerTag ? `-${ownerTag}` : "";
+  const cardKey = `brief:${date}-${mode}${suffix}`;
+  const dedupeKey = `brief-${mode}-${date}${suffix}`;
   const c = app.cfg.cards.enabled ? app.ext.cards?.brief?.(mode, text) : undefined;
-  if (c) app.ledger.emit(`card:brief:${date}-${mode}`, [card(`brief:${date}-${mode}`, c, "brief", ownerOpenId)], `brief-${mode}-${date}`);
-  else app.ledger.emit("brief", [notify(text, "brief", ownerOpenId)], `brief-${mode}-${date}`);
+  if (c) app.ledger.emit(`card:${cardKey}`, [card(cardKey, c, "brief", ownerOpenId)], dedupeKey);
+  else app.ledger.emit("brief", [notify(text, "brief", ownerOpenId)], dedupeKey);
 }
 
 /** 立即执行一个配置的作业并等待结果（命令行用）。 */
@@ -248,7 +255,8 @@ export async function runDaemon(app: App): Promise<void> {
     ),
   ];
   const contextSchedule = app.ext.context?.start();
-  // 心跳：控制台据此判断常驻进程是否在线
+  // 心跳与持钥标记：控制台据此判断常驻进程在线，同工作区交互式子命令据此强制启用 PID+挂载隔离
+  store.set("daemon.holds_web_key", WebLoginStore.hasEncryptionKey() ? "1" : "");
   const beat = () => store.set("daemon.heartbeat", `${ledger.owner}|${Date.now()}`);
   beat();
   const heartbeat = setInterval(beat, 15_000);
@@ -272,6 +280,7 @@ export async function runDaemon(app: App): Promise<void> {
       triageSoon.cancel();
       ctxSoon?.cancel();
       clearInterval(heartbeat);
+      store.set("daemon.holds_web_key", "");
       await server?.close();
       await events.stop();
       await engine.stop(); // 中止进行中的 harness；租约释放，下次启动从检查点继续

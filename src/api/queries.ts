@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { Cron } from "croner";
@@ -258,6 +259,13 @@ export function isContextOwnedTaskBlocked(app: Pick<App, "cfg" | "store" | "ledg
   return false;
 }
 
+/** 生成紧凑的主人隔离标签（用于 brief 卡片与去重键，保证飞书 50 字符幂等键不截断冲突） */
+export function briefOwnerTag(ownerOpenId: string): string {
+  const clean = ownerOpenId.trim();
+  if (!clean) return "";
+  return createHash("sha256").update(clean).digest("hex").slice(0, 12);
+}
+
 /**
  * 统一判断任意账本工作项 / 卡片 key（含 failure:<workId> 失败告警卡片、queued brief、delivery、effect、context）
  * 是否应因工作区主人隔离而被阻断或隐藏。
@@ -272,6 +280,7 @@ export function isWorkBlockedByOwner(
   visited.add(rawId);
 
   const curOwner = app.cfg.owner.open_id.trim();
+  const curBriefTag = briefOwnerTag(curOwner);
   const ownerMismatch = hasWorkspaceOwnerMismatch(app.store, curOwner);
   if (typeof workOrId === "string") {
     if (workOrId.startsWith("card:failure:")) {
@@ -284,16 +293,19 @@ export function isWorkBlockedByOwner(
 
   const w = typeof workOrId === "string" ? app.ledger.get(workOrId) : workOrId;
   if (!w) {
-    if (
-      ownerMismatch &&
-      (rawId.startsWith("card:ctx-") ||
+    if (ownerMismatch) {
+      const isBriefKey = rawId === "brief" || rawId.startsWith("card:brief:") || rawId.startsWith("brief:");
+      if (isBriefKey) {
+        // 显式按当前主人作用域生成的 brief 卡片键放行，未绑定或旧主人作用域的 brief 键阻断
+        return !curBriefTag || !rawId.endsWith(`-${curBriefTag}`);
+      }
+      if (
+        rawId.startsWith("card:ctx-") ||
         rawId.startsWith("ctx-draft:") ||
-        rawId === "brief" ||
-        rawId.startsWith("card:brief:") ||
-        rawId.startsWith("brief:") ||
-        (rawId.startsWith("context:") && rawId !== "context:pw-needs-login"))
-    ) {
-      return true;
+        (rawId.startsWith("context:") && rawId !== "context:pw-needs-login")
+      ) {
+        return true;
+      }
     }
     return isContextOwnedTaskBlocked(app, rawId);
   }
@@ -309,7 +321,8 @@ export function isWorkBlockedByOwner(
 
   if (w.kind === "effect") {
     const e = w.payload as unknown as Partial<Effect>;
-    // 显式绑定了目标主人的通知/卡片（如 sendBrief 生成的概览），若当前 owner.open_id 已变更则严禁投递给新主人
+    // 显式绑定了目标主人的通知/卡片（如 sendBrief 生成的概览），仅在目标主人与当前 owner.open_id 不一致时阻断；
+    // 为当前主人重新渲染并绑定了 curOwner 的 brief（buildBrief 已按主人过滤旧上下文任务）允许正常投递，未绑定旧版 brief 保持兜底阻断
     const boundRecipient =
       e.args && "owner_open_id" in e.args && typeof e.args.owner_open_id === "string"
         ? e.args.owner_open_id.trim()
@@ -319,7 +332,7 @@ export function isWorkBlockedByOwner(
       w.ref === "brief" ||
       w.ref.startsWith("card:brief:") ||
       (e.op === "card.upsert" && typeof e.args?.key === "string" && e.args.key.startsWith("brief:"));
-    if (isBriefEffect && ownerMismatch) return true;
+    if (isBriefEffect && !boundRecipient && ownerMismatch) return true;
     if (w.ref.startsWith("card:failure:")) {
       if (isWorkBlockedByOwner(app, w.ref.slice("card:failure:".length), visited)) return true;
     }
@@ -440,7 +453,9 @@ export async function dispatchDetail(app: App, id: string): Promise<DispatchDeta
   const s = summarize(app, w);
   const latest = app.ledger.latest("dispatch", w.ref);
   let diffStat = "";
-  if (p.base && p.cwd && fs.existsSync(p.cwd)) diffStat = (await tryGit(p.cwd, ["diff", "--stat", p.base])).stdout.trim();
+  if (p.base && p.cwd && fs.existsSync(p.cwd)) {
+    diffStat = (await tryGit(p.cwd, ["diff", "--stat", p.base], { cfg: app.cfg, readOnly: true })).stdout.trim();
+  }
   return {
     ...s,
     description: p.description ?? "",
@@ -481,9 +496,9 @@ export async function dispatchDiff(app: App, id: string): Promise<DiffView | und
   if (!p.base || !p.cwd || !fs.existsSync(p.cwd)) return { base: p.base ?? "", head: "", stat: "", patch: "", truncated: false };
   // 与基线比较（含尚未提交的已跟踪文件改动）；只读，不改动索引
   const [head, stat, patch] = await Promise.all([
-    tryGit(p.cwd, ["rev-parse", "HEAD"]),
-    tryGit(p.cwd, ["diff", "--stat", p.base]),
-    tryGit(p.cwd, ["diff", "--no-color", p.base]),
+    tryGit(p.cwd, ["rev-parse", "HEAD"], { cfg: app.cfg, readOnly: true }),
+    tryGit(p.cwd, ["diff", "--stat", p.base], { cfg: app.cfg, readOnly: true }),
+    tryGit(p.cwd, ["diff", "--no-color", p.base], { cfg: app.cfg, readOnly: true }),
   ]);
   return {
     base: p.base,

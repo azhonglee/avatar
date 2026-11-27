@@ -26,6 +26,7 @@ export {
   type VerifiedReplyResult,
 } from "./client.ts";
 export {
+  clearPendingCommitMarkerIfMatches,
   defaultCookiePath,
   hasSessionCookie,
   isAllowedFeishuHost,
@@ -35,6 +36,7 @@ export {
   type CookieDelta,
   type CookieRecord,
   type CookieSnapshot,
+  type PendingCommitKvStore,
   type WebLogin,
   type WebLoginInspectResult,
 } from "./cookies.ts";

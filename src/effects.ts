@@ -1,6 +1,6 @@
 import { isWorkBlockedByOwner } from "./api/queries.ts";
 import type { Board, SectionKey } from "./board.ts";
-import { computePwReplyCid, hasWorkspaceOwnerMismatch } from "./context/personal-web.ts";
+import { computePwReplyCid, hasWorkspaceOwnerMismatch, isLiveDaemonHeartbeat } from "./context/personal-web.ts";
 import { deepFind, runProcess } from "./util.ts";
 import type { Store } from "./store.ts";
 import type { Config } from "./config.ts";
@@ -25,13 +25,23 @@ export interface EffectHooks {
    * 个人 Web 协议回复执行器（由工作上下文模块注册，只在用户确认草稿后触发，绑定确认账号并带发送前核验与独立回读确认）。
    */
   pwReply?: (args: { owner_id: string; chat_id: string; message_id: string; root_id?: string; text: string; cid: string }) => Promise<void>;
+  /** 判断当前进程是否正以常驻模式运行（`pa run`）；单次 CLI 返回 false */
+  isDaemonRunning?: () => boolean;
+  /** 判断非持钥单次 CLI 是否应将 `pw.reply` 留给持钥常驻进程执行，避免无密钥进程误领并消耗重试次数 */
+  shouldDeferPwReply?: (cid?: string) => boolean;
 }
 
 export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: Lark, store: Store, hooks: EffectHooks = {}): Handler<Effect> {
+  const shouldReservePwReply = (cid?: string): boolean => {
+    if (hooks.isDaemonRunning?.()) return false;
+    if (hooks.shouldDeferPwReply) return hooks.shouldDeferPwReply(cid);
+    return !hooks.pwReply && isLiveDaemonHeartbeat(store);
+  };
   return {
     kind: "effect",
     concurrency: 1,
     maxAttempts: cfg.engine.effect_attempts,
+    claimOpts: () => (shouldReservePwReply() ? { excludeEffectOps: ["pw.reply"] } : undefined),
     async run(item) {
       const e = item.payload;
       // 若工作区 owner.open_id 与已绑定的个人 Web 主人不一致，严禁向新主人投递旧主人的上下文卡片、提醒、草稿或自主任务
@@ -88,7 +98,6 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
           });
           break;
         case "pw.reply": {
-          if (!hooks.pwReply) throw new Error("个人 Web 回复未注册");
           const { cid } = computePwReplyCid({
             draft_id: e.args.draft_id,
             effect_id: item.id,
@@ -97,6 +106,10 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
             message_id: e.args.message_id,
             text: e.args.text,
           });
+          if (shouldReservePwReply(cid)) {
+            return void ledger.release(item.id, { nextAt: Date.now() + 2_000, refund: true });
+          }
+          if (!hooks.pwReply) throw new Error("个人 Web 回复未注册");
           await hooks.pwReply({
             owner_id: e.args.owner_id,
             chat_id: e.args.chat_id,

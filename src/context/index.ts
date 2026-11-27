@@ -62,6 +62,7 @@ export class ContextService {
         return this.personalWeb.filterWindowByCurrentScope(conv, obs, nativeExcl);
       },
       (conv, convName) => this.personalWeb.checkConvAllowedForUnderstand(conv, convName),
+      () => this.personalWeb.policySignature(),
     );
     this.personalWeb = new PersonalWebBridge(app, this.store, {
       onFastTrigger: (t) => {
@@ -887,6 +888,7 @@ export function registerContext(app: App): ContextService | undefined {
   app.effectHooks.pwReply = async (args) => {
     await svc.personalWeb.sendVerifiedReply(args);
   };
+  app.effectHooks.shouldDeferPwReply = (cid) => svc.personalWeb.shouldDeferReplyToCredentialedConsumer(cid);
   bus.on("effect.settled", (e) => {
     if (e.ref.startsWith("ctx-draft:")) svc.syncDraft(e.ref.slice("ctx-draft:".length));
   });

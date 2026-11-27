@@ -252,20 +252,28 @@ export class Ledger {
    * 领取一项可运行的工作：未终结、到了重试时间、没有有效租约。原子地写入租约并把 attempts +1。
    * effect 额外要求同一 ref 下更早的 effect 已经落定，保证同一任务的“评论→移动”按顺序投递。
    */
-  claim<P = Record<string, unknown>>(kind: WorkKind, leaseMs: number): WorkItem<P> | undefined {
+  claim<P = Record<string, unknown>>(
+    kind: WorkKind,
+    leaseMs: number,
+    opts?: { excludeEffectOps?: string[] },
+  ): WorkItem<P> | undefined {
     const now = Date.now();
     const order =
       kind === "effect"
         ? `AND NOT EXISTS (SELECT 1 FROM work e WHERE e.kind = 'effect' AND e.ref = w.ref AND e.seq < w.seq AND e.terminal = 0)`
         : "";
+    const excludedOps = kind === "effect" ? (opts?.excludeEffectOps ?? []).filter(Boolean) : [];
+    const opFilter = excludedOps.length
+      ? `AND COALESCE(json_extract(w.payload, '$.op'), '') NOT IN (${excludedOps.map(() => "?").join(", ")})`
+      : "";
     const r = this.db
       .prepare(
         `UPDATE work SET lease_owner = ?, lease_until = ?, attempts = attempts + 1, updated = ?
-         WHERE seq = (SELECT seq FROM work w WHERE kind = ? AND terminal = 0 AND next_at <= ? AND lease_until < ? ${order}
+         WHERE seq = (SELECT seq FROM work w WHERE kind = ? AND terminal = 0 AND next_at <= ? AND lease_until < ? ${order} ${opFilter}
                       ORDER BY next_at, seq LIMIT 1)
          RETURNING *`,
       )
-      .get(this.owner, now + leaseMs, now, kind, now, now) as Row | undefined;
+      .get(this.owner, now + leaseMs, now, kind, now, now, ...excludedOps) as Row | undefined;
     return r ? toItem<P>(r) : undefined;
   }
 

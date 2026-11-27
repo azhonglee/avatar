@@ -5,7 +5,7 @@ import type { Effect } from "../ledger.ts";
 import { loadPrompt, runHarness } from "../harness.ts";
 import { render, truncate } from "../util.ts";
 import { BOUND_OWNER_KV_KEY, BOUND_WORKSPACE_OWNER_KV_KEY, isReadbackOnlyDelivery } from "./personal-web.ts";
-import type { ContextStore, DraftRow, ItemRow, Obs } from "./store.ts";
+import { obsRevision, type ContextStore, type DraftRow, type ItemRow, type Obs } from "./store.ts";
 
 /**
  * 草稿（M3 推进）：为事项起草回复 / 跟进 / Meego 评论，或按周起草项目周报。
@@ -38,16 +38,22 @@ export class Drafter {
   store: ContextStore;
   filterObs?: (conv: string, obs: Obs[]) => Obs[] | Promise<Obs[]>;
   checkConvAllowed?: (conv: string, convName: string) => Promise<"allowed" | "excluded" | "uncertain">;
+  policySignature?: () => string;
+  runner: typeof runHarness;
   constructor(
     app: App,
     store: ContextStore,
     filterObs?: (conv: string, obs: Obs[]) => Obs[] | Promise<Obs[]>,
     checkConvAllowed?: (conv: string, convName: string) => Promise<"allowed" | "excluded" | "uncertain">,
+    policySignature?: () => string,
+    runner: typeof runHarness = runHarness,
   ) {
     this.app = app;
     this.store = store;
     this.filterObs = filterObs;
     this.checkConvAllowed = checkConvAllowed;
+    this.policySignature = policySignature;
+    this.runner = runner;
   }
   private get cfg() {
     return this.app.cfg;
@@ -220,7 +226,7 @@ export class Drafter {
   private async llm(prompt: string, name: string): Promise<string> {
     const harness = this.cfg.context.harness || this.cfg.roles.brain;
     const logFile = path.join(this.cfg.dataDir, "runs", `draft-${name}-${Date.now()}.log`);
-    const r = await runHarness(this.cfg, {
+    const r = await this.runner(this.cfg, {
       harness,
       prompt,
       cwd: path.join(this.cfg.dataDir, "workspace", "context"),
@@ -232,6 +238,13 @@ export class Drafter {
     const text = r.text.replace(/^```[\w]*\n?|```$/g, "").trim();
     if (!text) throw new Error(`起草失败（exit ${r.exitCode}${r.timedOut ? "，超时" : ""}）`);
     return text;
+  }
+
+  private isConvSyncBlocked(conv: string): boolean {
+    if (!this.cfg.context.sources.im) return true;
+    if (this.store.isConvMutedById(conv)) return true;
+    if (conv.startsWith("pw_chat:") && this.store.isConvMutedById(conv.slice("pw_chat:".length))) return true;
+    return false;
   }
 
   private activeBoundNativeOwner(): string | null {
@@ -250,33 +263,79 @@ export class Drafter {
     if (!k || k === "weekly_report") throw new Error("这个事项没有合适的草稿类型");
     const tz = this.cfg.owner.timezone;
     const p = this.store.project(it.project_id);
-    const activeNativeOwner = this.activeBoundNativeOwner();
     const excludedTargets = new Set<string>();
     let chosen: { target: Record<string, string>; label: string; conv?: Obs } | undefined;
     let effectiveConvObs: Obs[] = [];
-    for (let attempt = 0; attempt < 5; attempt++) {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const policyBefore = this.policySignature?.() ?? "";
+      const ownerBefore = this.activeBoundNativeOwner();
       const cand = await this.resolveEligibleTarget(it, k, excludedTargets);
       if (!cand.conv) {
         chosen = cand;
         effectiveConvObs = [];
         break;
       }
-      const rawConvObs = this.store.convObs(cand.conv.conv, Date.now() - 7 * DAY, 30, activeNativeOwner);
-      // 先把当前目标证据并入待过滤集合，再统一走最终范围过滤；若目标未通过最终过滤（如群在异步查询期间移出白名单），绝不强行补回提示词
-      const combinedRaw = rawConvObs.some((o) => o.id === cand.conv!.id)
-        ? rawConvObs
-        : [...rawConvObs, cand.conv].sort((a, b) => a.time - b.time);
-      const scopedConvObs = this.filterObs ? await this.filterObs(cand.conv.conv, combinedRaw) : combinedRaw;
-      if (!scopedConvObs.some((o) => o.id === cand.conv!.id)) {
+      // 异步解析目标返回后必须从 SQLite 重读最新目标记录：绝不从旧快照补回已被撤回或删除的消息
+      const ownerMid = this.activeBoundNativeOwner();
+      const freshTarget = this.store.obs(cand.conv.id);
+      if (!freshTarget || !this.isEligibleImObs(freshTarget, ownerMid) || this.isConvSyncBlocked(freshTarget.conv)) {
         excludedTargets.add(cand.conv.id);
         continue;
       }
-      chosen = cand;
-      effectiveConvObs = scopedConvObs;
+      if (obsRevision(freshTarget) !== obsRevision(cand.conv) || ownerMid !== ownerBefore) {
+        continue;
+      }
+      const targetRev = obsRevision(freshTarget);
+      const rawConvObs = this.store
+        .convObs(freshTarget.conv, Date.now() - 7 * DAY, 30, ownerMid)
+        .filter((o) => this.isEligibleImObs(o, ownerMid));
+      // 若 freshTarget 早于最近 7 天窗口但仍未撤回且有效，仅并入刚从数据库重读的 freshTarget
+      const combinedRaw = rawConvObs.some((o) => o.id === freshTarget.id)
+        ? rawConvObs
+        : [...rawConvObs, freshTarget].sort((a, b) => a.time - b.time);
+      const scopedConvObs = this.filterObs ? await this.filterObs(freshTarget.conv, combinedRaw) : combinedRaw;
+
+      // 送模型推理前最终同步核验：策略签名（静音/排除/开关/主人绑定）、目标及全部窗口观测修订均须与当前数据库一致
+      const ownerAfter = this.activeBoundNativeOwner();
+      const policyAfter = this.policySignature?.() ?? "";
+      if (ownerAfter !== ownerBefore || policyAfter !== policyBefore) {
+        continue;
+      }
+      if (this.isConvSyncBlocked(freshTarget.conv)) {
+        excludedTargets.add(freshTarget.id);
+        continue;
+      }
+      if (!scopedConvObs.some((o) => o.id === freshTarget.id)) {
+        excludedTargets.add(freshTarget.id);
+        continue;
+      }
+      const targetNow = this.store.obs(freshTarget.id);
+      if (!targetNow || !this.isEligibleImObs(targetNow, ownerAfter)) {
+        excludedTargets.add(freshTarget.id);
+        continue;
+      }
+      if (obsRevision(targetNow) !== targetRev) {
+        continue;
+      }
+      let windowStale = false;
+      const verifiedWindow: Obs[] = [];
+      for (const o of scopedConvObs) {
+        const cur = this.store.obs(o.id);
+        if (!cur || !this.isEligibleImObs(cur, ownerAfter) || obsRevision(cur) !== obsRevision(o)) {
+          windowStale = true;
+          break;
+        }
+        verifiedWindow.push(cur);
+      }
+      if (windowStale) {
+        continue;
+      }
+      chosen = this.buildTargetForObs(it, k, targetNow, k === "reply" && !targetNow.is_me);
+      effectiveConvObs = verifiedWindow;
       break;
     }
     if (!chosen) {
-      throw new DraftTargetIneligibleError("该事项对应的目标消息已不在当前采集范围内，已停止起草回复");
+      throw new DraftTargetIneligibleError("该事项对应的目标消息已不在当前采集范围内或状态已变更，已停止起草回复");
     }
     const { target, label } = chosen;
     const convText = effectiveConvObs.length

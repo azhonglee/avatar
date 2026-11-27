@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import { z } from "zod";
 import type { App } from "../app.ts";
 import { deliveryOf, isContextDerivedDispatchBlocked, taskUrl } from "../api/queries.ts";
@@ -135,7 +136,7 @@ export function registerDelivery(app: App): void {
     target: (a) => a.id,
     run: async (a) => {
       const { w } = checkTarget(a.id, "merge_local");
-      if (a.target_branch && (await tryGit(w.payload.cwd, ["check-ref-format", "--branch", a.target_branch])).code !== 0)
+      if (a.target_branch && (await tryGit(w.payload.cwd, ["check-ref-format", "--branch", a.target_branch], { cfg, readOnly: true })).code !== 0)
         throw new CommandError("invalid", `分支名不合法：${a.target_branch}`);
       enqueue(w, "merge_local", { target_branch: a.target_branch });
       return { ok: true, message: `正在快进合并到本地分支${a.target_branch ? ` ${a.target_branch}` : ""}`, target: w.id };
@@ -207,22 +208,26 @@ export function registerDelivery(app: App): void {
     const spec = needWorktree(d);
     const prov = resolveProvider(cfg, spec);
     if ("error" in prov) throw new DeliveryError(prov.error);
-    const raw = await remoteUrl(d.cwd, prov.cfg.remote).catch((e) => {
+    const raw = await remoteUrl(d.cwd, prov.cfg.remote, { cfg }).catch((e) => {
       throw new DeliveryError(errMsg(e));
     });
     const remote = parseRemote(raw);
     if (!remote) throw new DeliveryError(`无法从 remote ${prov.cfg.remote} 的地址识别仓库：${maskUrl(raw)}`);
     const provider = makeProvider(prov.cfg, remote, deps);
 
-    await commitAll(d.cwd, "pa: 交付前提交未提交的改动");
-    const target = spec.target_branch || (await remoteDefaultBranch(d.cwd, prov.cfg.remote)) || (await currentBranch(spec.path)) || "main";
+    await commitAll(d.cwd, "pa: 交付前提交未提交的改动", { cfg });
+    const target =
+      spec.target_branch ||
+      (await remoteDefaultBranch(d.cwd, prov.cfg.remote, { cfg })) ||
+      (await currentBranch(spec.path, { cfg })) ||
+      "main";
     if (target === d.branch) throw new DeliveryError(`目标分支与源分支相同（${target}）`);
-    const pushed = await pushBranch(d.cwd, prov.cfg.remote, d.branch);
+    const pushed = await pushBranch(d.cwd, prov.cfg.remote, d.branch, { cfg });
     if (!pushed.ok) {
       const msg = `推送 ${d.branch} 到 ${prov.cfg.remote} 失败：${maskUrl(pushed.message)}`;
       throw pushed.rejected ? new DeliveryError(`${msg}\n远端分支有本地没有的提交，请检查后重试。`) : new Error(msg);
     }
-    const body = prBody(d, { taskUrl: taskUrl(app, w.ref), dispatchId: w.id, diffStat: await diffStat(d.cwd, d.base) });
+    const body = prBody(d, { taskUrl: taskUrl(app, w.ref), dispatchId: w.id, diffStat: await diffStat(d.cwd, d.base, { cfg }) });
     const pr = await openOrReuse(provider, { source: d.branch, target, title: prTitle(d.summary, p.title), body, draft: !!p.draft });
     const label = prLabel(prov.cfg.type);
     const message = `已${pr.reused ? "复用已有的" : "创建"} ${label}${p.draft && !pr.reused ? "（草稿）" : ""}：${pr.url}`;
@@ -234,27 +239,27 @@ export function registerDelivery(app: App): void {
     const d = loadDispatch(p.dispatch_id).payload;
     const spec = needWorktree(d);
     const repo = spec.path;
-    const target = p.target_branch || spec.target_branch || (await currentBranch(repo));
+    const target = p.target_branch || spec.target_branch || (await currentBranch(repo, { cfg }));
     if (!target) throw new DeliveryError(`主仓库 ${repo} 处于游离 HEAD，请指定目标分支`);
     if (target === d.branch) throw new DeliveryError(`目标分支与源分支相同（${target}）`);
-    if (!(await branchExists(repo, target))) throw new DeliveryError(`主仓库 ${repo} 没有本地分支 ${target}`);
-    await commitAll(d.cwd, "pa: 交付前提交未提交的改动");
-    const from = await revParse(repo, `refs/heads/${target}`);
-    const to = await revParse(repo, `refs/heads/${d.branch}`);
+    if (!(await branchExists(repo, target, { cfg }))) throw new DeliveryError(`主仓库 ${repo} 没有本地分支 ${target}`);
+    await commitAll(d.cwd, "pa: 交付前提交未提交的改动", { cfg });
+    const from = await revParse(repo, `refs/heads/${target}`, { cfg });
+    const to = await revParse(repo, `refs/heads/${d.branch}`, { cfg });
     const range = `${from.slice(0, 7)}..${to.slice(0, 7)}`;
     if (from !== to) {
-      if (!(await isAncestor(repo, from, to)))
+      if (!(await isAncestor(repo, from, to, { cfg })))
         throw new DeliveryError(
           `无法快进：${target} 上有 ${d.branch} 没有的新提交。可以改用“创建 PR”，或在 worktree（${d.cwd}）里 rebase 到 ${target} 后再合并。`,
         );
       try {
-        if ((await currentBranch(repo)) === target) {
+        if ((await currentBranch(repo, { cfg })) === target) {
           // 目标分支正检出在主仓库：只有工作区干净时才合并，且只允许快进
-          if (!(await isClean(repo))) throw new DeliveryError(`主仓库 ${repo} 当前检出了 ${target} 且有未提交的改动，为避免覆盖没有合并。请先提交或暂存后重试。`);
-          await git(repo, ["merge", "--ff-only", "-q", `refs/heads/${d.branch}`]);
+          if (!(await isClean(repo, { cfg }))) throw new DeliveryError(`主仓库 ${repo} 当前检出了 ${target} 且有未提交的改动，为避免覆盖没有合并。请先提交或暂存后重试。`);
+          await git(repo, ["merge", "--ff-only", "-q", `refs/heads/${d.branch}`], { cfg });
         } else {
           // 没检出：直接更新分支引用（不带 + 的 refspec 只允许快进；目标分支在别的 worktree 检出时 git 会拒绝）
-          await git(repo, ["fetch", "-q", ".", `refs/heads/${d.branch}:refs/heads/${target}`]);
+          await git(repo, ["fetch", "-q", ".", `refs/heads/${d.branch}:refs/heads/${target}`], { cfg });
         }
       } catch (e) {
         if (e instanceof DeliveryError) throw e;
@@ -314,13 +319,14 @@ export function registerDelivery(app: App): void {
     const spec = repoOf(cfg, d);
     const removed: string[] = [];
     if (spec && fs.existsSync(spec.path)) {
+      const wtParent = path.join(cfg.dataDir, "worktrees");
       if (d.cwd && fs.existsSync(d.cwd)) {
-        await git(spec.path, ["worktree", "remove", "--force", d.cwd]);
+        await git(spec.path, ["worktree", "remove", "--force", d.cwd], { cfg, extraWritablePaths: [wtParent] });
         removed.push(`worktree ${d.cwd}`);
       }
-      await tryGit(spec.path, ["worktree", "prune"]);
-      if (d.branch.startsWith("pa/") && (await branchExists(spec.path, d.branch))) {
-        await git(spec.path, ["branch", "-D", d.branch]);
+      await tryGit(spec.path, ["worktree", "prune"], { cfg, extraWritablePaths: [wtParent] });
+      if (d.branch.startsWith("pa/") && (await branchExists(spec.path, d.branch, { cfg }))) {
+        await git(spec.path, ["branch", "-D", d.branch], { cfg });
         removed.push(`本地分支 ${d.branch}`);
       }
     }

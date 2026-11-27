@@ -243,7 +243,21 @@ export class FeishuWebClient {
     if (!client.notifySessionConfirmed()) {
       throw new WebHttpError("aborted", "本地凭据已被登出或更新");
     }
-    const meta = await loadWebMetadata(jar, ep, { signal });
+    let meta: Awaited<ReturnType<typeof loadWebMetadata>>;
+    try {
+      meta = await loadWebMetadata(jar, ep, { signal });
+    } catch (err) {
+      // verifyOwner 已确认会话归属；若 loadWebMetadata 遭遇 5xx/缺 appKey 前收到了 Set-Cookie 轮换，
+      // 须立即落盘已验证会话的新增 Cookie，避免重连回退到已失效的旧磁盘 Cookie
+      if (client.hasPendingCookieDelta() && !(err instanceof WebHttpError && err.code === "credential_denied")) {
+        try {
+          client.notifySessionConfirmed();
+        } catch {
+          // 保留 loadWebMetadata 原始错误
+        }
+      }
+      throw err;
+    }
     client.deviceId = meta.deviceId;
     client.appKey = meta.appKey;
     if (!client.notifySessionConfirmed()) {
@@ -642,58 +656,73 @@ export class FeishuWebClient {
 
   async buildSocketUrl(signal?: AbortSignal): Promise<string> {
     this.refreshDeviceIdFromJar();
-    const url = `${this.endpoints.ticketUrl}?local_device_id=${encodeURIComponent(this.deviceId)}`;
-    const res = await fetchWithJar(this.jar, {
-      method: "GET",
-      url,
-      headers: authenticatedHeaders(this.jar, this.endpoints, url),
-      signal,
-      allowInsecureHttp: this.endpoints.allowInsecureHttp,
-      extraAllowedHosts: this.endpoints.extraAllowedHosts,
-    });
-    if (res.status === 401 || res.status === 403) {
-      throw new WebHttpError("credential_denied", `获取长连接票据鉴权失败 (HTTP ${res.status})`, res.status);
-    }
-    if (res.status !== 200) {
-      throw new WebHttpError("http_error", `获取长连接票据失败 (HTTP ${res.status})`, res.status);
-    }
-    let parsed: { code?: number; ticket?: string };
-    try {
-      parsed = JSON.parse(res.body.toString("utf8")) as typeof parsed;
-    } catch {
-      throw new WebHttpError("http_error", "长连接票据响应不可解析");
-    }
-    if (typeof parsed.code === "number" && parsed.code !== 0) {
-      throw new WebHttpError("http_error", `长连接票据服务返回异常 (code=${parsed.code})`);
-    }
-    if (!parsed.ticket) {
-      throw new WebHttpError("http_error", "长连接票据暂不可用");
-    }
-    if (res.cookiesUpdated) this.notifySessionConfirmed();
-    const accessKey = crypto
-      .createHash("md5")
-      .update(`2${this.appKey}${this.deviceId}${ACCESS_KEY_SALT}`)
-      .digest("hex");
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const requestedDeviceId = this.deviceId;
+      const url = `${this.endpoints.ticketUrl}?local_device_id=${encodeURIComponent(requestedDeviceId)}`;
+      const res = await fetchWithJar(this.jar, {
+        method: "GET",
+        url,
+        headers: authenticatedHeaders(this.jar, this.endpoints, url),
+        signal,
+        allowInsecureHttp: this.endpoints.allowInsecureHttp,
+        extraAllowedHosts: this.endpoints.extraAllowedHosts,
+      });
+      if (res.status === 401 || res.status === 403) {
+        throw new WebHttpError("credential_denied", `获取长连接票据鉴权失败 (HTTP ${res.status})`, res.status);
+      }
+      if (res.status !== 200) {
+        throw new WebHttpError("http_error", `获取长连接票据失败 (HTTP ${res.status})`, res.status);
+      }
+      let parsed: { code?: number; ticket?: string };
+      try {
+        parsed = JSON.parse(res.body.toString("utf8")) as typeof parsed;
+      } catch {
+        throw new WebHttpError("http_error", "长连接票据响应不可解析");
+      }
+      if (typeof parsed.code === "number" && parsed.code !== 0) {
+        throw new WebHttpError("http_error", `长连接票据服务返回异常 (code=${parsed.code})`);
+      }
+      if (!parsed.ticket) {
+        throw new WebHttpError("http_error", "长连接票据暂不可用");
+      }
+      if (res.cookiesUpdated || this.hasPendingCookieDelta()) {
+        if (!this.notifySessionConfirmed()) {
+          throw new WebHttpError("aborted", "本地凭据已被登出或更新");
+        }
+      }
+      this.refreshDeviceIdFromJar();
+      // 若票据响应或并发磁盘同步轮换了 passport_web_did，用最新 deviceId 重新申请一次匹配票据；
+      // 最终 access_key 与 WebSocket URL 始终使用与该票据严格对应的同一个 deviceId
+      if (this.deviceId && this.deviceId !== requestedDeviceId && attempt === 0) {
+        continue;
+      }
+      const effectiveDeviceId = requestedDeviceId;
+      const accessKey = crypto
+        .createHash("md5")
+        .update(`2${this.appKey}${effectiveDeviceId}${ACCESS_KEY_SALT}`)
+        .digest("hex");
 
-    const wsUrl = new URL(this.endpoints.websocketUrl);
-    const params: [string, string][] = [
-      ["aid", "1"],
-      ["fpid", "2"],
-      ["ticket", parsed.ticket],
-      ["device_id", this.deviceId],
-      ["access_key", accessKey],
-      ["request_id", randomRequestId()],
-      ["accept_encoding", "gzip"],
-      ["sdk_version", WEB_SDK_VERSION],
-      ["version_code", WEB_SDK_VERSION],
-      ["type", "sdk_main"],
-      ["terminal_type", "2"],
-      ["lark_version", WEB_LARK_VERSION],
-      ["net_status", "5"],
-      ["lark_env", "online"],
-    ];
-    for (const [k, v] of params) wsUrl.searchParams.set(k, v);
-    return wsUrl.toString();
+      const wsUrl = new URL(this.endpoints.websocketUrl);
+      const params: [string, string][] = [
+        ["aid", "1"],
+        ["fpid", "2"],
+        ["ticket", parsed.ticket],
+        ["device_id", effectiveDeviceId],
+        ["access_key", accessKey],
+        ["request_id", randomRequestId()],
+        ["accept_encoding", "gzip"],
+        ["sdk_version", WEB_SDK_VERSION],
+        ["version_code", WEB_SDK_VERSION],
+        ["type", "sdk_main"],
+        ["terminal_type", "2"],
+        ["lark_version", WEB_LARK_VERSION],
+        ["net_status", "5"],
+        ["lark_env", "online"],
+      ];
+      for (const [k, v] of params) wsUrl.searchParams.set(k, v);
+      return wsUrl.toString();
+    }
+    throw new WebHttpError("http_error", "长连接票据设备标识持续变化，暂不可用");
   }
 
   /**

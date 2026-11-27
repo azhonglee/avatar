@@ -430,7 +430,66 @@ function decryptPayload(env: EncryptedEnvelope, key: Buffer): string {
  *   - 支持通过 `PA_FEISHU_WEB_CRED_FILE` 将凭据存放在工作区外；
  *   - 跨进程互斥复用 Node 22 内置 SQLite (`BEGIN IMMEDIATE`) 的内核级 POSIX 文件锁，崩溃由操作系统自动原子释放，无陈旧锁竞态。
  */
-/** 同步父目录元数据，确保 rename 在掉电后也持久化到目录项（某些平台不支持目录 fsync 时安全忽略） */
+export interface PendingCommitKvStore {
+  get(k: string): string | undefined;
+  set(k: string, v: string): void;
+  db?: DatabaseSync;
+}
+
+/**
+ * 原子条件清除工作区共享的 pending_cred_commit 标记：
+ * 仅当当前 SQLite 标记仍对应本次安装的 file 与 session_id 时才清除，
+ * 避免两条使用不同凭据路径的并发 web-login 互相抹除对方的未完成暂存提交标记。
+ */
+export function clearPendingCommitMarkerIfMatches(
+  store: PendingCommitKvStore,
+  pendingKey: string,
+  expected: { file: string; sessionId: string; rawMarker?: string },
+): boolean {
+  const expectedFile = path.resolve(expected.file);
+  const expectedSid = expected.sessionId;
+  const matches = (raw: string | undefined): boolean => {
+    const t = (raw ?? "").trim();
+    if (!t) return false;
+    if (expected.rawMarker !== undefined && t === expected.rawMarker.trim()) return true;
+    try {
+      const obj = JSON.parse(t) as Record<string, unknown>;
+      const f = typeof obj.file === "string" ? path.resolve(obj.file) : "";
+      const sid = typeof obj.session_id === "string" ? obj.session_id : "";
+      return !!f && f === expectedFile && sid === expectedSid;
+    } catch {
+      return false;
+    }
+  };
+
+  if (store.db) {
+    store.db.exec("BEGIN IMMEDIATE");
+    try {
+      const cur = store.get(pendingKey);
+      if (!matches(cur)) {
+        store.db.exec("COMMIT");
+        return false;
+      }
+      store.set(pendingKey, "");
+      store.db.exec("COMMIT");
+      return true;
+    } catch (err) {
+      try {
+        store.db.exec("ROLLBACK");
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
+  }
+  if (!matches(store.get(pendingKey))) return false;
+  store.set(pendingKey, "");
+  return true;
+}
+
+/**
+ * 同步父目录元数据，确保 rename 在掉电后也持久化到目录项（某些平台不支持目录 fsync 时安全忽略）
+ */
 function fsyncDir(dirPath: string): void {
   try {
     const fd = fs.openSync(dirPath, "r");
@@ -655,7 +714,7 @@ export class WebLoginStore {
    *   - 若 SQLite 无 pending 标记且本路径残留孤儿 `.staged`，安全清理。
    */
   reconcilePendingCommit(
-    store: { get(k: string): string | undefined; set(k: string, v: string): void },
+    store: PendingCommitKvStore,
     pendingKey: string,
   ): void {
     const parsePending = (raw: string | undefined): { file?: string; staged_file?: string; owner_id?: string; session_id?: string } | undefined => {
@@ -682,7 +741,8 @@ export class WebLoginStore {
     if (!initialPending && !hasStaged) return;
     try {
       this.withLock(() => {
-        const pendingNow = parsePending(store.get(pendingKey));
+        const rawPendingNow = store.get(pendingKey);
+        const pendingNow = parsePending(rawPendingNow);
         if (pendingNow?.file && path.resolve(pendingNow.file) !== path.resolve(this.file)) {
           return;
         }
@@ -705,7 +765,11 @@ export class WebLoginStore {
             }
           }
           if (installed) {
-            store.set(pendingKey, "");
+            clearPendingCommitMarkerIfMatches(store, pendingKey, {
+              file: pendingNow.file || this.file,
+              sessionId: pendingNow.session_id ?? "",
+              rawMarker: rawPendingNow,
+            });
           }
         } else if (fs.existsSync(this.stagedFile)) {
           fs.rmSync(this.stagedFile, { force: true });

@@ -18,12 +18,13 @@ Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 # 若启用个人 Web 实时通道（context.personal_web.enabled: true），需提供静态加密密钥（禁止明文落盘）：
 # 1) 启用派单 / 仓库校验（执行不可信仓库代码或 git hooks）时的安全部署（二选一，绝不要使用同 UID 可读的明文密钥文件）：
 #    a) 用户级单元（~/.config/systemd/user/）：用 `systemd-creds encrypt` 生成由宿主机密钥/TPM 密封的加密凭据
-#       （同 UID 子进程无法解密源文件），并安装 bubblewrap（bwrap）对所有不可信子进程强制启用 PID + 挂载命名空间隔离
-#       （`--unshare-pid --proc /proc` 隐藏常驻进程的 `/proc/<pid>/{environ,root}`，并 `--bind /dev/null` 遮罩 `$CREDENTIALS_DIRECTORY/feishu-web-key`）：
+#       （同 UID 子进程无法解密源文件），并安装 bubblewrap（bwrap）对所有不可信子进程强制启用 PID + 最小权限只读根挂载隔离
+#       （`--ro-bind / / --unshare-pid --proc /proc --tmpfs /tmp --tmpfs <dataDir>` 隐藏常驻进程 `/proc/<pid>` 与整个 `dataDir/state.db`/凭据，
+#       仅开放当前 worktree 写入，并 `--bind /dev/null` 遮罩 `$CREDENTIALS_DIRECTORY/feishu-web-key`；即便从不含密钥的交互 shell 执行 `pa dispatch` 也会自动激活）：
 #       # LoadCredentialEncrypted=feishu-web-key:%h/.config/personal-agent/feishu-web.key.cred
 #    b) 系统级单元（/etc/systemd/system/personal-agent.service，配合 User=personal-agent）：
 #       由 root 级 PID 1 加载仅 root 可读（0600）的 EnvironmentFile=/etc/personal-agent/secrets.env（包含 PA_FEISHU_WEB_KEY=...）
-#       或 root 属主 0400 的 LoadCredential=，并安装 bubblewrap（bwrap）提供 PID + 挂载命名空间隔离（防止同 UID worker 通过 /proc/<daemon-pid>/environ 读取密钥）；
+#       或 root 属主 0400 的 LoadCredential=，并安装 bubblewrap（bwrap）提供 PID + 最小权限只读根挂载隔离（隐藏 `dataDir/state.db` 与 `/proc/<daemon-pid>/environ`）；
 #       若宿主机无法启用 PID + 挂载命名空间，则必须将不可信 worker 运行在独立 OS 用户身份下。
 # 2) 仅使用个人工作上下文且完全关闭派单仓库校验（无同 UID 不可信子进程）时，方可在用户单元中使用普通 0600 密钥文件：
 #    # LoadCredential=feishu-web-key:%h/.config/personal-agent/feishu-web.key  # 注意：同 UID 进程仍可直接读该源文件，不隔离仓库 worker
