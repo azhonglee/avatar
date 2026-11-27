@@ -519,9 +519,12 @@ export class Dispatcher {
           extraReadOnlyPaths: baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : [],
         }),
       );
+      const verifyEnv: NodeJS.ProcessEnv = wrapped.isolated
+        ? { ...baseEnv.env, XDG_RUNTIME_DIR: "/tmp/.pa-run" }
+        : baseEnv.env;
       const r = await runProcess(wrapped.cmd, wrapped.args, {
         cwd: p.cwd,
-        env: baseEnv.env,
+        env: verifyEnv,
         timeoutMs: this.cfg.acceptance.verify_timeout_sec * 1000,
         group: true,
         signal: ctx.signal,

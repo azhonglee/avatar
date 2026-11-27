@@ -168,6 +168,8 @@ export class Ledger {
         created INTEGER NOT NULL,
         updated INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS work_runnable ON work (kind, terminal, next_at);
+      CREATE INDEX IF NOT EXISTS work_kind_terminal_seq ON work (kind, terminal, seq DESC);
+      CREATE INDEX IF NOT EXISTS work_kind_state_seq ON work (kind, state, seq DESC);
       CREATE INDEX IF NOT EXISTS work_ref ON work (kind, ref);
       -- 不变量：同一张卡片同时至多一项未终结的派单（命令行和常驻进程同时对账也不会重复派单）
       CREATE UNIQUE INDEX IF NOT EXISTS work_one_active_dispatch ON work (ref) WHERE kind = 'dispatch' AND terminal = 0 AND ref != '';
@@ -389,17 +391,39 @@ export class Ledger {
     return n > 0;
   }
 
-  /** 列出工作（控制台用）。 */
-  list<P = Record<string, unknown>>(f: { kinds: WorkKind[]; states?: string[]; ref?: string; limit?: number; before?: number }): WorkItem<P>[] {
+  /** 列出工作（控制台用）。支持 terminal、states 与 search 下推 SQL 过滤，避免在长历史账本上空扫全表。 */
+  list<P = Record<string, unknown>>(f: {
+    kinds: WorkKind[];
+    states?: string[];
+    terminal?: boolean;
+    ref?: string;
+    search?: string;
+    limit?: number;
+    before?: number;
+  }): WorkItem<P>[] {
     const where = [`kind IN (${f.kinds.map(() => "?").join(",")})`];
     const args: (string | number)[] = [...f.kinds];
     if (f.states?.length) {
       where.push(`state IN (${f.states.map(() => "?").join(",")})`);
       args.push(...f.states);
     }
+    if (f.terminal !== undefined) {
+      where.push("terminal = ?");
+      args.push(f.terminal ? 1 : 0);
+    }
     if (f.ref) {
       where.push("ref = ?");
       args.push(f.ref);
+    }
+    if (f.search) {
+      const q = f.search.trim().toLowerCase();
+      if (q) {
+        const pat = `%${q.replace(/[\\%_]/g, "\\$&")}%`;
+        where.push(
+          `(LOWER(id) LIKE ? ESCAPE '\\' OR LOWER(ref) LIKE ? ESCAPE '\\' OR LOWER(CAST(COALESCE(json_extract(payload, '$.summary'), '') AS TEXT)) LIKE ? ESCAPE '\\')`,
+        );
+        args.push(pat, pat, pat);
+      }
     }
     if (f.before) {
       where.push("seq < ?");

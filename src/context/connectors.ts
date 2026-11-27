@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import type { App } from "../app.ts";
-import { deepFind, runProcess } from "../util.ts";
+import { extractOwnerOpenId } from "../lark.ts";
+import { deepFind, errMsg, runProcess } from "../util.ts";
 import { hashId, norm, type ContextStore, type Obs } from "./store.ts";
 
 /**
@@ -8,6 +10,7 @@ import { hashId, norm, type ContextStore, type Obs } from "./store.ts";
  */
 
 const DAY = 86_400_000;
+const IM_POLL_CLAIM_KEY = "__poll_im__";
 
 export interface SourceReport {
   source: string;
@@ -194,12 +197,15 @@ export function selectEffectiveOpenGroups(params: {
   const lookback = cfg.context.lookback_days * DAY;
   const maxGroups = Math.max(0, cfg.context.max_groups);
 
-  const resolveName = (id: string, fallback = ""): string => {
-    const first = (fallback || knownNames?.[id] || spoken[id]?.name || "").trim();
-    if (first && first !== "群聊" && !first.startsWith("私聊")) return first;
-    const obsName = (store.latestConvObs(id)?.conv_name ?? "").trim();
-    return obsName && obsName !== "群聊" && !obsName.startsWith("私聊") ? obsName : "";
+  const concreteGroupName = (raw?: string): string => {
+    const clean = (raw ?? "").trim();
+    return clean && clean !== "群聊" && !clean.startsWith("私聊") ? clean : "";
   };
+  const resolveName = (id: string, fallback = ""): string =>
+    concreteGroupName(knownNames?.[id]) ||
+    concreteGroupName(spoken[id]?.name) ||
+    concreteGroupName(fallback) ||
+    concreteGroupName(store.latestConvObs(id)?.conv_name);
 
   if (cfg.context.groups === "allowlist") {
     if (maxGroups === 0) return [];
@@ -256,8 +262,35 @@ export class Connectors {
     return j.data?.result?.structuredContent ?? j.data;
   }
 
+  /** 核验当前 lark-cli 登录用户 open_id 与工作区主人一致，防止切换 CLI 账号后跨账号拉取私聊/任务/妙记/日历 */
+  async verifyActiveLarkOwner(): Promise<
+    { ok: true; status: Record<string, unknown> } | { ok: false; error: string }
+  > {
+    const expectedOwner = this.cfg.owner.open_id.trim();
+    if (!expectedOwner) {
+      return { ok: false, error: "未配置 owner.open_id，无法确认 lark-cli 采集账号归属，已中止用户态来源采集" };
+    }
+    let status: Record<string, unknown>;
+    try {
+      status = await this.app.lark.authStatus();
+    } catch (err) {
+      return { ok: false, error: `无法核验当前 lark-cli 登录用户身份，已阻断用户态来源采集：${errMsg(err)}` };
+    }
+    const authedOpenId = extractOwnerOpenId(status).trim();
+    if (!authedOpenId || !authedOpenId.startsWith("ou_")) {
+      return { ok: false, error: "无法从 lark-cli auth status 解析当前登录用户的 open_id，已阻断用户态来源采集" };
+    }
+    if (authedOpenId !== expectedOwner) {
+      return {
+        ok: false,
+        error: `当前 lark-cli 登录用户 (${authedOpenId}) 与工作区主人 (${expectedOwner}) 不一致，已阻断用户态来源采集以防跨账号混入数据`,
+      };
+    }
+    return { ok: true, status };
+  }
+
   /** 跑一轮所有启用的来源 */
-  async pullAll(): Promise<SourceReport[]> {
+  async pullAll(opts?: { larkOwnerVerified?: boolean }): Promise<SourceReport[]> {
     const s = this.cfg.context.sources;
     const out: SourceReport[] = [];
     const step = async (name: string, enabled: boolean, fn: () => Promise<Omit<SourceReport, "source" | "error">>) => {
@@ -270,11 +303,26 @@ export class Connectors {
       }
       this.setKv(`source.${name}`, JSON.stringify({ at: Date.now(), ...out.at(-1) }));
     };
+    const needsLarkCli = s.tasks || s.im || s.minutes || s.calendar;
+    let larkOwnerErr = "";
+    if (needsLarkCli && !opts?.larkOwnerVerified) {
+      const check = await this.verifyActiveLarkOwner();
+      if (!check.ok) larkOwnerErr = check.error;
+    }
+    const larkStep = async (name: string, enabled: boolean, fn: () => Promise<Omit<SourceReport, "source" | "error">>) => {
+      if (!enabled) return;
+      if (larkOwnerErr) {
+        out.push({ source: name, count: 0, error: larkOwnerErr.slice(0, 300) });
+        this.setKv(`source.${name}`, JSON.stringify({ at: Date.now(), ...out.at(-1) }));
+        return;
+      }
+      await step(name, true, fn);
+    };
     await step("meego", s.meego, () => this.pullMeego());
-    await step("tasks", s.tasks, () => this.pullTasks());
-    await step("im", s.im, () => this.pullIm());
-    await step("minutes", s.minutes, () => this.pullMinutes());
-    await step("calendar", s.calendar, () => this.pullCalendar());
+    await larkStep("tasks", s.tasks, () => this.pullTasks());
+    await larkStep("im", s.im, () => this.pullIm());
+    await larkStep("minutes", s.minutes, () => this.pullMinutes());
+    await larkStep("calendar", s.calendar, () => this.pullCalendar());
     await step("docs", s.docs, async () => this.pullComments());
     return out;
   }
@@ -481,12 +529,21 @@ export class Connectors {
     const ct = chatType.trim().toLowerCase();
     const isKnownDm = ct === "p2p";
     const isKnownGroup = ct === "group" || ct === "topic" || ct === "topic_group";
+    const dmPeerName = isKnownDm ? chatName.replace(/^私聊[:：]?/, "").trim() : "";
     const needsNameForRules = this.hasNameDenyPatterns() || !!(nativeExcl && nativeExcl.confirmedGroupNames.size > 0);
     if (!nativeExcl) {
-      if (!isKnownDm && !chatName && requireName && this.hasNameDenyPatterns()) return "inconclusive";
+      if (isKnownDm) {
+        if (!dmPeerName && requireName && this.hasNameDenyPatterns()) return "inconclusive";
+        return "allowed";
+      }
+      if (!chatName && requireName && this.hasNameDenyPatterns()) return "inconclusive";
       return "allowed";
     }
-    if (isKnownDm) return nativeExcl.dmsInconclusive ? "inconclusive" : "allowed";
+    if (isKnownDm) {
+      if (nativeExcl.dmsInconclusive) return "inconclusive";
+      if (!dmPeerName && requireName && this.hasNameDenyPatterns()) return "inconclusive";
+      return "allowed";
+    }
     if (chatName && nativeExcl.confirmedGroupNames.has(norm(chatName))) return "denied";
     if (isKnownGroup) {
       if (nativeExcl.groupsInconclusive) return "inconclusive";
@@ -499,7 +556,7 @@ export class Connectors {
     return "allowed";
   }
 
-  private toObs(m: Raw, kind: string, me: string, atMeWindowStartMs?: number): Obs | undefined {
+  private toObs(m: Raw, kind: string, me: string, atMeWindowStartMs?: number, pollObservedAt?: number): Obs | undefined {
     const sender = m.sender ?? {};
     const senderType = String(sender.sender_type ?? sender.type ?? m.sender_type ?? "");
     const msgType = String(m.msg_type ?? m.message_type ?? "");
@@ -510,6 +567,15 @@ export class Connectors {
     const text = textOf(m.content ?? m.text ?? "");
     if (!text) return undefined;
     const msgTime = parseTime(m.create_time ?? m.time, this.cfg.owner.timezone);
+    const rawEditVer = m.edit_version ?? m.update_time ?? m.edit_time;
+    const editVersion =
+      typeof rawEditVer === "number" && Number.isFinite(rawEditVer) && rawEditVer > 0
+        ? rawEditVer
+        : typeof rawEditVer === "string" && rawEditVer.trim()
+          ? /^\d+$/.test(rawEditVer.trim())
+            ? Number(rawEditVer.trim())
+            : parseTime(rawEditVer, this.cfg.owner.timezone) || undefined
+          : undefined;
     // 独立记录 @我 判定状态：
     //   - 命中 --is-at-me 时记 at_me: true（确保白名单机器人 kind="bot" 也被识别为真实 @我）；
     //   - 落在本次 --is-at-me 查询窗口内但未命中时，明确记 at_me: false（用于覆盖已被编辑移除的旧 @我 标记）；
@@ -538,12 +604,36 @@ export class Connectors {
         thread_id: m.thread_id ?? "",
         parent_id: m.parent_id ?? m.root_id ?? "",
         sender_type: senderType,
+        ...(editVersion !== undefined ? { edit_version: editVersion } : {}),
+        ...(pollObservedAt !== undefined ? { poll_observed_at: pollObservedAt } : {}),
         ...atMeMeta,
       },
     };
   }
 
   async pullIm(restartAttempt = 0): Promise<{ count: number; dropped: number }> {
+    const procOwner = this.app.ledger.owner;
+    const pollToken = `poll_im:${randomUUID().slice(0, 8)}`;
+    // 通过跨进程 SQLite 租约串行化 IM 轮询，防止并发轮询中较慢的旧快照后提交覆盖较新的消息编辑或回退游标
+    if (!this.store.claimConv(IM_POLL_CLAIM_KEY, pollToken, procOwner, 120_000)) {
+      return { count: 0, dropped: 0 };
+    }
+    const heartbeat = setInterval(() => {
+      this.store.renewConv(IM_POLL_CLAIM_KEY, pollToken, procOwner, 120_000);
+    }, 30_000);
+    heartbeat.unref?.();
+    try {
+      return await this.pullImInner(restartAttempt, { token: pollToken, procOwner });
+    } finally {
+      clearInterval(heartbeat);
+      this.store.releaseConv(IM_POLL_CLAIM_KEY, pollToken, procOwner);
+    }
+  }
+
+  private async pullImInner(
+    restartAttempt: number,
+    lease: { token: string; procOwner: string },
+  ): Promise<{ count: number; dropped: number }> {
     const me = this.cfg.owner.open_id;
     const now = Date.now();
     const lookback = this.cfg.context.lookback_days * DAY;
@@ -650,9 +740,16 @@ export class Connectors {
     const scannedGroups = !nativeExcl?.groupsInconclusive;
     const needsNameForRanking = this.hasNameDenyPatterns() || !!(nativeExcl && nativeExcl.confirmedGroupNames.size > 0);
     if (scannedGroups && needsNameForRanking && this.cfg.context.max_groups > 0) {
+      const concreteGroupName = (raw?: string): string => {
+        const clean = (raw ?? "").trim();
+        return clean && clean !== "群聊" && !clean.startsWith("私聊") ? clean : "";
+      };
       const refreshCandidateNameIfNeeded = async (id: string, fallbackName = ""): Promise<string> => {
-        let name = (knownNames[id] || spoken[id]?.name || fallbackName || this.store.latestConvObs(id)?.conv_name || "").trim();
-        if (name === "群聊" || name.startsWith("私聊")) name = "";
+        let name =
+          concreteGroupName(knownNames[id]) ||
+          concreteGroupName(spoken[id]?.name) ||
+          concreteGroupName(fallbackName) ||
+          concreteGroupName(this.store.latestConvObs(id)?.conv_name);
         // 若名称缺失，或旧缓存名称正触发按名称排除，实时刷新一次当前群名（避免改名后的白名单/发言群永远困在旧排除缓存里）
         const excludedByCachedName = !!name && isOpenGroupDirectlyDenied(this.cfg, this.store, id, name, nativeExcl);
         if (!name || excludedByCachedName) {
@@ -787,6 +884,25 @@ export class Connectors {
       }
     }
 
+    // 预扫描本批全部私聊行，提取已知 p2p 会话集合及对方姓名（确保在排除规则判定前即可匹配 groups_deny 名称关键词）
+    const knownP2pChats = new Set<string>();
+    const peerNameByChat = new Map<string, string>();
+    for (const entry of mergedById.values()) {
+      const cid = String(entry.m.chat_id ?? "");
+      const ct = String(entry.m.chat_type ?? "").trim().toLowerCase();
+      if (cid && ct === "p2p") knownP2pChats.add(cid);
+    }
+    for (const entry of mergedById.values()) {
+      const cid = String(entry.m.chat_id ?? "");
+      if (!cid || !knownP2pChats.has(cid)) continue;
+      const sender = entry.m.sender ?? {};
+      const senderId = String(sender.id ?? sender.open_id ?? entry.m.sender_id ?? "");
+      const senderName = String(sender.name ?? entry.m.sender_name ?? "").trim();
+      if (senderId && senderId !== me && senderName) {
+        peerNameByChat.set(cid, senderName);
+      }
+    }
+
     const scopeSelectionChanged = (latestExcl?: NativePollingExclusions): boolean => {
       if (
         this.cfg.context.groups !== initialGroupsMode ||
@@ -825,7 +941,7 @@ export class Connectors {
       }
       if (scopeSelectionChanged(nativeExcl)) {
         if (restartAttempt < 1) {
-          return this.pullIm(restartAttempt + 1);
+          return this.pullImInner(restartAttempt + 1, lease);
         }
         return { count: 0, dropped: 0 };
       }
@@ -836,7 +952,8 @@ export class Connectors {
       let groupsBlocked = !!nativeExcl?.groupsInconclusive || !scannedGroups;
       for (const st of chatPollState.values()) st.hadInconclusiveRow = false;
 
-      const needsCurrentName = this.hasNameDenyPatterns() || !!(nativeExcl && nativeExcl.confirmedGroupNames.size > 0);
+      const hasNameDeny = this.hasNameDenyPatterns();
+      const needsCurrentName = hasNameDeny || !!(nativeExcl && nativeExcl.confirmedGroupNames.size > 0);
       const needsTypeLookup = !!(nativeExcl?.dmsInconclusive || nativeExcl?.groupsInconclusive);
 
       let dropped = 0;
@@ -851,14 +968,24 @@ export class Connectors {
         }
         const chatId = String(m.chat_id ?? "");
         let chatType = String(m.chat_type ?? "").trim();
+        if (!chatType && chatId && knownP2pChats.has(chatId)) chatType = "p2p";
+        const isP2p = chatType.toLowerCase() === "p2p";
         let chatName = String(m.chat_name ?? "").trim();
+        if (isP2p && chatName.replace(/^私聊[:：]?/, "").trim() === "") chatName = "";
         let nameSupplied = !!chatName;
 
-        // 对缺失 chat_name（有名称/原生静音规则）或缺失 chat_type（受限状态）的命中实时查一次 im chats get，不凭陈旧 spoken_groups 放行
+        // 对缺失 chat_name 的私聊先使用同批提取的对方姓名，仍未知且配置了名称排除规则时再查 im chats get
+        if (isP2p && !chatName && chatId) {
+          const peer = peerNameByChat.get(chatId);
+          if (peer) chatName = peer;
+        }
+
+        // 对缺失 chat_name（群有名称/原生静音规则，私聊有名称排除规则）或缺失 chat_type（受限状态）的命中实时查一次 im chats get，不凭陈旧 spoken_groups 放行
         const shouldLookupMeta =
           !!chatId &&
-          chatType.toLowerCase() !== "p2p" &&
-          ((!chatName && needsCurrentName) || (!chatType && (needsTypeLookup || needsCurrentName)));
+          (isP2p
+            ? !chatName && hasNameDeny
+            : (!chatName && needsCurrentName) || (!chatType && (needsTypeLookup || needsCurrentName)));
         if (shouldLookupMeta) {
           const fresh = await getChatMeta(chatId);
           if (fresh) {
@@ -869,12 +996,26 @@ export class Connectors {
             if (!chatType && fresh.chatType) chatType = fresh.chatType;
           }
         }
-        if (!chatName && !needsCurrentName && entry.fallbackGroupName) {
+        const isP2pFinal = chatType.toLowerCase() === "p2p";
+        if (isP2pFinal && !chatName && chatId) {
+          const peer = peerNameByChat.get(chatId);
+          if (peer) chatName = peer;
+        }
+        if (isP2pFinal && !chatName && chatId && hasNameDeny) {
+          // 仅含本人发出的无名私聊且 im chats get 仍未给出对方姓名时：
+          // 若本地历史观测已记录过对方姓名且命中排除规则则直接丢弃，否则保留空名由 classifyExclusion 按 inconclusive 暂缓
+          const stalePeer = (this.store.latestConvObs(chatId)?.conv_name ?? "").replace(/^私聊[:：]?/, "").trim();
+          if (stalePeer && this.classifyExclusion(chatId, stalePeer, "p2p", nativeExcl) === "denied") {
+            dropped++;
+            continue;
+          }
+        }
+        if (!isP2pFinal && !chatName && !needsCurrentName && entry.fallbackGroupName) {
           chatName = entry.fallbackGroupName;
         }
         if (nameSupplied && chatName && chatId) {
           if (spoken[chatId]) spoken[chatId].name = chatName;
-          if (chatId.startsWith("oc_") && chatType.toLowerCase() !== "p2p") {
+          if (chatId.startsWith("oc_") && !isP2pFinal) {
             recordLearnedName(chatId, chatName);
           }
         }
@@ -887,19 +1028,15 @@ export class Connectors {
           continue;
         }
         if (excl === "inconclusive") {
-          const isKnownDm = chatType.toLowerCase() === "p2p";
-          if (isKnownDm) {
-            p2pBlocked = true;
-          } else {
-            for (const s of entry.streams) {
-              if (s === "p2p") p2pBlocked = true;
-              else if (s === "at_me") atMeBlocked = true;
-              else if (s === "mine") mineBlocked = true;
-              else if (s === "group") {
-                const st = chatPollState.get(chatId);
-                if (st) st.hadInconclusiveRow = true;
-                else groupsBlocked = true;
-              }
+          if (isP2pFinal) p2pBlocked = true;
+          for (const s of entry.streams) {
+            if (s === "p2p") p2pBlocked = true;
+            else if (s === "at_me") atMeBlocked = true;
+            else if (s === "mine") mineBlocked = true;
+            else if (s === "group") {
+              const st = chatPollState.get(chatId);
+              if (st) st.hadInconclusiveRow = true;
+              else groupsBlocked = true;
             }
           }
           continue;
@@ -908,14 +1045,14 @@ export class Connectors {
         if (
           this.cfg.context.groups === "allowlist" &&
           entry.kind !== "at_me" &&
-          chatType.toLowerCase() !== "p2p" &&
+          !isP2pFinal &&
           chatId.startsWith("oc_") &&
           !rankedSet.has(chatId)
         ) {
           dropped++;
           continue;
         }
-        const o = this.toObs(m, entry.kind, me, effectiveAtMeWindowStartMs);
+        const o = this.toObs(m, entry.kind, me, effectiveAtMeWindowStartMs, now);
         if (o) obs.push(o);
       }
 
@@ -935,24 +1072,33 @@ export class Connectors {
         if (learnedRankedKey !== initialRankedKey) {
           mergeKnownOpenGroupNames(this.app.store, learnedNames);
           if (restartAttempt < 1) {
-            return this.pullIm(restartAttempt + 1);
+            return this.pullImInner(restartAttempt + 1, lease);
           }
           return { count: 0, dropped: 0 };
         }
       }
 
-      // 私聊没有会话名：用对方名字
-      const p2pName = new Map<string, string>();
+      // 私聊没有会话名：用对方名字（避免拼出「私聊：私聊：xxx」或「私聊：私聊」）
+      const p2pName = new Map<string, string>(peerNameByChat);
       for (const o of obs) if (o.meta.chat_type === "p2p" && !o.is_me && o.actor_name) p2pName.set(o.conv, o.actor_name);
-      for (const o of obs) if (o.meta.chat_type === "p2p") o.conv_name = `私聊：${p2pName.get(o.conv) ?? o.conv_name}`;
+      for (const o of obs) {
+        if (o.meta.chat_type === "p2p") {
+          const cleanPeer = (p2pName.get(o.conv) ?? o.conv_name).replace(/^私聊[:：]?/, "").trim();
+          o.conv_name = cleanPeer ? `私聊：${cleanPeer}` : "私聊";
+        }
+      }
 
-      // 原子事务提交前最后一次核对策略签名与群选择集合：若期间策略变更则重试/重启，绝不提交过期的观测或游标
+      // 原子事务提交前最后一次核对轮询租约、策略签名与群选择集合：
+      // 若租约丢失则立刻中止（防过期慢轮询覆写新编辑）；若策略变更则重试/重启，绝不提交过期观测或游标
       const commitRes = this.store.tx(() => {
+        if (!this.store.isConvClaimedBy(IM_POLL_CLAIM_KEY, lease.token, lease.procOwner)) {
+          return { committed: false as const, lostLease: true as const, count: 0 };
+        }
         if (this.pollingPolicySignature() !== policySig || scopeSelectionChanged(nativeExcl)) {
-          return { committed: false as const, count: 0 };
+          return { committed: false as const, lostLease: false as const, count: 0 };
         }
         if (!this.cfg.context.sources.im) {
-          return { committed: true as const, count: 0 };
+          return { committed: true as const, lostLease: false as const, count: 0 };
         }
         const n = this.store.addObs(obs);
         this.setKv("spoken_groups", JSON.stringify(spoken));
@@ -980,8 +1126,11 @@ export class Connectors {
         else if (!hadPriorGroups) this.setKv("cursor.im.groups", String(sinceGroups));
 
         if (!atMeBlocked && !p2pBlocked && !mineBlocked && !groupsBlocked) this.setKv("cursor.im", String(now));
-        return { committed: true as const, count: n };
+        return { committed: true as const, lostLease: false as const, count: n };
       });
+      if (commitRes.lostLease) {
+        return { count: 0, dropped: 0 };
+      }
       if (commitRes.committed) {
         return { count: commitRes.count, dropped };
       }

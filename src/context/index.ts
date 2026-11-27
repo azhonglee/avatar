@@ -158,10 +158,20 @@ export class ContextService {
     this.running = true;
     const kv = this.app.store;
     try {
+      const s = this.cfg.context.sources;
+      const needsLarkCli = s.tasks || s.im || s.minutes || s.calendar;
+      let verifiedLarkStatus: Record<string, unknown> | undefined;
+      if (needsLarkCli) {
+        const larkCheck = await this.connectors.verifyActiveLarkOwner();
+        if (!larkCheck.ok) {
+          return { ...rep, skipped: true, errors: [larkCheck.error] };
+        }
+        verifiedLarkStatus = larkCheck.status;
+      }
       this.store.wakeSnoozed();
-      rep.sources = await this.connectors.pullAll();
+      rep.sources = await this.connectors.pullAll({ larkOwnerVerified: needsLarkCli });
       for (const s of rep.sources) if (s.error) rep.errors.push(`${s.source}: ${s.error}`);
-      await this.ensureOwnerName();
+      await this.ensureOwnerName(verifiedLarkStatus);
       const created: ItemRow[] = [];
       if (this.cfg.context.understand) {
         // 每轮最多理解 max_convs_per_cycle 个会话批次；并行跑 understand_parallel 批（通过绑定进程与唯一令牌的 SQLite 租约+心跳跨进程互斥）
@@ -579,10 +589,10 @@ export class ContextService {
     return true;
   }
 
-  private async ensureOwnerName(): Promise<void> {
+  private async ensureOwnerName(prefetchedStatus?: Record<string, unknown>): Promise<void> {
     if (this.app.store.get("ctx.owner_name")) return;
     try {
-      const st = await this.app.lark.authStatus();
+      const st = prefetchedStatus ?? (await this.app.lark.authStatus());
       const ids = (st.identities ?? {}) as Record<string, { userName?: string; user_name?: string } | undefined>;
       const name = String(ids.user?.userName ?? ids.user?.user_name ?? deepFind(st, "userName") ?? deepFind(st, "user_name") ?? deepFind(st, "name") ?? "");
       if (name) this.app.store.set("ctx.owner_name", name);

@@ -7,6 +7,7 @@ import {
   buildWorkspaceIsolation,
   detectGitWorktreeDirs,
   prepareHarnessEnv,
+  workspaceRequiresIsolation,
   wrapCredentialIsolatedCommand,
   type IsolationOptions,
 } from "../harness.ts";
@@ -16,7 +17,8 @@ import { errMsg, runProcess, type ProcResult } from "../util.ts";
  * 交付用到的 git 操作：
  *   - 显式指定 -C 目录，不依赖进程当前目录；
  *   - 关闭交互认证、禁用仓库级 hooks / fsmonitor / external diff（防不可信仓库配置执行任意代码）；
- *   - 剥离个人 Web 凭据环境，并在需要隔离的工作区或持钥环境下通过内核 PID + 只读根挂载命名空间隐藏 dataDir 与密钥文件。
+ *   - 剥离个人 Web 凭据环境，并在需要隔离的工作区或持钥环境下通过内核 PID + 只读根挂载命名空间隐藏 dataDir 与密钥文件；
+ *   - 仅对明确需要远程传输的 git 子命令（push/fetch/ls-remote/pull/clone/lfs）窄范围透传单个 SSH_AUTH_SOCK 套接字，绝不暴露给普通 worker 或本地 git 命令。
  */
 
 const GIT_SAFE_ARGS = [
@@ -26,6 +28,8 @@ const GIT_SAFE_ARGS = [
   "-c", "core.fsmonitor=false",
   "-c", "core.pager=cat",
 ];
+
+const REMOTE_GIT_SUBCMDS = new Set(["push", "fetch", "ls-remote", "pull", "clone", "lfs"]);
 
 export interface GitRunOpts {
   input?: string;
@@ -40,7 +44,39 @@ export interface GitRunOpts {
   extraReadOnlyPaths?: string[];
 }
 
-function buildGitIsolation(cwd: string, opts: GitRunOpts | undefined, filteredCredDir?: string): IsolationOptions {
+/** 仅对授权的远程 Git 传输子命令解析并校验单个 SSH 代理 Unix 套接字路径（绝不开放给普通 worker 或本地 git 命令） */
+export function resolveAuthorizedSshAuthSock(
+  args: string[],
+  rawEnv: NodeJS.ProcessEnv = process.env,
+  dataDir?: string,
+): string | undefined {
+  if (!REMOTE_GIT_SUBCMDS.has(args[0] ?? "")) return undefined;
+  const rawSock = rawEnv.SSH_AUTH_SOCK?.trim();
+  if (!rawSock) return undefined;
+  try {
+    if (!fs.statSync(rawSock).isSocket()) return undefined;
+    const realSock = fs.realpathSync(rawSock);
+    if (dataDir) {
+      const realData = fs.existsSync(dataDir) ? fs.realpathSync(dataDir) : path.resolve(dataDir);
+      const rel = path.relative(realData, realSock);
+      if (rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))) return undefined;
+    }
+    return realSock;
+  } catch {
+    return undefined;
+  }
+}
+
+function buildGitIsolation(
+  cwd: string,
+  opts: GitRunOpts | undefined,
+  filteredCredDir?: string,
+  authorizedSshSock?: string,
+): IsolationOptions {
+  const extraRw = [
+    ...(opts?.extraWritablePaths ?? []),
+    ...(authorizedSshSock ? [authorizedSshSock] : []),
+  ];
   const extraRo = [
     ...(opts?.extraReadOnlyPaths ?? []),
     ...(filteredCredDir ? [filteredCredDir] : []),
@@ -51,32 +87,39 @@ function buildGitIsolation(cwd: string, opts: GitRunOpts | undefined, filteredCr
       cwd,
       trustedRepoRoot: opts.trustedRepoRoot,
       disableGitWorktreeMounts: opts.disableGitWorktreeMounts,
-      extraWritablePaths: opts.extraWritablePaths,
+      extraWritablePaths: extraRw,
       extraReadOnlyPaths: extraRo,
     });
   }
-  const wt = opts?.disableGitWorktreeMounts
-    ? {}
-    : detectGitWorktreeDirs(cwd, { trustedRepoRoot: opts?.trustedRepoRoot });
+  const isoActive = workspaceRequiresIsolation(undefined, process.env);
+  const wt =
+    !isoActive || opts?.disableGitWorktreeMounts
+      ? {}
+      : detectGitWorktreeDirs(cwd, { trustedRepoRoot: opts?.trustedRepoRoot });
   const wtTargets = [wt.commonDir, wt.gitDir].filter((p): p is string => !!p);
   return {
     cwd,
-    writablePaths: opts?.readOnly ? [] : [cwd, ...wtTargets, ...(opts?.extraWritablePaths ?? [])],
+    writablePaths: opts?.readOnly ? extraRw : [cwd, ...wtTargets, ...extraRw],
     readOnlyPaths: opts?.readOnly ? [cwd, ...wtTargets, ...extraRo] : extraRo,
   };
 }
 
 export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Promise<ProcResult> {
-  const baseEnv = prepareHarnessEnv();
+  const sshSock = resolveAuthorizedSshAuthSock(args, process.env, opts?.cfg?.dataDir);
+  const baseEnv = prepareHarnessEnv(process.env, { preserveSshAgent: !!sshSock });
   try {
     const safeSubArgs = args[0] === "diff" ? ["diff", "--no-ext-diff", ...args.slice(1)] : args;
-    const childEnv: NodeJS.ProcessEnv = { ...baseEnv.env, GIT_TERMINAL_PROMPT: "0" };
+    const childEnv: NodeJS.ProcessEnv = {
+      ...baseEnv.env,
+      GIT_TERMINAL_PROMPT: "0",
+      ...(sshSock ? { SSH_AUTH_SOCK: sshSock } : {}),
+    };
     delete childEnv.GIT_EXTERNAL_DIFF;
     const wrapped = wrapCredentialIsolatedCommand(
       "git",
       ["-C", cwd, ...GIT_SAFE_ARGS, ...safeSubArgs],
       process.env,
-      buildGitIsolation(cwd, opts, baseEnv.env.CREDENTIALS_DIRECTORY),
+      buildGitIsolation(cwd, opts, baseEnv.env.CREDENTIALS_DIRECTORY, sshSock),
     );
     return await runProcess(wrapped.cmd, wrapped.args, {
       env: childEnv,
@@ -185,7 +228,11 @@ const LFS_SPEC_HEADER_BUFS = LFS_SPEC_HEADERS.map((h) => Buffer.from(h, "utf8"))
 const LFS_POINTER_MIN_BYTES = 80;
 const LFS_POINTER_MAX_BYTES = 1024;
 const LFS_MAX_INT64 = 9223372036854775807n;
-const UTF8_FATAL = new TextDecoder("utf-8", { fatal: true });
+// 保留 UTF-8 BOM（ignoreBOM: true），避免 BOM 字节序列被静默剥离而与 git-lfs（bytes.TrimSpace 不去 BOM）产生分歧
+const UTF8_FATAL = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+// 精确对齐 Go unicode.IsSpace（含 U+0085 NEL、U+00A0 NBSP 及 Unicode Zs 空白，但绝不包含 U+FEFF BOM）
+const GO_UNICODE_SPACE_TRIM =
+  /^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g;
 const LFS_META_CHUNK_SIZE = 1024;
 const LFS_BATCH_CHUNK_SIZE = 256;
 
@@ -262,8 +309,8 @@ export function extractGitLfsPointerOid(content: string | Buffer): string | unde
     if (!content || Buffer.byteLength(content, "utf8") > LFS_POINTER_MAX_BYTES || content.includes("\0")) return undefined;
     text = content;
   }
-  // 仅剥离首尾 ASCII 空白（保留 \ufeff BOM 以拒绝带 BOM 的非法指针，与 Go bytes.TrimSpace 一致）
-  const trimmed = text.replace(/^[ \t\r\n\f\v]+|[ \t\r\n\f\v]+$/g, "");
+  // 精确对齐 Go bytes.TrimSpace（剥离首尾 Go unicode.IsSpace 空白，保留 \ufeff BOM 以拒绝带 BOM 的非法指针）
+  const trimmed = text.replace(GO_UNICODE_SPACE_TRIM, "");
   if (!trimmed) return undefined;
   const lines = trimmed
     .split("\n")
@@ -435,25 +482,10 @@ async function scanOutgoingGitLfs(
   }
 
   const revInput = [targetRev, ...validRemoteCommits.map((sha) => `^${sha}`)].join("\n") + "\n";
-  const revList = await tryGit(cwd, ["rev-list", "--objects", "--stdin"], { ...roOpts, input: revInput });
-  if (revList.code !== 0) {
-    throw new Error(`git rev-list 扫描提交 ${branchOrCommit} 待推送对象失败：${(revList.stderr || revList.stdout).trim()}`);
-  }
-  const objShas: string[] = [];
-  const seen = new Set<string>();
-  for (const line of revList.stdout.split("\n")) {
-    const sha = line.trim().split(/\s+/)[0];
-    if (sha && !seen.has(sha)) {
-      seen.add(sha);
-      objShas.push(sha);
-    }
-  }
   const oids = new Set<string>();
-  if (objShas.length === 0) return { hasLfsAttr, oids: [] };
 
-  // 有界分块扫描（每批至多 256 个 ≤1KiB 候选 blob，峰值内存 <256KiB），stopOnFirst=true 时命中首条即短路返回
-  for (let i = 0; i < objShas.length; i += LFS_META_CHUNK_SIZE) {
-    const metaChunk = objShas.slice(i, i + LFS_META_CHUNK_SIZE);
+  // 将待检查的 1024 条对象分批送入 cat-file --batch-check 与 ≤256 条 cat-file --batch，保持 O(1) 峰值内存
+  const processMetaChunk = async (metaChunk: string[]): Promise<boolean> => {
     const metaCheck = await tryGit(cwd, ["cat-file", "--batch-check=%(objecttype) %(objectsize) %(objectname)"], {
       ...roOpts,
       input: metaChunk.join("\n") + "\n",
@@ -481,9 +513,97 @@ async function scanOutgoingGitLfs(
         throw new Error(`git cat-file --batch 读取候选 blob 失败：${batchRes.stderr.trim()}`);
       }
       if (collectBatchBufferLfsOids(batchRes.stdout, oids, stopOnFirst) && stopOnFirst) {
-        return { hasLfsAttr, oids: [...oids] };
+        return true;
       }
     }
+    return false;
+  };
+
+  // 流式消费 `git rev-list --objects --stdin`（配合 async iterator 背压），避免首推或 push-only 远端将整仓历史读入内存
+  const revEnv = prepareHarnessEnv();
+  try {
+    const childEnv: NodeJS.ProcessEnv = { ...revEnv.env, GIT_TERMINAL_PROMPT: "0" };
+    delete childEnv.GIT_EXTERNAL_DIFF;
+    const wrapped = wrapCredentialIsolatedCommand(
+      "git",
+      ["-C", cwd, ...GIT_SAFE_ARGS, "rev-list", "--objects", "--stdin"],
+      process.env,
+      buildGitIsolation(cwd, roOpts, revEnv.env.CREDENTIALS_DIRECTORY),
+    );
+    const child = spawn(wrapped.cmd, wrapped.args, {
+      env: childEnv,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let errStr = "";
+    let timedOut = false;
+    let stoppedEarly = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, roOpts.timeoutMs ?? 300_000);
+    timer.unref?.();
+    child.stdin.on("error", () => undefined);
+    child.stderr.on("data", (d: Buffer) => {
+      if (errStr.length < 16_384) errStr += d.toString("utf8");
+    });
+    const exitPromise = new Promise<{ code: number; spawnErr?: Error }>((resolve) => {
+      child.on("error", (err) => resolve({ code: 127, spawnErr: err }));
+      child.on("close", (code) => resolve({ code: timedOut ? 124 : (code ?? 1) }));
+    });
+    child.stdin.end(revInput);
+
+    let carry = "";
+    let chunk: string[] = [];
+    try {
+      for await (const raw of child.stdout as AsyncIterable<Buffer>) {
+        carry += raw.toString("utf8");
+        let nl = carry.indexOf("\n");
+        while (nl !== -1) {
+          const line = carry.slice(0, nl).trim();
+          carry = carry.slice(nl + 1);
+          const sha = line.split(/\s+/)[0];
+          if (sha) {
+            chunk.push(sha);
+            if (chunk.length >= LFS_META_CHUNK_SIZE) {
+              const batch = chunk;
+              chunk = [];
+              if (await processMetaChunk(batch)) {
+                stoppedEarly = true;
+                child.kill("SIGKILL");
+                break;
+              }
+            }
+          }
+          nl = carry.indexOf("\n");
+        }
+        if (stoppedEarly) break;
+      }
+      if (!stoppedEarly) {
+        const lastSha = carry.trim().split(/\s+/)[0];
+        if (lastSha) chunk.push(lastSha);
+        if (chunk.length > 0 && (await processMetaChunk(chunk))) {
+          stoppedEarly = true;
+        }
+      }
+    } catch (err) {
+      child.kill("SIGKILL");
+      await exitPromise;
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+    const exitRes = await exitPromise;
+    if (!stoppedEarly) {
+      if (exitRes.spawnErr) {
+        throw new Error(`git rev-list 启动失败：${exitRes.spawnErr.message}`);
+      }
+      if (exitRes.code !== 0) {
+        const detail = (timedOut ? `${errStr}\n(timeout)` : errStr).trim();
+        throw new Error(`git rev-list 扫描提交 ${branchOrCommit} 待推送对象失败：${detail}`);
+      }
+    }
+  } finally {
+    revEnv.cleanup();
   }
   return { hasLfsAttr, oids: [...oids] };
 }

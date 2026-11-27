@@ -1,7 +1,7 @@
 import http from "node:http";
 import https from "node:https";
 import zlib from "node:zlib";
-import { isAllowedFeishuHost, RecordingCookieJar } from "./cookies.ts";
+import { isAllowedFeishuHost, RecordingCookieJar, type CookieSnapshot } from "./cookies.ts";
 import { MAX_WIRE_BYTES } from "./proto.ts";
 
 /**
@@ -174,13 +174,20 @@ export async function fetchWithJar(jar: RecordingCookieJar, opts: HttpRequestOpt
   let method: "GET" | "POST" = opts.method;
   let body = opts.body === undefined ? undefined : Buffer.isBuffer(opts.body) ? opts.body : Buffer.from(opts.body, "utf8");
   let headers: Record<string, string> = { ...(opts.headers ?? {}) };
-  let cookiesUpdated = false;
   const hadCsrfHeader = Object.keys(headers).some((k) => k.toLowerCase() === "x-csrf-token");
+  // 按请求暂存每一跳的 Set-Cookie，仅在最终非 401/403 响应时提交回共享活罐；
+  // 鉴权拒绝响应（401/403）或异常重定向的 Cookie 变更一律丢弃，且绝不影响并发请求的无关 Cookie 轮换。
+  const stagedCookies: { url: URL; headers: string[] | string; nowMs: number; snapshot: CookieSnapshot }[] = [];
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     validateTarget(currentUrl, allowInsecureHttp, opts.extraAllowedHosts);
     const reqHeaders: Record<string, string> = { ...headers };
-    const cookie = jar.cookieHeader(currentUrl);
+    let viewJar: RecordingCookieJar = jar;
+    if (stagedCookies.length > 0) {
+      viewJar = jar.clone();
+      for (const s of stagedCookies) viewJar.setFromHeaders(s.url, s.headers, s.nowMs);
+    }
+    const cookie = viewJar.cookieHeader(currentUrl);
     if (cookie) reqHeaders["Cookie"] = cookie;
     else delete reqHeaders["Cookie"];
     // 每次重定向跳（含同主机 307/302 轮换 swp_csrf_token 或切路径）均按目标 URL 重新派生 x-csrf-token
@@ -188,21 +195,26 @@ export async function fetchWithJar(jar: RecordingCookieJar, opts: HttpRequestOpt
       for (const k of Object.keys(reqHeaders)) {
         if (k.toLowerCase() === "x-csrf-token") delete reqHeaders[k];
       }
-      const destCsrf = jar.cookieValue(currentUrl, "swp_csrf_token");
+      const destCsrf = viewJar.cookieValue(currentUrl, "swp_csrf_token");
       if (destCsrf) reqHeaders["x-csrf-token"] = destCsrf;
     }
 
     const reqSnap = jar.snapshot();
     const res = await singleRequest(currentUrl, method, reqHeaders, body, timeoutMs, maxBytes, opts.signal);
-    if (res.headers["set-cookie"]) {
-      if (jar.setFromHeaders(currentUrl, res.headers["set-cookie"], Date.now(), reqSnap)) {
-        cookiesUpdated = true;
-      }
+    const rawSetCookie = res.headers["set-cookie"];
+    if (rawSetCookie) {
+      stagedCookies.push({ url: new URL(currentUrl.toString()), headers: rawSetCookie, nowMs: Date.now(), snapshot: reqSnap });
     }
 
     const isRedirect = res.status === 301 || res.status === 302 || res.status === 303 || res.status === 307 || res.status === 308;
     const loc = getHeader(res.headers, "location");
-    if (!isRedirect || !loc) return { ...res, cookiesUpdated };
+    if (!isRedirect || !loc) {
+      if (res.status === 401 || res.status === 403) {
+        return { ...res, cookiesUpdated: false };
+      }
+      const cookiesUpdated = stagedCookies.length > 0 ? jar.applyStaged(stagedCookies) : false;
+      return { ...res, cookiesUpdated };
+    }
 
     if (hop >= MAX_REDIRECTS) {
       throw new WebHttpError("redirect_rejected", "个人 Web 重定向次数超过上限");

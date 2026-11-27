@@ -12,14 +12,14 @@ import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
-import type net from "node:net";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
 import * as Q from "../src/api/queries.ts";
-import { createApp, runDispatchOnce, sendBrief } from "../src/app.ts";
+import { createApp, initApp, runDispatchOnce, sendBrief } from "../src/app.ts";
 import { CardService } from "../src/cards/index.ts";
 import { loadConfig } from "../src/config.ts";
 import {
@@ -94,7 +94,14 @@ import {
   verifyWorkspaceOwnerBinding,
 } from "../src/context/personal-web.ts";
 import { obsRevision, type Obs } from "../src/context/store.ts";
-import { branchUsesGitLfs, isGitLfsPointerBlob, pushBranch, resolveLocalGitRemoteDir, tryGit } from "../src/delivery/git.ts";
+import {
+  branchUsesGitLfs,
+  isGitLfsPointerBlob,
+  pushBranch,
+  resolveAuthorizedSshAuthSock,
+  resolveLocalGitRemoteDir,
+  tryGit,
+} from "../src/delivery/git.ts";
 import { runDoctor } from "../src/doctor.ts";
 import { card as cardEffect, effectHandler } from "../src/effects.ts";
 import {
@@ -4597,7 +4604,7 @@ data_dir: ${dir}
     svc.store.markProcessed(["pw:partial_a"]);
 
     // 13) [R6 P1-5 & P1-6] checkConvAllowedForUnderstand 刷新已知 oc_* 群名 + 未知 chat_mode 保持 unknown（对群与私聊双双 fail-closed）
-    const client = await FeishuWebClient.connect(loginA, { endpoints: mock.endpoints });
+    const client = await FeishuWebClient.connect(new WebLoginStore(dir).load() ?? loginA, { endpoints: mock.endpoints });
     (svc.personalWeb as unknown as { client?: FeishuWebClient }).client = client;
     mock.setChatName("9604", "新静音群名");
     svc.store.muteConv("pw_chat:9604", "新静音群名", true);
@@ -5226,7 +5233,7 @@ data_dir: ${dir}
     ];
     const loginA = { owner_id: "7001", owner_name: "张三", cookies: baseCookies };
     commitWorkspaceLogin(app, loginA, { allowUnverifiedOwner: true });
-    const client = await FeishuWebClient.connect(loginA, { endpoints: mock.endpoints });
+    let client = await FeishuWebClient.connect(new WebLoginStore(dir).load() ?? loginA, { endpoints: mock.endpoints });
     (svc.personalWeb as unknown as { client?: FeishuWebClient }).client = client;
 
     // 3) [R7 P2-17] 两阶段暂存凭据提交：SQLite COMMIT 失败时不覆盖旧凭据且清理 .staged；COMMIT 后崩溃未 rename 时启动自动协调补全
@@ -5260,6 +5267,8 @@ data_dir: ${dir}
     assert.equal(loginStore.load()?.owner_name, "已提交待恢复", "崩溃恢复必须把已提交的新凭据原子就位");
     // 恢复正常登录态以便后续测试
     commitWorkspaceLogin(app, loginA, { allowUnverifiedOwner: true });
+    client = await FeishuWebClient.connect(loginStore.load() ?? loginA, { endpoints: mock.endpoints });
+    (svc.personalWeb as unknown as { client?: FeishuWebClient }).client = client;
 
     // 4) [R7 P1-8] resolveNativeExclusionsForPolling：未知原生会话类型即使有非空名也必须让群与私聊双路 inconclusive
     mock.setChatName("9502", "某个名字非空的未知类型会话");
@@ -8689,7 +8698,7 @@ test("Codex 第十一轮回归：PID+挂载隔离、草稿终检防重插、晨�
         meta: { chat_type: "group", at_me: false },
       },
     ]);
-    fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({}));
+    fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner_a", user_name: "张三" }));
     fs.writeFileSync(path.join(ctxDir, "understand.txt"), "NOT VALID JSON {{{");
     for (let i = 0; i < 3; i++) {
       await svc.cycle(`ctx:r11-parse-fail-${i}`);
@@ -9578,7 +9587,12 @@ test("Codex 第十三轮回归：dataDir 祖先重遮蔽、worktree .git 防篡�
       fs.writeFileSync(path.join(wtA, ".git"), `gitdir: ${secretHost}\n`);
       assert.throws(() => detectGitWorktreeDirs(wtA, { trustedRepoRoot: repoA }), /元数据校验失败|拒绝挂载/);
       assert.throws(
-        () => buildWorkspaceIsolation(undefined, { mode: "verify", cwd: wtA, trustedRepoRoot: repoA }, {}),
+        () =>
+          buildWorkspaceIsolation(
+            { dataDir: base, context: { personal_web: { enabled: true } } } as never,
+            { mode: "verify", cwd: wtA, trustedRepoRoot: repoA },
+            {},
+          ),
         /元数据校验失败|拒绝挂载/,
       );
 
@@ -10203,6 +10217,1066 @@ test("Codex 第十三轮回归：dataDir 祖先重遮蔽、worktree .git 防篡�
     else process.env.CTX_DIR = prevCtxDir;
     app?.store.db.close();
     await mock.close();
+  }
+});
+
+test("Codex 第十四轮回归：宿主控制套接字隔离、共享 Git 元数据只读、无隔离跳过校验与 separate-git-dir/submodule、授权远程 Git SSH_AUTH_SOCK、LFS 流式扫描与原始字节对齐 git-lfs、轮询前核验 lark-cli 主人、遗留看板迁移保原主人、观测写事务锁内吊销校验、无名轮询私聊解析与 fail-closed、401/403 丢弃 Set-Cookie、并发轮询防旧覆盖新编辑、自动预起草推理后复检、发言群新名优先、派单 SQL 过滤下推与补读保留 DM 类型", async () => {
+  const prevKey = process.env.PA_FEISHU_WEB_KEY;
+  const prevCredFile = process.env.PA_FEISHU_WEB_CRED_FILE;
+  const prevCredDir = process.env.CREDENTIALS_DIRECTORY;
+  const prevCtxDir = process.env.CTX_DIR;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-r14-"));
+  const dataDir = path.join(dir, "data");
+  const ctxDir = path.join(dir, "ctx");
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(ctxDir, { recursive: true });
+  process.env.CTX_DIR = ctxDir;
+  process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
+  delete process.env.PA_FEISHU_WEB_CRED_FILE;
+  delete process.env.CREDENTIALS_DIRECTORY;
+
+  const mock = await startMockFeishuWebServer();
+  let app: ReturnType<typeof createApp> | undefined;
+  let httpCookieServer: http.Server | undefined;
+  let hostSockServer: net.Server | undefined;
+  let sshSockServer: net.Server | undefined;
+  let shmRunDir: string | undefined;
+
+  try {
+    const gitEnv = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "Test",
+      GIT_AUTHOR_EMAIL: "test@example.com",
+      GIT_COMMITTER_NAME: "Test",
+      GIT_COMMITTER_EMAIL: "test@example.com",
+    };
+
+    // 1) [R14 #1 P1] 沙箱工人隔离宿主机控制套接字（/run/user、XDG_RUNTIME_DIR、DBUS_SESSION_BUS_ADDRESS、剥离环境变量）
+    {
+      const stripped = prepareHarnessEnv({
+        PATH: process.env.PATH,
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/tmp/fake-dbus.sock",
+        NOTIFY_SOCKET: "/run/user/1000/systemd/notify",
+        GPG_AGENT_INFO: "/run/user/1000/gnupg/S.gpg-agent:0:1",
+        SSH_AUTH_SOCK: "/tmp/ssh-test/agent.1",
+        SSH_AGENT_PID: "12345",
+      });
+      try {
+        assert.equal(stripped.env.DBUS_SESSION_BUS_ADDRESS, undefined, "默认剥离 DBUS_SESSION_BUS_ADDRESS");
+        assert.equal(stripped.env.NOTIFY_SOCKET, undefined, "默认剥离 NOTIFY_SOCKET");
+        assert.equal(stripped.env.GPG_AGENT_INFO, undefined, "默认剥离 GPG_AGENT_INFO");
+        assert.equal(stripped.env.SSH_AUTH_SOCK, undefined, "普通工人默认剥离 SSH_AUTH_SOCK");
+        assert.equal(stripped.env.SSH_AGENT_PID, undefined, "普通工人默认剥离 SSH_AGENT_PID");
+      } finally {
+        stripped.cleanup();
+      }
+      const keptSsh = prepareHarnessEnv(
+        {
+          PATH: process.env.PATH,
+          DBUS_SESSION_BUS_ADDRESS: "unix:path=/tmp/fake-dbus.sock",
+          SSH_AUTH_SOCK: "/tmp/ssh-test/agent.1",
+        },
+        { preserveSshAgent: true },
+      );
+      try {
+        assert.equal(keptSsh.env.SSH_AUTH_SOCK, "/tmp/ssh-test/agent.1", "授权远程 Git 允许保留 SSH_AUTH_SOCK");
+        assert.equal(keptSsh.env.DBUS_SESSION_BUS_ADDRESS, undefined, "即使保留 SSH_AUTH_SOCK 也仍须剥离 DBUS_SESSION_BUS_ADDRESS");
+      } finally {
+        keptSsh.cleanup();
+      }
+
+      // 在 /var/tmp（既不在 /tmp 也不在 /dev/shm 或 dataDir 内）下建立真实宿主 Unix 套接字作为 XDG_RUNTIME_DIR，
+      // 验证 bwrap 与 unshare 均用空 tmpfs 遮蔽它，阻止同 UID 沙箱工人 connect(2) 到宿主服务套接字
+      if (fs.existsSync("/var/tmp")) {
+        shmRunDir = fs.mkdtempSync(path.join("/var/tmp", "pa-r14-run-"));
+        const hostSockPath = path.join(shmRunDir, "systemd-private.sock");
+        const extraDbusSockPath = path.join(shmRunDir, "dbus-extra.sock");
+        hostSockServer = net.createServer((s) => s.end("HOST_REACHED"));
+        await new Promise<void>((resolve) => hostSockServer!.listen(hostSockPath, resolve));
+        fs.writeFileSync(extraDbusSockPath, "");
+
+        const activeCfg = { dataDir, context: { personal_web: { enabled: true } } } as never;
+        const fakeEnv = {
+          ...process.env,
+          XDG_RUNTIME_DIR: shmRunDir,
+          DBUS_SESSION_BUS_ADDRESS: `unix:path=${extraDbusSockPath}`,
+        };
+        const plan = buildWorkspaceIsolation(activeCfg, { mode: "worker-ro", cwd: dir }, fakeEnv);
+
+        if (hasCredentialMountIsolation()) {
+          const probeCode = `
+            const net = require("node:net");
+            const s = net.connect(${JSON.stringify(hostSockPath)});
+            s.on("connect", () => { process.stdout.write("CONNECTED"); s.destroy(); });
+            s.on("error", (e) => { process.stdout.write("BLOCKED:" + e.code); });
+          `;
+          const wrapped = wrapCredentialIsolatedCommand(process.execPath, ["-e", probeCode], fakeEnv, plan);
+          assert.equal(wrapped.isolated, true);
+          assert.ok(wrapped.args.includes(fs.realpathSync(shmRunDir)), "隔离命令必须将自定义 XDG_RUNTIME_DIR 纳入 tmpfs 遮蔽");
+          const res = await runProcess(wrapped.cmd, wrapped.args, { cwd: dir, timeoutMs: 10_000 });
+          assert.equal(res.code, 0, res.stderr);
+          assert.match(res.stdout, /^BLOCKED:ENOENT/, "沙箱工人绝不能连上宿主机 XDG_RUNTIME_DIR 下的服务套接字");
+        }
+      }
+    }
+
+    // 2) [R14 #2 P1] 共享 Git 元数据（wt.commonDir / wt.gitDir / .git）对不可信工人（worker-write / verify）保持只读
+    const gitBase = path.join(dir, "git-r14");
+    const repoA = path.join(gitBase, "repoA");
+    const wtA = path.join(gitBase, "wtA");
+    fs.mkdirSync(repoA, { recursive: true });
+    assert.equal((await runProcess("git", ["init", "-q", repoA], { env: gitEnv })).code, 0);
+    fs.writeFileSync(path.join(repoA, "hello.txt"), "v1\n");
+    assert.equal((await runProcess("git", ["-C", repoA, "add", "-A"], { env: gitEnv })).code, 0);
+    assert.equal((await runProcess("git", ["-C", repoA, "commit", "-q", "-m", "init"], { env: gitEnv })).code, 0);
+    assert.equal((await runProcess("git", ["-C", repoA, "worktree", "add", "-q", "-b", "pa/r14-a", wtA], { env: gitEnv })).code, 0);
+
+    const activeIsoCfg = { dataDir, context: { personal_web: { enabled: true } } } as never;
+    const wtMeta = detectGitWorktreeDirs(wtA, { trustedRepoRoot: repoA });
+    const workerWritePlan = buildWorkspaceIsolation(activeIsoCfg, { mode: "worker-write", cwd: wtA, trustedRepoRoot: repoA }, process.env);
+    const verifyPlan = buildWorkspaceIsolation(activeIsoCfg, { mode: "verify", cwd: wtA, trustedRepoRoot: repoA }, process.env);
+    const gitRwPlan = buildWorkspaceIsolation(activeIsoCfg, { mode: "git-rw", cwd: wtA, trustedRepoRoot: repoA }, process.env);
+    const realRepoADotGit = fs.realpathSync(path.join(repoA, ".git"));
+    assert.ok(!workerWritePlan.writablePaths?.includes(wtMeta.commonDir!), "worker-write 绝不能将共享 commonDir 挂为可写");
+    assert.ok(!workerWritePlan.writablePaths?.includes(wtMeta.gitDir!), "worker-write 绝不能将 worktree gitDir 挂为可写");
+    assert.ok(workerWritePlan.readOnlyPaths?.includes(wtMeta.commonDir!), "worker-write 必须将共享 commonDir 挂为只读");
+    assert.ok(verifyPlan.readOnlyPaths?.includes(wtMeta.commonDir!), "verify 必须将共享 commonDir 挂为只读");
+    assert.ok(gitRwPlan.writablePaths?.includes(wtMeta.commonDir!), "受信任 git-rw 提交步骤允许写入 commonDir");
+
+    const standaloneWritePlan = buildWorkspaceIsolation(activeIsoCfg, { mode: "worker-write", cwd: repoA, trustedRepoRoot: repoA }, process.env);
+    assert.ok(standaloneWritePlan.readOnlyPaths?.includes(realRepoADotGit), "独立仓库 worker-write 必须把 .git 目录挂为只读");
+
+    if (hasCredentialMountIsolation()) {
+      const hookProbe = path.join(realRepoADotGit, "hooks", "r14-worker-pwn");
+      const wtWorkFile = path.join(wtA, "r14-worker-ok.txt");
+      const writeTestCode = `
+        const fs = require("node:fs");
+        fs.writeFileSync(${JSON.stringify(wtWorkFile)}, "ok");
+        let gitErr = "";
+        try { fs.writeFileSync(${JSON.stringify(hookProbe)}, "pwn"); } catch (e) { gitErr = e.code || String(e); }
+        process.stdout.write(gitErr);
+      `;
+      const wrapped = wrapCredentialIsolatedCommand(process.execPath, ["-e", writeTestCode], process.env, workerWritePlan);
+      assert.equal(wrapped.isolated, true);
+      const res = await runProcess(wrapped.cmd, wrapped.args, { cwd: wtA, timeoutMs: 10_000 });
+      assert.equal(res.code, 0, res.stderr);
+      assert.equal(res.stdout, "EROFS", "沙箱工人在 worktree 内可以改代码，但写主仓库 .git/hooks 必须被内核 EROFS 拦截");
+      assert.equal(fs.existsSync(hookProbe), false);
+      fs.rmSync(wtWorkFile, { force: true });
+    }
+
+    // 3) [R14 #3 P2] 未启用隔离时跳过 .git 挂载校验；启用隔离时支持 --separate-git-dir 与 submodule，且仍拒绝篡改
+    {
+      const sepWork = path.join(gitBase, "sep-work");
+      const sepGit = path.join(gitBase, "sep-gitdir");
+      fs.mkdirSync(sepWork, { recursive: true });
+      assert.equal(
+        (await runProcess("git", ["init", "-q", `--separate-git-dir=${sepGit}`, sepWork], { env: gitEnv })).code,
+        0,
+      );
+      const sepMeta = detectGitWorktreeDirs(sepWork);
+      assert.equal(sepMeta.gitDir, fs.realpathSync(sepGit), "--separate-git-dir 必须被识别为合法独立 Git 目录");
+      assert.equal(sepMeta.commonDir, fs.realpathSync(sepGit));
+      const sepPlan = buildWorkspaceIsolation(activeIsoCfg, { mode: "worker-write", cwd: sepWork }, process.env);
+      assert.ok(sepPlan.readOnlyPaths?.includes(fs.realpathSync(sepGit)), "--separate-git-dir 在 worker-write 下保持只读");
+
+      // 合法 submodule 布局（.git 文件指向 superRepo/.git/modules/sub）
+      const subSrc = path.join(gitBase, "sub-src");
+      const superRepo = path.join(gitBase, "super-repo");
+      fs.mkdirSync(subSrc, { recursive: true });
+      fs.mkdirSync(superRepo, { recursive: true });
+      assert.equal((await runProcess("git", ["init", "-q", subSrc], { env: gitEnv })).code, 0);
+      fs.writeFileSync(path.join(subSrc, "s.txt"), "sub\n");
+      assert.equal((await runProcess("git", ["-C", subSrc, "add", "-A"], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", subSrc, "commit", "-q", "-m", "sub init"], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["init", "-q", superRepo], { env: gitEnv })).code, 0);
+      assert.equal(
+        (await runProcess("git", ["-C", superRepo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", subSrc, "sub"], { env: gitEnv })).code,
+        0,
+      );
+      const subDir = path.join(superRepo, "sub");
+      const subMeta = detectGitWorktreeDirs(subDir, { trustedRepoRoot: superRepo });
+      assert.equal(subMeta.gitDir, fs.realpathSync(path.join(superRepo, ".git", "modules", "sub")), "合法 submodule 必须通过受信任父仓校验");
+
+      // 无隔离需求时，即使存在被篡改的 .git 文件也不得提前抛错阻塞工作流
+      const tamperedDir = path.join(gitBase, "tampered-inactive");
+      fs.mkdirSync(tamperedDir, { recursive: true });
+      fs.writeFileSync(path.join(tamperedDir, ".git"), "gitdir: /nonexistent/outside/path\n");
+      const inactiveCfg = { dataDir: path.join(dir, "empty-data"), context: { personal_web: { enabled: false } } } as never;
+      const inactivePlan = buildWorkspaceIsolation(inactiveCfg, { mode: "verify", cwd: tamperedDir }, {});
+      assert.equal(inactivePlan.requireIsolation, false, "未启用隔离时不得要求沙箱或因 .git 挂载规划提前抛错");
+    }
+
+    // 4) [R14 #4 P2] 授权远程 Git 操作（push/fetch/ls-remote/pull/clone/lfs）保留并仅挂载 SSH_AUTH_SOCK，本地 Git 与普通工人均不暴露
+    {
+      const sockDir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-r14-ssh-"));
+      const sshSock = path.join(sockDir, "agent.sock");
+      const badSock = path.join(dataDir, "inside-data.sock");
+      sshSockServer = net.createServer((s) => s.end("AGENT_OK"));
+      await new Promise<void>((resolve) => sshSockServer!.listen(sshSock, resolve));
+      const badSockSrv = net.createServer();
+      await new Promise<void>((resolve) => badSockSrv.listen(badSock, resolve));
+      try {
+        assert.equal(
+          resolveAuthorizedSshAuthSock(["push", "origin", "HEAD"], { SSH_AUTH_SOCK: sshSock }, dataDir),
+          fs.realpathSync(sshSock),
+          "push 远程操作应授权透传合法 SSH_AUTH_SOCK",
+        );
+        assert.equal(
+          resolveAuthorizedSshAuthSock(["ls-remote", "origin"], { SSH_AUTH_SOCK: sshSock }, dataDir),
+          fs.realpathSync(sshSock),
+          "ls-remote 应授权透传合法 SSH_AUTH_SOCK",
+        );
+        assert.equal(
+          resolveAuthorizedSshAuthSock(["status"], { SSH_AUTH_SOCK: sshSock }, dataDir),
+          undefined,
+          "本地 git status 绝不暴露 SSH_AUTH_SOCK",
+        );
+        assert.equal(
+          resolveAuthorizedSshAuthSock(["push", "origin", "HEAD"], { SSH_AUTH_SOCK: badSock }, dataDir),
+          undefined,
+          "位于 dataDir 内的套接字绝不允许作为 SSH_AUTH_SOCK 透传",
+        );
+
+        if (hasCredentialMountIsolation()) {
+          const planWithAgent = buildWorkspaceIsolation(
+            activeIsoCfg,
+            { mode: "git-rw", cwd: repoA, trustedRepoRoot: repoA, extraWritablePaths: [fs.realpathSync(sshSock)] },
+            process.env,
+          );
+          const probeAgent = `
+            const net = require("node:net");
+            const s = net.connect(${JSON.stringify(fs.realpathSync(sshSock))});
+            let out = "";
+            s.on("data", (d) => { out += d.toString(); });
+            s.on("end", () => process.stdout.write(out));
+            s.on("error", (e) => process.stdout.write("ERR:" + e.code));
+          `;
+          const wrapped = wrapCredentialIsolatedCommand(process.execPath, ["-e", probeAgent], process.env, planWithAgent);
+          const r = await runProcess(wrapped.cmd, wrapped.args, { cwd: repoA, timeoutMs: 10_000 });
+          assert.equal(r.code, 0, r.stderr);
+          assert.equal(r.stdout, "AGENT_OK", "授权远程 Git 沙箱必须可连通单点挂载的 SSH_AUTH_SOCK（即使它在 /tmp 下）");
+        }
+      } finally {
+        await new Promise<void>((resolve) => badSockSrv.close(() => resolve()));
+        fs.rmSync(sockDir, { recursive: true, force: true });
+      }
+    }
+
+    // 5) [R14 #5 P2] 流式扫描出站 Git 对象：跨越多个 1024 批次仍能完整扫描且命中首条即早停
+    {
+      const bigRepo = path.join(gitBase, "big-stream-repo");
+      fs.mkdirSync(bigRepo, { recursive: true });
+      assert.equal((await runProcess("git", ["init", "-q", bigRepo], { env: gitEnv })).code, 0);
+      // 一次创建 1100 个独立小文件（> 1024 单批大小）验证跨批流式扫描
+      for (let i = 0; i < 1100; i++) {
+        fs.writeFileSync(path.join(bigRepo, `f_${i}.txt`), `plain file content ${i}\n`);
+      }
+      assert.equal((await runProcess("git", ["-C", bigRepo, "add", "-A"], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", bigRepo, "commit", "-q", "-m", "1100 plain files"], { env: gitEnv })).code, 0);
+      const curBranch = (await runProcess("git", ["-C", bigRepo, "rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
+      assert.equal(await branchUsesGitLfs(bigRepo, curBranch), false, "超过单批上限的纯文本仓库流式扫描应返回 false");
+
+      // 再提交一个有效 LFS 指针，流式扫描必须命中返回 true
+      const validPtr = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 42\n`;
+      fs.writeFileSync(path.join(bigRepo, "model.bin"), validPtr);
+      assert.equal((await runProcess("git", ["-C", bigRepo, "add", "model.bin"], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", bigRepo, "commit", "-q", "-m", "add lfs ptr"], { env: gitEnv })).code, 0);
+      assert.equal(await branchUsesGitLfs(bigRepo, curBranch), true, "跨批流式扫描必须准确检出新增的 LFS 指针");
+    }
+
+    // 6) [R14 #6 P2] 原始字节级 LFS 指针校验与官方 `git lfs pointer --check --stdin` 逐项一致（含 UTF-8 BOM 与 Unicode 空白）
+    {
+      const basePtr = `version https://git-lfs.github.com/spec/v1\noid sha256:${"b".repeat(64)}\nsize 123\n`;
+      const vectors: { name: string; buf: Buffer; expected: boolean }[] = [
+        { name: "clean LF", buf: Buffer.from(basePtr, "utf8"), expected: true },
+        { name: "clean CRLF", buf: Buffer.from(basePtr.replace(/\n/g, "\r\n"), "utf8"), expected: true },
+        { name: "raw UTF-8 BOM rejected", buf: Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(basePtr, "utf8")]), expected: false },
+        { name: "leading NBSP U+00A0 accepted", buf: Buffer.from(`\u00a0${basePtr}`, "utf8"), expected: true },
+        { name: "trailing NBSP U+00A0 accepted", buf: Buffer.from(`${basePtr}\u00a0`, "utf8"), expected: true },
+        { name: "leading NEL U+0085 accepted", buf: Buffer.from(`\u0085${basePtr}`, "utf8"), expected: true },
+        { name: "leading ideographic space U+3000 accepted", buf: Buffer.from(`\u3000${basePtr}`, "utf8"), expected: true },
+        { name: "mid-line NBSP rejected", buf: Buffer.from(basePtr.replace("version ", "version\u00a0"), "utf8"), expected: false },
+        { name: "invalid UTF-8 bytes rejected", buf: Buffer.concat([Buffer.from(basePtr, "utf8"), Buffer.from([0xff, 0xfe])]), expected: false },
+        { name: "uppercase hex rejected", buf: Buffer.from(basePtr.replace("b".repeat(64), "B".repeat(64)), "utf8"), expected: false },
+      ];
+      const hasGitLfs = (await runProcess("git", ["lfs", "version"], { timeoutMs: 5_000 })).code === 0;
+      for (const v of vectors) {
+        const ours = isGitLfsPointerBlob(v.buf);
+        assert.equal(ours, v.expected, `LFS 字节校验 [${v.name}] 应为 ${v.expected}`);
+        if (hasGitLfs) {
+          const refRc = await new Promise<number>((resolve) => {
+            const c = spawn("git", ["lfs", "pointer", "--check", "--stdin"], { stdio: ["pipe", "pipe", "pipe"] });
+            c.on("close", (code) => resolve(code ?? 1));
+            c.stdin.end(v.buf);
+          });
+          assert.equal(ours, refRc === 0, `LFS 字节校验 [${v.name}] 必须与 git lfs pointer --check --stdin 完全一致`);
+        }
+      }
+    }
+
+    // 初始化 App / ContextService 用于 #7 ~ #16 回归测试
+    const cfgPath = path.join(dir, "config.yaml");
+    fs.writeFileSync(
+      cfgPath,
+      `owner:
+  open_id: ou_owner_a
+  name: 主人A
+  timezone: Asia/Shanghai
+bins:
+  lark: ${path.join(STUBS, "ctx-lark")}
+  bytedcli: ${path.join(STUBS, "ctx-bytedcli")}
+harnesses:
+  codex:
+    type: codex-exec
+    cmd: ${path.join(STUBS, "ctx-codex")}
+roles:
+  brain: codex
+server:
+  enabled: false
+cards:
+  enabled: true
+kb:
+  enabled: false
+context:
+  enabled: true
+  understand: true
+  harness: codex
+  groups: spoken
+  groups_allow: []
+  groups_deny: []
+  sources:
+    meego: false
+    tasks: true
+    im: true
+    minutes: false
+    calendar: false
+    docs: false
+  personal_web:
+    enabled: true
+    fast_lane: true
+    pre_draft: true
+    send_replies: false
+    debounce_ms: 0
+data_dir: ${dataDir}
+`,
+    );
+    app = createApp(loadConfig(cfgPath));
+    const { registerContext } = await import("../src/context/index.ts");
+    const svc = registerContext(app)!;
+    const baseCookies = [
+      { name: "session", value: "sess_r14_v1", domain: "127.0.0.1", path: "/" },
+      { name: "passport_web_did", value: "did_r14_1", domain: "127.0.0.1", path: "/" },
+    ];
+    const loginA = { owner_id: "7001", owner_name: "主人A", cookies: baseCookies };
+    commitWorkspaceLogin(app, loginA, { allowUnverifiedOwner: true });
+    const loginStore = new WebLoginStore(dataDir);
+    const client = await FeishuWebClient.connect(loginStore.load()!, { endpoints: mock.endpoints });
+    (svc.personalWeb as unknown as { client?: FeishuWebClient }).client = client;
+    const now = Date.now();
+    const nowSec = Math.floor(now / 1000);
+
+    // 7) [R14 #7 P1] 轮询前核验活跃 lark-cli 账号：CLI 切换至账号 B 后 cycle() 与 pullAll() 必须阻断并拒绝混入 B 的私聊与任务
+    {
+      fs.writeFileSync(
+        path.join(ctxDir, "lark.json"),
+        JSON.stringify({
+          user_open_id: "ou_other_user_b",
+          user_name: "其他账号B",
+          p2p: [
+            {
+              message_id: "om_b_secret_dm",
+              chat_id: "oc_b_dm",
+              chat_type: "p2p",
+              msg_type: "text",
+              create_time: new Date(now).toISOString(),
+              sender: { id: "ou_b_peer", name: "B的私聊对象", sender_type: "user" },
+              content: "属于B的私密消息",
+            },
+          ],
+          tasks: [{ guid: "t_b_secret", summary: "属于B的私人任务", created_at: new Date(now).toISOString() }],
+        }),
+      );
+      const cyc = await svc.cycle("ctx:r14-cli-mismatch");
+      assert.equal(cyc.skipped, true, "lark-cli 切换为他人账号 B 时 cycle() 必须跳过采集");
+      assert.ok(cyc.errors.some((e) => e.includes("ou_other_user_b") && e.includes("ou_owner_a")), cyc.errors.join(";"));
+      assert.equal(svc.store.obs("im:om_b_secret_dm"), undefined, "B 的私聊绝不能落入 A 的观测库");
+      assert.equal(svc.store.obs("task:t_b_secret"), undefined, "B 的任务绝不能落入 A 的观测库");
+
+      const directPull = await svc.connectors.pullAll();
+      assert.ok(directPull.every((s) => s.count === 0 && /ou_other_user_b/.test(s.error)), "直接调用 pullAll() 同样必须拒绝拉取账号 B 的用户态来源");
+      assert.equal(svc.store.obs("im:om_b_secret_dm"), undefined);
+      assert.equal(svc.store.obs("task:t_b_secret"), undefined);
+    }
+
+    // 8) [R14 #8 P1] 升级迁移遗留看板时保留原始主人，绝不在 initApp 校验前覆盖 owner.open_id 或改标无主/他主看板
+    {
+      const miniCfg = (openId: string, dd: string) =>
+        `owner:\n  open_id: ${openId}\nbins:\n  lark: ${path.join(STUBS, "lark")}\nharnesses:\n  codex:\n    type: codex-exec\n    cmd: ${path.join(STUBS, "ctx-codex")}\nroles:\n  brain: codex\nkb:\n  enabled: false\ndata_dir: ${dd}\n`;
+      // 8a) 遗留目录归属 A（有 board.tasklist 与 owner.open_id = A，无 board.owner_open_id）：用 B 配置初始化必须拒绝且保留 owner.open_id = A
+      const legDirA = path.join(dir, "legacy-board-a");
+      fs.mkdirSync(legDirA, { recursive: true });
+      const legCfgB = path.join(legDirA, "config.yaml");
+      fs.writeFileSync(legCfgB, miniCfg("ou_owner_b", legDirA));
+      const legAppB = createApp(loadConfig(legCfgB));
+      try {
+        legAppB.store.set("board.tasklist", "tl_legacy_a");
+        legAppB.store.set("owner.open_id", "ou_owner_a");
+        await assert.rejects(() => initApp(legAppB), /不一致|拒绝改标/);
+        assert.equal(legAppB.store.get("owner.open_id"), "ou_owner_a", "拒绝后必须保留原始 owner.open_id");
+        assert.equal(legAppB.store.get("board.owner_open_id"), undefined, "绝不能把 A 的遗留看板改标成 B");
+      } finally {
+        legAppB.store.db.close();
+      }
+
+      // 8b) 遗留目录缺少原始主人记录（有 board.tasklist，无 owner.open_id 也无 board.owner_open_id）：必须拒绝接管
+      const legDirUnknown = path.join(dir, "legacy-board-unknown");
+      fs.mkdirSync(legDirUnknown, { recursive: true });
+      const legCfgU = path.join(legDirUnknown, "config.yaml");
+      fs.writeFileSync(legCfgU, miniCfg("ou_owner_b", legDirUnknown));
+      const legAppU = createApp(loadConfig(legCfgU));
+      try {
+        legAppU.store.set("board.tasklist", "tl_legacy_unknown");
+        await assert.rejects(() => initApp(legAppU), /无法确立归属|拒绝自动接管/);
+        assert.equal(legAppU.store.get("board.owner_open_id"), undefined);
+      } finally {
+        legAppU.store.db.close();
+      }
+
+      // 8c) 原主人 A 本人执行 initApp：安全回填 board.owner_open_id = A
+      const legCfgA = path.join(legDirA, "config-a.yaml");
+      fs.writeFileSync(legCfgA, miniCfg("ou_owner_a", legDirA));
+      const legAppA = createApp(loadConfig(legCfgA));
+      try {
+        let secSeq = 0;
+        legAppA.lark.run = async (args) => {
+          if (args.includes("create")) return { guid: `sec_leg_${++secSeq}` };
+          return { items: [] };
+        };
+        await initApp(legAppA);
+        assert.equal(legAppA.store.get("board.owner_open_id"), "ou_owner_a", "原主人 A 迁移遗留看板时应安全回填归属");
+      } finally {
+        legAppA.store.db.close();
+      }
+    }
+
+    // 9) [R14 #9 P1] 观测写事务锁内校验会话吊销（handleMessage & hydrateContext）：
+    //    模拟跨进程 web-logout 在 pre-check 之后、addObs/addBackgroundObs 获取 BEGIN IMMEDIATE 写锁前提交吊销
+    {
+      mock.setChatName("9910", "写锁吊销测试群");
+      mock.setChatKind("9910", CHAT_KIND_GROUP);
+      const revMsgBuf = buildNativeMessage({
+        id: "r14_rev_tx_1",
+        chatId: "9910",
+        actorId: "7002",
+        createdAtSec: nowSec,
+        position: 10,
+        richBytes: encodeRichText([{ text: "@主人A", mentionId: "7001" }, { text: " 写锁竞态消息" }]),
+      });
+      mock.addMessage("r14_rev_tx_1", revMsgBuf);
+
+      const origTx = svc.store.tx.bind(svc.store);
+      let injectedRevoke = false;
+      svc.store.tx = (<T>(fn: () => T): T =>
+        origTx(() => {
+          if (!injectedRevoke) {
+            injectedRevoke = true;
+            // 在 BEGIN IMMEDIATE 写事务已持锁、beforeCommit 尚未执行前写入吊销键（等价于另一进程刚提交 web-logout）
+            app!.store.set(REVOKED_AT_KV_KEY, String(Date.now()));
+          }
+          return fn();
+        })) as typeof svc.store.tx;
+      try {
+        await assert.rejects(
+          () => svc.personalWeb.handleMessage(decodeMessage(revMsgBuf, "7001"), client),
+          /吊销|aborted/,
+          "addObs 写事务锁内检测到 web-logout 吊销后必须中止且回滚",
+        );
+      } finally {
+        svc.store.tx = origTx;
+      }
+      assert.equal(injectedRevoke, true);
+      assert.equal(svc.store.obs("pw:r14_rev_tx_1"), undefined, "写锁内吊销后观测绝不能写入 ctx_obs");
+      // 恢复登录态并测试 hydrateContext 的 addBackgroundObs 写事务锁内吊销校验
+      app.store.set(REVOKED_AT_KV_KEY, "");
+
+      const hydTriggerBuf = buildNativeMessage({
+        id: "r14_hyd_trig",
+        chatId: "9910",
+        actorId: "7002",
+        createdAtSec: nowSec,
+        position: 11,
+        richBytes: encodeRichText([{ text: "@主人A", mentionId: "7001" }, { text: " 需要补读背景" }]),
+      });
+      const hydHistBuf = buildNativeMessage({
+        id: "r14_hyd_bg_1",
+        chatId: "9910",
+        actorId: "7002",
+        createdAtSec: nowSec - 10,
+        position: 9,
+        richBytes: encodeRichText([{ text: "写锁吊销时不应落库的历史消息" }]),
+      });
+      app.store.set(pwSpokenGroupsKey("7001"), JSON.stringify({ "pw_chat:9910": { name: "写锁吊销测试群", at: now } }));
+      mock.addMessage("r14_hyd_trig", hydTriggerBuf);
+      mock.addMessage("r14_hyd_bg_1", hydHistBuf);
+      mock.setHistory("9910", { 9: hydHistBuf });
+      await svc.personalWeb.handleMessage(decodeMessage(hydTriggerBuf, "7001"), client);
+
+      let injectedHydRevoke = false;
+      svc.store.tx = (<T>(fn: () => T): T =>
+        origTx(() => {
+          if (!injectedHydRevoke) {
+            injectedHydRevoke = true;
+            app!.store.set(REVOKED_AT_KV_KEY, String(Date.now()));
+          }
+          return fn();
+        })) as typeof svc.store.tx;
+      try {
+        const bgCount = await svc.personalWeb.hydrateContext(
+          { id: "r14_hyd_trig", conversationId: "9910", rootId: "", parentId: "", threadId: "", position: 11, createdAtMs: now },
+          "pw_chat:9910",
+          "写锁吊销测试群",
+        );
+        assert.equal(bgCount, 0, "addBackgroundObs 写事务锁内检测到吊销必须返回 0");
+      } finally {
+        svc.store.tx = origTx;
+      }
+      assert.equal(injectedHydRevoke, true);
+      assert.equal(svc.store.obs("pw:r14_hyd_bg_1"), undefined, "写锁内吊销后历史背景绝不能落库");
+      app.store.set(REVOKED_AT_KV_KEY, "");
+    }
+
+    // 10) [R14 #10 P1] 无名轮询私聊（p2p）：先解析对方姓名再应用 groups_deny，仅含本人发出的无名私聊 fail-closed 且不推进 p2p/mine 游标
+    {
+      app.cfg.context.groups_deny = ["保密对象"];
+      // 10a) 无 chat_name 但同批有对方来信（sender.name = 保密对象）：来信与本人回信均须被过滤丢弃
+      fs.writeFileSync(
+        path.join(ctxDir, "lark.json"),
+        JSON.stringify({
+          user_open_id: "ou_owner_a",
+          user_name: "主人A",
+          p2p: [
+            {
+              message_id: "om_dm_sec_in",
+              chat_id: "oc_dm_sec",
+              chat_type: "p2p",
+              msg_type: "text",
+              create_time: new Date(now).toISOString(),
+              sender: { id: "ou_sec", name: "保密对象", sender_type: "user" },
+              content: "不要存储的私聊来信",
+            },
+            {
+              message_id: "om_dm_sec_out",
+              chat_id: "oc_dm_sec",
+              chat_type: "p2p",
+              msg_type: "text",
+              create_time: new Date(now + 1000).toISOString(),
+              sender: { id: "ou_owner_a", name: "主人A", sender_type: "user" },
+              content: "我在被排除私聊里的回复",
+            },
+          ],
+          mine: [
+            {
+              message_id: "om_dm_sec_out",
+              chat_id: "oc_dm_sec",
+              chat_type: "p2p",
+              msg_type: "text",
+              create_time: new Date(now + 1000).toISOString(),
+              sender: { id: "ou_owner_a", name: "主人A", sender_type: "user" },
+              content: "我在被排除私聊里的回复",
+            },
+          ],
+        }),
+      );
+      const r10a = await svc.connectors.pullIm();
+      assert.equal(r10a.count, 0, "命中 groups_deny 关键词的无名私聊来信与回信均不得入库");
+      assert.equal(svc.store.obs("im:om_dm_sec_in"), undefined);
+      assert.equal(svc.store.obs("im:om_dm_sec_out"), undefined);
+
+      // 10b) 仅含本人发出的无名私聊（im chats get 返回空 name）：必须按 inconclusive 暂缓且不推进 cursor.im.p2p 与 cursor.im.mine
+      const prevP2pCur = Number(app.store.get("ctx.cursor.im.p2p") ?? 0);
+      const prevMineCur = Number(app.store.get("ctx.cursor.im.mine") ?? 0);
+      await new Promise((r) => setTimeout(r, 10));
+      fs.writeFileSync(
+        path.join(ctxDir, "lark.json"),
+        JSON.stringify({
+          user_open_id: "ou_owner_a",
+          user_name: "主人A",
+          chat_meta: { oc_dm_unknown: { name: "", chat_mode: "p2p" } },
+          p2p: [
+            {
+              message_id: "om_dm_unk_out",
+              chat_id: "oc_dm_unknown",
+              chat_type: "p2p",
+              msg_type: "text",
+              create_time: new Date(now + 2000).toISOString(),
+              sender: { id: "ou_owner_a", name: "主人A", sender_type: "user" },
+              content: "仅本人发出的无名私聊消息",
+            },
+          ],
+          mine: [
+            {
+              message_id: "om_dm_unk_out",
+              chat_id: "oc_dm_unknown",
+              chat_type: "p2p",
+              msg_type: "text",
+              create_time: new Date(now + 2000).toISOString(),
+              sender: { id: "ou_owner_a", name: "主人A", sender_type: "user" },
+              content: "仅本人发出的无名私聊消息",
+            },
+          ],
+        }),
+      );
+      const r10b = await svc.connectors.pullIm();
+      assert.equal(r10b.count, 0, "无法确认对方的无名私聊不得入库");
+      assert.equal(svc.store.obs("im:om_dm_unk_out"), undefined);
+      assert.equal(Number(app.store.get("ctx.cursor.im.p2p") ?? 0), prevP2pCur, "无名私聊暂缓时不得推进 cursor.im.p2p");
+      assert.equal(Number(app.store.get("ctx.cursor.im.mine") ?? 0), prevMineCur, "来自 mine 流的无名私聊暂缓时不得推进 cursor.im.mine");
+
+      // 10c) 已存在的通用占位名「私聊」在存在名称排除规则时，checkConvAllowedForUnderstand 必须 fail-closed 返回 uncertain
+      svc.store.addObs([
+        {
+          id: "im:om_dm_generic_existing",
+          source: "im",
+          kind: "mine",
+          conv: "oc_dm_unknown",
+          conv_name: "私聊",
+          actor_id: "ou_owner_a",
+          actor_name: "主人A",
+          is_me: true,
+          time: now,
+          text: "旧版本写入的无名私聊",
+          url: "",
+          meta: { chat_type: "p2p" },
+        },
+      ]);
+      assert.equal(
+        await svc.personalWeb.checkConvAllowedForUnderstand("oc_dm_unknown", "私聊"),
+        "uncertain",
+        "存在名称排除规则且私聊仅有通用占位名「私聊」时不得送模型",
+      );
+      svc.store.markProcessed(["im:om_dm_generic_existing"]);
+      app.cfg.context.groups_deny = [];
+    }
+
+    // 11) [R14 #11 P2] fetchWithJar 对 401/403 响应暂存并彻底丢弃 Set-Cookie，既不污染活罐也不丢失并发轮换
+    {
+      let receivedOnOk = "";
+      httpCookieServer = http.createServer((req, res) => {
+        if (req.url === "/deny") {
+          res.writeHead(401, {
+            "Set-Cookie": ["session=; Path=/; Max-Age=0", "poison=bad; Path=/"],
+          });
+          res.end("unauthorized");
+          return;
+        }
+        if (req.url === "/redir-deny") {
+          res.writeHead(302, {
+            Location: "/deny",
+            "Set-Cookie": "session=wiped_on_hop0; Path=/",
+          });
+          res.end();
+          return;
+        }
+        if (req.url === "/ok") {
+          receivedOnOk = String(req.headers.cookie ?? "");
+          res.writeHead(200, { "Set-Cookie": "rotated=v2; Path=/" });
+          res.end("ok");
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+      await new Promise<void>((resolve) => httpCookieServer!.listen(0, "127.0.0.1", resolve));
+      const port = (httpCookieServer.address() as net.AddressInfo).port;
+      const base = `http://127.0.0.1:${port}`;
+      const jar = RecordingCookieJar.fromRecords(
+        [
+          { name: "session", value: "sess_live_keep", domain: "127.0.0.1", path: "/" },
+          { name: "other", value: "v1", domain: "127.0.0.1", path: "/" },
+        ],
+        ["127.0.0.1"],
+      );
+      const rDeny = await fetchWithJar(jar, {
+        method: "GET",
+        url: `${base}/deny`,
+        allowInsecureHttp: true,
+        extraAllowedHosts: ["127.0.0.1"],
+      });
+      assert.equal(rDeny.status, 401);
+      assert.equal(rDeny.cookiesUpdated, false, "401 拒绝响应不得标记 cookiesUpdated");
+      assert.equal(jar.cookieValue(new URL(`${base}/ok`), "session"), "sess_live_keep", "401 Set-Cookie 绝不能清除活罐里的 session");
+      assert.equal(jar.cookieValue(new URL(`${base}/ok`), "poison"), "", "401 新增 Cookie 必须丢弃");
+      assert.equal(jar.peekDelta().deletes.length, 0, "401 绝不能在 dirtyDeletes 留下删除增量");
+
+      const rRedirDeny = await fetchWithJar(jar, {
+        method: "GET",
+        url: `${base}/redir-deny`,
+        allowInsecureHttp: true,
+        extraAllowedHosts: ["127.0.0.1"],
+      });
+      assert.equal(rRedirDeny.status, 401);
+      assert.equal(rRedirDeny.cookiesUpdated, false);
+      assert.equal(jar.cookieValue(new URL(`${base}/ok`), "session"), "sess_live_keep", "经 302 跳进 401 时，302 跳暂存的 Set-Cookie 同样必须全部丢弃");
+
+      // 并发同步旋转无关 Cookie 后再发起成功请求：活罐继续发送原始 session 且保留并发轮换的 other=v_concurrent
+      jar.syncFromRecords(
+        [
+          { name: "session", value: "sess_live_keep", domain: "127.0.0.1", path: "/" },
+          { name: "other", value: "v_concurrent", domain: "127.0.0.1", path: "/" },
+        ],
+        Date.now(),
+        { preservePendingDelta: true },
+      );
+      const rOk = await fetchWithJar(jar, {
+        method: "GET",
+        url: `${base}/ok`,
+        allowInsecureHttp: true,
+        extraAllowedHosts: ["127.0.0.1"],
+      });
+      assert.equal(rOk.status, 200);
+      assert.equal(rOk.cookiesUpdated, true);
+      assert.ok(receivedOnOk.includes("session=sess_live_keep"), "下一次请求必须继续携带完好的原始 session");
+      assert.ok(receivedOnOk.includes("other=v_concurrent"), "无关并发 Cookie 轮换必须完整保留");
+      assert.equal(jar.cookieValue(new URL(`${base}/ok`), "rotated"), "v2");
+    }
+
+    // 12) [R14 #12 P2] 防止旧轮询覆写新消息编辑：跨进程 __poll_im__ 租约串行化 + poll_observed_at 单调保护
+    {
+      // 12a) 另一轮询正持有 __poll_im__ 租约时，重叠 pullIm() 跳过不竞态
+      assert.equal(svc.store.claimConv("__poll_im__", "other_holder", app.ledger.owner, 60_000), true);
+      fs.writeFileSync(
+        path.join(ctxDir, "lark.json"),
+        JSON.stringify({
+          user_open_id: "ou_owner_a",
+          user_name: "主人A",
+          at_me: [
+            {
+              message_id: "om_overlap_skip",
+              chat_id: "oc_overlap",
+              chat_name: "重叠群",
+              chat_type: "group",
+              msg_type: "text",
+              create_time: new Date(now).toISOString(),
+              sender: { id: "ou_x", name: "X", sender_type: "user" },
+              content: "租约占用时不该拉取",
+            },
+          ],
+        }),
+      );
+      const skippedOverlap = await svc.connectors.pullIm();
+      assert.equal(skippedOverlap.count, 0, "重叠轮询检测到活跃 __poll_im__ 租约时必须跳过");
+      assert.equal(svc.store.obs("im:om_overlap_skip"), undefined);
+      svc.store.releaseConv("__poll_im__", "other_holder", app.ledger.owner);
+
+      // 12b) addObs 的 poll_observed_at 单调保护：较早的慢轮询快照绝不能覆写并重开较新的消息编辑
+      svc.store.addObs([
+        {
+          id: "im:om_mono_edit",
+          source: "im",
+          kind: "at_me",
+          conv: "oc_mono",
+          conv_name: "单调群",
+          actor_id: "ou_x",
+          actor_name: "X",
+          is_me: false,
+          time: now,
+          text: "较新的已编辑正文",
+          url: "",
+          meta: { chat_type: "group", at_me: true, poll_observed_at: 2_000 },
+        },
+      ]);
+      svc.store.markProcessed(["im:om_mono_edit"]);
+      const staleOverwritten = svc.store.addObs([
+        {
+          id: "im:om_mono_edit",
+          source: "im",
+          kind: "at_me",
+          conv: "oc_mono",
+          conv_name: "单调群",
+          actor_id: "ou_x",
+          actor_name: "X",
+          is_me: false,
+          time: now,
+          text: "旧轮询拿到的编辑前正文",
+          url: "",
+          meta: { chat_type: "group", at_me: true, poll_observed_at: 1_000 },
+        },
+      ]);
+      assert.equal(staleOverwritten, 0, "较早的 poll_observed_at 绝不能覆盖较新的编辑");
+      assert.equal(svc.store.obs("im:om_mono_edit")?.text, "较新的已编辑正文");
+      assert.equal(svc.store.obsPending("im:om_mono_edit"), false, "旧快照绝不能重新打开已处理的新编辑观测");
+    }
+
+    // 13) [R14 #13 P2] 自动预起草在模型推理返回后必须复检事项状态、目标消息修订与静音策略；期间变更须丢弃且不发草稿卡
+    {
+      const draftProj = svc.store.upsertProject({ name: "R14推理后复检项目" });
+      const postTargetId = "pw:r14_post_draft_target";
+      svc.store.addObs([
+        {
+          id: postTargetId,
+          source: "im",
+          kind: "at_me",
+          conv: "pw_chat:9913",
+          conv_name: "推理后复检群",
+          actor_id: "7002",
+          actor_name: "同事",
+          is_me: false,
+          time: now,
+          text: "@主人A 请确认方案",
+          url: "",
+          meta: {
+            transport: "personal_web",
+            native_owner_id: "7001",
+            native_message_id: "r14_post_draft_target",
+            native_chat_id: "9913",
+            chat_type: "group",
+            at_me: true,
+          },
+        },
+      ]);
+      mock.setChatName("9913", "推理后复检群");
+      mock.setChatKind("9913", CHAT_KIND_GROUP);
+      const { item: postItem } = svc.store.upsertItem({
+        title: "推理期间被关闭或编辑的事项",
+        kind: "ask_me",
+        source: "im",
+        project_id: draftProj.id,
+        priority: "high",
+        confidence: 0.95,
+        status: "open",
+        meta: {},
+      });
+      svc.store.addEvidence("item", postItem.id, postTargetId, "请确认方案", now);
+
+      const origDraftRunner = svc.drafter.runner;
+      // 13a) 模型推理期间事项被关闭 -> 丢弃结果，既不落库也不发草稿卡
+      let draftLlmRan = 0;
+      svc.drafter.runner = async () => {
+        draftLlmRan++;
+        svc.store.setItemStatus(postItem.id, "done", { reason: "推理期间主人已手动完成" });
+        return { ok: true, aborted: false, text: "过期自动回复草稿", exitCode: 0, timedOut: false, durationMs: 1 };
+      };
+      const wClose = `draft:r14-post-close`;
+      svc.enqueue(wClose, { task: "draft", item_id: postItem.id, kind: "reply", auto: true });
+      await app.engine.drain(["context"]);
+      assert.equal(draftLlmRan, 1);
+      assert.equal(app.ledger.get(`context:${wClose}`)?.state, "skipped", "推理期间事项关闭时自动预起草必须跳过");
+      assert.equal(svc.store.drafts({ item_id: postItem.id }).length, 0, "推理期间事项关闭后绝不能保存过期草稿");
+      assert.equal(
+        app.ledger.list({ kinds: ["effect"], limit: 200 }).some((e) => e.ref.startsWith("card:ctx-draft:")),
+        false,
+        "丢弃过期草稿时绝不能发布草稿卡片",
+      );
+
+      // 13b) 重新打开事项，改为模型推理期间目标消息被编辑 -> 同样必须丢弃不保存
+      svc.store.setItemStatus(postItem.id, "open");
+      svc.drafter.runner = async () => {
+        svc.store.addObs([
+          {
+            id: postTargetId,
+            source: "im",
+            kind: "at_me",
+            conv: "pw_chat:9913",
+            conv_name: "推理后复检群",
+            actor_id: "7002",
+            actor_name: "同事",
+            is_me: false,
+            time: now,
+            text: "@主人A 需求已变更请先别回旧方案",
+            url: "",
+            meta: {
+              transport: "personal_web",
+              native_owner_id: "7001",
+              native_message_id: "r14_post_draft_target",
+              native_chat_id: "9913",
+              chat_type: "group",
+              at_me: true,
+            },
+          },
+        ]);
+        return { ok: true, aborted: false, text: "基于旧消息生成的回复", exitCode: 0, timedOut: false, durationMs: 1 };
+      };
+      const wEdit = `draft:r14-post-edit`;
+      svc.enqueue(wEdit, { task: "draft", item_id: postItem.id, kind: "reply", auto: true });
+      await app.engine.drain(["context"]);
+      assert.equal(app.ledger.get(`context:${wEdit}`)?.state, "skipped", "推理期间目标消息被编辑时必须丢弃草稿");
+      assert.equal(svc.store.drafts({ item_id: postItem.id }).length, 0);
+
+      // 13c) 模型推理期间会话被静音 -> 同样必须丢弃不保存
+      svc.drafter.runner = async () => {
+        svc.store.muteConv("pw_chat:9913", "推理后复检群", true);
+        return { ok: true, aborted: false, text: "静音期间生成的回复", exitCode: 0, timedOut: false, durationMs: 1 };
+      };
+      const wMute = `draft:r14-post-mute`;
+      svc.enqueue(wMute, { task: "draft", item_id: postItem.id, kind: "reply", auto: true });
+      await app.engine.drain(["context"]);
+      svc.drafter.runner = origDraftRunner;
+      assert.equal(app.ledger.get(`context:${wMute}`)?.state, "skipped", "推理期间会话被静音时必须丢弃草稿");
+      assert.equal(svc.store.drafts({ item_id: postItem.id }).length, 0);
+      svc.store.muteConv("pw_chat:9913", "", false);
+    }
+
+    // 14) [R14 #14 P2] spoken 模式排位优先使用 knownNames 中核验过的新群名，改名脱离排除词后立即恢复轮询
+    {
+      app.cfg.context.groups = "spoken";
+      app.cfg.context.groups_deny = ["旧禁用名"];
+      const ranked = selectEffectiveOpenGroups({
+        cfg: app.cfg,
+        store: svc.store,
+        spoken: { oc_r14_renamed: { name: "旧禁用名", at: now } },
+        knownNames: { oc_r14_renamed: "已改名合法群" },
+        now,
+      });
+      assert.equal(ranked.length, 1, "knownNames 中核验的新群名必须优先于 spoken 旧名，使改名后的群恢复入选");
+      assert.equal(ranked[0][0], "oc_r14_renamed");
+      assert.equal(ranked[0][1].name, "已改名合法群");
+
+      // 端到端 pullIm 验证：spoken_groups 仍存旧禁用名、known_open_group_names 已存新合法名 -> 必须恢复轮询该群消息
+      app.store.set("ctx.spoken_groups", JSON.stringify({ oc_r14_renamed: { name: "旧禁用名", at: now } }));
+      rememberOpenGroupName(app.store, "oc_r14_renamed", "已改名合法群");
+      fs.writeFileSync(
+        path.join(ctxDir, "lark.json"),
+        JSON.stringify({
+          user_open_id: "ou_owner_a",
+          user_name: "主人A",
+          chats: {
+            oc_r14_renamed: [
+              {
+                message_id: "om_r14_resumed",
+                chat_id: "oc_r14_renamed",
+                chat_name: "已改名合法群",
+                chat_type: "group",
+                msg_type: "text",
+                create_time: new Date(now).toISOString(),
+                sender: { id: "ou_x", name: "同事", sender_type: "user" },
+                content: "改名后应恢复拉取的群消息",
+              },
+            ],
+          },
+        }),
+      );
+      const r14Pull = await svc.connectors.pullIm();
+      assert.ok(r14Pull.count >= 1);
+      assert.ok(svc.store.obs("im:om_r14_resumed"), "改名后的发言群必须恢复轮询并入库消息");
+      app.cfg.context.groups_deny = [];
+    }
+
+    // 15) [R14 #15 P2] listDispatches 将 terminal / states / search 下推到 SQL，不空扫整张历史账本
+    {
+      for (let i = 0; i < 120; i++) {
+        const wid = `dispatch:r14-hist-${i}`;
+        app.ledger.enqueue({
+          id: wid,
+          kind: "dispatch",
+          ref: `t_hist_${i}`,
+          state: "accepted",
+          payload: { guid: `t_hist_${i}`, summary: `历史已完成任务 ${i}`, branch: `pa/h${i}` },
+        });
+        app.store.db.prepare("UPDATE work SET terminal = 1 WHERE id = ?").run(wid);
+      }
+      const origStoreGet = app.store.get.bind(app.store);
+      let ownerLookupCalls = 0;
+      app.store.get = ((k: string) => {
+        if (k.startsWith("ctx.dispatch_owner.") || k.startsWith("ctx.dispatch_ref_owner.")) ownerLookupCalls++;
+        return origStoreGet(k);
+      }) as typeof app.store.get;
+      try {
+        const emptyActive = Q.listDispatches(app, { filter: "active", limit: 10 });
+        assert.deepEqual(emptyActive, []);
+        assert.equal(ownerLookupCalls, 0, "无进行中派单时 active 查询必须经 SQL 直接返回空，零次历史行归属校验");
+      } finally {
+        app.store.get = origStoreGet;
+      }
+
+      // 加入 1 条被主人隔离的 active 派单 + 1 条当前主人可见的 active 派单 + 搜索词验证
+      app.ledger.enqueue({
+        id: "dispatch:r14-act-visible",
+        kind: "dispatch",
+        ref: "t_act_vis",
+        state: "executing",
+        payload: { guid: "t_act_vis", summary: "可见活跃修复 Alpha", branch: "pa/vis" },
+      });
+      app.ledger.enqueue({
+        id: "dispatch:r14-act-hidden",
+        kind: "dispatch",
+        ref: "t_act_hid",
+        state: "executing",
+        payload: { guid: "t_act_hid", summary: "他人活跃修复 Alpha", branch: "pa/hid" },
+      });
+      app.store.set("ctx.dispatch_owner.dispatch:r14-act-hidden", "ou_other_owner");
+      const actRes = Q.listDispatches(app, { filter: "active", q: "alpha", limit: 1 });
+      assert.equal(actRes.length, 1, "过滤掉他人活跃派单后仍必须补足 limit=1");
+      assert.equal(actRes[0].id, "dispatch:r14-act-visible");
+      const doneSearch = Q.listDispatches(app, { filter: "done", q: "历史已完成任务 99", limit: 5 });
+      assert.equal(doneSearch.length, 1);
+      assert.equal(doneSearch[0].id, "dispatch:r14-hist-99");
+    }
+
+    // 16) [R14 #16 P3] hydrateContext 最终同步排除检查保留 DM 类型，同名已静音开放平台群不得误删合法私聊历史背景
+    {
+      app.cfg.context.groups_deny = ["某个不相关关键词"];
+      // 静音一个名为「Alice」的开放平台群（与私聊完全无关）
+      fs.writeFileSync(
+        path.join(ctxDir, "lark.json"),
+        JSON.stringify({
+          user_open_id: "ou_owner_a",
+          user_name: "主人A",
+          chat_meta: { oc_muted_grp_alice: { name: "Alice", chat_mode: "group" } },
+        }),
+      );
+      svc.store.muteConv("oc_muted_grp_alice", "Alice", true);
+      mock.setChatName("9916", "Alice");
+      mock.setChatKind("9916", CHAT_KIND_P2P);
+      const dmTrigBuf = buildNativeMessage({
+        id: "r14_dm_hyd_trig",
+        chatId: "9916",
+        actorId: "7008",
+        chatKind: CHAT_KIND_P2P,
+        createdAtSec: nowSec,
+        position: 5,
+        richBytes: encodeRichText([{ text: "Alice 私聊最新消息" }]),
+      });
+      const dmHistBuf = buildNativeMessage({
+        id: "r14_dm_hyd_bg",
+        chatId: "9916",
+        actorId: "7008",
+        chatKind: CHAT_KIND_P2P,
+        createdAtSec: nowSec - 30,
+        position: 4,
+        richBytes: encodeRichText([{ text: "Alice 私聊上下文历史背景" }]),
+      });
+      mock.addMessage("r14_dm_hyd_trig", dmTrigBuf);
+      mock.addMessage("r14_dm_hyd_bg", dmHistBuf);
+      mock.setHistory("9916", { 4: dmHistBuf });
+      await svc.personalWeb.handleMessage(decodeMessage(dmTrigBuf, "7001"), client);
+
+      const hydCount = await svc.personalWeb.hydrateContext(
+        { id: "r14_dm_hyd_trig", conversationId: "9916", rootId: "", parentId: "", threadId: "", position: 5, createdAtMs: now },
+        "pw_chat:9916",
+        "私聊：Alice",
+      );
+      assert.ok(hydCount >= 1, "同名已静音群不得导致合法私聊的补读历史被最终同步检查误丢弃");
+      assert.ok(svc.store.obs("pw:r14_dm_hyd_bg"), "合法私聊的历史背景应完整入库");
+      svc.store.muteConv("oc_muted_grp_alice", "", false);
+      app.cfg.context.groups_deny = [];
+    }
+  } finally {
+    if (httpCookieServer) await new Promise<void>((resolve) => httpCookieServer!.close(() => resolve()));
+    if (hostSockServer) await new Promise<void>((resolve) => hostSockServer!.close(() => resolve()));
+    if (sshSockServer) await new Promise<void>((resolve) => sshSockServer!.close(() => resolve()));
+    if (shmRunDir) fs.rmSync(shmRunDir, { recursive: true, force: true });
+    if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevKey;
+    if (prevCredFile === undefined) delete process.env.PA_FEISHU_WEB_CRED_FILE;
+    else process.env.PA_FEISHU_WEB_CRED_FILE = prevCredFile;
+    if (prevCredDir === undefined) delete process.env.CREDENTIALS_DIRECTORY;
+    else process.env.CREDENTIALS_DIRECTORY = prevCredDir;
+    if (prevCtxDir === undefined) delete process.env.CTX_DIR;
+    else process.env.CTX_DIR = prevCtxDir;
+    app?.store.db.close();
+    await mock.close();
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

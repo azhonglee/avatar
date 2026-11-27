@@ -358,33 +358,44 @@ export function listDispatches(app: App, f: { filter?: DispatchFilter; q?: strin
   const maxItems = Math.min(Math.max(0, f.limit ?? 200), 500);
   if (maxItems === 0) return [];
   const q = f.q?.trim().toLowerCase();
+  // SQLite LOWER() 仅折叠 ASCII 字母，对于全 ASCII 或无大小写差异字符（如中文/数字）直接下推 SQL 过滤；
+  // 含非 ASCII 大小写字母（如德语/俄语）时保留内存端完整匹配。
+  const canPushSearch =
+    !!q && [...q].every((ch) => ch.charCodeAt(0) < 128 || ch.toLowerCase() === ch.toUpperCase());
+  let states: string[] | undefined;
+  let terminal: boolean | undefined;
+  switch (f.filter ?? "all") {
+    case "active":
+      terminal = false;
+      break;
+    case "attention":
+      states = [...ATTENTION];
+      break;
+    case "review":
+      states = [...REVIEW];
+      break;
+    case "done":
+      terminal = true;
+      break;
+    default:
+      break;
+  }
   const pageSize = Math.min(Math.max(maxItems * 2, 50), 500);
   const matched: WorkItem<DispatchPayload>[] = [];
   let before: number | undefined;
   for (;;) {
-    const page = app.ledger.list<DispatchPayload>({ kinds: ["dispatch"], limit: pageSize, before });
+    const page = app.ledger.list<DispatchPayload>({
+      kinds: ["dispatch"],
+      states,
+      terminal,
+      search: canPushSearch ? q : undefined,
+      limit: pageSize,
+      before,
+    });
     if (!page.length) break;
     for (const w of page) {
+      if (q && !canPushSearch && !`${w.payload.summary ?? ""} ${w.ref} ${w.id}`.toLowerCase().includes(q)) continue;
       if (isContextDerivedDispatchBlocked(app, w.id)) continue;
-      let matchesFilter = true;
-      switch (f.filter ?? "all") {
-        case "active":
-          matchesFilter = !w.terminal;
-          break;
-        case "attention":
-          matchesFilter = ATTENTION.includes(w.state as DispatchState);
-          break;
-        case "review":
-          matchesFilter = REVIEW.includes(w.state as DispatchState);
-          break;
-        case "done":
-          matchesFilter = w.terminal;
-          break;
-        default:
-          matchesFilter = true;
-      }
-      if (!matchesFilter) continue;
-      if (q && !`${w.payload.summary ?? ""} ${w.ref} ${w.id}`.toLowerCase().includes(q)) continue;
       matched.push(w);
       if (matched.length >= maxItems) break;
     }

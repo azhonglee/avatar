@@ -1344,6 +1344,23 @@ export class PersonalWebBridge {
       if (nameRules.length > 0 && dmLabels.some((lbl) => nameRules.some((d) => lbl.includes(d)))) {
         return "excluded";
       }
+      // 存在名称关键词排除规则时，若开放平台私聊仅存通用占位名（如「私聊」或空）且无法核实对方姓名，
+      // 先实时查询一次 im chats get，仍无法确认对方身份时按 uncertain 暂缓（fail-closed）
+      if (nameRules.length > 0) {
+        const hasConcretePeer = (lbl: string): boolean => {
+          const clean = lbl.replace(/^私聊[:：]?/, "").trim();
+          return !!clean && clean !== "私聊" && clean !== conv;
+        };
+        let concrete = dmLabels.some(hasConcretePeer);
+        if (!concrete) {
+          const fresh = await this.resolveOpenChatMeta(conv, { force: true });
+          if (fresh?.meta.name) {
+            if (nameRules.some((d) => fresh.meta.name.includes(d))) return "excluded";
+            concrete = hasConcretePeer(fresh.meta.name);
+          }
+        }
+        if (!concrete) return "uncertain";
+      }
       return nativeExcl.dmsInconclusive ? "uncertain" : "allowed";
     }
     if (recordedType === "unknown") {
@@ -1673,10 +1690,28 @@ export class PersonalWebBridge {
 
     // 5) 落库前最终核验会话代际、中止信号与当前采集策略（包含 oc_* 与关键词排除规则）：
     //    如果异步排除查询期间策略变化，先重跑排除校验并用核验后的真实群名/私聊名做同步终检，
-    //    彻底杜绝「登出/静音/新增关键词排除/关闭 sources.im 发生在最后一次 await 期间仍把消息写入数据库」的竞态。
+    //    随后在 addObs 的 BEGIN IMMEDIATE 写事务锁内再次执行同一同步终检与策略签名核对，
+    //    彻底杜绝跨进程 web-logout/静音/新增关键词排除/关闭 sources.im 在写锁竞争窗口内仍把消息写入数据库。
     const checkFinalIngestSync = (): boolean => {
       if (signal?.aborted) {
         throw new WebHttpError("aborted", "会话已中止，放弃提交推送观测");
+      }
+      if ((this.app.store.get(REVOKED_AT_KV_KEY) ?? "").trim()) {
+        throw new WebHttpError("aborted", "个人 Web 会话已被 web-logout 吊销，放弃提交推送观测");
+      }
+      if (capturedSessionId && loadRevokedSessionIds(this.app.store).has(capturedSessionId)) {
+        throw new WebHttpError("aborted", "个人 Web 会话代际已被吊销，放弃提交推送观测");
+      }
+      const activeSession = (this.app.store.get(ACTIVE_SESSION_KV_KEY) ?? "").trim();
+      if (activeSession && (capturedSessionId || activeClient) && capturedSessionId !== activeSession) {
+        throw new WebHttpError("aborted", "个人 Web 会话已被更新的登录取代，放弃提交推送观测");
+      }
+      if (hasWorkspaceOwnerMismatch(this.app.store, this.cfg.owner.open_id)) {
+        throw new WebHttpError("aborted", "工作区主人已变更，放弃提交推送观测");
+      }
+      const boundNative = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
+      if (boundNative && ownerId && boundNative !== ownerId) {
+        throw new WebHttpError("aborted", "个人 Web 账号绑定已变更，放弃提交推送观测");
       }
       if (capturedSessionId) {
         const diskNow = this.loginStore.load();
@@ -1692,7 +1727,8 @@ export class PersonalWebBridge {
     };
 
     if (!checkFinalIngestSync()) return;
-    if (this.nativeExclusionPolicyKey() !== exclPolicyBefore) {
+    let verifiedExclPolicy = exclPolicyBefore;
+    if (this.nativeExclusionPolicyKey() !== verifiedExclPolicy) {
       const exclPolicyRetry = this.nativeExclusionPolicyKey();
       const exclResNow = await this.evaluateChatExclusion({
         chatId: effectiveMsg.conversationId,
@@ -1715,14 +1751,7 @@ export class PersonalWebBridge {
         // 排除规则连续两次在异步查询期间变化：抛可重试错误暂缓 ACK，防止 handlePush 误确认导致合法消息丢失
         throw new Error("推送入库期间排除规则连续变化，暂缓 ACK 留待飞书重投");
       }
-    }
-
-    if (effectiveMsg.conversationKind === "group" && isMe && this.cfg.context.groups !== "allowlist") {
-      this.recordPwSpokenGroup(ownerId, pwConv, chatName, effectiveMsg.createdAtMs || Date.now());
-    }
-    if (effectiveMsg.conversationKind === "group" && !isAtMe && !this.isGroupInScope(effectiveMsg.conversationId, pwConv, ownerId)) {
-      if (!isMe) this.store.retirePendingObs(`pw:${effectiveMsg.id}`);
-      return;
+      verifiedExclPolicy = exclPolicyRetry;
     }
 
     const obs: Obs = {
@@ -1753,7 +1782,23 @@ export class PersonalWebBridge {
       },
     };
 
-    const inserted = this.store.addObs([obs]);
+    let committed = false;
+    const inserted = this.store.addObs([obs], () => {
+      if (!checkFinalIngestSync()) return false;
+      if (this.nativeExclusionPolicyKey() !== verifiedExclPolicy) {
+        throw new Error("推送入库写事务锁内检测到排除规则变更，暂缓 ACK 留待飞书重投");
+      }
+      if (effectiveMsg.conversationKind === "group" && isMe && this.cfg.context.groups !== "allowlist") {
+        this.recordPwSpokenGroup(ownerId, pwConv, chatName, effectiveMsg.createdAtMs || Date.now());
+      }
+      if (effectiveMsg.conversationKind === "group" && !isAtMe && !this.isGroupInScope(effectiveMsg.conversationId, pwConv, ownerId)) {
+        if (!isMe) this.store.retirePendingObs(`pw:${effectiveMsg.id}`);
+        return false;
+      }
+      committed = true;
+      return true;
+    });
+    if (!committed) return;
     this.persistState({ last_message_at: Date.now() });
 
     const pwCfg = this.cfg.context.personal_web;
@@ -1952,18 +1997,19 @@ export class PersonalWebBridge {
         }
       }
       if (!collected.size) return 0;
-      // 落库前重新核验会话代际与全部采集策略（含最后一次异步复核之后的无 await 同步终检）
+      // 落库前重新核验会话代际与全部采集策略（含最后一次异步复核之后在写事务锁内的无 await 同步终检）
       const checkHydrateFinalSync = (): boolean => {
         if (signal?.aborted) return false;
         if (!sessionStillValid()) return false;
         if (!this.cfg.context.sources.im || !this.cfg.context.personal_web.enabled) return false;
         if (this.store.isConvMutedById(conv) || this.store.isConvMutedById(primary.conversationId)) return false;
-        if (this.isDirectlyDenied(conv, chatName || convName)) return false;
+        if (this.isDirectlyDenied(conv, chatName || convName, undefined, isDm ? "dm" : "group")) return false;
         if (!isDm && !this.isGroupInScope(primary.conversationId, conv, clientOwnerId)) return false;
         return true;
       };
       if (!checkHydrateFinalSync()) return 0;
-      if (this.nativeExclusionPolicyKey() !== exclPolicyBefore) {
+      let verifiedHydratePolicy = exclPolicyBefore;
+      if (this.nativeExclusionPolicyKey() !== verifiedHydratePolicy) {
         const exclPolicyRetry = this.nativeExclusionPolicyKey();
         try {
           const exclResNow = await this.evaluateChatExclusion({
@@ -1983,6 +2029,7 @@ export class PersonalWebBridge {
         }
         if (!checkHydrateFinalSync()) return 0;
         if (this.nativeExclusionPolicyKey() !== exclPolicyRetry) return 0;
+        verifiedHydratePolicy = exclPolicyRetry;
       }
       const ownerName = this.app.store.get("ctx.owner_name") || clientOwnerName || "我";
       const bg: Obs[] = [...collected.values()].map((m) => {
@@ -2014,7 +2061,10 @@ export class PersonalWebBridge {
           },
         };
       });
-      return this.store.addBackgroundObs(bg);
+      return this.store.addBackgroundObs(
+        bg,
+        () => checkHydrateFinalSync() && this.nativeExclusionPolicyKey() === verifiedHydratePolicy,
+      );
     } catch (e) {
       log("warn", "快通道补读会话背景失败（继续理解当前消息）", { conv, err: errMsg(e) });
       return 0;

@@ -132,8 +132,10 @@ export async function initApp(app: App): Promise<void> {
     }
     app.cfg.owner.open_id = id;
   }
+  const prevOwner = (app.store.get("owner.open_id") ?? "").trim();
+  // 先核验既有看板归属再写入 owner.open_id，避免用新配置覆盖旧主人记录后把遗留看板永久改标为新主人
+  await app.board.init({ prevOwner });
   app.store.set("owner.open_id", app.cfg.owner.open_id);
-  await app.board.init();
   await app.kb.init();
 }
 

@@ -37,7 +37,7 @@ export class Board {
   }
 
   /** 幂等：找到同名清单/分组就复用，找不到才创建。 */
-  async init(): Promise<void> {
+  async init(opts?: { prevOwner?: string }): Promise<void> {
     let tasklist = this.store.get("board.tasklist");
     const cfgOwner = this.cfg.owner.open_id.trim();
     if (!tasklist) {
@@ -51,10 +51,27 @@ export class Board {
       }
       this.store.set("board.tasklist", tasklist);
       if (cfgOwner) this.store.set("board.owner_open_id", cfgOwner);
-    } else if (cfgOwner && !this.store.get("board.owner_open_id")) {
-      const recordedOwner = (this.store.get("owner.open_id") ?? "").trim();
-      if (!recordedOwner || recordedOwner === cfgOwner) {
-        this.store.set("board.owner_open_id", cfgOwner);
+    } else {
+      const existingBoardOwner = (this.store.get("board.owner_open_id") ?? "").trim();
+      if (existingBoardOwner) {
+        if (!cfgOwner || existingBoardOwner !== cfgOwner) {
+          throw new Error(
+            `本地持久化看板归属账号 (${existingBoardOwner}) 与当前配置 owner.open_id (${cfgOwner || "未配置"}) 不一致，拒绝复用或改标；请切回原主人或使用全新的 data_dir 重新运行 pa init`,
+          );
+        }
+      } else {
+        const priorOwner = (opts?.prevOwner !== undefined ? opts.prevOwner : (this.store.get("owner.open_id") ?? "")).trim();
+        if (!priorOwner) {
+          throw new Error(
+            "本地已有遗留看板 (board.tasklist)，但缺少原始主人记录 (owner.open_id)，无法确立归属；为防跨账号混用，拒绝自动接管，请使用全新的 data_dir 重新运行 pa init",
+          );
+        }
+        if (!cfgOwner || priorOwner !== cfgOwner) {
+          throw new Error(
+            `本地遗留看板归属原主人 (${priorOwner})，与当前配置 owner.open_id (${cfgOwner || "未配置"}) 不一致，拒绝改标为新主人；请切回原主人或使用全新的 data_dir 重新运行 pa init`,
+          );
+        }
+        this.store.set("board.owner_open_id", priorOwner);
       }
     }
     const listed = await this.lark.run(

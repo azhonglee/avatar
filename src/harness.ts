@@ -102,12 +102,45 @@ function isGenuineGitCommonDir(dir: string): boolean {
   }
 }
 
+function parseGitConfigWorktree(gitDir: string): string | undefined {
+  const cfgPath = path.join(gitDir, "config");
+  try {
+    if (!fs.lstatSync(cfgPath).isFile()) return undefined;
+    const text = fs.readFileSync(cfgPath, "utf8");
+    let inCore = false;
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+      const sec = line.match(/^\[([^\]]+)\]$/);
+      if (sec) {
+        inCore = sec[1].trim().toLowerCase() === "core";
+        continue;
+      }
+      if (!inCore) continue;
+      const m = line.match(/^worktree\s*=\s*(.+)$/i);
+      if (m) {
+        let val = m[1].trim();
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+          val = val.slice(1, -1);
+        }
+        if (val) return safeRealpath(path.isAbsolute(val) ? val : path.resolve(gitDir, val));
+      }
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
 /**
- * 探测并严格校验 worktree 对应的 .git 管理目录与主仓 commondir：
- *   - 绝不盲信可写 worktree 内的 `.git` / `commondir` 指向任意宿主机路径；
- *   - 拒绝符号链接 `.git` / `commondir` / `gitdir`，要求 `<gitDir>/gitdir` 反向指向当前 `<dir>/.git`，
- *     要求 `gitDir` 严格位于 `<commonDir>/worktrees/` 下且 `commonDir` 为合法 Git 仓库目录且不在 `dataDir` 内；
- *   - 提供 `trustedRepoRoot` 时，进一步要求 `commonDir` 与受信任仓库的真实 `.git` 目录完全一致，不一致直接抛错拒绝挂载。
+ * 探测并严格校验 worktree / `--separate-git-dir` / submodule 对应的 .git 管理目录与主仓 commondir：
+ *   - 绝不盲信可写工作区内的 `.git` / `commondir` 指向任意宿主机路径；
+ *   - 拒绝符号链接 `.git` / `commondir` / `gitdir`；
+ *   - 链接 worktree（存在 commondir）：要求 `<gitDir>/gitdir` 反向指向当前 `<dir>/.git`、
+ *     `gitDir` 严格位于 `<commonDir>/worktrees/` 下且 `commonDir` 为合法 Git 仓库目录且不在 `dataDir` 内；
+ *   - `--separate-git-dir` 或 submodule（无 commondir）：要求 `gitDir` 自身为合法 Git 仓库目录且 `core.worktree` 指回当前 `dir`，
+ *     提供 `trustedRepoRoot` 时要求 `gitDir` 归属受信任仓库（等于其 `.git` 或位于其 `.git/modules/` 下）；
+ *   - 不满足以上任一约束时直接抛错拒绝挂载。
  */
 export function detectGitWorktreeDirs(
   dir: string,
@@ -148,7 +181,40 @@ export function detectGitWorktreeDirs(
     return reject("gitdir 目标不存在或不可访问");
   }
 
+  const resolvedDataDir = opts?.dataDir ? safeRealpath(opts.dataDir) : undefined;
   const commonFile = path.join(gitDir, "commondir");
+  const hasCommonFile = fs.existsSync(commonFile);
+
+  if (!hasCommonFile) {
+    // 区分合法的 `--separate-git-dir` 仓库与 submodule 检出（两者均无 commondir，gitDir 自身是完整 Git 目录）：
+    //   - submodule 的 <gitDir>/config 含 core.worktree 且必须反向指向 realDir；
+    //   - `git init --separate-git-dir` 不写 core.worktree，若指定了 trustedRepoRoot 必须严格匹配该受信任仓库的 expectedCommon。
+    if (!isGenuineGitCommonDir(gitDir)) {
+      return reject("gitdir 缺少 commondir 且自身不是合法 Git 仓库目录");
+    }
+    if (resolvedDataDir && isPathInsideOrEqual(gitDir, resolvedDataDir)) {
+      return reject("Git 元数据目录不得落入 dataDir 私有目录内");
+    }
+    const configuredWt = parseGitConfigWorktree(gitDir);
+    if (configuredWt && configuredWt !== realDir) {
+      return reject("gitdir/config 中的 core.worktree 与当前检出目录不一致");
+    }
+    if (opts?.trustedRepoRoot) {
+      const trustedRoot = safeRealpath(opts.trustedRepoRoot);
+      const expectedCommon = resolveExpectedGitCommonDir(trustedRoot);
+      const modulesRoot = path.join(expectedCommon, "modules");
+      const isTrustedSeparate = realDir === trustedRoot && gitDir === expectedCommon;
+      const isTrustedSubmodule =
+        isPathInsideOrEqual(gitDir, modulesRoot) &&
+        gitDir !== modulesRoot &&
+        configuredWt === realDir;
+      if (!isTrustedSeparate && !isTrustedSubmodule) {
+        return reject(`gitdir (${gitDir}) 不属于受信任仓库 (${expectedCommon})`);
+      }
+    }
+    return { gitDir, commonDir: gitDir };
+  }
+
   const backFile = path.join(gitDir, "gitdir");
   let commonDir: string;
   try {
@@ -183,8 +249,7 @@ export function detectGitWorktreeDirs(
   if (!isGenuineGitCommonDir(commonDir)) {
     return reject("commondir 不是合法的 Git 仓库目录");
   }
-  if (opts?.dataDir) {
-    const resolvedDataDir = safeRealpath(opts.dataDir);
+  if (resolvedDataDir) {
     if (isPathInsideOrEqual(gitDir, resolvedDataDir) || isPathInsideOrEqual(commonDir, resolvedDataDir)) {
       return reject("Git 元数据目录不得落入 dataDir 私有目录内");
     }
@@ -293,21 +358,30 @@ export function buildWorkspaceIsolation(
   const writablePaths: string[] = [];
   const readOnlyPaths: string[] = [];
   const resolvedCwd = opts.cwd ? safeRealpath(opts.cwd) : undefined;
-  const shouldInspectGit = opts.mode !== "llm-none" && !opts.disableGitWorktreeMounts && !!resolvedCwd;
+  // 仅在实际需要启用沙箱隔离时才规划并校验 Git 外部挂载目录，避免未启用隔离的工作区在 submodule / --separate-git-dir 上误报
+  const shouldInspectGit =
+    requireIsolation && opts.mode !== "llm-none" && !opts.disableGitWorktreeMounts && !!resolvedCwd;
   const wt = shouldInspectGit
     ? detectGitWorktreeDirs(resolvedCwd!, { trustedRepoRoot: opts.trustedRepoRoot, dataDir })
     : {};
 
   if (opts.mode === "llm-none") {
     if (resolvedCwd) readOnlyPaths.push(resolvedCwd);
-  } else if (opts.mode === "verify") {
-    if (resolvedCwd) writablePaths.push(resolvedCwd);
-    if (wt.gitDir) writablePaths.push(wt.gitDir);
-    if (wt.commonDir && wt.commonDir !== wt.gitDir) readOnlyPaths.push(wt.commonDir);
-  } else if (opts.mode === "worker-write") {
-    if (resolvedCwd) writablePaths.push(resolvedCwd);
-    if (wt.commonDir) writablePaths.push(wt.commonDir);
-    else if (wt.gitDir) writablePaths.push(wt.gitDir);
+  } else if (opts.mode === "verify" || opts.mode === "worker-write") {
+    if (resolvedCwd) {
+      writablePaths.push(resolvedCwd);
+      // 若工作目录自身直接含 .git 目录（非 linked worktree），同样将其覆挂为只读，防止不可信 worker/verify 改写仓库 hooks 或配置
+      const localDotGit = path.join(resolvedCwd, ".git");
+      try {
+        if (fs.lstatSync(localDotGit).isDirectory()) readOnlyPaths.push(safeRealpath(localDotGit));
+      } catch {
+        // ignore
+      }
+    }
+    // 共享 Git 元数据（主仓 commondir 及 worktree admin gitDir）对不可信 worker 与 verify 一律只读，
+    // 防止改写共享 refs / config / hooks 或 commondir；实际 Git 提交由受信任的 Dispatcher/Delivery (git-rw) 完成。
+    if (wt.commonDir) readOnlyPaths.push(wt.commonDir);
+    if (wt.gitDir && wt.gitDir !== wt.commonDir) readOnlyPaths.push(wt.gitDir);
   } else if (opts.mode === "worker-ro" || opts.mode === "codex-exec") {
     if (resolvedCwd) readOnlyPaths.push(resolvedCwd);
     if (wt.commonDir) readOnlyPaths.push(wt.commonDir);
@@ -445,8 +519,8 @@ const MOUNTINFO_UNESCAPE_AWK = [
 
 const UNSHARE_ISOLATION_SCRIPT = [
   "set -e",
-  'PIVOT_ROOT="$1"; SETPRIV="$2"; DD="$3"; CWD="$4"; PRE_COUNT="$5"; POST_COUNT="$6"; M_COUNT="$7"',
-  "shift 7",
+  'PIVOT_ROOT="$1"; SETPRIV="$2"; DD="$3"; CWD="$4"; TM_COUNT="$5"; PRE_COUNT="$6"; POST_COUNT="$7"; M_COUNT="$8"',
+  "shift 8",
   "mount -n --make-rprivate /",
   "S=",
   'TMP_STAGE=""',
@@ -466,6 +540,12 @@ const UNSHARE_ISOLATION_SCRIPT = [
   'mount -n -t tmpfs tmpfs "$S"',
   'mkdir -p "$S/newroot" "$S/save"',
   'mount -n --rbind / "$S/newroot"',
+  "i=0",
+  'while [ "$i" -lt "$TM_COUNT" ]; do',
+  '  p="$1"; shift',
+  '  printf "%sx" "$p" > "$S/save/tm$i.path"',
+  "  i=$((i + 1))",
+  "done",
   "i=0",
   'while [ "$i" -lt "$PRE_COUNT" ]; do',
   '  mode="$1"; p="$2"; shift 2',
@@ -500,6 +580,13 @@ const UNSHARE_ISOLATION_SCRIPT = [
   `awk -v prefix="$S/newroot" '${MOUNTINFO_UNESCAPE_AWK}\n{ mp = unescape($5); if (mp == prefix || index(mp, prefix "/") == 1) { subp = substr(mp, length(prefix) + 1); if (is_virt(subp)) next; opts = "," $6 ","; if (index(opts, ",ro,") == 0) { print "unshare read-only verification failed: " mp > "/dev/stderr"; exit 1 } } }' /proc/self/mountinfo`,
   'mount -n -t tmpfs tmpfs "$S/newroot/tmp"',
   'if [ -d "$S/newroot/dev/shm" ]; then mount -n -t tmpfs tmpfs "$S/newroot/dev/shm"; fi',
+  // 遮蔽宿主机用户运行时目录（如 /run/user、$XDG_RUNTIME_DIR），隔离 systemd --user 与 D-Bus 套接字
+  "i=0",
+  'while [ "$i" -lt "$TM_COUNT" ]; do',
+  '  p=$(cat "$S/save/tm$i.path"); p=${p%x}',
+  '  if [ -d "$S/newroot$p" ]; then mount -n -t tmpfs tmpfs "$S/newroot$p"; fi',
+  "  i=$((i + 1))",
+  "done",
   // 第一阶段：挂载位于 dataDir 之外（含可能包含 dataDir 的祖先目录）的允许路径
   "i=0",
   'while [ "$i" -lt "$PRE_COUNT" ]; do',
@@ -606,12 +693,38 @@ export function wrapCredentialIsolatedCommand(
     return [...set].sort((a, b) => a.length - b.length || a.localeCompare(b));
   };
 
+  // 遮蔽宿主机用户运行时目录（含 systemd --user 控制套接字、D-Bus 会话总线、GPG/SSH 代理套接字等）：
+  // 只读挂载不能阻止同 UID 进程 connect(2) 到 Unix 域套接字，必须用空 tmpfs 彻底隐藏后再按需恢复显式允许路径。
+  const runtimeMaskDirs: string[] = [];
+  const addRuntimeMaskDir = (dir: string | undefined) => {
+    if (!dir) return;
+    const real = safeRealpath(dir);
+    if (real === "/" || !fs.existsSync(real)) return;
+    try {
+      if (!fs.statSync(real).isDirectory()) return;
+    } catch {
+      return;
+    }
+    if (isPathInsideOrEqual(real, "/tmp") || isPathInsideOrEqual(real, "/dev/shm")) return;
+    if (runtimeMaskDirs.some((existing) => isPathInsideOrEqual(real, existing))) return;
+    runtimeMaskDirs.push(real);
+  };
+  addRuntimeMaskDir("/run/user");
+  const rawXdgRuntime = rawEnv.XDG_RUNTIME_DIR?.trim();
+  if (rawXdgRuntime) addRuntimeMaskDir(rawXdgRuntime);
+  runtimeMaskDirs.sort((a, b) => a.length - b.length || a.localeCompare(b));
+
+  const isHiddenByEphemeralTmpfs = (p: string): boolean =>
+    isPathInsideOrEqual(p, "/tmp") ||
+    isPathInsideOrEqual(p, "/dev/shm") ||
+    runtimeMaskDirs.some((d) => isPathInsideOrEqual(p, d));
+
   const writablePaths = dedupeSorted(opts?.writablePaths ?? []);
   const writableSet = new Set(writablePaths);
   const rawReadOnly = [...(opts?.readOnlyPaths ?? [])];
   if (hasCredKeyFile && credDir && fs.existsSync(credDir)) {
     const resolvedCredDir = safeRealpath(credDir);
-    if (isPathInsideOrEqual(resolvedCredDir, "/tmp") || isPathInsideOrEqual(resolvedCredDir, "/dev/shm")) {
+    if (isHiddenByEphemeralTmpfs(resolvedCredDir)) {
       rawReadOnly.push(resolvedCredDir);
     }
   }
@@ -642,6 +755,22 @@ export function wrapCredentialIsolatedCommand(
       if (fs.existsSync(f)) rawMasks.push(path.resolve(f), safeRealpath(f));
     }
   }
+  // 遮罩宿主机全局服务控制套接字（保留 /run/systemd/resolve 以免破坏 DNS 解析）
+  for (const hostSock of [
+    "/run/systemd/private",
+    "/run/systemd/notify",
+    "/run/dbus/system_bus_socket",
+    "/var/run/dbus/system_bus_socket",
+    "/run/docker.sock",
+    "/var/run/docker.sock",
+  ]) {
+    if (fs.existsSync(hostSock)) rawMasks.push(safeRealpath(hostSock));
+  }
+  const dbusAddr = rawEnv.DBUS_SESSION_BUS_ADDRESS?.trim();
+  if (dbusAddr) {
+    const dm = dbusAddr.match(/unix:path=([^,;]+)/);
+    if (dm?.[1] && fs.existsSync(dm[1])) rawMasks.push(safeRealpath(dm[1]));
+  }
   const isReExposedBy = (p: string, mounts: MountEntry[]): boolean =>
     mounts.some((m) => isPathInsideOrEqual(p, m.path));
   const maskFiles = [...new Set(rawMasks.map((m) => safeRealpath(m)).filter((m) => fs.existsSync(m)))].filter((m) => {
@@ -649,8 +778,8 @@ export function wrapCredentialIsolatedCommand(
     if (resolvedDataDir && isPathInsideOrEqual(m, resolvedDataDir)) {
       return isReExposedBy(m, postMounts);
     }
-    // 位于 /tmp 或 /dev/shm 内的文件已被空 tmpfs 隐藏，仅当被 preMounts 重新暴露时才需额外 /dev/null 遮罩
-    if (isPathInsideOrEqual(m, "/tmp") || isPathInsideOrEqual(m, "/dev/shm")) {
+    // 位于 /tmp、/dev/shm 或已遮蔽用户运行时目录内的文件已被空 tmpfs 隐藏，仅当被 preMounts 重新暴露时才需额外 /dev/null 遮罩
+    if (isHiddenByEphemeralTmpfs(m)) {
       return isReExposedBy(m, preMounts);
     }
     return true;
@@ -671,6 +800,9 @@ export function wrapCredentialIsolatedCommand(
       "--tmpfs",
       "/tmp",
     ];
+    for (const d of runtimeMaskDirs) {
+      bwrapArgs.push("--tmpfs", d);
+    }
     for (const m of preMounts) {
       bwrapArgs.push(m.mode === "ro" ? "--ro-bind" : "--bind", m.path, m.path);
     }
@@ -709,9 +841,11 @@ export function wrapCredentialIsolatedCommand(
       backend.setprivBin,
       resolvedDataDir,
       resolvedCwd,
+      String(runtimeMaskDirs.length),
       String(preMounts.length),
       String(postMounts.length),
       String(maskFiles.length),
+      ...runtimeMaskDirs,
       ...flatten(preMounts),
       ...flatten(postMounts),
       ...maskFiles,
@@ -753,13 +887,21 @@ function findVolatileTmpfsBase(env: NodeJS.ProcessEnv, overrideCandidates?: stri
  *     仅在检测到内核级内存 tmpfs（`$XDG_RUNTIME_DIR` 或 `/dev/shm`）时，将无关凭据以 0400 投影到 0700 易失目录并在结束及进程退出时清理；
  *     绝不将任何无关凭据落盘写入磁盘 `os.tmpdir()`（无可用 tmpfs 时按安全策略移除 `CREDENTIALS_DIRECTORY`）。
  */
+const STRIPPED_HOST_SOCKET_ENVS = new Set([
+  "DBUS_SESSION_BUS_ADDRESS",
+  "NOTIFY_SOCKET",
+  "GPG_AGENT_INFO",
+]);
+
 export function prepareHarnessEnv(
   env: NodeJS.ProcessEnv = process.env,
-  opts?: { tmpfsCandidates?: string[] },
+  opts?: { tmpfsCandidates?: string[]; preserveSshAgent?: boolean },
 ): { env: NodeJS.ProcessEnv; cleanup: () => void } {
   const clean: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(env)) {
     if (k.startsWith("PA_FEISHU_WEB_")) continue;
+    if (STRIPPED_HOST_SOCKET_ENVS.has(k)) continue;
+    if (!opts?.preserveSshAgent && (k === "SSH_AUTH_SOCK" || k === "SSH_AGENT_PID")) continue;
     clean[k] = v;
   }
   const credDir = env.CREDENTIALS_DIRECTORY?.trim();
@@ -1554,6 +1696,7 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
             TMPDIR: "/tmp",
             XDG_CACHE_HOME: "/tmp/.pa-cache",
             XDG_STATE_HOME: "/tmp/.pa-state",
+            XDG_RUNTIME_DIR: "/tmp/.pa-run",
           }
         : {}),
     };
@@ -1701,6 +1844,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
         TMPDIR: "/tmp",
         XDG_CACHE_HOME: "/tmp/.pa-cache",
         XDG_STATE_HOME: "/tmp/.pa-state",
+        XDG_RUNTIME_DIR: "/tmp/.pa-run",
       };
     }
     r = await runProcess(wrapped.cmd, wrapped.args, {
@@ -1796,6 +1940,7 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
             TMPDIR: "/tmp",
             XDG_CACHE_HOME: "/tmp/.pa-cache",
             XDG_STATE_HOME: "/tmp/.pa-state",
+            XDG_RUNTIME_DIR: "/tmp/.pa-run",
           }
         : {}),
     };

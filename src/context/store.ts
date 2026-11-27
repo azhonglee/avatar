@@ -292,10 +292,11 @@ export class ContextStore {
   /**
    * 幂等写入观测（严格按通道原生主键 ID 索引查找，绝不做跨通道启发式猜群或合并）：
    *   - 同 ID 已存在且曾仅作为历史背景写入（meta.background_only = true）时，首次真实投递将其提升为待处理；
-   *   - 同 ID 已存在且正文变化（消息被编辑）时，更新正文并重新标为待处理。
+   *   - 同 ID 已存在且正文变化（消息被编辑）时，更新正文并重新标为待处理；
+   *   - 可选 `beforeCommit` 回调在 `BEGIN IMMEDIATE` 写事务锁内执行，用于跨进程吊销/静音/策略变更的原子终检。
    * 返回新增或重新变为待处理的数量。
    */
-  addObs(list: Obs[]): number {
+  addObs(list: Obs[], beforeCommit?: () => boolean): number {
     const now = Date.now();
     const get = this.db.prepare("SELECT kind, conv_name, actor_name, text, url, meta, processed FROM ctx_obs WHERE id = ?");
     const ins = this.db.prepare(
@@ -305,6 +306,7 @@ export class ContextStore {
     const upd = this.db.prepare("UPDATE ctx_obs SET kind = ?, conv_name = ?, actor_name = ?, text = ?, url = ?, meta = ?, processed = 0 WHERE id = ?");
     let n = 0;
     this.tx(() => {
+      if (beforeCommit && !beforeCommit()) return;
       for (const o of list) {
         if (!o.id || !o.time) continue;
         const cur = get.get(o.id) as Row | undefined;
@@ -318,6 +320,18 @@ export class ContextStore {
           const curVer = typeof curMeta.edit_version === "number" && Number.isFinite(curMeta.edit_version) ? curMeta.edit_version : undefined;
           const nextVer = typeof o.meta?.edit_version === "number" && Number.isFinite(o.meta.edit_version) ? o.meta.edit_version : undefined;
           if (curVer !== undefined && nextVer !== undefined && nextVer < curVer) continue;
+          const hasNewerEditVer = curVer !== undefined && nextVer !== undefined && nextVer > curVer;
+          if (!hasNewerEditVer) {
+            const curPollAt =
+              typeof curMeta.poll_observed_at === "number" && Number.isFinite(curMeta.poll_observed_at)
+                ? curMeta.poll_observed_at
+                : undefined;
+            const nextPollAt =
+              typeof o.meta?.poll_observed_at === "number" && Number.isFinite(o.meta.poll_observed_at)
+                ? o.meta.poll_observed_at
+                : undefined;
+            if (curPollAt !== undefined && nextPollAt !== undefined && nextPollAt < curPollAt) continue;
+          }
           const curEffectiveMeta =
             curMeta.at_me === undefined && String(cur.kind ?? "") === "at_me" ? { ...curMeta, at_me: true } : curMeta;
           const incomingMeta = o.meta ?? {};
@@ -351,8 +365,9 @@ export class ContextStore {
   /**
    * 写入历史背景观测（仅插入未出现过的 ID，标为 processed = 1 且 meta.background_only = true）。
    * 后续若该消息经真实推送或轮询到达，addObs 会将其提升为待处理。
+   * 可选 `beforeCommit` 回调在 `BEGIN IMMEDIATE` 写事务锁内执行，防止并发吊销/静音后落库背景消息。
    */
-  addBackgroundObs(list: Obs[]): number {
+  addBackgroundObs(list: Obs[], beforeCommit?: () => boolean): number {
     const now = Date.now();
     const get = this.db.prepare("SELECT 1 FROM ctx_obs WHERE id = ?");
     const ins = this.db.prepare(
@@ -361,6 +376,7 @@ export class ContextStore {
     );
     let n = 0;
     this.tx(() => {
+      if (beforeCommit && !beforeCommit()) return;
       for (const o of list) {
         if (!o.id || !o.time) continue;
         if (get.get(o.id)) continue;

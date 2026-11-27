@@ -266,6 +266,13 @@ export class Drafter {
     const excludedTargets = new Set<string>();
     let chosen: { target: Record<string, string>; label: string; conv?: Obs } | undefined;
     let effectiveConvObs: Obs[] = [];
+    let verifiedPolicySig = "";
+    let verifiedOwner: string | null = null;
+    let verifiedConv = "";
+    let verifiedConvName = "";
+    let verifiedTargetObsId = "";
+    let verifiedTargetRev = "";
+    let verifiedWindowRevs: [string, string][] = [];
     for (let attempt = 0; attempt < 6; attempt++) {
       const policyBefore = this.policySignature?.() ?? "";
       const ownerBefore = this.activeBoundNativeOwner();
@@ -273,6 +280,8 @@ export class Drafter {
       if (!cand.conv) {
         chosen = cand;
         effectiveConvObs = [];
+        verifiedPolicySig = policyBefore;
+        verifiedOwner = ownerBefore;
         break;
       }
       // 异步解析目标返回后必须从 SQLite 重读最新目标记录：绝不从旧快照补回已被撤回或删除的消息
@@ -332,6 +341,13 @@ export class Drafter {
       }
       chosen = this.buildTargetForObs(it, k, targetNow, k === "reply" && !targetNow.is_me);
       effectiveConvObs = verifiedWindow;
+      verifiedPolicySig = policyAfter;
+      verifiedOwner = ownerAfter;
+      verifiedConv = targetNow.conv;
+      verifiedConvName = targetNow.conv_name;
+      verifiedTargetObsId = targetNow.id;
+      verifiedTargetRev = targetRev;
+      verifiedWindowRevs = verifiedWindow.map((o) => [o.id, obsRevision(o)]);
       break;
     }
     if (!chosen) {
@@ -362,7 +378,54 @@ export class Drafter {
       throw new DraftTargetIneligibleError("自动预起草资格在推理前已失效，已跳过起草");
     }
     const content = await this.llm(prompt, k);
-    return this.store.addDraft({ item_id: it.id, project_id: it.project_id, kind: k, target, target_label: label, content });
+    // 模型推理返回后、落库与发布草稿卡前，重新核验自动资格、服务端会话排除状态，并在写事务锁内校验事项/目标修订与采集策略
+    if (opts?.beforeInfer && !opts.beforeInfer()) {
+      throw new DraftTargetIneligibleError("自动预起草资格在推理期间已失效，已丢弃过期草稿");
+    }
+    if (verifiedConv && this.checkConvAllowed) {
+      const postDecision = await this.checkConvAllowed(verifiedConv, verifiedConvName);
+      if (postDecision !== "allowed") {
+        throw new DraftTargetIneligibleError("目标会话在推理期间已被静音、排除或状态未确认，已丢弃过期草稿");
+      }
+    }
+    return this.store.tx(() => {
+      const latestItem = this.store.item(itemId);
+      if (!latestItem) {
+        throw new DraftTargetIneligibleError("事项在推理期间已不存在，已丢弃过期草稿");
+      }
+      if (opts?.beforeInfer && !opts.beforeInfer()) {
+        throw new DraftTargetIneligibleError("自动预起草资格在落库前已失效，已丢弃过期草稿");
+      }
+      if (this.activeBoundNativeOwner() !== verifiedOwner) {
+        throw new DraftTargetIneligibleError("工作区绑定账号在推理期间已变更，已丢弃过期草稿");
+      }
+      if ((this.policySignature?.() ?? "") !== verifiedPolicySig) {
+        throw new DraftTargetIneligibleError("采集或排除策略在推理期间已变更，已丢弃过期草稿");
+      }
+      if (verifiedTargetObsId) {
+        if (this.isConvSyncBlocked(verifiedConv)) {
+          throw new DraftTargetIneligibleError("目标会话在推理期间已被静音或关闭 IM 采集，已丢弃过期草稿");
+        }
+        const postTarget = this.store.obs(verifiedTargetObsId);
+        if (!postTarget || !this.isEligibleImObs(postTarget, verifiedOwner) || obsRevision(postTarget) !== verifiedTargetRev) {
+          throw new DraftTargetIneligibleError("目标消息在推理期间已被编辑、撤回或移出范围，已丢弃过期草稿");
+        }
+        for (const [obsId, rev] of verifiedWindowRevs) {
+          const cur = this.store.obs(obsId);
+          if (!cur || !this.isEligibleImObs(cur, verifiedOwner) || obsRevision(cur) !== rev) {
+            throw new DraftTargetIneligibleError("会话上下文在推理期间已发生变更，已丢弃过期草稿");
+          }
+        }
+      }
+      return this.store.addDraft({
+        item_id: latestItem.id,
+        project_id: latestItem.project_id,
+        kind: k,
+        target,
+        target_label: label,
+        content,
+      });
+    });
   }
 
   /** 周报草稿：按项目汇总这段时间的动态、知识、关闭和打开的事项 */

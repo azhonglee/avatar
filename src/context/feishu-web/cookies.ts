@@ -155,6 +155,13 @@ export class RecordingCookieJar {
     return { generation: this.syncGeneration, values: snap };
   }
 
+  /** 复制当前内存 Cookie 视图供单次请求的重定向跳暂存叠算使用，不修改共享活罐也不携带未提交增量 */
+  clone(): RecordingCookieJar {
+    const copy = new RecordingCookieJar(this.extraAllowed);
+    for (const [k, v] of this.values) copy.values.set(k, { ...v });
+    return copy;
+  }
+
   static fromRecords(cookies: CookieRecord[], extraAllowedHosts?: Iterable<string>, nowMs = Date.now()): RecordingCookieJar {
     const jar = new RecordingCookieJar(extraAllowedHosts);
     for (const c of cookies) {
@@ -186,6 +193,7 @@ export class RecordingCookieJar {
     setCookieHeaders: string[] | string | undefined,
     nowMs = Date.now(),
     requestSnapshot?: CookieSnapshot,
+    selfWrittenKeys?: Set<string>,
   ): boolean {
     if (!setCookieHeaders) return false;
     const host = requestUrl.hostname.toLowerCase();
@@ -218,7 +226,7 @@ export class RecordingCookieJar {
         ...(expiresMs && expiresMs > nowMs ? { expires_at: new Date(expiresMs).toISOString() } : {}),
       };
       const key = this.keyOf(record);
-      if (requestSnapshot && requestSnapshot.generation !== this.syncGeneration) {
+      if (requestSnapshot && requestSnapshot.generation !== this.syncGeneration && !selfWrittenKeys?.has(key)) {
         const sentBase = requestSnapshot.values.get(key) ?? null;
         const curVal = this.values.get(key)?.value ?? null;
         // 请求在途期间磁盘同步已轮换了该 Cookie：拒绝用陈旧响应覆盖较新的轮换值
@@ -237,7 +245,26 @@ export class RecordingCookieJar {
         this.dirtyDeletes.delete(key);
         this.dirtyUpserts.set(key, { ...record });
       }
+      selfWrittenKeys?.add(key);
       applied = true;
+    }
+    return applied;
+  }
+
+  /**
+   * 批量提交单次请求各重定向跳暂存的 Set-Cookie 变更：
+   *   - 同请求多跳连续更新同一 Cookie 时经 selfWritten 放行后续跳；
+   *   - 与并发 syncFromRecords() 发生冲突的键保留磁盘较新轮换值，无关并发轮换完全保留。
+   */
+  applyStaged(
+    entries: { url: URL; headers: string[] | string; nowMs: number; snapshot: CookieSnapshot }[],
+  ): boolean {
+    const selfWritten = new Set<string>();
+    let applied = false;
+    for (const e of entries) {
+      if (this.setFromHeaders(e.url, e.headers, e.nowMs, e.snapshot, selfWritten)) {
+        applied = true;
+      }
     }
     return applied;
   }
