@@ -15,7 +15,15 @@ const LINUX_TMPFS_MAGIC = 0x01021994;
 
 export type MountMaskBackend =
   | { kind: "bwrap"; bin: string }
-  | { kind: "unshare"; bin: string; setprivBin: string; pivotRootBin?: string; shBin?: string; killChild?: boolean }
+  | {
+      kind: "unshare";
+      bin: string;
+      setprivBin: string;
+      pivotRootBin?: string;
+      shBin?: string;
+      killChild?: boolean;
+      restoreUserMap?: boolean;
+    }
   | { kind: "none" };
 let cachedMountMaskBackend: MountMaskBackend | undefined;
 
@@ -1027,19 +1035,210 @@ export function collectSafeGitConfigMounts(
   return { readOnlyPaths, symlinks };
 }
 
-const KNOWN_ACPX_PROVIDERS = ["claude", "codex", "gemini", "doubao", "opencode"] as const;
+const INTERPRETER_EXECUTABLES = new Set([
+  "node",
+  "nodejs",
+  "python",
+  "python3",
+  "bun",
+  "deno",
+  "tsx",
+  "ts-node",
+  "npx",
+  "uv",
+  "bash",
+  "sh",
+  "zsh",
+  "dash",
+  "ruby",
+  "perl",
+  "env",
+]);
+
+const ACPX_PROVIDER_AUTH_ALLOWLIST: Record<string, ReadonlySet<string>> = {
+  claude: new Set(["claude", "anthropic"]),
+  codex: new Set(["codex", "openai", "chatgpt"]),
+  gemini: new Set(["gemini", "google", "vertex"]),
+  doubao: new Set(["doubao", "volc", "volcengine", "ark"]),
+  opencode: new Set(["opencode"]),
+  copilot: new Set(["copilot", "github"]),
+};
+
+const ALL_KNOWN_AUTH_PROVIDER_TOKENS = new Set(
+  Object.values(ACPX_PROVIDER_AUTH_ALLOWLIST).flatMap((set) => [...set]),
+);
+
+/** 按 POSIX 单引号/双引号/反斜杠语义拆分 shell 命令参数（不执行任何展开） */
+export function parseShellCommandTokens(cmdStr: string): string[] {
+  const tokens: string[] = [];
+  let cur = "";
+  let inToken = false;
+  let quote: "'" | '"' | undefined;
+  for (let i = 0; i < cmdStr.length; i++) {
+    const ch = cmdStr[i];
+    if (quote === "'") {
+      if (ch === "'") quote = undefined;
+      else cur += ch;
+      inToken = true;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') {
+        quote = undefined;
+      } else if (ch === "\\" && i + 1 < cmdStr.length && ['"', "\\", "$", "`"].includes(cmdStr[i + 1])) {
+        cur += cmdStr[++i];
+      } else {
+        cur += ch;
+      }
+      inToken = true;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      inToken = true;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < cmdStr.length) {
+      cur += cmdStr[++i];
+      inToken = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (inToken) {
+        tokens.push(cur);
+        cur = "";
+        inToken = false;
+      }
+      continue;
+    }
+    cur += ch;
+    inToken = true;
+  }
+  if (inToken) tokens.push(cur);
+  return tokens;
+}
+
+function extractCommandExecAndScriptTokens(tokens: string[]): {
+  execToken?: string;
+  scriptCandidates: string[];
+} {
+  let idx = 0;
+  // 跳过前导 VAR=val 赋值与 `env [opts] [VAR=val]` 包装
+  while (idx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[idx])) {
+    idx++;
+  }
+  if (idx < tokens.length && path.basename(tokens[idx]).toLowerCase() === "env") {
+    idx++;
+    while (idx < tokens.length) {
+      const t = tokens[idx];
+      if (t === "--") {
+        idx++;
+        break;
+      }
+      if (t === "-u" || t === "-C" || t === "-S") {
+        idx += 2;
+        continue;
+      }
+      if (t.startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+        idx++;
+        continue;
+      }
+      break;
+    }
+  }
+  if (idx >= tokens.length) return { scriptCandidates: [] };
+  const execToken = tokens[idx];
+  const scriptCandidates: string[] = [];
+  const skipNextForFlags = new Set(["-e", "--eval", "-p", "--print", "-c", "-m", "--cwd", "--port", "--host", "--model"]);
+  for (let i = idx + 1; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (!tok) continue;
+    if (tok === "--") continue;
+    if (skipNextForFlags.has(tok)) {
+      i++;
+      continue;
+    }
+    if (tok.startsWith("-")) {
+      const eq = tok.indexOf("=");
+      if (eq > 1) {
+        const rhs = tok.slice(eq + 1);
+        if (rhs.startsWith("/") || rhs.startsWith("~/")) {
+          scriptCandidates.push(rhs);
+        }
+      }
+      continue;
+    }
+    if (tok.startsWith("/") || tok.startsWith("~/")) {
+      scriptCandidates.push(tok);
+    }
+  }
+  return { execToken, scriptCandidates };
+}
 
 function resolveSelectedAcpxAgentId(h: Pick<Config["harnesses"][string], "agent" | "agentCommand">): string {
   const agentRaw = (h.agent?.trim() || "").toLowerCase();
-  const cmdFirst = h.agentCommand?.trim().split(/\s+/)[0] || "";
-  const cmdBase = cmdFirst ? path.basename(cmdFirst).toLowerCase() : "";
-  return agentRaw || cmdBase;
+  if (agentRaw) return agentRaw;
+  if (!h.agentCommand?.trim()) return "";
+  const { execToken, scriptCandidates } = extractCommandExecAndScriptTokens(parseShellCommandTokens(h.agentCommand));
+  const execBase = execToken ? path.basename(execToken).toLowerCase() : "";
+  if (execBase && !INTERPRETER_EXECUTABLES.has(execBase)) return execBase;
+  if (scriptCandidates.length > 0) {
+    const base = path.basename(scriptCandidates[0]).toLowerCase();
+    const stem = base.replace(/\.(?:[cm]?[jt]s|py|sh|rb|pl)$/i, "");
+    if (stem && !INTERPRETER_EXECUTABLES.has(stem)) return stem;
+  }
+  return execBase;
+}
+
+function resolveKnownAcpxProviderFamily(selectedId: string): string | undefined {
+  if (!selectedId) return undefined;
+  for (const fam of Object.keys(ACPX_PROVIDER_AUTH_ALLOWLIST)) {
+    if (selectedId === fam || selectedId === `${fam}-code` || selectedId.startsWith(`${fam}-`) || selectedId.startsWith(`${fam}_`)) {
+      return fam;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * 严格白名单判断 ACP `config.json` 中的 `auth` 凭据条目是否明确属于当前选定的适配器：
+ *   - 绝不把未识别的自定义/Copilot 凭据默认视为共享并泄露给其他适配器；
+ *   - 仅允许选定 agent 显式引用的 method ID、所属已知提供方家族词元、或以选定自定义 agent ID 精确匹配/前缀命名的条目。
+ */
+export function isAuthMethodAllowedForAcpxAgent(
+  methodId: string,
+  selectedId: string,
+  explicitAuthMethods?: ReadonlySet<string>,
+): boolean {
+  if (explicitAuthMethods?.has(methodId)) return true;
+  if (!selectedId || INTERPRETER_EXECUTABLES.has(selectedId)) return false;
+  const lk = methodId.toLowerCase().trim();
+  if (!lk) return false;
+  const segments = lk.split(/[^a-z0-9]+/).filter(Boolean);
+  const family = resolveKnownAcpxProviderFamily(selectedId);
+  if (family) {
+    const allowed = ACPX_PROVIDER_AUTH_ALLOWLIST[family];
+    const hasOwnToken = segments.some((seg) => allowed.has(seg));
+    if (!hasOwnToken) return false;
+    const hasForeignToken = segments.some((seg) => ALL_KNOWN_AUTH_PROVIDER_TOKENS.has(seg) && !allowed.has(seg));
+    return !hasForeignToken;
+  }
+  // 自定义适配器：仅精确匹配或以 `<selectedId><sep>` 为前缀（绝不放行无关未知 method ID）
+  return (
+    lk === selectedId ||
+    lk.startsWith(`${selectedId}-`) ||
+    lk.startsWith(`${selectedId}_`) ||
+    lk.startsWith(`${selectedId}.`) ||
+    lk.startsWith(`${selectedId}:`)
+  );
 }
 
 export interface StagedAcpxState {
   dir: string;
   mountDest: string;
   extraCmdPaths: string[];
+  /** 位于 `~/.acpx` 之外的解释器入口脚本或其静态相对依赖（需以只读挂载入沙箱） */
+  extraReadOnlyPaths: string[];
   /** `tools === "none"` 时提供的空 MCP 配置文件路径（用于 `--mcp-config`，屏蔽全局与项目 `.acpxrc.json` 中的全部 MCP Server） */
   emptyMcpConfigFile?: string;
   /** 同上，映射到沙箱挂载点下的路径 */
@@ -1048,23 +1247,90 @@ export interface StagedAcpxState {
 }
 
 function extractFirstShellCommandToken(cmdStr: string): string {
-  const s = cmdStr.trim();
-  if (!s) return "";
-  if (s.startsWith('"')) {
-    const end = s.indexOf('"', 1);
-    return end > 1 ? s.slice(1, end) : s.slice(1);
+  const tokens = parseShellCommandTokens(cmdStr);
+  return tokens[0] || "";
+}
+
+const RELATIVE_MODULE_SPECIFIER_RE =
+  /(?:(?:import|export)\s+(?:[^"'`]*?\s+from\s+)?|import\s*\(\s*|require\s*\(\s*)["'](\.\.?\/[^"'`\r\n]+)["']/g;
+
+function resolveRelativeScriptImport(fromFile: string, spec: string): string | undefined {
+  const base = path.resolve(path.dirname(fromFile), spec);
+  const candidates = [
+    base,
+    `${base}.mjs`,
+    `${base}.js`,
+    `${base}.cjs`,
+    `${base}.ts`,
+    `${base}.mts`,
+    `${base}.cts`,
+    `${base}.json`,
+    path.join(base, "index.mjs"),
+    path.join(base, "index.js"),
+    path.join(base, "index.cjs"),
+    path.join(base, "index.ts"),
+  ];
+  for (const cand of candidates) {
+    try {
+      const st = fs.statSync(cand);
+      if (st.isFile() && st.size <= 4 * 1024 * 1024) return fs.realpathSync(cand);
+    } catch {
+      // try next extension
+    }
   }
-  if (s.startsWith("'")) {
-    const end = s.indexOf("'", 1);
-    return end > 1 ? s.slice(1, end) : s.slice(1);
+  return undefined;
+}
+
+/**
+ * 收集入口脚本经静态相对 `import`/`require` 引用的依赖文件（限定在 `boundaryDir` 内且绝不越界到禁止目录或 dataDir）。
+ */
+function collectStaticRelativeScriptDeps(
+  entryFile: string,
+  boundaryDir: string,
+  resolvedDataDir: string,
+  forbiddenTopDirs?: ReadonlySet<string>,
+): string[] {
+  const found: string[] = [];
+  const visited = new Set<string>();
+  const queue: { file: string; depth: number }[] = [{ file: entryFile, depth: 0 }];
+  while (queue.length > 0 && visited.size < 64) {
+    const cur = queue.shift()!;
+    if (visited.has(cur.file)) continue;
+    visited.add(cur.file);
+    found.push(cur.file);
+    if (cur.depth >= 5) continue;
+    if (!/\.(?:[cm]?js|[cm]?ts)$/i.test(cur.file)) continue;
+    let src: string;
+    try {
+      const st = fs.statSync(cur.file);
+      if (!st.isFile() || st.size > 1024 * 1024) continue;
+      src = fs.readFileSync(cur.file, "utf8");
+    } catch {
+      continue;
+    }
+    RELATIVE_MODULE_SPECIFIER_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = RELATIVE_MODULE_SPECIFIER_RE.exec(src)) !== null) {
+      const target = resolveRelativeScriptImport(cur.file, m[1]);
+      if (!target || visited.has(target)) continue;
+      if (!isPathInsideOrEqual(target, boundaryDir)) continue;
+      if (resolvedDataDir && isPathInsideOrEqual(target, resolvedDataDir)) continue;
+      if (forbiddenTopDirs) {
+        const rel = path.relative(boundaryDir, target);
+        const top = rel.split(path.sep)[0];
+        if (!rel || rel.startsWith("..") || forbiddenTopDirs.has(top)) continue;
+      }
+      queue.push({ file: target, depth: cur.depth + 1 });
+    }
   }
-  return s.split(/\s+/)[0] || "";
+  return found;
 }
 
 /**
  * 为一次性 `acpx exec` 调用分配私有 `0700` 状态目录并绑定挂载到 `~/.acpx`：
  *   - 绝不暴露宿主机 `~/.acpx/sessions` 或 `~/.acpx/queues` 中的跨仓库历史会话；
- *   - 当显式指定 `agentCommand` 时，省略 `config.json` 中全部无关 `agents` 定义，仅暂存该显式适配器命令（即使其位于 `~/.acpx` 内且未写入 `config.json`）；
+ *   - 当显式指定 `agentCommand` 时，省略 `config.json` 中全部无关 `agents` 定义，仅暂存该显式适配器命令及解释器入口脚本与声明的运行时文件；
+ *   - `auth` 仅按严格白名单投影明确属于当前选定适配器的凭据，绝不复制无关或未知 method ID；
  *   - 当 `tools === "none"` 时强制剥离 `mcpServers` 并生成空 MCP 配置文件（`{"mcpServers":[]}`）供 `--mcp-config` 禁用全局与项目 MCP 服务器。
  */
 export function stageIsolatedAcpxState(
@@ -1084,14 +1350,16 @@ export function stageIsolatedAcpxState(
   const disableMcp = opts?.tools === "none";
   const scoped = createScopedSecretDir("pa-acpx-state-", rawEnv);
   const extraCmdPaths: string[] = [];
+  const extraReadOnlyPaths: string[] = [];
 
   try {
     const stateDir = path.join(scoped.dir, "acpx");
     fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-    const adapterCommands: string[] = [];
+    const adapterCmdTokensList: string[][] = [];
+    const explicitAuthMethods = new Set<string>();
     if (hasExplicitAgentCmd) {
-      const explicitToken = extractFirstShellCommandToken(h.agentCommand!);
-      if (explicitToken) adapterCommands.push(explicitToken);
+      const toks = parseShellCommandTokens(h.agentCommand!);
+      if (toks.length > 0) adapterCmdTokensList.push(toks);
     }
 
     const hostCfgPath = path.join(hostAcpxDir, "config.json");
@@ -1136,10 +1404,19 @@ export function stageIsolatedAcpxState(
                 if (def && typeof def === "object" && !Array.isArray(def)) {
                   const rec = def as Record<string, unknown>;
                   if (typeof rec.command === "string" && rec.command.trim()) {
-                    const tok = extractFirstShellCommandToken(rec.command);
-                    if (tok) adapterCommands.push(tok);
-                  } else if (Array.isArray(rec.argv) && typeof rec.argv[0] === "string" && rec.argv[0].trim()) {
-                    adapterCommands.push(rec.argv[0].trim());
+                    const toks = parseShellCommandTokens(rec.command);
+                    if (toks.length > 0) adapterCmdTokensList.push(toks);
+                  } else if (Array.isArray(rec.argv)) {
+                    const toks = rec.argv.filter((a): a is string => typeof a === "string" && a.trim().length > 0);
+                    if (toks.length > 0) adapterCmdTokensList.push(toks);
+                  }
+                  if (typeof rec.authMethod === "string" && rec.authMethod.trim()) {
+                    explicitAuthMethods.add(rec.authMethod.trim());
+                  }
+                  if (Array.isArray(rec.authMethods)) {
+                    for (const am of rec.authMethods) {
+                      if (typeof am === "string" && am.trim()) explicitAuthMethods.add(am.trim());
+                    }
                   }
                 }
               }
@@ -1150,13 +1427,7 @@ export function stageIsolatedAcpxState(
             if (parsed.auth && typeof parsed.auth === "object" && !Array.isArray(parsed.auth)) {
               const filteredAuth: Record<string, unknown> = {};
               for (const [k, v] of Object.entries(parsed.auth as Record<string, unknown>)) {
-                const lk = k.toLowerCase();
-                const otherProvider = KNOWN_ACPX_PROVIDERS.find(
-                  (prov) =>
-                    lk.includes(prov) &&
-                    (!selectedId || (!selectedId.startsWith(prov) && selectedId !== `${prov}-code`)),
-                );
-                if (otherProvider) continue;
+                if (!isAuthMethodAllowedForAcpxAgent(k, selectedId, explicitAuthMethods)) continue;
                 filteredAuth[k] = v;
               }
               if (Object.keys(filteredAuth).length > 0) {
@@ -1190,32 +1461,98 @@ export function stageIsolatedAcpxState(
       });
     }
 
-    // 仅复制被选定 agent 或显式 agentCommand 引用的 `~/.acpx` 内适配器文件（绝不触及 sessions/queues/logs/cache/history）
+    // 仅复制被选定 agent 或显式 agentCommand 引用的可执行文件、入口脚本及其声明/静态依赖的运行时文件（绝不触及 sessions/queues/logs/cache/history 或兄弟适配器）
     const forbiddenTopDirs = new Set(["sessions", "queues", "logs", "cache", "history"]);
-    for (const rawCmd of adapterCommands) {
-      const expanded = rawCmd.startsWith("~/") ? path.join(resolvedHome, rawCmd.slice(2)) : rawCmd;
-      if (!path.isAbsolute(expanded)) {
-        extraCmdPaths.push(rawCmd);
-        continue;
+    const copyFileIntoStagedAcpx = (realSrcFile: string) => {
+      if (!fs.existsSync(hostAcpxDir) || !isPathInsideOrEqual(realSrcFile, realHostAcpxDir)) return;
+      if (resolvedData && isPathInsideOrEqual(realSrcFile, resolvedData)) return;
+      const rel = path.relative(realHostAcpxDir, realSrcFile);
+      const top = rel.split(path.sep)[0];
+      if (!rel || rel.startsWith("..") || forbiddenTopDirs.has(top)) return;
+      try {
+        const cst = fs.statSync(realSrcFile);
+        if (!cst.isFile() || cst.size > 4 * 1024 * 1024) return;
+        const dst = path.join(stateDir, rel);
+        fs.mkdirSync(path.dirname(dst), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(dst, fs.readFileSync(realSrcFile), { mode: cst.mode & 0o111 ? 0o700 : 0o600 });
+      } catch {
+        // ignore unreadable adapter file
       }
-      const realCmd = fs.existsSync(expanded) ? safeRealpath(expanded) : "";
-      if (!realCmd) continue;
-      if (fs.existsSync(hostAcpxDir) && isPathInsideOrEqual(realCmd, realHostAcpxDir)) {
-        const rel = path.relative(realHostAcpxDir, realCmd);
-        const top = rel.split(path.sep)[0];
-        if (!rel || rel.startsWith("..") || forbiddenTopDirs.has(top)) continue;
+    };
+
+    const stageAcpxScriptAndDeps = (realScriptFile: string) => {
+      if (!fs.existsSync(hostAcpxDir) || !isPathInsideOrEqual(realScriptFile, realHostAcpxDir)) {
+        // 位于 `~/.acpx` 之外的解释器入口脚本：放入 extraCmdPaths（自动挂载自身与独立包依赖）并补齐同目录静态相对依赖
+        if (!(resolvedData && isPathInsideOrEqual(realScriptFile, resolvedData))) {
+          extraCmdPaths.push(realScriptFile);
+          const scriptDir = path.dirname(realScriptFile);
+          for (const dep of collectStaticRelativeScriptDeps(realScriptFile, scriptDir, resolvedData)) {
+            if (dep !== realScriptFile) extraReadOnlyPaths.push(dep);
+          }
+          const siblingPkgJson = path.join(scriptDir, "package.json");
+          if (fs.existsSync(siblingPkgJson)) {
+            const realPj = safeRealpath(siblingPkgJson);
+            if (!(resolvedData && isPathInsideOrEqual(realPj, resolvedData))) {
+              extraReadOnlyPaths.push(realPj);
+            }
+          }
+        }
+        return;
+      }
+
+      const rel = path.relative(realHostAcpxDir, realScriptFile);
+      const relParts = rel.split(path.sep);
+      const top = relParts[0];
+      if (!rel || rel.startsWith("..") || forbiddenTopDirs.has(top)) return;
+
+      // 1) 复制入口脚本及同目录下的静态相对 import/require 依赖
+      const scriptDir = path.dirname(realScriptFile);
+      for (const dep of collectStaticRelativeScriptDeps(realScriptFile, realHostAcpxDir, resolvedData, forbiddenTopDirs)) {
+        copyFileIntoStagedAcpx(dep);
+      }
+
+      // 2) 若入口脚本父目录存在 package.json（确保 ESM `"type":"module"` 等声明生效），复制该 package.json；
+      //    若处于专属适配器子目录（如 `~/.acpx/adapters/my-bot/package.json`，深度 >= 3）则按白名单复制该子目录内声明的运行时文件
+      const dirPkgJson = path.join(scriptDir, "package.json");
+      if (fs.existsSync(dirPkgJson)) {
+        const realPj = safeRealpath(dirPkgJson);
+        copyFileIntoStagedAcpx(realPj);
+        if (relParts.length >= 3) {
+          // 专属适配器目录（如 adapters/<name>/...）：安全复制该子目录，绝不暴露兄弟适配器目录
+          copyTreeBounded(scriptDir, path.join(stateDir, path.relative(realHostAcpxDir, scriptDir)), realHostAcpxDir, resolvedData, {
+            skipNames: new Set([".env", ".git", "sessions", "queues", "logs", "cache", "history"]),
+          });
+        }
+      }
+    };
+
+    for (const tokens of adapterCmdTokensList) {
+      const { execToken, scriptCandidates } = extractCommandExecAndScriptTokens(tokens);
+      if (execToken) {
+        const expanded = execToken.startsWith("~/") ? path.join(resolvedHome, execToken.slice(2)) : execToken;
+        if (!path.isAbsolute(expanded)) {
+          extraCmdPaths.push(execToken);
+        } else if (fs.existsSync(expanded)) {
+          const realCmd = safeRealpath(expanded);
+          if (fs.existsSync(hostAcpxDir) && isPathInsideOrEqual(realCmd, realHostAcpxDir)) {
+            stageAcpxScriptAndDeps(realCmd);
+          } else {
+            extraCmdPaths.push(realCmd);
+          }
+        }
+      }
+      for (const rawScript of scriptCandidates) {
+        const expanded = rawScript.startsWith("~/") ? path.join(resolvedHome, rawScript.slice(2)) : rawScript;
+        if (!path.isAbsolute(expanded) || !fs.existsSync(expanded)) continue;
+        const realScript = safeRealpath(expanded);
         try {
-          const cst = fs.statSync(realCmd);
-          if (cst.isFile() && cst.size <= 4 * 1024 * 1024) {
-            const dst = path.join(stateDir, rel);
-            fs.mkdirSync(path.dirname(dst), { recursive: true, mode: 0o700 });
-            fs.writeFileSync(dst, fs.readFileSync(realCmd), { mode: cst.mode & 0o111 ? 0o700 : 0o600 });
+          const st = fs.statSync(realScript);
+          if (st.isFile()) {
+            stageAcpxScriptAndDeps(realScript);
           }
         } catch {
-          // ignore unreadable adapter file
+          // ignore unreadable candidate
         }
-      } else {
-        extraCmdPaths.push(realCmd);
       }
     }
 
@@ -1223,7 +1560,223 @@ export function stageIsolatedAcpxState(
       dir: stateDir,
       mountDest: hostAcpxDir,
       extraCmdPaths: [...new Set(extraCmdPaths)],
+      extraReadOnlyPaths: [...new Set(extraReadOnlyPaths)],
       ...(emptyMcpConfigFile ? { emptyMcpConfigFile, emptyMcpConfigMountedPath } : {}),
+      cleanup: scoped.cleanup,
+    };
+  } catch (err) {
+    scoped.cleanup();
+    throw err;
+  }
+}
+
+const SAFE_CLAUDE_JSON_KEYS = new Set([
+  "oauthAccount",
+  "userID",
+  "hasCompletedOnboarding",
+  "lastOnboardingVersion",
+  "primaryApiKey",
+  "customApiKeyResponses",
+  "bypassPermissionsModeAccepted",
+  "hasAvailableSubscription",
+  "theme",
+  "preferredNotifChannel",
+  "shiftEnterKeyBindingInstalled",
+  "installMethod",
+  "autoUpdates",
+  "hasTrustDialogAccepted",
+  "firstStartTime",
+  "numStartups",
+]);
+
+function sanitizeClaudeJsonContent(raw: string, opts?: { tools?: "none" | "read" | "write" }): string {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "{}\n";
+    const src = parsed as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of SAFE_CLAUDE_JSON_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(src, key)) {
+        out[key] = src[key];
+      }
+    }
+    if (opts?.tools !== "none" && Object.prototype.hasOwnProperty.call(src, "mcpServers")) {
+      out.mcpServers = src.mcpServers;
+    }
+    // 明确置空 projects，彻底隐藏宿主机其他仓库会话记录、提示历史与项目级 MCP 配置
+    out.projects = {};
+    return `${JSON.stringify(out, null, 2)}\n`;
+  } catch {
+    return "{}\n";
+  }
+}
+
+function sanitizeClaudeSettingsForNoTools(raw: string): string | undefined {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const src = parsed as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of ["model", "forceLoginMethod", "forceLoginOrgUUID"] as const) {
+      if (typeof src[key] === "string" && src[key].trim()) {
+        out[key] = src[key];
+      }
+    }
+    if (src.env && typeof src.env === "object" && !Array.isArray(src.env)) {
+      const safeEnv: Record<string, string> = {};
+      for (const [k, v] of Object.entries(src.env as Record<string, unknown>)) {
+        if (typeof v !== "string") continue;
+        if (k.startsWith("PA_FEISHU_WEB_") || k === "CREDENTIALS_DIRECTORY") continue;
+        safeEnv[k] = v;
+      }
+      if (Object.keys(safeEnv).length > 0) out.env = safeEnv;
+    }
+    return Object.keys(out).length > 0 ? `${JSON.stringify(out, null, 2)}\n` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export interface StagedClaudeState {
+  hostClaudeDir: string;
+  hostClaudeJson: string;
+  dir: string;
+  claudeJsonFile: string;
+  bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[];
+  symlinks: { dest: string; target: string }[];
+  cleanup: () => void;
+}
+
+/**
+ * 为隔离运行的 Claude ACP 工人构造按次隔离的 `0700` 配置目录与脱敏 `~/.claude.json`：
+ *   - 仅拷贝运行所需的凭据与设置（`.credentials.json`、`credentials.json`，以及非 `tools="none"` 时的 `settings.json`/`settings.local.json`/`CLAUDE.md`；`tools="none"` 时仅保留安全模型与路由环境变量，剔除 hooks/mcpServers/apiKeyHelper）；
+ *   - 绝不挂载或复制宿主机 `~/.claude/projects/`、`history.jsonl`、`file-history/`、`todos/`、`debug/`、`session-env/` 等跨仓库会话记录，也剥离 `~/.claude.json` 中的 `projects` 字段。
+ */
+export function stageIsolatedClaudeState(
+  hostHome: string,
+  effectiveEnv: NodeJS.ProcessEnv = process.env,
+  dataDir?: string,
+  opts?: { tools?: "none" | "read" | "write" },
+): StagedClaudeState | undefined {
+  const effectiveHome = effectiveEnv.HOME?.trim() || hostHome || os.homedir();
+  if (!effectiveHome) return undefined;
+  const resolvedHome = safeRealpath(effectiveHome);
+  const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
+  const explicitDir = effectiveEnv.CLAUDE_CONFIG_DIR?.trim();
+  const logicalClaudeDir = explicitDir
+    ? (path.isAbsolute(explicitDir) ? explicitDir : path.join(resolvedHome, explicitDir))
+    : path.join(resolvedHome, ".claude");
+  const hostClaudeDir = fs.existsSync(logicalClaudeDir) ? safeRealpath(logicalClaudeDir) : logicalClaudeDir;
+  const logicalClaudeJson = path.join(resolvedHome, ".claude.json");
+  const hostClaudeJson = fs.existsSync(logicalClaudeJson) ? safeRealpath(logicalClaudeJson) : logicalClaudeJson;
+
+  const isSafeSource = (realPath: string): boolean =>
+    !(resolvedData && (isPathInsideOrEqual(realPath, resolvedData) || isPathInsideOrEqual(resolvedData, realPath)));
+
+  const scoped = createScopedSecretDir("pa-claude-state-", effectiveEnv);
+  try {
+    const stageDir = path.join(scoped.dir, "claude");
+    fs.mkdirSync(stageDir, { recursive: true, mode: 0o700 });
+
+    const copyAllowedFile = (srcFile: string, dstFile: string, maxBytes: number) => {
+      try {
+        const st = fs.statSync(srcFile);
+        if (!st.isFile() || st.size > maxBytes) return;
+        const realSrc = fs.realpathSync(srcFile);
+        if (!isSafeSource(realSrc)) return;
+        fs.writeFileSync(dstFile, fs.readFileSync(realSrc), { mode: 0o600 });
+      } catch {
+        // ignore missing or unreadable optional file
+      }
+    };
+
+    if (fs.existsSync(hostClaudeDir) && isSafeSource(hostClaudeDir)) {
+      try {
+        if (fs.statSync(hostClaudeDir).isDirectory()) {
+          copyAllowedFile(path.join(hostClaudeDir, ".credentials.json"), path.join(stageDir, ".credentials.json"), 256 * 1024);
+          copyAllowedFile(path.join(hostClaudeDir, "credentials.json"), path.join(stageDir, "credentials.json"), 256 * 1024);
+
+          if (opts?.tools === "none") {
+            const settingsSrc = path.join(hostClaudeDir, "settings.json");
+            try {
+              const st = fs.statSync(settingsSrc);
+              if (st.isFile() && st.size <= 512 * 1024) {
+                const realSettings = fs.realpathSync(settingsSrc);
+                if (isSafeSource(realSettings)) {
+                  const sanitized = sanitizeClaudeSettingsForNoTools(fs.readFileSync(realSettings, "utf8"));
+                  if (sanitized) {
+                    fs.writeFileSync(path.join(stageDir, "settings.json"), sanitized, { mode: 0o600 });
+                  }
+                }
+              }
+            } catch {
+              // ignore missing/invalid settings.json
+            }
+          } else {
+            copyAllowedFile(path.join(hostClaudeDir, "settings.json"), path.join(stageDir, "settings.json"), 512 * 1024);
+            copyAllowedFile(path.join(hostClaudeDir, "settings.local.json"), path.join(stageDir, "settings.local.json"), 512 * 1024);
+            copyAllowedFile(path.join(hostClaudeDir, "CLAUDE.md"), path.join(stageDir, "CLAUDE.md"), 1024 * 1024);
+          }
+
+          // 若 CLAUDE_CONFIG_DIR 内部自身存有 .claude.json，也做同样脱敏投影
+          const innerClaudeJson = path.join(hostClaudeDir, ".claude.json");
+          try {
+            const st = fs.statSync(innerClaudeJson);
+            if (st.isFile() && st.size <= 4 * 1024 * 1024) {
+              const realInner = fs.realpathSync(innerClaudeJson);
+              if (isSafeSource(realInner)) {
+                const sanitized = sanitizeClaudeJsonContent(fs.readFileSync(realInner, "utf8"), opts);
+                fs.writeFileSync(path.join(stageDir, ".claude.json"), sanitized, { mode: 0o600 });
+              }
+            }
+          } catch {
+            // ignore missing inner .claude.json
+          }
+        }
+      } catch {
+        // ignore non-directory hostClaudeDir
+      }
+    }
+
+    const claudeJsonFile = path.join(scoped.dir, "claude.json");
+    let sanitizedHomeJson = "{}\n";
+    try {
+      const st = fs.statSync(logicalClaudeJson);
+      if (st.isFile() && st.size <= 4 * 1024 * 1024) {
+        const realJson = fs.realpathSync(logicalClaudeJson);
+        if (isSafeSource(realJson)) {
+          sanitizedHomeJson = sanitizeClaudeJsonContent(fs.readFileSync(realJson, "utf8"), opts);
+        }
+      }
+    } catch {
+      // absent or unreadable ~/.claude.json -> empty sanitized object
+    }
+    fs.writeFileSync(claudeJsonFile, sanitizedHomeJson, { mode: 0o600 });
+
+    const bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[] = [
+      { src: stageDir, dest: logicalClaudeDir, mode: "rw" },
+      { src: claudeJsonFile, dest: logicalClaudeJson, mode: "rw" },
+    ];
+    const symlinks: { dest: string; target: string }[] = [];
+    try {
+      const jsonLst = fs.lstatSync(logicalClaudeJson);
+      if (jsonLst.isSymbolicLink()) {
+        const logicalDest = path.join(safeRealpath(path.dirname(logicalClaudeJson)), path.basename(logicalClaudeJson));
+        if (logicalDest !== hostClaudeJson) {
+          symlinks.push({ dest: logicalDest, target: hostClaudeJson });
+        }
+      }
+    } catch {
+      // not a symlink
+    }
+
+    return {
+      hostClaudeDir,
+      hostClaudeJson,
+      dir: stageDir,
+      claudeJsonFile,
+      bindMounts,
+      symlinks,
       cleanup: scoped.cleanup,
     };
   } catch (err) {
@@ -1282,7 +1835,8 @@ export function selectAcpxAgentConfigPaths(
 /** 提取 acpx 选定 agent 对应的底层可执行名/路径，供沙箱挂载其全局 npm 包与运行时依赖 */
 function resolveAcpxAgentExecutable(h: Pick<Config["harnesses"][string], "agent" | "agentCommand">): string | undefined {
   if (h.agentCommand?.trim()) {
-    return h.agentCommand.trim().split(/\s+/)[0];
+    const { execToken } = extractCommandExecAndScriptTokens(parseShellCommandTokens(h.agentCommand));
+    return execToken || extractFirstShellCommandToken(h.agentCommand) || undefined;
   }
   const a = (h.agent?.trim() || "").toLowerCase();
   if (a === "claude" || a === "claude-code") return "claude";
@@ -1576,6 +2130,7 @@ export function buildWorkspaceIsolation(
     allowGuardLog?: boolean;
     extraWritablePaths?: string[];
     extraReadOnlyPaths?: string[];
+    extraSymlinks?: { dest: string; target: string }[];
     extraBindMounts?: { src: string; dest: string; mode: "ro" | "rw" }[];
   },
   rawEnv: NodeJS.ProcessEnv = process.env,
@@ -1658,7 +2213,7 @@ export function buildWorkspaceIsolation(
   //   - 仅受信任 Git 传输（git-rw / git-ro）挂载完整全局配置与适用 include（保留 url.*.pushInsteadOf、credential.* 等交付设置）；
   //   - 不可信仓库工人、审查与校验命令（verify / worker-write / worker-ro / codex-exec）只挂载无凭据的 git/ignore 与 git/attributes，
   //     脱敏后的全局偏好由调用方通过 stageSanitizedGitConfig 单独投影，绝不把 ~/.gitconfig 中的 http.extraHeader 或带令牌 URL 暴露给工人。
-  const extraSymlinks: { dest: string; target: string }[] = [];
+  const extraSymlinks: { dest: string; target: string }[] = [...(opts.extraSymlinks ?? [])];
   if (opts.mode === "git-rw" || opts.mode === "git-ro") {
     const gitCfgMounts = collectSafeGitConfigMounts(rawEnv, dataDir, { cwd: resolvedCwd });
     readOnlyPaths.push(...gitCfgMounts.readOnlyPaths);
@@ -1791,68 +2346,94 @@ function probeMountMaskBackend(): MountMaskBackend {
     const pivotRootBin = resolvePivotRootBin();
     const shBin = resolveTrustedSystemBin("sh");
     if (unshareBin && setprivBin && pivotRootBin && shBin) {
-      const probeScript = [
-        "set -e",
-        `export PATH="${TRUSTED_BOOTSTRAP_PATH}"`,
-        'PIVOT="$1"; SP="$2"',
-        "mount -n --make-rprivate /",
-        "S=",
-        "for d in /mnt /media /srv /var/tmp; do [ -d \"$d\" ] && S=\"$d\" && break; done",
-        'if [ -z "$S" ]; then exit 1; fi',
-        'mount -n -t tmpfs tmpfs "$S"',
-        'mkdir -p "$S/newroot"',
-        'mount -n -t tmpfs tmpfs "$S/newroot"',
-        'mkdir -p "$S/newroot/proc" "$S/newroot/dev" "$S/newroot/tmp" "$S/newroot/usr" "$S/newroot/etc"',
-        'mount -n --rbind /proc "$S/newroot/proc"',
-        'mount -n -t tmpfs -o mode=755,nosuid tmpfs "$S/newroot/dev"',
-        ': > "$S/newroot/dev/null"; mount -n --bind /dev/null "$S/newroot/dev/null"',
-        'mount -n -t tmpfs -o mode=1777,nosuid,nodev tmpfs "$S/newroot/tmp"',
-        'mount -n --rbind /usr "$S/newroot/usr"; mount -n -o remount,ro,bind "$S/newroot/usr"',
-        'mount -n --rbind /etc "$S/newroot/etc"; mount -n -o remount,ro,bind "$S/newroot/etc"',
-        'for top in bin sbin lib lib64 lib32 libx32; do',
-        '  if [ -L "/$top" ]; then ln -s "$(readlink "/$top")" "$S/newroot/$top"; elif [ -d "/$top" ]; then mkdir -p "$S/newroot/$top"; mount -n --rbind "/$top" "$S/newroot/$top"; mount -n -o remount,ro,bind "$S/newroot/$top"; fi',
-        "done",
-        'mount -n -o remount,ro,bind "$S/newroot"',
-        'mkdir -p "$S/newroot/tmp/.oldroot"',
-        'cd "$S/newroot"',
-        '"$PIVOT" . tmp/.oldroot',
-        "umount -n -l /tmp/.oldroot",
-        "rmdir /tmp/.oldroot",
-        'exec "$SP" --bounding-set -all --inh-caps -all --ambient-caps -all --no-new-privs true',
-      ].join("\n");
-      const probeArgsWithKill = [
-        "--user",
-        "--map-root-user",
-        "--mount",
-        "--pid",
-        "--fork",
-        "--mount-proc",
-        "--kill-child",
-        "--",
-        shBin,
-        "-c",
-        probeScript,
-        "_",
-        pivotRootBin,
-        setprivBin,
-      ];
-      const rKill = spawnSync(unshareBin, probeArgsWithKill, {
-        env: TRUSTED_BOOTSTRAP_ENV,
-        timeout: 3_000,
-        stdio: "ignore",
-      });
-      if (rKill.status === 0) {
-        cachedMountMaskBackend = { kind: "unshare", bin: unshareBin, setprivBin, pivotRootBin, shBin, killChild: true };
-        return cachedMountMaskBackend;
-      }
-      const r = spawnSync(
-        unshareBin,
-        ["--user", "--map-root-user", "--mount", "--pid", "--fork", "--mount-proc", "--", shBin, "-c", probeScript, "_", pivotRootBin, setprivBin],
-        { env: TRUSTED_BOOTSTRAP_ENV, timeout: 3_000, stdio: "ignore" },
-      );
-      if (r.status === 0) {
-        cachedMountMaskBackend = { kind: "unshare", bin: unshareBin, setprivBin, pivotRootBin, shBin, killChild: false };
-        return cachedMountMaskBackend;
+      const origUid = typeof process.getuid === "function" ? process.getuid() : 0;
+      const origGid = typeof process.getgid === "function" ? process.getgid() : 0;
+      const buildProbeScript = (withUserRestore: boolean) =>
+        [
+          "set -e",
+          `export PATH="${TRUSTED_BOOTSTRAP_PATH}"`,
+          'UNSHARE_BIN="$1"; PIVOT="$2"; SP="$3"; U="$4"; G="$5"',
+          "mount -n --make-rprivate /",
+          "S=",
+          "for d in /mnt /media /srv /var/tmp; do [ -d \"$d\" ] && S=\"$d\" && break; done",
+          'if [ -z "$S" ]; then exit 1; fi',
+          'mount -n -t tmpfs tmpfs "$S"',
+          'mkdir -p "$S/newroot"',
+          'mount -n -t tmpfs tmpfs "$S/newroot"',
+          'mkdir -p "$S/newroot/proc" "$S/newroot/dev" "$S/newroot/tmp" "$S/newroot/usr" "$S/newroot/etc"',
+          'mount -n --rbind /proc "$S/newroot/proc"',
+          'mount -n -t tmpfs -o mode=755,nosuid tmpfs "$S/newroot/dev"',
+          ': > "$S/newroot/dev/null"; mount -n --bind /dev/null "$S/newroot/dev/null"',
+          'mount -n -t tmpfs -o mode=1777,nosuid,nodev tmpfs "$S/newroot/tmp"',
+          'mount -n --rbind /usr "$S/newroot/usr"; mount -n -o remount,ro,bind "$S/newroot/usr"',
+          'mount -n --rbind /etc "$S/newroot/etc"; mount -n -o remount,ro,bind "$S/newroot/etc"',
+          'for top in bin sbin lib lib64 lib32 libx32; do',
+          '  if [ -L "/$top" ]; then ln -s "$(readlink "/$top")" "$S/newroot/$top"; elif [ -d "/$top" ]; then mkdir -p "$S/newroot/$top"; mount -n --rbind "/$top" "$S/newroot/$top"; mount -n -o remount,ro,bind "$S/newroot/$top"; fi',
+          "done",
+          'mount -n -o remount,ro,bind "$S/newroot"',
+          'mkdir -p "$S/newroot/tmp/.oldroot"',
+          'cd "$S/newroot"',
+          '"$PIVOT" . tmp/.oldroot',
+          "umount -n -l /tmp/.oldroot",
+          "rmdir /tmp/.oldroot",
+          withUserRestore
+            ? 'exec "$UNSHARE_BIN" --user --map-user="$U" --map-group="$G" -- "$SP" --bounding-set -all --inh-caps -all --ambient-caps -all --no-new-privs sh -c \'test "$(id -u)" = "$1"\' _ "$U"'
+            : 'exec "$SP" --bounding-set -all --inh-caps -all --ambient-caps -all --no-new-privs true',
+        ].join("\n");
+
+      const runUnshareProbe = (killChild: boolean, restoreUserMap: boolean): boolean => {
+        const probeArgs = [
+          "--user",
+          "--map-root-user",
+          "--mount",
+          "--pid",
+          "--fork",
+          "--mount-proc",
+          ...(killChild ? ["--kill-child"] : []),
+          "--",
+          shBin,
+          "-c",
+          buildProbeScript(restoreUserMap),
+          "_",
+          unshareBin,
+          pivotRootBin,
+          setprivBin,
+          String(origUid),
+          String(origGid),
+        ];
+        const r = spawnSync(unshareBin, probeArgs, {
+          env: TRUSTED_BOOTSTRAP_ENV,
+          timeout: 3_000,
+          stdio: "ignore",
+        });
+        return r.status === 0;
+      };
+
+      const tryOrder: { killChild: boolean; restoreUserMap: boolean }[] =
+        origUid > 0
+          ? [
+              { killChild: true, restoreUserMap: true },
+              { killChild: false, restoreUserMap: true },
+              { killChild: true, restoreUserMap: false },
+              { killChild: false, restoreUserMap: false },
+            ]
+          : [
+              { killChild: true, restoreUserMap: false },
+              { killChild: false, restoreUserMap: false },
+            ];
+      for (const opt of tryOrder) {
+        if (runUnshareProbe(opt.killChild, opt.restoreUserMap)) {
+          cachedMountMaskBackend = {
+            kind: "unshare",
+            bin: unshareBin,
+            setprivBin,
+            pivotRootBin,
+            shBin,
+            killChild: opt.killChild,
+            restoreUserMap: opt.restoreUserMap,
+          };
+          return cachedMountMaskBackend;
+        }
       }
     }
   } catch {
@@ -1893,8 +2474,8 @@ const UNSHARE_ISOLATION_SCRIPT = [
   'ORIG_PATH="${PATH-}"',
   'HAS_ORIG_PATH="${PATH+1}"',
   `export PATH="${TRUSTED_BOOTSTRAP_PATH}"`,
-  'PIVOT_ROOT="$1"; SETPRIV="$2"; DD="$3"; CWD="$4"; SYS_COUNT="$5"; SYM_COUNT="$6"; TM_COUNT="$7"; PRE_COUNT="$8"; POST_COUNT="$9"; EXTRA_COUNT="${10}"; M_COUNT="${11}"',
-  "shift 11",
+  'UNSHARE_BIN="$1"; PIVOT_ROOT="$2"; SETPRIV="$3"; ORIG_UID="$4"; ORIG_GID="$5"; DD="$6"; CWD="$7"; SYS_COUNT="$8"; SYM_COUNT="$9"; TM_COUNT="${10}"; PRE_COUNT="${11}"; POST_COUNT="${12}"; EXTRA_COUNT="${13}"; M_COUNT="${14}"',
+  "shift 14",
   "mount -n --make-rprivate /",
   "S=",
   'TMP_STAGE=""',
@@ -2011,6 +2592,9 @@ const UNSHARE_ISOLATION_SCRIPT = [
   "rmdir /tmp/.oldroot",
   'if [ -n "$CWD" ]; then cd "$CWD"; fi',
   'if [ -n "$HAS_ORIG_PATH" ]; then export PATH="$ORIG_PATH"; else unset PATH; fi',
+  // 非 root 调用者在完成挂载与 pivot_root 后再嵌套一层无特权用户命名空间还原真实 UID/GID，
+  // 使 OpenSSH getpwuid(getuid())->pw_dir 与文件属主校验（0600 密钥）指向调用者的真实宿主目录而非 /root。
+  'if [ -n "$UNSHARE_BIN" ] && [ -n "$ORIG_UID" ] && [ "$ORIG_UID" != "0" ]; then exec "$UNSHARE_BIN" --user --map-user="$ORIG_UID" --map-group="$ORIG_GID" -- "$SETPRIV" --bounding-set -all --inh-caps -all --ambient-caps -all --no-new-privs "$@"; fi',
   'exec "$SETPRIV" --bounding-set -all --inh-caps -all --ambient-caps -all --no-new-privs "$@"',
 ].join("\n");
 
@@ -2491,7 +3075,13 @@ export function wrapCredentialIsolatedCommand(
   const fileSymlinks = [...fileSymlinkMap.entries()]
     .map(([dest, target]) => ({ dest, target }))
     .sort((a, b) => a.dest.length - b.dest.length || a.dest.localeCompare(b.dest));
-  const allSymlinks = [...dirSymlinks, ...fileSymlinks];
+  const isInsideTmpfsMask = (p: string): boolean =>
+    isHiddenByEphemeralTmpfs(p) || (!!resolvedDataDir && isPathInsideOrEqual(p, resolvedDataDir));
+  const preTmpfsDirSymlinks = dirSymlinks.filter((s) => !isInsideTmpfsMask(s.dest));
+  const postTmpfsSymlinks = [...dirSymlinks.filter((s) => isInsideTmpfsMask(s.dest)), ...fileSymlinks].sort(
+    (a, b) => a.dest.length - b.dest.length || a.dest.localeCompare(b.dest),
+  );
+  const allSymlinks = [...preTmpfsDirSymlinks, ...postTmpfsSymlinks];
 
   const rawMasks: string[] = [...(opts?.maskFiles ?? [])];
   if (hasCredKeyFile) {
@@ -2558,7 +3148,7 @@ export function wrapCredentialIsolatedCommand(
     for (const p of systemRoAll) {
       bwrapArgs.push("--ro-bind", p, p);
     }
-    for (const s of dirSymlinks) {
+    for (const s of preTmpfsDirSymlinks) {
       bwrapArgs.push("--symlink", s.target, s.dest);
     }
     bwrapArgs.push("--dev", "/dev", "--unshare-pid", "--proc", "/proc", "--tmpfs", "/tmp");
@@ -2577,7 +3167,7 @@ export function wrapCredentialIsolatedCommand(
     for (const em of extraBindMounts) {
       bwrapArgs.push(em.mode === "ro" ? "--ro-bind" : "--bind", em.src, em.dest);
     }
-    for (const s of fileSymlinks) {
+    for (const s of postTmpfsSymlinks) {
       bwrapArgs.push("--symlink", s.target, s.dest);
     }
     if (resolvedDataDir) {
@@ -2597,6 +3187,9 @@ export function wrapCredentialIsolatedCommand(
       throw new Error("unshare 回退缺少 setpriv 或 pivot_root，无法构建最小只读根挂载视图并永久剥离权限，已按安全策略拒绝执行");
     }
     const shBin = backend.shBin ?? resolveTrustedSystemBin("sh") ?? "/bin/sh";
+    const origUid = typeof process.getuid === "function" ? process.getuid() : 0;
+    const origGid = typeof process.getgid === "function" ? process.getgid() : 0;
+    const restoreUnshareBin = origUid > 0 && backend.restoreUserMap !== false ? backend.bin : "";
     const flatten = (list: MountEntry[]): string[] => list.flatMap((m) => [m.mode, m.path]);
     const flattenExtra = (list: { mode: "ro" | "rw"; src: string; dest: string }[]): string[] =>
       list.flatMap((m) => [m.mode, m.src, m.dest]);
@@ -2614,8 +3207,11 @@ export function wrapCredentialIsolatedCommand(
       "-c",
       UNSHARE_ISOLATION_SCRIPT,
       "_",
+      restoreUnshareBin,
       backend.pivotRootBin,
       backend.setprivBin,
+      String(origUid),
+      String(origGid),
       resolvedDataDir,
       resolvedCwd,
       String(systemRoAll.length),
@@ -3962,6 +4558,53 @@ export function extractSafeCodexProviderArgs(
   return extractSafeCodexProviderConfig(env, extraArgs, hasExplicitModel).args;
 }
 
+/**
+ * 将 `extractSafeCodexProviderConfig` 提取的安全路由、供应商与账号限制参数渲染为标准 `config.toml`，
+ * 供隔离无工具模式的 Codex ACP（`agent: codex` + `tools: none`）在临时 `CODEX_HOME` 中生效，
+ * 绝不复制宿主机 `mcp_servers`、`hooks`、`plugins`、`profiles` 或工具权限配置。
+ */
+export function renderSafeCodexConfigToml(safeCfg: SafeCodexProviderConfig): string {
+  const topLines: string[] = [];
+  const sectionBlocks: string[] = [];
+  for (let i = 0; i < safeCfg.args.length; i += 2) {
+    if (safeCfg.args[i] !== "-c") continue;
+    const expr = safeCfg.args[i + 1];
+    if (!expr) continue;
+    const parsed = parseCliConfigAssignment(expr);
+    if (!parsed) continue;
+    if (parsed.key === "model_providers") {
+      const providersVal = parseTomlValue(parsed.value);
+      if (isPlainTable(providersVal)) {
+        for (const [pName, pDef] of Object.entries(providersVal)) {
+          if (!isPlainTable(pDef)) continue;
+          const pSeg = formatTomlKeySegment(pName);
+          const pLines: string[] = [`[model_providers.${pSeg}]`];
+          const subBlocks: string[] = [];
+          for (const [k, v] of Object.entries(pDef)) {
+            const kSeg = formatTomlKeySegment(k);
+            if (isPlainTable(v)) {
+              const sLines: string[] = [`[model_providers.${pSeg}.${kSeg}]`];
+              for (const [sk, sv] of Object.entries(v)) {
+                sLines.push(`${formatTomlKeySegment(sk)} = ${serializeTomlInlineValue(sv)}`);
+              }
+              subBlocks.push(sLines.join("\n"));
+            } else {
+              pLines.push(`${kSeg} = ${serializeTomlInlineValue(v)}`);
+            }
+          }
+          sectionBlocks.push(pLines.join("\n"), ...subBlocks);
+        }
+      }
+      continue;
+    }
+    topLines.push(`${formatTomlKeySegment(parsed.key)} = ${parsed.value}`);
+  }
+  topLines.push("sandbox_permissions = []");
+  topLines.push('web_search = "disabled"');
+  const allParts = [topLines.join("\n"), ...sectionBlocks].filter(Boolean);
+  return `${allParts.join("\n\n")}\n`;
+}
+
 export interface HarnessRun {
   harness: string;
   prompt: string;
@@ -4026,12 +4669,14 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
   const baseEnv = prepareHarnessEnv();
   const started = new Date().toISOString();
   let stagedAcpx: StagedAcpxState | undefined;
+  let stagedClaude: StagedClaudeState | undefined;
   let stagedDoubao: StagedDoubaoDataDir | undefined;
   let stagedNpmrc: StagedSanitizedNpmrc | undefined;
   let stagedGitCfg: StagedSanitizedGitConfig | undefined;
   let stagedCodexHome: StagedCodexHome | undefined;
   let stagedAws: StagedAwsProfile | undefined;
   let oauthLease: CodexOAuthRefreshLease | undefined;
+  let syncedCodexAuth = false;
   let r: Awaited<ReturnType<typeof runProcess>>;
   try {
     const mode: WorkspaceIsolationMode =
@@ -4041,6 +4686,8 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
     const hostHome = acpxIsolationEnv.HOME?.trim() || os.homedir();
     const resolvedDataDir = cfg.dataDir && fs.existsSync(cfg.dataDir) ? safeRealpath(cfg.dataDir) : "";
     const selectedAgentId = resolveSelectedAcpxAgentId(h);
+    const isClaudeAcpx =
+      selectedAgentId === "claude" || selectedAgentId === "claude-code" || selectedAgentId.startsWith("claude-");
     const isDoubaoAcpx = selectedAgentId === "doubao" || selectedAgentId.startsWith("doubao-");
     const isCodexAcpx = selectedAgentId === "codex" || selectedAgentId.startsWith("codex-");
     const acpxTimeoutMs = (run.timeoutSec + 120) * 1000;
@@ -4068,6 +4715,11 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
     );
     const willIsolate = willIsolateCommand(acpxIsolationEnv, basePlan);
 
+    // 隔离模式下为 Claude 工人暂存仅含凭据与设置的私有目录及脱敏 ~/.claude.json，彻底隔离宿主机 projects/ 与 history.jsonl
+    if (isClaudeAcpx && willIsolate) {
+      stagedClaude = stageIsolatedClaudeState(hostHome, acpxIsolationEnv, cfg.dataDir, { tools: run.tools });
+    }
+
     // tools === "none" 时显式传入空 --mcp-config，阻断宿主机全局配置与项目 .acpxrc.json 注入 MCP 服务器
     if (run.tools === "none" && stagedAcpx?.emptyMcpConfigFile) {
       const mcpCfgArg = willIsolate
@@ -4078,9 +4730,11 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
     if (h.agentCommand) args.push("--agent", h.agentCommand, "exec", "--file", "-");
     else args.push(h.agent!, "exec", "--file", "-");
 
-    // 对 Codex ACP 复用与 codex-exec 相同的私有可写 CODEX_HOME 暂存、AWS profile 投影与跨进程 OAuth 写回协调，
-    // 绝不把宿主机整个 ~/.codex（含跨仓库 sessions 历史）挂载给一次性 ACP 工人，且支持刷新后的文件凭据安全写回。
+    // 对 Codex ACP 复用与 codex-exec 相同的私有可写 CODEX_HOME 暂存、无工具安全供应商配置渲染、AWS profile 投影与跨进程 OAuth 写回协调，
+    // 绝不把宿主机整个 ~/.codex（含跨仓库 sessions 历史）挂载给一次性 ACP 工人，且支持刷新后的文件凭据崩溃可恢复安全写回。
     let codexHostHomeToSkip: string | undefined;
+    let codexNeedsCredentialStore = false;
+    let safeCodexExtraEnv: Record<string, string> = {};
     if (isCodexAcpx) {
       const effectiveCredInfo = resolveEffectiveCodexCredentialStore(childMergedEnv, [], {
         ignoreProfiles: run.tools === "none",
@@ -4088,11 +4742,17 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       if (effectiveCredInfo.configError) {
         throw new Error(`${effectiveCredInfo.configError}；为避免将私聊或代码误发往默认供应商，已中止执行`);
       }
+      codexNeedsCredentialStore = effectiveCredInfo.needsCredentialStore;
       if (willIsolate) {
         if (process.platform === "linux" && effectiveCredInfo.needsCredentialStore && effectiveCredInfo.store === "keyring") {
           throw new Error(
             `执行者 ${run.harness} 配置了 cli_auth_credentials_store="keyring"，但当前 Linux 隔离沙箱已屏蔽宿主机 D-Bus 会话总线与 XDG_RUNTIME_DIR，无法访问 Secret Service；请在 ~/.codex/config.toml 中改用 cli_auth_credentials_store="file" 并重新运行 codex login，或通过 OPENAI_API_KEY / CODEX_API_KEY / 供应商 env_key 提供 API 密钥`,
           );
+        }
+        const safeCodexCfg =
+          run.tools === "none" ? extractSafeCodexProviderConfig(childMergedEnv, [], !!h.model) : undefined;
+        if (safeCodexCfg) {
+          safeCodexExtraEnv = safeCodexCfg.extraEnv;
         }
         codexHostHomeToSkip = safeRealpath(effectiveCredInfo.codexHome);
         oauthLease = await coordinateCodexOAuthRefresh(effectiveCredInfo.codexHome, {
@@ -4104,7 +4764,17 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
         stagedCodexHome = stageIsolatedCodexHome(effectiveCredInfo.codexHome, {
           copyUserConfig: run.tools !== "none",
           needsCredentialStore: effectiveCredInfo.needsCredentialStore,
+          dataDir: cfg.dataDir,
         });
+        if (safeCodexCfg) {
+          // 隔离 tools="none" 仅将经过校验的路由/供应商/工作区限制写入暂存 config.toml，绝不复制 hooks/tools/MCP
+          fs.writeFileSync(
+            path.join(stagedCodexHome.scratchDir, "config.toml"),
+            renderSafeCodexConfigToml(safeCodexCfg),
+            { mode: 0o600 },
+          );
+        }
+        oauthLease.attachScratch?.(stagedCodexHome);
         if (effectiveCredInfo.awsProfile) {
           stagedAws = stageIsolatedAwsProfile(effectiveCredInfo.awsProfile, childMergedEnv, cfg.dataDir);
         }
@@ -4113,6 +4783,7 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
 
     const acpxExtraRo: string[] = [];
     const acpxExtraRw: string[] = [];
+    const acpxExtraSymlinks: { dest: string; target: string }[] = [];
     const acpxExtraBindMounts: { src: string; dest: string; mode: "ro" | "rw" }[] = [];
     if (baseEnv.env.CREDENTIALS_DIRECTORY) acpxExtraRo.push(baseEnv.env.CREDENTIALS_DIRECTORY);
     // 仅挂载 bin/guard/lark-cli 运行所需的 4 个精确文件，绝不挂载整个 ROOT（防暴露 ROOT/config.yaml 与 ROOT/.worktrees）
@@ -4120,6 +4791,11 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
     if (run.lark !== "none" && fs.existsSync(realLark)) acpxExtraRo.push(realLark);
     if (stagedAcpx) {
       acpxExtraBindMounts.push({ src: stagedAcpx.dir, dest: stagedAcpx.mountDest, mode: "rw" });
+      acpxExtraRo.push(...stagedAcpx.extraReadOnlyPaths);
+    }
+    if (stagedClaude) {
+      acpxExtraBindMounts.push(...stagedClaude.bindMounts);
+      acpxExtraSymlinks.push(...stagedClaude.symlinks);
     }
     if (stagedDoubao) {
       acpxExtraBindMounts.push(...stagedDoubao.bindMounts);
@@ -4146,6 +4822,9 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
     for (const p of selectedConfigPaths) {
       if (!fs.existsSync(p)) continue;
       const real = safeRealpath(p);
+      if (stagedClaude && (isPathInsideOrEqual(real, stagedClaude.hostClaudeDir) || real === stagedClaude.hostClaudeJson)) {
+        continue;
+      }
       if (stagedDoubao && isPathInsideOrEqual(real, stagedDoubao.hostDataDir)) {
         continue;
       }
@@ -4179,19 +4858,29 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
           allowGuardLog: run.lark !== "none",
           extraWritablePaths: acpxExtraRw,
           extraReadOnlyPaths: acpxExtraRo,
+          extraSymlinks: acpxExtraSymlinks,
           extraBindMounts: acpxExtraBindMounts,
         },
         acpxIsolationEnv,
       ),
     );
+    const restoreCodexDbus =
+      isCodexAcpx &&
+      !wrapped.isolated &&
+      process.platform === "linux" &&
+      codexNeedsCredentialStore &&
+      !!process.env.DBUS_SESSION_BUS_ADDRESS &&
+      !childMergedEnv.DBUS_SESSION_BUS_ADDRESS;
     const env: NodeJS.ProcessEnv = {
       ...childMergedEnv,
+      ...safeCodexExtraEnv,
       PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${process.env.PATH ?? ""}`,
       PA_GUARD_PROFILE: run.lark,
       PA_OWNER_OPEN_ID: cfg.owner.open_id,
       PA_LARK_REAL: realLark,
       PA_GUARD_LOG: path.join(cfg.dataDir, "logs", "guard.log"),
       ...(wrapped.isolated ? isolatedSandboxTempEnv() : {}),
+      ...(restoreCodexDbus ? { DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS } : {}),
       ...(stagedCodexHome ? { CODEX_HOME: stagedCodexHome.scratchDir } : {}),
       ...(stagedAws
         ? {
@@ -4214,16 +4903,22 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       signal: run.signal,
       onSpawn: run.onSpawn,
     });
-    if (stagedCodexHome) {
+    if (stagedCodexHome && !syncedCodexAuth) {
+      syncedCodexAuth = true;
       syncRefreshedCodexAuth(stagedCodexHome);
     }
   } finally {
-    oauthLease?.release();
+    if (stagedCodexHome && !syncedCodexAuth) {
+      syncedCodexAuth = true;
+      syncRefreshedCodexAuth(stagedCodexHome);
+    }
     stagedCodexHome?.cleanup();
+    oauthLease?.release();
     stagedAws?.cleanup();
     stagedGitCfg?.cleanup();
     stagedNpmrc?.cleanup();
     stagedDoubao?.cleanup();
+    stagedClaude?.cleanup();
     stagedAcpx?.cleanup();
     baseEnv.cleanup();
   }
@@ -4399,7 +5094,351 @@ function openCodexLockDb(resolvedAuthPath: string): DatabaseSync {
       expires_at INTEGER NOT NULL
     )
   `);
+  // 崩溃可恢复登记表：仅存非敏感元数据与暂存目录路径（绝不存原始令牌），
+  // 当常驻进程在 Codex 轮换单次 refresh_token 后异常崩溃时，下次调用在读取宿主机旧令牌前先原子恢复新令牌。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS pending_recovery (
+      holder TEXT PRIMARY KEY,
+      pid INTEGER NOT NULL,
+      scratch_auth_path TEXT NOT NULL,
+      scratch_dir TEXT NOT NULL,
+      host_auth_path TEXT NOT NULL,
+      was_symlink INTEGER NOT NULL,
+      orig_dev INTEGER NOT NULL,
+      orig_ino INTEGER NOT NULL,
+      orig_sha256 TEXT NOT NULL,
+      orig_auth_mode TEXT,
+      orig_account_id TEXT,
+      orig_last_refresh TEXT,
+      created_at INTEGER NOT NULL
+    )
+  `);
   return db;
+}
+
+interface CodexPendingRecoveryRow {
+  holder: string;
+  pid: number;
+  scratch_auth_path: string;
+  scratch_dir: string;
+  host_auth_path: string;
+  was_symlink: number;
+  orig_dev: number;
+  orig_ino: number;
+  orig_sha256: string;
+  orig_auth_mode: string | null;
+  orig_account_id: string | null;
+  orig_last_refresh: string | null;
+  created_at: number;
+}
+
+function sha256Hex(buf: Buffer): string {
+  return createHash("sha256").update(buf).digest("hex");
+}
+
+function isSafeCodexScratchDirForCleanup(scratchDir: string): boolean {
+  if (!scratchDir || !path.isAbsolute(scratchDir)) return false;
+  const base = path.basename(scratchDir);
+  if (!base.startsWith(".pa-codex-home-") && !base.startsWith("pa-codex-home-")) return false;
+  try {
+    const lst = fs.lstatSync(scratchDir);
+    return !lst.isSymbolicLink() && lst.isDirectory() && isCurrentUidOwner(lst);
+  } catch {
+    return false;
+  }
+}
+
+interface CodexSyncTargetMeta {
+  hostAuthPath: string;
+  resolvedAuthPath: string;
+  wasSymlink: boolean;
+  origDev: number;
+  origIno: number;
+  origSha256: string;
+  origAuthMode?: string;
+  origAccountId?: string;
+  origLastRefresh?: string;
+  origJson?: Record<string, unknown>;
+}
+
+function applyValidatedCodexAuthSyncLocked(meta: CodexSyncTargetMeta, scratchAuthPath: string): boolean {
+  let nextBytes: Buffer;
+  try {
+    const lst = fs.lstatSync(scratchAuthPath);
+    if (
+      lst.isSymbolicLink() ||
+      !lst.isFile() ||
+      !isCurrentUidOwner(lst) ||
+      lst.size <= 0 ||
+      lst.size > MAX_CODEX_AUTH_BYTES
+    ) {
+      return false;
+    }
+    nextBytes = fs.readFileSync(scratchAuthPath);
+  } catch {
+    return false;
+  }
+  if (sha256Hex(nextBytes) === meta.origSha256) return false;
+
+  let nextJson: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(nextBytes.toString("utf8")) as unknown;
+    if (!isPlainJsonRecord(parsed)) return false;
+    nextJson = parsed;
+  } catch {
+    return false;
+  }
+
+  const nextTokens = isPlainJsonRecord(nextJson.tokens) ? nextJson.tokens : undefined;
+  if (
+    !nextTokens ||
+    typeof nextTokens.access_token !== "string" ||
+    !nextTokens.access_token.trim() ||
+    typeof nextTokens.refresh_token !== "string" ||
+    !nextTokens.refresh_token.trim()
+  ) {
+    return false;
+  }
+  if (meta.origAuthMode && nextJson.auth_mode !== meta.origAuthMode) return false;
+  if (meta.origAccountId && nextTokens.account_id !== meta.origAccountId) return false;
+
+  const origRefreshMs = meta.origLastRefresh ? Date.parse(meta.origLastRefresh) : NaN;
+  const nextRefreshMs = typeof nextJson.last_refresh === "string" ? Date.parse(nextJson.last_refresh) : NaN;
+  if (Number.isFinite(origRefreshMs) && Number.isFinite(nextRefreshMs) && nextRefreshMs < origRefreshMs) {
+    return false;
+  }
+
+  const verifyEntryPointsToTarget = (): boolean => {
+    try {
+      const entryLst = fs.lstatSync(meta.hostAuthPath);
+      if (meta.wasSymlink) {
+        if (!entryLst.isSymbolicLink()) return false;
+        return fs.realpathSync(meta.hostAuthPath) === meta.resolvedAuthPath;
+      }
+      return (
+        !entryLst.isSymbolicLink() &&
+        entryLst.isFile() &&
+        Number(entryLst.dev) === meta.origDev &&
+        Number(entryLst.ino) === meta.origIno
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  if (!verifyEntryPointsToTarget()) return false;
+
+  const roFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  let readFd: number;
+  try {
+    readFd = fs.openSync(meta.resolvedAuthPath, roFlags);
+  } catch {
+    return false;
+  }
+  let beforeStat: fs.Stats;
+  let curHostBytes: Buffer;
+  try {
+    beforeStat = fs.fstatSync(readFd);
+    if (
+      !beforeStat.isFile() ||
+      !isCurrentUidOwner(beforeStat) ||
+      beforeStat.size > MAX_CODEX_AUTH_BYTES ||
+      Number(beforeStat.dev) !== meta.origDev ||
+      Number(beforeStat.ino) !== meta.origIno
+    ) {
+      return false;
+    }
+    const buf = Buffer.allocUnsafe(beforeStat.size);
+    let readOff = 0;
+    while (readOff < beforeStat.size) {
+      const n = fs.readSync(readFd, buf, readOff, beforeStat.size - readOff, readOff);
+      if (n <= 0) break;
+      readOff += n;
+    }
+    curHostBytes = buf.subarray(0, readOff);
+  } finally {
+    try {
+      fs.closeSync(readFd);
+    } catch {
+      // ignore
+    }
+  }
+
+  let curHostJson: Record<string, unknown> | undefined;
+  try {
+    const parsedCur = JSON.parse(curHostBytes.toString("utf8")) as unknown;
+    if (isPlainJsonRecord(parsedCur)) curHostJson = parsedCur;
+  } catch {
+    curHostJson = undefined;
+  }
+
+  if (sha256Hex(curHostBytes) !== meta.origSha256) {
+    if (!curHostJson || !isPlainJsonRecord(curHostJson.tokens)) return false;
+    if (meta.origAuthMode && curHostJson.auth_mode !== meta.origAuthMode) return false;
+    if (meta.origAccountId && curHostJson.tokens.account_id !== meta.origAccountId) return false;
+    const curHostRefreshMs = typeof curHostJson.last_refresh === "string" ? Date.parse(curHostJson.last_refresh) : NaN;
+    if (!Number.isFinite(nextRefreshMs) || !Number.isFinite(curHostRefreshMs) || nextRefreshMs <= curHostRefreshMs) {
+      return false;
+    }
+  }
+
+  const baseJson = meta.origJson ?? curHostJson;
+  if (!baseJson || !isPlainJsonRecord(baseJson.tokens)) return false;
+  const baseTokens = baseJson.tokens;
+  const tokensChanged =
+    nextTokens.access_token !== baseTokens.access_token ||
+    nextTokens.refresh_token !== baseTokens.refresh_token ||
+    (typeof nextTokens.id_token === "string" && nextTokens.id_token !== baseTokens.id_token);
+  const refreshAdvanced = Number.isFinite(nextRefreshMs) && (!Number.isFinite(origRefreshMs) || nextRefreshMs > origRefreshMs);
+  if (!tokensChanged && !refreshAdvanced) return false;
+
+  const sanitizedTokens: Record<string, unknown> = {
+    ...(typeof baseTokens.id_token === "string" ? { id_token: baseTokens.id_token } : {}),
+    ...(typeof nextTokens.id_token === "string" ? { id_token: nextTokens.id_token } : {}),
+    access_token: nextTokens.access_token,
+    refresh_token: nextTokens.refresh_token,
+    ...(typeof nextTokens.account_id === "string"
+      ? { account_id: nextTokens.account_id }
+      : typeof baseTokens.account_id === "string"
+        ? { account_id: baseTokens.account_id }
+        : {}),
+  };
+  const nextLastRefresh =
+    typeof nextJson.last_refresh === "string" && nextJson.last_refresh.trim()
+      ? nextJson.last_refresh
+      : new Date().toISOString();
+  const mergedPayload: Record<string, unknown> = {
+    ...baseJson,
+    tokens: sanitizedTokens,
+    last_refresh: nextLastRefresh,
+  };
+  const outBuf = Buffer.from(`${JSON.stringify(mergedPayload, null, 2)}\n`, "utf8");
+
+  // 写入同目录独立 0600 临时文件并 fsync，成功后再二次核验目标未变并原子 rename 替换（出错时原文件完好无损）
+  const targetDir = path.dirname(meta.resolvedAuthPath);
+  const dirSt = fs.lstatSync(targetDir);
+  if (!dirSt.isDirectory() || !isCurrentUidOwner(dirSt)) return false;
+  const tmpPath = path.join(
+    targetDir,
+    `.${path.basename(meta.resolvedAuthPath)}.pa-tmp-${process.pid}-${Date.now()}-${randomUUID().slice(0, 8)}`,
+  );
+  const tmpFlags =
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
+  let tmpFd: number | undefined;
+  try {
+    tmpFd = fs.openSync(tmpPath, tmpFlags, 0o600);
+    let written = 0;
+    while (written < outBuf.length) {
+      const n = fs.writeSync(tmpFd, outBuf, written, outBuf.length - written, written);
+      if (n <= 0) throw new Error("short write to temporary auth.json");
+      written += n;
+    }
+    try {
+      fs.fchmodSync(tmpFd, 0o600);
+    } catch {
+      // ignore on fs without fchmod
+    }
+    fs.fsyncSync(tmpFd);
+    fs.closeSync(tmpFd);
+    tmpFd = undefined;
+
+    if (!verifyEntryPointsToTarget()) {
+      fs.rmSync(tmpPath, { force: true });
+      return false;
+    }
+    const preRenameStat = fs.lstatSync(meta.resolvedAuthPath);
+    if (
+      preRenameStat.isSymbolicLink() ||
+      !preRenameStat.isFile() ||
+      !isCurrentUidOwner(preRenameStat) ||
+      Number(preRenameStat.dev) !== meta.origDev ||
+      Number(preRenameStat.ino) !== meta.origIno ||
+      preRenameStat.size !== beforeStat.size ||
+      preRenameStat.mtimeMs !== beforeStat.mtimeMs
+    ) {
+      fs.rmSync(tmpPath, { force: true });
+      return false;
+    }
+
+    fs.renameSync(tmpPath, meta.resolvedAuthPath);
+    fsyncDirectoryBestEffort(targetDir);
+    return true;
+  } catch (err) {
+    if (tmpFd !== undefined) {
+      try {
+        fs.closeSync(tmpFd);
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {
+      // ignore
+    }
+    throw err;
+  }
+}
+
+/**
+ * 在持锁状态下扫描并恢复已死亡进程或已过期租约持有者遗留的暂存 `auth.json` 轮换结果，
+ * 确保后续工作进程不会重新读取并消费已作废的旧单次 refresh_token。
+ */
+function recoverOrphanedCodexAuthLocked(
+  db: DatabaseSync,
+  resolvedAuthPath: string,
+  expiredLeaseHolder?: string,
+): boolean {
+  const rows = db
+    .prepare(
+      "SELECT holder, pid, scratch_auth_path, scratch_dir, host_auth_path, was_symlink, orig_dev, orig_ino, orig_sha256, orig_auth_mode, orig_account_id, orig_last_refresh, created_at FROM pending_recovery ORDER BY created_at DESC",
+    )
+    .all() as unknown as CodexPendingRecoveryRow[];
+  let recoveredAny = false;
+  for (const rec of rows) {
+    const dead = !isPidAlive(rec.pid);
+    const isExpiredHolder = !!expiredLeaseHolder && rec.holder === expiredLeaseHolder;
+    if (!dead && !isExpiredHolder) continue;
+    try {
+      const ok = applyValidatedCodexAuthSyncLocked(
+        {
+          hostAuthPath: rec.host_auth_path,
+          resolvedAuthPath,
+          wasSymlink: rec.was_symlink !== 0,
+          origDev: rec.orig_dev,
+          origIno: rec.orig_ino,
+          origSha256: rec.orig_sha256,
+          origAuthMode: rec.orig_auth_mode ?? undefined,
+          origAccountId: rec.orig_account_id ?? undefined,
+          origLastRefresh: rec.orig_last_refresh ?? undefined,
+        },
+        rec.scratch_auth_path,
+      );
+      if (ok) {
+        recoveredAny = true;
+        log("info", "已从崩溃遗留的暂存 CODEX_HOME 原子恢复刷新后的 OAuth 凭据", {
+          holder: rec.holder,
+          resolvedAuthPath,
+        });
+      }
+    } catch (err) {
+      log("warn", "恢复崩溃遗留的 Codex OAuth 凭据失败（保留原文件）", {
+        holder: rec.holder,
+        err: errMsg(err),
+      });
+    }
+    if (dead) {
+      if (isSafeCodexScratchDirForCleanup(rec.scratch_dir)) {
+        try {
+          fs.rmSync(rec.scratch_dir, { recursive: true, force: true });
+        } catch {
+          // ignore cleanup error
+        }
+      }
+      db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(rec.holder);
+    }
+  }
+  return recoveredAny;
 }
 
 function copyRegularTreeShallow(
@@ -4588,14 +5627,17 @@ function sleepAbortableMs(ms: number, signal?: AbortSignal): Promise<void> {
 export interface CodexOAuthRefreshLease {
   held: boolean;
   resolvedAuthPath?: string;
+  /** 在启动隔离子进程前登记暂存目录，确保若常驻进程在轮换单次 refresh_token 后异常崩溃，下次调用先原子恢复新令牌再复用宿主机凭据 */
+  attachScratch?: (staged: StagedCodexHome) => void;
   release: () => void;
 }
 
 /**
- * 在拷贝 `auth.json` 启动隔离 `codex exec` 之前，按规范化目标路径跨进程、跨工作区协调 OAuth 刷新租约：
+ * 在拷贝 `auth.json` 启动隔离 `codex exec` / Codex ACP 之前，按规范化目标路径跨进程、跨工作区协调 OAuth 刷新租约：
  *   - 若另一活跃进程正在持有刷新租约（可能即将轮换单次 refresh_token），本调用方等待其写回并释放后再重新读取宿主机 `auth.json`；
+ *   - 若此前持有者已崩溃或租约已过期，先从其登记的暂存目录原子恢复已轮换的新令牌，避免后续工人重用已消耗的旧 refresh_token；
  *   - 若当前凭据可能需要刷新（JWT 即将/已过期、非 JWT 刷新时间陈旧），获取独占刷新租约并附带心跳续期，直到本进程完成写回后释放；
- *   - 若凭据新鲜且无在途刷新租约，立刻返回 `held: false`，多个隔离 worker 可完全并发执行。
+ *   - 无论是否获取独占租约，均返回 `attachScratch` 以登记本次暂存目录，保证意外崩溃后刷新结果可恢复。
  */
 export async function coordinateCodexOAuthRefresh(
   hostCodexHome: string,
@@ -4632,6 +5674,37 @@ export async function coordinateCodexOAuthRefresh(
   const deadline = Date.now() + (opts?.maxWaitMs ?? 180_000);
   const holder = `${process.pid}:${randomUUID().slice(0, 8)}`;
 
+  const makeAttachScratch = (): ((staged: StagedCodexHome) => void) => (staged: StagedCodexHome) => {
+    const snap = staged.origAuth;
+    if (!snap || !snap.canSyncBack || !hasOAuthRefreshToken(snap.origJson)) return;
+    const origTokens = isPlainJsonRecord(snap.origJson.tokens) ? snap.origJson.tokens : undefined;
+    try {
+      withCodexAuthSyncLock(snap.resolvedAuthPath, (db) => {
+        db.prepare(
+          `INSERT OR REPLACE INTO pending_recovery
+            (holder, pid, scratch_auth_path, scratch_dir, host_auth_path, was_symlink, orig_dev, orig_ino, orig_sha256, orig_auth_mode, orig_account_id, orig_last_refresh, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          holder,
+          process.pid,
+          path.join(staged.scratchDir, "auth.json"),
+          staged.scratchDir,
+          snap.hostAuthPath,
+          snap.wasSymlink ? 1 : 0,
+          snap.origDev,
+          snap.origIno,
+          sha256Hex(snap.origBytes),
+          typeof snap.origJson.auth_mode === "string" && snap.origJson.auth_mode ? snap.origJson.auth_mode : null,
+          typeof origTokens?.account_id === "string" && origTokens.account_id ? origTokens.account_id : null,
+          typeof snap.origJson.last_refresh === "string" && snap.origJson.last_refresh ? snap.origJson.last_refresh : null,
+          Date.now(),
+        );
+      });
+    } catch {
+      // best-effort recovery registration
+    }
+  };
+
   for (;;) {
     if (opts?.signal?.aborted) throw new Error("aborted");
     const attempt = withCodexAuthSyncLock(resolvedAuthPath, (db) => {
@@ -4642,7 +5715,9 @@ export async function coordinateCodexOAuthRefresh(
       if (row && row.expires_at > now && isPidAlive(row.pid)) {
         return { action: "wait" as const };
       }
-      // 若此前租约已过期或持有者进程已退出，清除陈旧租约并重新检查宿主机最新 auth.json
+      // 在重新检查宿主机 auth.json 前，先从死亡进程或过期租约遗留的暂存目录原子恢复已轮换的新令牌
+      recoverOrphanedCodexAuthLocked(db, resolvedAuthPath, row?.holder);
+
       const cur = inspectHostCodexAuth(hostAuthPath);
       if (cur.kind === "broken_symlink") {
         throw new Error(cur.error);
@@ -4667,7 +5742,21 @@ export async function coordinateCodexOAuthRefresh(
     });
 
     if (attempt.action === "proceed_unlocked") {
-      return { held: false, resolvedAuthPath, release: () => undefined };
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        process.off("exit", release);
+        try {
+          withCodexAuthSyncLock(resolvedAuthPath, (db) => {
+            db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+          });
+        } catch {
+          // ignore cleanup failure on exit
+        }
+      };
+      process.once("exit", release);
+      return { held: false, resolvedAuthPath, attachScratch: makeAttachScratch(), release };
     }
     if (attempt.action === "acquired") {
       let released = false;
@@ -4693,6 +5782,7 @@ export async function coordinateCodexOAuthRefresh(
         process.off("exit", release);
         try {
           withCodexAuthSyncLock(resolvedAuthPath, (db) => {
+            db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
             db.prepare("DELETE FROM refresh_lease WHERE id = 1 AND holder = ?").run(holder);
           });
         } catch {
@@ -4700,7 +5790,7 @@ export async function coordinateCodexOAuthRefresh(
         }
       };
       process.once("exit", release);
-      return { held: true, resolvedAuthPath, release };
+      return { held: true, resolvedAuthPath, attachScratch: makeAttachScratch(), release };
     }
 
     if (Date.now() >= deadline) {
@@ -4710,8 +5800,40 @@ export async function coordinateCodexOAuthRefresh(
   }
 }
 
+function resolvePersistentCodexScratchBase(
+  resolvedAuthPath: string,
+  hostCodexHome: string,
+  resolvedDataDir: string,
+): string {
+  const authParent = safeRealpath(path.dirname(resolvedAuthPath));
+  const realHostCodexHome = safeRealpath(hostCodexHome);
+  const home = os.homedir();
+  if (home) {
+    const candidate = path.join(safeRealpath(home), ".local", "state", "personal-agent", "codex-scratch");
+    const collides =
+      isPathInsideOrEqual(candidate, realHostCodexHome) ||
+      isPathInsideOrEqual(realHostCodexHome, candidate) ||
+      isPathInsideOrEqual(candidate, authParent) ||
+      isPathInsideOrEqual(authParent, candidate) ||
+      (!!resolvedDataDir && (isPathInsideOrEqual(candidate, resolvedDataDir) || isPathInsideOrEqual(resolvedDataDir, candidate)));
+    if (!collides) {
+      try {
+        fs.mkdirSync(candidate, { recursive: true, mode: 0o700 });
+        const st = fs.lstatSync(candidate);
+        if (!st.isSymbolicLink() && st.isDirectory() && isCurrentUidOwner(st)) {
+          fs.chmodSync(candidate, 0o700);
+          return safeRealpath(candidate);
+        }
+      } catch {
+        // fallback to os.tmpdir()
+      }
+    }
+  }
+  return os.tmpdir();
+}
+
 /**
- * 为隔离沙箱中的 `codex exec` 准备私有临时 `CODEX_HOME`：
+ * 为隔离沙箱中的 `codex exec` / Codex ACP 准备私有临时 `CODEX_HOME`：
  *   - 宿主机真实 `~/.codex` 保持只读，防止沙箱内进程篡改 `config.toml` / `hooks` / `plugins` / `skills`；
  *   - 将 `auth.json` 以 0600 拷贝到临时 `CODEX_HOME`，支持安全解引用 dotfiles 符号链接目标并提前校验其归属与可写性：
  *     若文件态 OAuth 凭据（含 refresh_token）为损坏符号链接或目标不可写/非当前用户所有，在启动子进程前即 fail-closed 拒绝，
@@ -4721,14 +5843,13 @@ export async function coordinateCodexOAuthRefresh(
  */
 export function stageIsolatedCodexHome(
   hostCodexHome: string,
-  opts: { copyUserConfig: boolean; lockDir?: string; needsCredentialStore?: boolean },
+  opts: { copyUserConfig: boolean; lockDir?: string; needsCredentialStore?: boolean; dataDir?: string },
 ): StagedCodexHome {
-  const scratchDir = safeRealpath(fs.mkdtempSync(path.join(os.tmpdir(), "pa-codex-home-")));
-  fs.chmodSync(scratchDir, 0o700);
+  let scratchDir = "";
   let origAuth: CodexAuthOrigSnapshot | undefined;
 
   const cleanup = () => {
-    fs.rmSync(scratchDir, { recursive: true, force: true });
+    if (scratchDir) fs.rmSync(scratchDir, { recursive: true, force: true });
   };
 
   try {
@@ -4756,33 +5877,79 @@ export function stageIsolatedCodexHome(
       }
     }
 
+    const resolvedData = opts.dataDir && fs.existsSync(opts.dataDir) ? safeRealpath(opts.dataDir) : "";
+    let authInspected: ReturnType<typeof inspectHostCodexAuth> = { kind: "absent" };
     // 当生效供应商不依赖宿主机 OpenAI/ChatGPT 登录态（如本地模型、Bedrock 或显式 API Key）时，
     // 绝不检查或拷贝宿主机 auth.json，防止把无关的 ChatGPT refresh_token 暴露给隔离子进程或残留在临时目录中
     if (opts.needsCredentialStore !== false) {
       const hostAuthPath = path.join(hostCodexHome, "auth.json");
-      const authInspected = inspectHostCodexAuth(hostAuthPath);
+      authInspected = inspectHostCodexAuth(hostAuthPath);
       if (authInspected.kind === "broken_symlink") {
         throw new Error(authInspected.error);
-      } else if (authInspected.kind === "ok") {
-        const isOAuth = !!authInspected.origJson && hasOAuthRefreshToken(authInspected.origJson);
-        if (isOAuth && !authInspected.canSyncBack) {
-          throw new Error(
-            `宿主机 Codex OAuth 凭据不可安全写回（${authInspected.unwritableReason ?? "权限不足"}）；为防止隔离沙箱消耗单次 refresh_token 后丢失新令牌，已中止执行`,
-          );
+      }
+      // 若宿主机已有协同锁库，先恢复任何已崩溃进程遗留的 OAuth 刷新结果，再重新读取最新宿主机 auth.json
+      if (
+        authInspected.kind === "ok" &&
+        authInspected.canSyncBack &&
+        authInspected.origJson &&
+        hasOAuthRefreshToken(authInspected.origJson) &&
+        fs.existsSync(canonicalCodexLockFilePath(authInspected.resolvedAuthPath))
+      ) {
+        const resolvedAuthForRecovery = authInspected.resolvedAuthPath;
+        try {
+          const recovered = withCodexAuthSyncLock(resolvedAuthForRecovery, (db) => {
+            const row = db
+              .prepare("SELECT holder, pid, expires_at FROM refresh_lease WHERE id = 1")
+              .get() as { holder: string; pid: number; expires_at: number } | undefined;
+            if (row && row.expires_at > Date.now() && isPidAlive(row.pid)) return false;
+            return recoverOrphanedCodexAuthLocked(db, resolvedAuthForRecovery, row?.holder);
+          });
+          if (recovered) {
+            authInspected = inspectHostCodexAuth(hostAuthPath);
+            if (authInspected.kind === "broken_symlink") throw new Error(authInspected.error);
+          }
+        } catch {
+          // best-effort pre-stage recovery
         }
-        fs.writeFileSync(path.join(scratchDir, "auth.json"), authInspected.origBytes, { mode: 0o600 });
-        if (authInspected.origJson) {
-          origAuth = {
-            hostAuthPath: authInspected.hostAuthPath,
-            resolvedAuthPath: authInspected.resolvedAuthPath,
-            wasSymlink: authInspected.wasSymlink,
-            origBytes: authInspected.origBytes,
-            origJson: authInspected.origJson,
-            origDev: authInspected.origDev,
-            origIno: authInspected.origIno,
-            canSyncBack: authInspected.canSyncBack,
-          };
-        }
+      }
+    }
+
+    // 对可写 OAuth 凭据，将暂存目录建在宿主机持久化用户状态目录（~/.local/state/personal-agent/codex-scratch/.pa-codex-home-*），
+    // 既独立于 hostCodexHome（不在沙箱内造出 hostCodexHome 祖先目录），又不受 systemd PrivateTmp 重启清除，
+    // 使常驻进程在轮换单次 refresh_token 后崩溃也能被下次启动原子恢复。
+    let scratchBase = os.tmpdir();
+    let scratchPrefix = "pa-codex-home-";
+    if (
+      authInspected.kind === "ok" &&
+      authInspected.canSyncBack &&
+      authInspected.origJson &&
+      hasOAuthRefreshToken(authInspected.origJson)
+    ) {
+      scratchBase = resolvePersistentCodexScratchBase(authInspected.resolvedAuthPath, hostCodexHome, resolvedData);
+      scratchPrefix = ".pa-codex-home-";
+    }
+    scratchDir = safeRealpath(fs.mkdtempSync(path.join(scratchBase, scratchPrefix)));
+    fs.chmodSync(scratchDir, 0o700);
+
+    if (authInspected.kind === "ok") {
+      const isOAuth = !!authInspected.origJson && hasOAuthRefreshToken(authInspected.origJson);
+      if (isOAuth && !authInspected.canSyncBack) {
+        throw new Error(
+          `宿主机 Codex OAuth 凭据不可安全写回（${authInspected.unwritableReason ?? "权限不足"}）；为防止隔离沙箱消耗单次 refresh_token 后丢失新令牌，已中止执行`,
+        );
+      }
+      fs.writeFileSync(path.join(scratchDir, "auth.json"), authInspected.origBytes, { mode: 0o600 });
+      if (authInspected.origJson) {
+        origAuth = {
+          hostAuthPath: authInspected.hostAuthPath,
+          resolvedAuthPath: authInspected.resolvedAuthPath,
+          wasSymlink: authInspected.wasSymlink,
+          origBytes: authInspected.origBytes,
+          origJson: authInspected.origJson,
+          origDev: authInspected.origDev,
+          origIno: authInspected.origIno,
+          canSyncBack: authInspected.canSyncBack,
+        };
       }
     }
 
@@ -4897,229 +6064,25 @@ export function syncRefreshedCodexAuth(staged: StagedCodexHome): boolean {
   }
 
   const scratchAuthPath = path.join(staged.scratchDir, "auth.json");
-  let nextBytes: Buffer;
   try {
-    const lst = fs.lstatSync(scratchAuthPath);
-    if (lst.isSymbolicLink() || !lst.isFile() || lst.size <= 0 || lst.size > MAX_CODEX_AUTH_BYTES) {
-      return false;
-    }
-    nextBytes = fs.readFileSync(scratchAuthPath);
-  } catch {
-    return false;
-  }
-  if (nextBytes.equals(snap.origBytes)) return false;
-
-  let nextJson: Record<string, unknown>;
-  try {
-    const parsed = JSON.parse(nextBytes.toString("utf8")) as unknown;
-    if (!isPlainJsonRecord(parsed)) return false;
-    nextJson = parsed;
-  } catch {
-    return false;
-  }
-
-  const nextTokens = isPlainJsonRecord(nextJson.tokens) ? nextJson.tokens : undefined;
-  if (
-    !nextTokens ||
-    typeof nextTokens.access_token !== "string" ||
-    !nextTokens.access_token.trim() ||
-    typeof nextTokens.refresh_token !== "string" ||
-    !nextTokens.refresh_token.trim()
-  ) {
-    return false;
-  }
-  if (typeof snap.origJson.auth_mode === "string" && snap.origJson.auth_mode) {
-    if (nextJson.auth_mode !== snap.origJson.auth_mode) return false;
-  }
-  if (typeof origTokens.account_id === "string" && origTokens.account_id) {
-    if (nextTokens.account_id !== origTokens.account_id) return false;
-  }
-
-  const origRefreshMs = typeof snap.origJson.last_refresh === "string" ? Date.parse(snap.origJson.last_refresh) : NaN;
-  const nextRefreshMs = typeof nextJson.last_refresh === "string" ? Date.parse(nextJson.last_refresh) : NaN;
-  if (Number.isFinite(origRefreshMs) && Number.isFinite(nextRefreshMs) && nextRefreshMs < origRefreshMs) {
-    return false;
-  }
-  const tokensChanged =
-    nextTokens.access_token !== origTokens.access_token ||
-    nextTokens.refresh_token !== origTokens.refresh_token ||
-    (typeof nextTokens.id_token === "string" && nextTokens.id_token !== origTokens.id_token);
-  const refreshAdvanced = Number.isFinite(nextRefreshMs) && (!Number.isFinite(origRefreshMs) || nextRefreshMs > origRefreshMs);
-  if (!tokensChanged && !refreshAdvanced) return false;
-
-  const sanitizedTokens: Record<string, unknown> = {
-    ...(typeof origTokens.id_token === "string" ? { id_token: origTokens.id_token } : {}),
-    ...(typeof nextTokens.id_token === "string" ? { id_token: nextTokens.id_token } : {}),
-    access_token: nextTokens.access_token,
-    refresh_token: nextTokens.refresh_token,
-    ...(typeof nextTokens.account_id === "string"
-      ? { account_id: nextTokens.account_id }
-      : typeof origTokens.account_id === "string"
-        ? { account_id: origTokens.account_id }
-        : {}),
-  };
-  const nextLastRefresh =
-    typeof nextJson.last_refresh === "string" && nextJson.last_refresh.trim()
-      ? nextJson.last_refresh
-      : new Date().toISOString();
-  const mergedPayload: Record<string, unknown> = {
-    ...snap.origJson,
-    tokens: sanitizedTokens,
-    last_refresh: nextLastRefresh,
-  };
-  const outBuf = Buffer.from(`${JSON.stringify(mergedPayload, null, 2)}\n`, "utf8");
-
-  const verifyEntryPointsToTarget = (): boolean => {
-    try {
-      const entryLst = fs.lstatSync(snap.hostAuthPath);
-      if (snap.wasSymlink) {
-        if (!entryLst.isSymbolicLink()) return false;
-        return fs.realpathSync(snap.hostAuthPath) === snap.resolvedAuthPath;
-      }
-      return (
-        !entryLst.isSymbolicLink() &&
-        entryLst.isFile() &&
-        Number(entryLst.dev) === snap.origDev &&
-        Number(entryLst.ino) === snap.origIno
-      );
-    } catch {
-      return false;
-    }
-  };
-
-  try {
-    return withCodexAuthSyncLock(snap.resolvedAuthPath, () => {
-      if (!verifyEntryPointsToTarget()) return false;
-
-      const roFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
-      let readFd: number;
-      try {
-        readFd = fs.openSync(snap.resolvedAuthPath, roFlags);
-      } catch {
-        return false;
-      }
-      let beforeStat: fs.Stats;
-      let curHostBytes: Buffer;
-      try {
-        beforeStat = fs.fstatSync(readFd);
-        if (
-          !beforeStat.isFile() ||
-          !isCurrentUidOwner(beforeStat) ||
-          beforeStat.size > MAX_CODEX_AUTH_BYTES ||
-          Number(beforeStat.dev) !== snap.origDev ||
-          Number(beforeStat.ino) !== snap.origIno
-        ) {
-          return false;
-        }
-        const buf = Buffer.allocUnsafe(beforeStat.size);
-        let readOff = 0;
-        while (readOff < beforeStat.size) {
-          const n = fs.readSync(readFd, buf, readOff, beforeStat.size - readOff, readOff);
-          if (n <= 0) break;
-          readOff += n;
-        }
-        curHostBytes = buf.subarray(0, readOff);
-      } finally {
-        try {
-          fs.closeSync(readFd);
-        } catch {
-          // ignore
-        }
-      }
-
-      if (!curHostBytes.equals(snap.origBytes)) {
-        try {
-          const curHostJson = JSON.parse(curHostBytes.toString("utf8")) as unknown;
-          if (!isPlainJsonRecord(curHostJson) || !isPlainJsonRecord(curHostJson.tokens)) return false;
-          if (
-            typeof snap.origJson.auth_mode === "string" &&
-            snap.origJson.auth_mode &&
-            curHostJson.auth_mode !== snap.origJson.auth_mode
-          ) {
-            return false;
-          }
-          if (
-            typeof origTokens.account_id === "string" &&
-            origTokens.account_id &&
-            curHostJson.tokens.account_id !== origTokens.account_id
-          ) {
-            return false;
-          }
-          const curHostRefreshMs = typeof curHostJson.last_refresh === "string" ? Date.parse(curHostJson.last_refresh) : NaN;
-          if (!Number.isFinite(nextRefreshMs) || !Number.isFinite(curHostRefreshMs) || nextRefreshMs <= curHostRefreshMs) {
-            return false;
-          }
-        } catch {
-          return false;
-        }
-      }
-
-      // 写入同目录独立 0600 临时文件并 fsync，成功后再二次核验目标未变并原子 rename 替换（出错时原文件完好无损）
-      const targetDir = path.dirname(snap.resolvedAuthPath);
-      const dirSt = fs.lstatSync(targetDir);
-      if (!dirSt.isDirectory() || !isCurrentUidOwner(dirSt)) return false;
-      const tmpPath = path.join(
-        targetDir,
-        `.${path.basename(snap.resolvedAuthPath)}.pa-tmp-${process.pid}-${Date.now()}-${randomUUID().slice(0, 8)}`,
-      );
-      const tmpFlags =
-        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
-      let tmpFd: number | undefined;
-      try {
-        tmpFd = fs.openSync(tmpPath, tmpFlags, 0o600);
-        let written = 0;
-        while (written < outBuf.length) {
-          const n = fs.writeSync(tmpFd, outBuf, written, outBuf.length - written, written);
-          if (n <= 0) throw new Error("short write to temporary auth.json");
-          written += n;
-        }
-        try {
-          fs.fchmodSync(tmpFd, 0o600);
-        } catch {
-          // ignore on fs without fchmod
-        }
-        fs.fsyncSync(tmpFd);
-        fs.closeSync(tmpFd);
-        tmpFd = undefined;
-
-        // 原子换名前再次校验入口未登出/重定向且目标 inode、大小、修改时间未变化
-        if (!verifyEntryPointsToTarget()) {
-          fs.rmSync(tmpPath, { force: true });
-          return false;
-        }
-        const preRenameStat = fs.lstatSync(snap.resolvedAuthPath);
-        if (
-          preRenameStat.isSymbolicLink() ||
-          !preRenameStat.isFile() ||
-          !isCurrentUidOwner(preRenameStat) ||
-          Number(preRenameStat.dev) !== snap.origDev ||
-          Number(preRenameStat.ino) !== snap.origIno ||
-          preRenameStat.size !== beforeStat.size ||
-          preRenameStat.mtimeMs !== beforeStat.mtimeMs
-        ) {
-          fs.rmSync(tmpPath, { force: true });
-          return false;
-        }
-
-        fs.renameSync(tmpPath, snap.resolvedAuthPath);
-        fsyncDirectoryBestEffort(targetDir);
-        return true;
-      } catch (err) {
-        if (tmpFd !== undefined) {
-          try {
-            fs.closeSync(tmpFd);
-          } catch {
-            // ignore
-          }
-        }
-        try {
-          fs.rmSync(tmpPath, { force: true });
-        } catch {
-          // ignore
-        }
-        throw err;
-      }
-    });
+    return withCodexAuthSyncLock(snap.resolvedAuthPath, () =>
+      applyValidatedCodexAuthSyncLocked(
+        {
+          hostAuthPath: snap.hostAuthPath,
+          resolvedAuthPath: snap.resolvedAuthPath,
+          wasSymlink: snap.wasSymlink,
+          origDev: snap.origDev,
+          origIno: snap.origIno,
+          origSha256: sha256Hex(snap.origBytes),
+          origAuthMode: typeof snap.origJson.auth_mode === "string" && snap.origJson.auth_mode ? snap.origJson.auth_mode : undefined,
+          origAccountId: typeof origTokens.account_id === "string" && origTokens.account_id ? origTokens.account_id : undefined,
+          origLastRefresh:
+            typeof snap.origJson.last_refresh === "string" && snap.origJson.last_refresh ? snap.origJson.last_refresh : undefined,
+          origJson: snap.origJson,
+        },
+        scratchAuthPath,
+      ),
+    );
   } catch (err) {
     log("warn", "写回刷新后的 Codex auth.json 失败（保留原文件）", { err: errMsg(err) });
     return false;
@@ -5151,6 +6114,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   let stagedNpmrc: StagedSanitizedNpmrc | undefined;
   let stagedGitCfg: StagedSanitizedGitConfig | undefined;
   let oauthLease: CodexOAuthRefreshLease | undefined;
+  let syncedCodexAuth = false;
   let r: Awaited<ReturnType<typeof runProcess>>;
   let text = "";
   let args: string[] = [];
@@ -5232,7 +6196,9 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       stagedCodexHome = stageIsolatedCodexHome(hostCodexHome, {
         copyUserConfig: run.tools !== "none",
         needsCredentialStore: effectiveCredInfo.needsCredentialStore,
+        dataDir: cfg.dataDir,
       });
+      oauthLease.attachScratch?.(stagedCodexHome);
       if (effectiveCredInfo.awsProfile) {
         stagedAws = stageIsolatedAwsProfile(effectiveCredInfo.awsProfile, finalEnv, cfg.dataDir);
       }
@@ -5312,7 +6278,8 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       signal: run.signal,
       onSpawn: run.onSpawn,
     });
-    if (stagedCodexHome) {
+    if (stagedCodexHome && !syncedCodexAuth) {
+      syncedCodexAuth = true;
       syncRefreshedCodexAuth(stagedCodexHome);
     }
     try {
@@ -5322,11 +6289,15 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       text = r.stdout.trim();
     }
   } finally {
+    if (stagedCodexHome && !syncedCodexAuth) {
+      syncedCodexAuth = true;
+      syncRefreshedCodexAuth(stagedCodexHome);
+    }
+    stagedCodexHome?.cleanup();
     oauthLease?.release();
     baseEnv.cleanup();
     stagedGitCfg?.cleanup();
     stagedNpmrc?.cleanup();
-    stagedCodexHome?.cleanup();
     stagedAws?.cleanup();
     if (isolatedTmp) fs.rmSync(isolatedTmp, { recursive: true, force: true });
     if (readOutDir) fs.rmSync(readOutDir, { recursive: true, force: true });

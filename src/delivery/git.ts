@@ -56,6 +56,7 @@ export interface GitRunOpts {
   disableGitWorktreeMounts?: boolean;
   extraWritablePaths?: string[];
   extraReadOnlyPaths?: string[];
+  extraSymlinks?: { dest: string; target: string }[];
   extraEnv?: Record<string, string>;
 }
 
@@ -122,18 +123,36 @@ export function classifyGitRemoteTransport(cwd: string, rawUrl: string): "ssh" |
   return "local";
 }
 
-function extractSshHostname(rawUrl: string, cwd?: string): string | undefined {
+export interface SshRemoteTarget {
+  host: string;
+  user?: string;
+  port?: string;
+}
+
+function extractSshTarget(rawUrl: string, cwd?: string): SshRemoteTarget | undefined {
   const u = rawUrl.trim();
   if (/^(?:ssh|git\+ssh|ssh\+git):\/\//i.test(u)) {
     try {
       const normalized = u.replace(/^(?:git\+ssh|ssh\+git):\/\//i, "ssh://");
       const parsed = new URL(normalized);
-      return parsed.hostname.toLowerCase() || undefined;
+      const host = parsed.hostname.toLowerCase();
+      if (!host) return undefined;
+      let user: string | undefined;
+      if (parsed.username) {
+        try {
+          user = decodeURIComponent(parsed.username);
+        } catch {
+          user = parsed.username;
+        }
+      }
+      return { host, ...(user ? { user } : {}), ...(parsed.port ? { port: parsed.port } : {}) };
     } catch {
       return undefined;
     }
   }
-  return parseScpGitUrl(u, cwd)?.host;
+  const scp = parseScpGitUrl(u, cwd);
+  if (!scp) return undefined;
+  return { host: scp.host, ...(scp.user ? { user: scp.user } : {}) };
 }
 
 function sshPatternMatch(pattern: string, host: string): boolean {
@@ -154,12 +173,86 @@ function sshHostClauseMatches(patterns: string[], host: string): boolean {
   return matchedPositive;
 }
 
-function expandSshPath(raw: string, hostHome: string): string | undefined {
+interface SshTokenContext {
+  hostHome: string;
+  origHost?: string;
+  hostName?: string;
+  remoteUser?: string;
+  localUser?: string;
+  port?: string;
+}
+
+function getLocalUsername(rawEnv: NodeJS.ProcessEnv): string {
+  const envUser = rawEnv.USER?.trim() || rawEnv.LOGNAME?.trim();
+  if (envUser) return envUser;
+  try {
+    return os.userInfo().username || "";
+  } catch {
+    return "";
+  }
+}
+
+/** 按 OpenSSH `ssh_config(5)` 语义展开路径占位符（支持 `%%`、`%d`、`%h`、`%n`、`%r`、`%u`、`%p`、`%i`、`%L`、`%l`）；遇未知占位符保守返回 undefined */
+function expandSshTokens(raw: string, ctx?: SshTokenContext): string | undefined {
+  if (!raw.includes("%")) return raw;
+  const localHost = os.hostname() || "";
+  const shortLocalHost = localHost.split(".")[0] || "";
+  const uidStr = typeof process.getuid === "function" ? String(process.getuid()) : "";
+  let out = "";
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (ch !== "%") {
+      out += ch;
+      continue;
+    }
+    if (i + 1 >= raw.length) return undefined;
+    const tok = raw[++i];
+    if (tok === "%") {
+      out += "%";
+    } else if (tok === "d") {
+      if (!ctx?.hostHome) return undefined;
+      out += ctx.hostHome;
+    } else if (tok === "h") {
+      const v = ctx?.hostName || ctx?.origHost;
+      if (!v) return undefined;
+      out += v;
+    } else if (tok === "n") {
+      if (!ctx?.origHost) return undefined;
+      out += ctx.origHost;
+    } else if (tok === "r") {
+      const v = ctx?.remoteUser || ctx?.localUser;
+      if (!v) return undefined;
+      out += v;
+    } else if (tok === "u") {
+      if (!ctx?.localUser) return undefined;
+      out += ctx.localUser;
+    } else if (tok === "p") {
+      out += ctx?.port || "22";
+    } else if (tok === "i") {
+      if (!uidStr) return undefined;
+      out += uidStr;
+    } else if (tok === "L") {
+      if (!shortLocalHost) return undefined;
+      out += shortLocalHost;
+    } else if (tok === "l") {
+      if (!localHost) return undefined;
+      out += localHost;
+    } else {
+      return undefined;
+    }
+  }
+  return out;
+}
+
+function expandSshPath(raw: string, hostHome: string, tokenCtx?: SshTokenContext): string | undefined {
   let s = raw.trim();
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
     s = s.slice(1, -1).trim();
   }
-  if (!s || /%[a-zA-Z%]/.test(s)) return undefined;
+  if (!s) return undefined;
+  const expandedTokens = expandSshTokens(s, tokenCtx ? { ...tokenCtx, hostHome } : undefined);
+  if (!expandedTokens || /%[a-zA-Z%]/.test(expandedTokens)) return undefined;
+  s = expandedTokens;
   if (s === "~") return hostHome || undefined;
   if (s.startsWith("~/")) return hostHome ? path.join(hostHome, s.slice(2)) : undefined;
   return path.isAbsolute(s) ? s : hostHome ? path.join(hostHome, ".ssh", s) : undefined;
@@ -300,11 +393,15 @@ function querySshAgentLoadedKeys(sshSock: string): Set<string> {
  *     若代理为空或未持有该默认密钥，仍以只读方式挂载标准默认密钥对（id_ed25519 / id_rsa / id_ecdsa / id_dsa）以保留 OpenSSH 文件回退，绝不暴露无关命名私钥。
  */
 export function collectScopedSshMounts(
-  sshHosts: string[],
+  sshHosts: (string | SshRemoteTarget)[],
   rawEnv: NodeJS.ProcessEnv = process.env,
   dataDir?: string,
   hasSshAgentOrSock: boolean | string = false,
 ): { readOnlyPaths: string[]; symlinks: { dest: string; target: string }[] } {
+  const normalizedTargets: SshRemoteTarget[] = sshHosts
+    .map((entry) => (typeof entry === "string" ? { host: entry.trim().toLowerCase() } : { ...entry, host: entry.host.trim().toLowerCase() }))
+    .filter((t) => !!t.host);
+  const localUser = getLocalUsername(rawEnv);
   const sshSockPath =
     typeof hasSshAgentOrSock === "string"
       ? hasSshAgentOrSock.trim()
@@ -356,10 +453,21 @@ export function collectScopedSshMounts(
   if (gitSshCmd) {
     const idMatches = gitSshCmd.matchAll(/(?:^|\s)-i\s*(?:"([^"]+)"|'([^']+)'|(\S+))/g);
     for (const m of idMatches) {
-      const expanded = expandSshPath(m[1] ?? m[2] ?? m[3] ?? "", hostHome);
-      if (expanded) {
-        addSingleFile(expanded);
-        addSingleFile(`${expanded}.pub`);
+      const rawId = m[1] ?? m[2] ?? m[3] ?? "";
+      const targetsForCmd = normalizedTargets.length > 0 ? normalizedTargets : [{ host: "" }];
+      for (const t of targetsForCmd) {
+        const expanded = expandSshPath(rawId, hostHome, {
+          hostHome,
+          origHost: t.host || undefined,
+          hostName: t.host || undefined,
+          remoteUser: t.user,
+          localUser,
+          port: t.port,
+        });
+        if (expanded) {
+          addSingleFile(expanded);
+          addSingleFile(`${expanded}.pub`);
+        }
       }
     }
   }
@@ -379,68 +487,112 @@ export function collectScopedSshMounts(
   };
 
   const matchedIdentityFiles: string[] = [];
-  const visitedConfigs = new Set<string>();
-  const parseSshConfigFile = (cfgFile: string, depth: number, isRoot: boolean): boolean => {
-    if (depth > 4 || !fs.existsSync(cfgFile)) return false;
-    let realCfg: string;
-    try {
-      const st = fs.statSync(cfgFile);
-      if (!st.isFile() || st.size > 256 * 1024) return false;
-      realCfg = fs.realpathSync(cfgFile);
-    } catch {
-      return false;
-    }
-    if (visitedConfigs.has(realCfg) || !isOutsideData(realCfg)) return false;
-    visitedConfigs.add(realCfg);
-    if (isRoot) addSingleFile(cfgFile);
+  const rootCfgPath = path.join(sshDir, "config");
 
-    let active = true;
-    let matchedAny = false;
-    const text = fs.readFileSync(realCfg, "utf8");
-    for (const rawLine of text.split(/\r?\n/)) {
-      const trimmed = rawLine.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const m = trimmed.match(/^([A-Za-z][A-Za-z0-9]*)(?:\s*=\s*|\s+)(.+)$/);
-      if (!m) continue;
-      const key = m[1].toLowerCase();
-      const val = m[2].trim();
-      if (key === "host") {
-        const patterns = tokenizeSshValues(val);
-        active = sshHosts.length > 0 && sshHosts.some((h) => sshHostClauseMatches(patterns, h));
-        if (active) matchedAny = true;
-      } else if (key === "match") {
-        active = false;
-      } else if (key === "include" && active) {
-        for (const rawInc of tokenizeSshValues(val)) {
-          for (const incPath of expandSshIncludePattern(rawInc, hostHome, isOutsideData)) {
-            if (parseSshConfigFile(incPath, depth + 1, false)) {
-              matchedAny = true;
+  // 按 OpenSSH 逐目标先收集生效的 HostName/User/Port（首次命中优先）与全部匹配片段，
+  // 再用最终生效的主机/用户/端口展开 IdentityFile / CertificateFile / UserKnownHostsFile 中的 %h/%n/%r/%u/%p/%d 等占位符。
+  const evalTargets = normalizedTargets.length > 0 ? normalizedTargets : [{ host: "" }];
+  for (const target of evalTargets) {
+    let effectiveHostName: string | undefined;
+    let effectiveUser: string | undefined = target.user;
+    let effectivePort: string | undefined = target.port;
+    const rawIdentityFiles: string[] = [];
+    const rawCertificateFiles: string[] = [];
+    const rawUserKnownHostsFiles: string[] = [];
+    const visitedConfigs = new Set<string>();
+
+    const parseSshConfigForTarget = (cfgFile: string, depth: number, isRoot: boolean): boolean => {
+      if (depth > 4 || !fs.existsSync(cfgFile)) return false;
+      let realCfg: string;
+      try {
+        const st = fs.statSync(cfgFile);
+        if (!st.isFile() || st.size > 256 * 1024) return false;
+        realCfg = fs.realpathSync(cfgFile);
+      } catch {
+        return false;
+      }
+      if (visitedConfigs.has(realCfg) || !isOutsideData(realCfg)) return false;
+      visitedConfigs.add(realCfg);
+      if (isRoot) addSingleFile(cfgFile);
+
+      let active = true;
+      let matchedAny = false;
+      const text = fs.readFileSync(realCfg, "utf8");
+      for (const rawLine of text.split(/\r?\n/)) {
+        const trimmed = rawLine.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const m = trimmed.match(/^([A-Za-z][A-Za-z0-9]*)(?:\s*=\s*|\s+)(.+)$/);
+        if (!m) continue;
+        const key = m[1].toLowerCase();
+        const val = m[2].trim();
+        if (key === "host") {
+          const patterns = tokenizeSshValues(val);
+          active = !!target.host && sshHostClauseMatches(patterns, target.host);
+          if (active) matchedAny = true;
+        } else if (key === "match") {
+          active = false;
+        } else if (key === "include" && active) {
+          for (const rawInc of tokenizeSshValues(val)) {
+            for (const incPath of expandSshIncludePattern(rawInc, hostHome, isOutsideData)) {
+              if (parseSshConfigForTarget(incPath, depth + 1, false)) {
+                matchedAny = true;
+              }
             }
           }
-        }
-      } else if (active) {
-        matchedAny = true;
-        if (key === "identityfile") {
-          const idPath = expandSshPath(val, hostHome);
-          if (idPath) matchedIdentityFiles.push(idPath);
-        } else if (key === "certificatefile") {
-          const certPath = expandSshPath(val, hostHome);
-          if (certPath) addSingleFile(certPath);
-        } else if (key === "userknownhostsfile") {
-          for (const tok of tokenizeSshValues(val)) {
-            const kh = expandSshPath(tok, hostHome);
-            if (kh) addSingleFile(kh);
+        } else if (active) {
+          matchedAny = true;
+          if (key === "hostname" && !effectiveHostName) {
+            const firstTok = tokenizeSshValues(val)[0];
+            if (firstTok) {
+              // OpenSSH 允许 HostName 内部引用 %h（原目标别名）与 %%
+              effectiveHostName =
+                expandSshTokens(firstTok, { hostHome, origHost: target.host, hostName: target.host }) ?? firstTok;
+            }
+          } else if (key === "user" && !effectiveUser) {
+            const firstTok = tokenizeSshValues(val)[0];
+            if (firstTok) effectiveUser = firstTok;
+          } else if (key === "port" && !effectivePort) {
+            const firstTok = tokenizeSshValues(val)[0];
+            if (firstTok) effectivePort = firstTok;
+          } else if (key === "identityfile") {
+            rawIdentityFiles.push(val);
+          } else if (key === "certificatefile") {
+            rawCertificateFiles.push(val);
+          } else if (key === "userknownhostsfile") {
+            rawUserKnownHostsFiles.push(...tokenizeSshValues(val));
           }
         }
       }
-    }
-    if (!isRoot && matchedAny) {
-      addSingleFile(cfgFile);
-    }
-    return matchedAny;
-  };
+      if (!isRoot && matchedAny) {
+        addSingleFile(cfgFile);
+      }
+      return matchedAny;
+    };
 
-  parseSshConfigFile(path.join(sshDir, "config"), 0, true);
+    parseSshConfigForTarget(rootCfgPath, 0, true);
+
+    const tokenCtx: SshTokenContext = {
+      hostHome,
+      origHost: target.host || undefined,
+      hostName: effectiveHostName || target.host || undefined,
+      remoteUser: effectiveUser || localUser || undefined,
+      localUser: localUser || undefined,
+      port: effectivePort || "22",
+    };
+
+    for (const rawId of rawIdentityFiles) {
+      const idPath = expandSshPath(rawId, hostHome, tokenCtx);
+      if (idPath) matchedIdentityFiles.push(idPath);
+    }
+    for (const rawCert of rawCertificateFiles) {
+      const certPath = expandSshPath(rawCert, hostHome, tokenCtx);
+      if (certPath) addSingleFile(certPath);
+    }
+    for (const rawKh of rawUserKnownHostsFiles) {
+      const khPath = expandSshPath(rawKh, hostHome, tokenCtx);
+      if (khPath) addSingleFile(khPath);
+    }
+  }
 
   if (matchedIdentityFiles.length > 0) {
     for (const idFile of matchedIdentityFiles) {
@@ -489,7 +641,7 @@ function buildGitIsolation(
     ...(filteredCredDir ? [filteredCredDir] : []),
     ...(sshMounts?.readOnlyPaths ?? []),
   ];
-  const sshSymlinks = sshMounts?.symlinks ?? [];
+  const extraSymlinks = [...(opts?.extraSymlinks ?? []), ...(sshMounts?.symlinks ?? [])];
   if (opts?.cfg) {
     const plan = buildWorkspaceIsolation(
       opts.cfg,
@@ -500,12 +652,10 @@ function buildGitIsolation(
         disableGitWorktreeMounts: opts.disableGitWorktreeMounts,
         extraWritablePaths: extraRw,
         extraReadOnlyPaths: extraRo,
+        extraSymlinks,
       },
       rawEnv,
     );
-    if (sshSymlinks.length) {
-      return { ...plan, extraSymlinks: [...(plan.extraSymlinks ?? []), ...sshSymlinks] };
-    }
     return plan;
   }
   const isoActive = process.platform === "linux" || workspaceRequiresIsolation(undefined, rawEnv);
@@ -516,7 +666,7 @@ function buildGitIsolation(
   const wtTargets = [wt.commonDir, wt.gitDir].filter((p): p is string => !!p);
   const gitCfg = isoActive ? collectSafeGitConfigMounts(rawEnv, undefined, { cwd }) : { readOnlyPaths: [], symlinks: [] };
   const combinedRo = [...gitCfg.readOnlyPaths, ...extraRo];
-  const combinedSymlinks = [...gitCfg.symlinks, ...sshSymlinks];
+  const combinedSymlinks = [...gitCfg.symlinks, ...extraSymlinks];
   return {
     cwd,
     requireIsolation: isoActive,
@@ -552,11 +702,20 @@ function normalizeCredPath(pathname: string): string {
   return stripped === "/" ? "" : stripped;
 }
 
-/** 按 git-credential-store 匹配语义判断单行凭据是否适用于指定目标 HTTP(S) URL */
+function decodeUrlUser(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/** 按 git-credential-store 匹配语义判断单行凭据是否适用于指定目标 HTTP(S) URL（兼容 URL 内嵌或 `credential.<url>.username` 指定的用户名） */
 export function gitCredentialLineMatchesTarget(
   credLine: string,
   target: URL,
   useHttpPath: boolean,
+  effectiveUsername?: string,
 ): boolean {
   const trimmed = credLine.trim();
   if (!trimmed || trimmed.startsWith("#")) return false;
@@ -567,7 +726,8 @@ export function gitCredentialLineMatchesTarget(
   const targetPort = target.port || defaultPortForProtocol(target.protocol);
   const entryPort = entry.port || defaultPortForProtocol(entry.protocol);
   if (targetPort !== entryPort) return false;
-  if (target.username && entry.username !== target.username) return false;
+  const wantUser = effectiveUsername || (target.username ? decodeUrlUser(target.username) : "");
+  if (wantUser && decodeUrlUser(entry.username) !== wantUser) return false;
   const entryPath = normalizeCredPath(entry.pathname);
   const targetPath = normalizeCredPath(target.pathname);
   if (useHttpPath || entryPath) {
@@ -705,6 +865,76 @@ export function rewriteGitCredentialHelperChain(
   return gitConfigArgs;
 }
 
+/**
+ * 解析 `git lfs` 实际生效的 LFS 服务端点 URL（按 `git-lfs` 优先级检查 `remote.<target>.lfsurl`、`lfs.pushurl`、`lfs.url`，
+ * 同时覆盖 Git 配置（含 `--includes`）与仓库根目录 `.lfsconfig`），避免 SSH origin 搭配独立 HTTPS `lfs.url`/`lfs.pushurl` 时漏授 HTTPS 凭据。
+ */
+async function resolveEffectiveLfsUrls(
+  cwd: string,
+  spec: { mode: "push" | "fetch"; target?: string },
+  baseUrls: Iterable<string>,
+  opts?: GitRunOpts,
+): Promise<string[]> {
+  const keys: string[] = [];
+  const targetLooksLikeName =
+    !!spec.target &&
+    spec.target !== "." &&
+    spec.target !== ".." &&
+    !/^[a-z][a-z0-9+.-]*:\/\//i.test(spec.target) &&
+    !spec.target.startsWith("/") &&
+    !spec.target.startsWith("./") &&
+    !spec.target.startsWith("../") &&
+    !parseScpGitUrl(spec.target, cwd);
+  if (targetLooksLikeName) {
+    if (spec.mode === "push") keys.push(`remote.${spec.target}.lfspushurl`);
+    keys.push(`remote.${spec.target}.lfsurl`);
+  }
+  if (spec.mode === "push") {
+    keys.push("lfs.pushurl");
+  }
+  keys.push("lfs.url");
+
+  const rawCandidates = new Set<string>();
+  const readKey = async (extraCfgArgs: string[], key: string) => {
+    const r = await tryGit(cwd, ["config", ...extraCfgArgs, "--get-all", key], { ...opts, readOnly: true });
+    if (r.code !== 0 || !r.stdout) return;
+    for (const line of r.stdout.split(/\r?\n/)) {
+      const v = line.trim();
+      if (v) rawCandidates.add(v);
+    }
+  };
+
+  for (const key of keys) {
+    await readKey(["--includes"], key);
+  }
+  const lfsConfigPath = path.join(cwd, ".lfsconfig");
+  try {
+    const st = fs.statSync(lfsConfigPath);
+    if (st.isFile() && st.size <= 256 * 1024) {
+      for (const key of keys) {
+        await readKey(["--file", lfsConfigPath], key);
+      }
+    }
+  } catch {
+    // no .lfsconfig
+  }
+
+  const baseHttpUrl = [...baseUrls].find((u) => /^https?:\/\//i.test(u.trim()));
+  const out = new Set<string>();
+  for (const cand of rawCandidates) {
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(cand) || cand.startsWith("/") || cand.startsWith("./") || cand.startsWith("../") || parseScpGitUrl(cand, cwd)) {
+      out.add(cand);
+    } else if (baseHttpUrl) {
+      try {
+        out.add(new URL(cand, baseHttpUrl.endsWith("/") ? baseHttpUrl : `${baseHttpUrl}/`).href);
+      } catch {
+        // ignore invalid relative LFS URL
+      }
+    }
+  }
+  return [...out];
+}
+
 async function resolveEffectiveRemoteUrls(
   cwd: string,
   args: string[],
@@ -736,18 +966,24 @@ async function resolveEffectiveRemoteUrls(
       }
     }
   }
+  if (args[0] === "lfs") {
+    for (const lfsUrl of await resolveEffectiveLfsUrls(cwd, spec, rawUrls, opts)) {
+      rawUrls.add(lfsUrl);
+    }
+  }
   return [...rawUrls];
 }
 
 /**
  * 在受信任宿主机上下文中调用单个 global/system 配置的非 store helper（例如 `gh auth setup-git`、`git credential-cache`），
- * 严格隔离仓库级 `.git/config` 与个人 Web 凭据，仅解析目标 URL 的单次用户名与密码。
+ * 严格隔离仓库级 `.git/config` 与个人 Web 凭据，仅解析目标 URL 的单次用户名与密码（携带 URL 内嵌或 `credential.<url>.username` 生效用户名）。
  */
 async function resolveHostCredentialViaHelper(
   helperValue: string,
   target: URL,
   useHttpPath: boolean,
   rawEnv: NodeJS.ProcessEnv,
+  effectiveUsername?: string,
 ): Promise<string | undefined> {
   const hostPrep = prepareHarnessEnv(rawEnv, { preserveDbusSession: true });
   try {
@@ -761,12 +997,9 @@ async function resolveHostCredentialViaHelper(
     const cleanPath = target.pathname.replace(/^\/+/, "");
     const lines = [`protocol=${proto}`, `host=${target.host}`];
     if (useHttpPath && cleanPath) lines.push(`path=${cleanPath}`);
-    if (target.username) {
-      try {
-        lines.push(`username=${decodeURIComponent(target.username)}`);
-      } catch {
-        lines.push(`username=${target.username}`);
-      }
+    const queryUser = effectiveUsername || (target.username ? decodeUrlUser(target.username) : "");
+    if (queryUser) {
+      lines.push(`username=${queryUser}`);
     }
     const input = `${lines.join("\n")}\n\n`;
     const r = await runProcess(
@@ -801,7 +1034,7 @@ async function resolveHostCredentialViaHelper(
       if (eq <= 0) continue;
       kv.set(rawLine.slice(0, eq).trim(), rawLine.slice(eq + 1));
     }
-    const username = kv.get("username");
+    const username = kv.get("username") ?? queryUser;
     const password = kv.get("password");
     if (username === undefined || password === undefined || (!username && !password)) return undefined;
     const outProto = (kv.get("protocol") || proto).trim();
@@ -891,14 +1124,25 @@ async function prepareScopedGitHttpCredentials(
   }
   if (matchingKeys.size === 0) return undefined;
 
-  // 检查目标 URL 是否启用 credential.useHttpPath
+  // 检查目标 URL 是否启用 credential.useHttpPath 及 URL 作用域的 credential.<url>.username
   const useHttpPathByTarget = new Map<URL, boolean>();
+  const effectiveUsernameByTarget = new Map<URL, string>();
   for (const t of targetUrls) {
     const uhp = await tryGit(cwd, ["config", "--includes", "--bool", "--get-urlmatch", "credential.useHttpPath", t.href], {
       ...opts,
       readOnly: true,
     });
     useHttpPathByTarget.set(t, uhp.code === 0 && uhp.stdout.trim() === "true");
+    if (t.username) {
+      effectiveUsernameByTarget.set(t, decodeUrlUser(t.username));
+    } else {
+      const uCfg = await tryGit(cwd, ["config", "--includes", "--get-urlmatch", "credential.username", t.href], {
+        ...opts,
+        readOnly: true,
+      });
+      const cfgUser = uCfg.code === 0 ? uCfg.stdout.trim() : "";
+      if (cfgUser) effectiveUsernameByTarget.set(t, cfgUser);
+    }
   }
 
   const dataDir = opts?.cfg?.dataDir;
@@ -942,7 +1186,12 @@ async function prepareScopedGitHttpCredentials(
                 const line = rawLine.trim();
                 if (!line || line.startsWith("#")) continue;
                 const matches = keyTargets.some((t) =>
-                  gitCredentialLineMatchesTarget(line, t, useHttpPathByTarget.get(t) === true),
+                  gitCredentialLineMatchesTarget(
+                    line,
+                    t,
+                    useHttpPathByTarget.get(t) === true,
+                    effectiveUsernameByTarget.get(t),
+                  ),
                 );
                 if (matches) slotLines.add(line);
               }
@@ -970,6 +1219,7 @@ async function prepareScopedGitHttpCredentials(
               t,
               useHttpPathByTarget.get(t) === true,
               rawEnv,
+              effectiveUsernameByTarget.get(t),
             );
             if (line) slotLines.add(line);
           }
@@ -1033,9 +1283,18 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
   const baseEnv = prepareHarnessEnv(process.env, { preserveSshAgent: !!sshSock });
   let scopedHttpCreds: ScopedGitHttpCreds | undefined;
   try {
-    const sshHosts = [...new Set(sshUrls.map((u) => extractSshHostname(u, cwd)).filter((h): h is string => !!h))];
+    const sshTargets: SshRemoteTarget[] = [];
+    const seenSshTarget = new Set<string>();
+    for (const u of sshUrls) {
+      const t = extractSshTarget(u, cwd);
+      if (!t) continue;
+      const key = `${t.user ?? ""}@${t.host}:${t.port ?? ""}`;
+      if (seenSshTarget.has(key)) continue;
+      seenSshTarget.add(key);
+      sshTargets.push(t);
+    }
     const sshMounts = usesSsh
-      ? collectScopedSshMounts(sshHosts, effectiveRawEnv, opts?.cfg?.dataDir, sshSock ?? false)
+      ? collectScopedSshMounts(sshTargets, effectiveRawEnv, opts?.cfg?.dataDir, sshSock ?? false)
       : undefined;
     const baseIsoPlan = buildGitIsolation(cwd, opts, baseEnv.env.CREDENTIALS_DIRECTORY, sshSock, sshMounts, effectiveRawEnv);
     const willIsolate = willIsolateCommand(effectiveRawEnv, baseIsoPlan);
@@ -1197,20 +1456,26 @@ export async function remoteUrl(cwd: string, remote: string, opts?: GitRunOpts):
   return r.stdout.trim();
 }
 
-/** 远端默认分支（ls-remote --symref HEAD）；解析并只读挂载本地镜像（如 url.*.insteadOf 重写），查不到返回 ""。 */
+/** 远端默认分支（ls-remote --symref HEAD）；解析并只读挂载本地镜像及其逻辑符号链接（如 url.*.insteadOf 或符号链接镜像路径），查不到返回 ""。 */
 export async function remoteDefaultBranch(cwd: string, remote: string, opts?: GitRunOpts): Promise<string> {
   const urlRes = await tryGit(cwd, ["remote", "get-url", "--all", remote], { ...opts, readOnly: true });
   const urls =
     urlRes.code === 0
       ? urlRes.stdout.split("\n").map((s) => s.trim()).filter(Boolean)
       : [remote];
-  const localDirs = [
-    ...new Set(urls.map((u) => resolveLocalGitRemoteDir(cwd, u)).filter((p): p is string => !!p)),
-  ];
+  const localDirs: string[] = [];
+  const localSymlinks: { dest: string; target: string }[] = [];
+  for (const u of urls) {
+    const m = resolveLocalGitRemoteMount(cwd, u);
+    if (!m) continue;
+    localDirs.push(m.realDir);
+    localSymlinks.push(...m.symlinks);
+  }
   const r = await tryGit(cwd, ["ls-remote", "--symref", remote, "HEAD"], {
     ...opts,
     readOnly: true,
-    extraReadOnlyPaths: [...(opts?.extraReadOnlyPaths ?? []), ...localDirs],
+    extraReadOnlyPaths: [...(opts?.extraReadOnlyPaths ?? []), ...new Set(localDirs)],
+    ...(localSymlinks.length ? { extraSymlinks: [...(opts?.extraSymlinks ?? []), ...localSymlinks] } : {}),
   });
   if (r.code !== 0) return "";
   return r.stdout.match(/^ref:\s+refs\/heads\/(\S+)\s+HEAD/m)?.[1] ?? "";
@@ -1425,8 +1690,16 @@ function collectBatchBufferLfsOids(buf: Buffer, out: Set<string>, stopOnFirst: b
   return found;
 }
 
-/** 将本地远端路径（含 `file://` URL 与相对 `cwd` 的路径）解析为真实宿主机路径，供沙箱显式挂载；非本地远端返回 undefined。 */
-export function resolveLocalGitRemoteDir(cwd: string, rawUrl: string): string | undefined {
+export interface LocalGitRemoteMount {
+  realDir: string;
+  symlinks: { dest: string; target: string }[];
+}
+
+/**
+ * 将本地远端路径（含 `file://` URL 与相对 `cwd` 的路径）解析为真实宿主机路径及逻辑路径上的符号链接映射，
+ * 使隔离沙箱既挂载真实仓库目录又保留原始符号链接路径供 Git 直接按 `.git/config` URL 打开；非本地远端返回 undefined。
+ */
+export function resolveLocalGitRemoteMount(cwd: string, rawUrl: string): LocalGitRemoteMount | undefined {
   const u = rawUrl.trim();
   if (!u) return undefined;
   let candidate: string | undefined;
@@ -1443,12 +1716,44 @@ export function resolveLocalGitRemoteDir(cwd: string, rawUrl: string): string | 
   } else {
     candidate = path.resolve(cwd, u);
   }
+  if (!candidate) return undefined;
   try {
-    if (candidate && fs.existsSync(candidate)) return fs.realpathSync(candidate);
+    if (!fs.existsSync(candidate)) return undefined;
+    const realDir = fs.realpathSync(candidate);
+    const symlinks: { dest: string; target: string }[] = [];
+    const seenDest = new Set<string>();
+    const abs = path.resolve(candidate);
+    const parts = abs.split(path.sep).filter(Boolean);
+    let cur: string = path.sep;
+    for (let i = 0; i < parts.length; i++) {
+      const next = path.join(cur, parts[i]);
+      try {
+        const lst = fs.lstatSync(next);
+        if (lst.isSymbolicLink()) {
+          const parentReal = fs.realpathSync(path.dirname(next));
+          const dest = path.join(parentReal, path.basename(next));
+          const target = fs.realpathSync(next);
+          if (dest !== target && !seenDest.has(dest)) {
+            seenDest.add(dest);
+            symlinks.push({ dest, target });
+          }
+          cur = target;
+          continue;
+        }
+      } catch {
+        break;
+      }
+      cur = next;
+    }
+    return { realDir, symlinks };
   } catch {
-    // ignore
+    return undefined;
   }
-  return undefined;
+}
+
+/** 将本地远端路径（含 `file://` URL 与相对 `cwd` 的路径）解析为真实宿主机路径，供沙箱显式挂载；非本地远端返回 undefined。 */
+export function resolveLocalGitRemoteDir(cwd: string, rawUrl: string): string | undefined {
+  return resolveLocalGitRemoteMount(cwd, rawUrl)?.realDir;
 }
 
 /**
@@ -1838,24 +2143,28 @@ export async function pushBranch(
     ? [...new Set(pushUrlRes.stdout.split("\n").map((s) => s.trim()).filter(Boolean))]
     : [];
   const effectivePushUrls = pushUrls.length > 0 ? pushUrls : [remote];
-  const localDirByUrl = new Map<string, string>();
+  const localMountByUrl = new Map<string, LocalGitRemoteMount>();
   for (const u of effectivePushUrls) {
-    const resolved = resolveLocalGitRemoteDir(cwd, u);
-    if (resolved) localDirByUrl.set(u, resolved);
+    const resolved = resolveLocalGitRemoteMount(cwd, u);
+    if (resolved) localMountByUrl.set(u, resolved);
   }
-  const localRemoteDirs = [...new Set(localDirByUrl.values())];
+  const localRemoteDirs = [...new Set([...localMountByUrl.values()].map((m) => m.realDir))];
+  const localRemoteSymlinks = [...localMountByUrl.values()].flatMap((m) => m.symlinks);
 
   // 仅在至少存在一个需要更新的目标远端时按需执行一次 .gitattributes 流式扫描（避免已发布相同提交触发无谓扫描与 git-lfs 预检）
   let precomputedHasLfsAttr: boolean | undefined;
 
   for (const pushUrl of effectivePushUrls) {
-    const localDir = localDirByUrl.get(pushUrl);
+    const localMount = localMountByUrl.get(pushUrl);
+    const localDir = localMount?.realDir;
+    const localSyms = localMount?.symlinks ?? [];
     // 尽量用 ls-remote 缩小扫描范围；若远端是仅允许 receive-pack（禁止 upload-pack）的 push-only 端点，
     // 不在此处中止，而是保守按远端无已知引用扫描全量待推对象（非 LFS 仓库可直接进入 git push）。
     const lsRemote = await tryGit(cwd, ["ls-remote", pushUrl], {
       ...opts,
       readOnly: true,
       extraReadOnlyPaths: [...(opts?.extraReadOnlyPaths ?? []), ...(localDir ? [localDir] : [])],
+      ...(localSyms.length ? { extraSymlinks: [...(opts?.extraSymlinks ?? []), ...localSyms] } : {}),
     });
     let remoteSha = ZERO_OID;
     const knownRemoteShas: string[] = [];
@@ -1899,11 +2208,13 @@ export async function pushBranch(
 
     if (scan.hasLfsAttr || scan.oids.length > 0) {
       const lfsWritePaths = [...(opts?.extraWritablePaths ?? []), ...(localDir ? [localDir] : [])];
+      const lfsSyms = localSyms.length ? [...(opts?.extraSymlinks ?? []), ...localSyms] : opts?.extraSymlinks;
       // 1) 始终先运行受信任、感知路径的 `git lfs pre-push`，保留客户端 LFS 文件锁校验（lfs.locksverify）
       const prePush = await tryGit(cwd, ["lfs", "pre-push", remote, pushUrl], {
         ...opts,
         input: `${localRef} ${localSha} ${localRef} ${remoteSha}\n`,
         extraWritablePaths: lfsWritePaths,
+        ...(lfsSyms?.length ? { extraSymlinks: lfsSyms } : {}),
       });
       if (prePush.code !== 0) {
         const lfsOut = `${prePush.stdout}\n${prePush.stderr}`.trim();
@@ -1925,6 +2236,7 @@ export async function pushBranch(
           const lfs = await tryGit(cwd, ["lfs", "push", "--object-id", lfsTarget, ...oidChunk], {
             ...opts,
             extraWritablePaths: lfsWritePaths,
+            ...(lfsSyms?.length ? { extraSymlinks: lfsSyms } : {}),
           });
           if (lfs.code !== 0) {
             const lfsOut = `${lfs.stdout}\n${lfs.stderr}`.trim();
@@ -1945,6 +2257,7 @@ export async function pushBranch(
   const r = await tryGit(cwd, ["push", "--porcelain", ...force, remote, `${localSha}:${localRef}`], {
     ...opts,
     extraWritablePaths: [...(opts?.extraWritablePaths ?? []), ...localRemoteDirs],
+    ...(localRemoteSymlinks.length ? { extraSymlinks: [...(opts?.extraSymlinks ?? []), ...localRemoteSymlinks] } : {}),
   });
   if (r.code === 0) return { ok: true };
   const out = `${r.stdout}\n${r.stderr}`.trim();

@@ -1767,6 +1767,7 @@ export class PersonalWebBridge {
       if ((allowlistMode || !isMe) && !this.isGroupInScope(effectiveMsg.conversationId, pwConv, ownerId)) {
         await this.ensureCrossTransportScopeMeta(ownerId, activeClient, signal);
         if (!this.isGroupInScope(effectiveMsg.conversationId, pwConv, ownerId)) {
+          assertSessionActiveForStoreMutation();
           if (!isMe) this.store.retirePendingObs(`pw:${effectiveMsg.id}`);
           return;
         }

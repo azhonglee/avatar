@@ -339,9 +339,16 @@ export class ContextStore {
           if (!hasNewerRevision && curPollAt !== undefined && nextPollAt !== undefined && nextPollAt < curPollAt) {
             continue;
           }
+          // 若已有带修订标尺的撤回墓碑（如轮询收到 rev=3 的 deleted=true），除非新到达的副本具备更高修订或经服务端权威回读确认存活，
+          // 否则绝不允许同修订/无修订标尺的陈旧副本重新激活已撤回观测
+          const incomingAuthoritativeLive = o.meta?.authoritative_live === true;
+          if (wasWithdrawn && (curVer !== undefined || curEditTime !== undefined) && !hasNewerRevision && !incomingAuthoritativeLive) {
+            continue;
+          }
           const curEffectiveMeta =
             curMeta.at_me === undefined && String(cur.kind ?? "") === "at_me" ? { ...curMeta, at_me: true } : curMeta;
-          const incomingMeta = o.meta ?? {};
+          const incomingMeta = { ...(o.meta ?? {}) };
+          delete incomingMeta.authoritative_live;
           const nextMeta: Record<string, unknown> = { ...curEffectiveMeta, ...incomingMeta };
           if (curVer !== undefined && nextVer !== undefined) nextMeta.edit_version = Math.max(curVer, nextVer);
           if (curEditTime !== undefined && nextEditTime !== undefined) nextMeta.edit_time = Math.max(curEditTime, nextEditTime);
@@ -452,18 +459,90 @@ export class ContextStore {
     return !!r;
   }
 
-  /** 撤回一条观测（例如范围外群的 @我 消息被编辑移除了 @我），将其移出待处理队列并永久排除在后续理解/起草背景窗口之外（直至再次收到合格投递才重新激活） */
-  retirePendingObs(id: string): boolean {
+  /**
+   * 撤回一条观测（例如消息被撤回或范围外群的 @我 被编辑移除），将其移出待处理队列并永久排除在后续理解/起草背景窗口之外：
+   *   - 当携带修订水位（`editVersion` / `editTimeMs` / `pollObservedAt`）时，比较并推进水位，避免陈旧撤回覆盖更新的存活编辑；
+   *   - 若该 ID 尚未入库但携带修订水位，写入已处理的撤回墓碑行（`processed = 1, meta.withdrawn = true`），防止后续到达的陈旧副本复活已撤回消息。
+   */
+  retirePendingObs(
+    id: string,
+    opts?: {
+      editVersion?: number;
+      editTimeMs?: number;
+      pollObservedAt?: number;
+      conv?: string;
+      source?: CtxSource;
+      kind?: string;
+      time?: number;
+    },
+  ): boolean {
     return this.tx(() => {
       const cur = this.db.prepare("SELECT processed, meta FROM ctx_obs WHERE id = ?").get(id) as
         | { processed: number; meta: string }
         | undefined;
-      if (!cur) return false;
+      const incVer =
+        typeof opts?.editVersion === "number" && Number.isFinite(opts.editVersion) ? opts.editVersion : undefined;
+      const incEditTime =
+        typeof opts?.editTimeMs === "number" && Number.isFinite(opts.editTimeMs) ? opts.editTimeMs : undefined;
+      const incPollAt =
+        typeof opts?.pollObservedAt === "number" && Number.isFinite(opts.pollObservedAt)
+          ? opts.pollObservedAt
+          : undefined;
+      if (!cur) {
+        if (incVer === undefined && incEditTime === undefined && incPollAt === undefined) return false;
+        const now = Date.now();
+        const tombstoneMeta: Record<string, unknown> = {
+          withdrawn: true,
+          edit_gen: 1,
+          ...(incVer !== undefined ? { edit_version: incVer } : {}),
+          ...(incEditTime !== undefined ? { edit_time: incEditTime } : {}),
+          ...(incPollAt !== undefined ? { poll_observed_at: incPollAt } : {}),
+        };
+        this.db
+          .prepare(
+            `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed)
+             VALUES (?, ?, ?, ?, '', '', '', 0, ?, '', '', ?, ?, 1)`,
+          )
+          .run(
+            id,
+            opts?.source ?? "im",
+            opts?.kind ?? "group",
+            opts?.conv ?? "im",
+            opts?.time ?? now,
+            JSON.stringify(tombstoneMeta),
+            now,
+          );
+        return true;
+      }
       const m = j<Record<string, unknown>>(cur.meta, {});
-      if (cur.processed !== 0 && m.withdrawn === true) return false;
-      const prevGen = typeof m.edit_gen === "number" && Number.isFinite(m.edit_gen) ? m.edit_gen : 0;
-      m.edit_gen = prevGen + 1;
+      const curVer = typeof m.edit_version === "number" && Number.isFinite(m.edit_version) ? m.edit_version : undefined;
+      const curEditTime =
+        typeof m.edit_time === "number" && Number.isFinite(m.edit_time) ? m.edit_time : undefined;
+      const curPollAt =
+        typeof m.poll_observed_at === "number" && Number.isFinite(m.poll_observed_at)
+          ? m.poll_observed_at
+          : undefined;
+      if (curVer !== undefined && incVer !== undefined && incVer < curVer) return false;
+      if (curEditTime !== undefined && incEditTime !== undefined && incEditTime < curEditTime) return false;
+      const hasNewer =
+        (curVer !== undefined && incVer !== undefined && incVer > curVer) ||
+        (curEditTime !== undefined && incEditTime !== undefined && incEditTime > curEditTime);
+      if (!hasNewer && curPollAt !== undefined && incPollAt !== undefined && incPollAt < curPollAt) return false;
+
+      const verChanged = incVer !== undefined && (curVer === undefined || incVer > curVer);
+      const editTimeChanged = incEditTime !== undefined && (curEditTime === undefined || incEditTime > curEditTime);
+      const pollAtChanged = incPollAt !== undefined && (curPollAt === undefined || incPollAt > curPollAt);
+      if (cur.processed !== 0 && m.withdrawn === true && !verChanged && !editTimeChanged && !pollAtChanged) {
+        return false;
+      }
+      if (cur.processed === 0 || m.withdrawn !== true) {
+        const prevGen = typeof m.edit_gen === "number" && Number.isFinite(m.edit_gen) ? m.edit_gen : 0;
+        m.edit_gen = prevGen + 1;
+      }
       m.withdrawn = true;
+      if (incVer !== undefined) m.edit_version = curVer !== undefined ? Math.max(curVer, incVer) : incVer;
+      if (incEditTime !== undefined) m.edit_time = curEditTime !== undefined ? Math.max(curEditTime, incEditTime) : incEditTime;
+      if (incPollAt !== undefined) m.poll_observed_at = curPollAt !== undefined ? Math.max(curPollAt, incPollAt) : incPollAt;
       this.db.prepare("UPDATE ctx_obs SET processed = 1, meta = ? WHERE id = ?").run(JSON.stringify(m), id);
       return true;
     });

@@ -250,6 +250,23 @@ export class Ledger {
     return r ? toItem<P>(r) : undefined;
   }
 
+  /** 按 ID 批量读取工作项，避免大窗口扫描时的 N+1 同步查询。 */
+  getMany<P = Record<string, unknown>>(ids: string[]): Map<string, WorkItem<P>> {
+    const out = new Map<string, WorkItem<P>>();
+    const unique = [...new Set(ids.filter(Boolean))];
+    const CHUNK = 400;
+    for (let i = 0; i < unique.length; i += CHUNK) {
+      const slice = unique.slice(i, i + CHUNK);
+      const placeholders = slice.map(() => "?").join(", ");
+      const rows = this.db.prepare(`SELECT * FROM work WHERE id IN (${placeholders})`).all(...slice) as Row[];
+      for (const r of rows) {
+        const item = toItem<P>(r);
+        out.set(item.id, item);
+      }
+    }
+    return out;
+  }
+
   /**
    * 领取一项可运行的工作：未终结、到了重试时间、没有有效租约。原子地写入租约并把 attempts +1。
    * effect 额外要求同一 ref 下更早的 effect 已经落定，保证同一任务的“评论→移动”按顺序投递。

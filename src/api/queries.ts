@@ -735,8 +735,318 @@ function isContextHealthWork(w: WorkItem): boolean {
   return false;
 }
 
-function healthItem(app: App, w: WorkItem, ownerMismatch = false): HealthItem {
-  if ((ownerMismatch && isContextHealthWork(w)) || isWorkBlockedByOwner(app, w)) {
+/**
+ * `health()` 专用的批量主人隔离检查器：
+ *   - 在单次请求内仅以常数次 SQLite 查询预加载 `kv` 归属映射、旧主人 `ctx_item` 委派集合及历史委派 ref；
+ *   - 每页按需以 `IN (...)` 批量预取可能涉及归属链路的关联 `work` 行并缓存结果，彻底消除大窗口下的逐行 N+1 同步查询，
+ *     同时与 `isWorkBlockedByOwner` 保持逐分支一致的隔离判定语义。
+ */
+class HealthOwnerBatch {
+  readonly curOwner: string;
+  readonly curBriefTag: string;
+  readonly ownerMismatch: boolean;
+  readonly prevOwnerOpenId: string;
+  readonly ownerSwitched: boolean;
+  private readonly dispatchOwner = new Map<string, string>();
+  private readonly dispatchRefOwner = new Map<string, string>();
+  private readonly ownTaskOwner = new Map<string, string>();
+  private readonly legacyOwnTaskGuids = new Set<string>();
+  private readonly legacyDelegatedIds = new Set<string>();
+  private readonly legacyDelegatedDispatchRefs = new Set<string>();
+  private readonly hasAnyForeignOrigin: boolean;
+  private readonly workCache = new Map<string, WorkItem | null>();
+  private readonly ledger: App["ledger"];
+
+  constructor(app: Pick<App, "cfg" | "store" | "ledger">) {
+    this.ledger = app.ledger;
+    this.curOwner = app.cfg.owner.open_id.trim();
+    this.curBriefTag = briefOwnerTag(this.curOwner);
+    this.ownerMismatch = hasWorkspaceOwnerMismatch(app.store, this.curOwner);
+    this.prevOwnerOpenId = (app.store.get("owner.open_id") ?? "").trim();
+    this.ownerSwitched = this.ownerMismatch || (!!this.prevOwnerOpenId && this.prevOwnerOpenId !== this.curOwner);
+
+    let foreignOrigin = this.ownerSwitched;
+    try {
+      const kvRows = app.store.db
+        .prepare(
+          `SELECT k, v FROM kv
+           WHERE k LIKE 'ctx.dispatch_owner.%'
+              OR k LIKE 'ctx.dispatch_ref_owner.%'
+              OR k LIKE 'ctx.own_task_owner.%'
+              OR (? = 1 AND k LIKE 'op.task.create_own.%')`,
+        )
+        .all(this.ownerSwitched ? 1 : 0) as { k: string; v: string }[];
+      for (const row of kvRows) {
+        const val = (row.v ?? "").trim();
+        if (!val) continue;
+        if (row.k.startsWith("ctx.dispatch_owner.")) {
+          this.dispatchOwner.set(row.k.slice("ctx.dispatch_owner.".length), val);
+          if (val !== this.curOwner) foreignOrigin = true;
+        } else if (row.k.startsWith("ctx.dispatch_ref_owner.")) {
+          this.dispatchRefOwner.set(row.k.slice("ctx.dispatch_ref_owner.".length), val);
+          if (val !== this.curOwner) foreignOrigin = true;
+        } else if (row.k.startsWith("ctx.own_task_owner.")) {
+          this.ownTaskOwner.set(row.k.slice("ctx.own_task_owner.".length), val);
+          if (val !== this.curOwner) foreignOrigin = true;
+        } else if (row.k.startsWith("op.task.create_own.")) {
+          this.legacyOwnTaskGuids.add(val);
+        }
+      }
+      if (this.ownerSwitched) {
+        const hasCtxTable = app.store.db
+          .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ctx_item'")
+          .get();
+        if (hasCtxTable) {
+          const delRows = app.store.db
+            .prepare("SELECT DISTINCT json_extract(meta, '$.delegated') AS d FROM ctx_item WHERE json_extract(meta, '$.delegated') IS NOT NULL")
+            .all() as { d: unknown }[];
+          for (const r of delRows) {
+            if (typeof r.d === "string" && r.d) this.legacyDelegatedIds.add(r.d);
+          }
+          if (this.legacyDelegatedIds.size > 0) {
+            const refRows = app.store.db
+              .prepare(
+                `SELECT DISTINCT w.ref AS ref FROM work w
+                 WHERE w.kind = 'dispatch'
+                   AND EXISTS (SELECT 1 FROM ctx_item ci WHERE json_extract(ci.meta, '$.delegated') = w.id)`,
+              )
+              .all() as { ref: string }[];
+            for (const r of refRows) {
+              if (r.ref) this.legacyDelegatedDispatchRefs.add(r.ref);
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore optional table absence
+    }
+    this.hasAnyForeignOrigin = foreignOrigin;
+  }
+
+  private collectLookupIdsFromWork(w: WorkItem, out: Set<string>): void {
+    const addNorm = (raw: string) => {
+      if (!raw) return;
+      const norm = raw.startsWith("card:") ? raw.slice("card:".length) : raw;
+      if (norm && !this.workCache.has(norm)) out.add(norm);
+    };
+    const addFailureTarget = (raw: string) => {
+      if (raw.startsWith("card:failure:")) addNorm(raw.slice("card:failure:".length));
+      else if (raw.startsWith("failure:")) addNorm(raw.slice("failure:".length));
+    };
+
+    addFailureTarget(w.ref);
+    if (w.kind === "effect") {
+      const e = w.payload as unknown as Partial<Effect>;
+      if (e.op === "card.upsert" && typeof e.args?.key === "string") {
+        addFailureTarget(e.args.key);
+      }
+    }
+    if (!this.hasAnyForeignOrigin) return;
+
+    if (w.kind === "delivery") {
+      const p = w.payload as { dispatch_id?: unknown; guid?: unknown };
+      addNorm(w.ref);
+      if (typeof p.dispatch_id === "string") addNorm(p.dispatch_id);
+      if (typeof p.guid === "string") addNorm(p.guid);
+    } else if (w.kind === "dispatch") {
+      addNorm(w.ref);
+    } else if (w.kind === "effect") {
+      const e = w.payload as unknown as Partial<Effect>;
+      addNorm(w.ref);
+      if (e.op === "card.upsert" && typeof e.args?.key === "string") addNorm(e.args.key);
+      if (e.args && "guid" in e.args && typeof e.args.guid === "string") addNorm(e.args.guid);
+    } else if (w.ref) {
+      addNorm(w.ref);
+    }
+  }
+
+  preloadPage(items: WorkItem[]): void {
+    for (const w of items) {
+      this.workCache.set(w.id, w);
+    }
+    let frontier = items;
+    for (let depth = 0; depth < 3 && frontier.length > 0; depth++) {
+      const missing = new Set<string>();
+      for (const w of frontier) {
+        this.collectLookupIdsFromWork(w, missing);
+      }
+      // 也解析 `delivery:dispatch:...` 合成键中的派单 ID
+      if (this.hasAnyForeignOrigin) {
+        for (const id of [...missing]) {
+          if (id.startsWith("delivery:dispatch:")) {
+            const parts = id.slice("delivery:".length).split(":");
+            const parsedDispatchId = parts.length >= 3 ? parts.slice(0, 3).join(":") : "";
+            if (parsedDispatchId && !this.workCache.has(parsedDispatchId)) missing.add(parsedDispatchId);
+          }
+        }
+      }
+      if (missing.size === 0) break;
+      const missingList = [...missing];
+      const fetched = this.ledger.getMany(missingList);
+      const nextFrontier: WorkItem[] = [];
+      for (const id of missingList) {
+        const hit = fetched.get(id) ?? null;
+        this.workCache.set(id, hit);
+        if (hit) nextFrontier.push(hit);
+      }
+      frontier = nextFrontier;
+    }
+  }
+
+  private getCachedWork(id: string): WorkItem | undefined {
+    if (this.workCache.has(id)) return this.workCache.get(id) ?? undefined;
+    const hit = this.ledger.get(id) ?? null;
+    this.workCache.set(id, hit);
+    return hit ?? undefined;
+  }
+
+  private isContextDerivedDispatchBlockedFast(dispatchId: string, visited: Set<string> = new Set()): boolean {
+    if (!dispatchId || !this.hasAnyForeignOrigin) return false;
+    const normalized = dispatchId.startsWith("card:") ? dispatchId.slice("card:".length) : dispatchId;
+    if (!normalized || visited.has(normalized)) return false;
+    visited.add(normalized);
+
+    const w = this.getCachedWork(normalized);
+    if (w?.kind === "delivery") {
+      const p = w.payload as { dispatch_id?: unknown; guid?: unknown };
+      const candidates = [
+        w.ref,
+        typeof p.dispatch_id === "string" ? p.dispatch_id : "",
+        typeof p.guid === "string" ? p.guid : "",
+      ].filter(Boolean);
+      if (candidates.some((c) => c !== normalized && this.isContextDerivedDispatchBlockedFast(c, visited))) return true;
+    } else if (!w && normalized.startsWith("delivery:")) {
+      const rest = normalized.slice("delivery:".length);
+      if (rest.startsWith("dispatch:")) {
+        const parts = rest.split(":");
+        const parsedDispatchId = parts.length >= 3 ? parts.slice(0, 3).join(":") : "";
+        const parsedDeliveryGuid = parts[1] ?? "";
+        if (parsedDispatchId && this.isContextDerivedDispatchBlockedFast(parsedDispatchId, visited)) return true;
+        if (parsedDeliveryGuid && this.isContextDerivedDispatchBlockedFast(parsedDeliveryGuid, visited)) return true;
+      }
+    }
+
+    const parsedGuid = normalized.startsWith("dispatch:") ? (normalized.split(":")[1] ?? "") : "";
+    const candidateGuids = [...new Set([normalized, w?.ref ?? "", parsedGuid].filter(Boolean))];
+    const directOrigin = this.dispatchOwner.get(normalized) ?? "";
+    const refOrigin = (w?.ref ? this.dispatchRefOwner.get(w.ref) : "") ?? "";
+    const idAsRefOrigin = this.dispatchRefOwner.get(normalized) ?? "";
+    const parsedGuidOrigin = parsedGuid ? (this.dispatchRefOwner.get(parsedGuid) ?? "") : "";
+    const ownTaskOrigin = candidateGuids.map((g) => this.ownTaskOwner.get(g) ?? "").find(Boolean) ?? "";
+    const originOwner = directOrigin || refOrigin || idAsRefOrigin || parsedGuidOrigin || ownTaskOrigin;
+    if (originOwner && originOwner !== this.curOwner) return true;
+    if (!this.ownerSwitched) return false;
+    if (originOwner) return true;
+
+    for (const g of candidateGuids) {
+      if (this.legacyOwnTaskGuids.has(g)) return true;
+    }
+    if (this.legacyDelegatedIds.has(normalized)) return true;
+    const candidateRef = w?.ref || parsedGuid || normalized;
+    if (candidateRef) {
+      if (this.legacyDelegatedIds.has(candidateRef)) return true;
+      if (this.legacyDelegatedDispatchRefs.has(candidateRef)) return true;
+    }
+    return false;
+  }
+
+  private isContextOwnedTaskBlockedFast(guid: string): boolean {
+    if (!guid || !this.hasAnyForeignOrigin) return false;
+    if (this.isContextDerivedDispatchBlockedFast(guid)) return true;
+    const ownOrigin = this.ownTaskOwner.get(guid) ?? "";
+    if (ownOrigin && ownOrigin !== this.curOwner) return true;
+    if (!this.ownerSwitched) return false;
+    if (ownOrigin) return true;
+    return this.legacyOwnTaskGuids.has(guid);
+  }
+
+  isWorkBlocked(workOrId: WorkItem | string, visited: Set<string> = new Set()): boolean {
+    const rawId = typeof workOrId === "string" ? workOrId : workOrId.id;
+    if (!rawId || visited.has(rawId)) return false;
+    visited.add(rawId);
+
+    if (typeof workOrId === "string") {
+      if (workOrId.startsWith("card:failure:")) {
+        return this.isWorkBlocked(workOrId.slice("card:failure:".length), visited);
+      }
+      if (workOrId.startsWith("failure:")) {
+        return this.isWorkBlocked(workOrId.slice("failure:".length), visited);
+      }
+    }
+
+    const w = typeof workOrId === "string" ? this.getCachedWork(workOrId) : workOrId;
+    if (!w) {
+      if (this.ownerMismatch) {
+        const isBriefKey = rawId === "brief" || rawId.startsWith("card:brief:") || rawId.startsWith("brief:");
+        if (isBriefKey) {
+          return !this.curBriefTag || !rawId.endsWith(`-${this.curBriefTag}`);
+        }
+        if (
+          rawId.startsWith("card:ctx-") ||
+          rawId.startsWith("ctx-draft:") ||
+          (rawId.startsWith("context:") && rawId !== "context:pw-needs-login")
+        ) {
+          return true;
+        }
+      }
+      return this.isContextOwnedTaskBlockedFast(rawId);
+    }
+
+    if (this.ownerMismatch && isContextHealthWork(w)) return true;
+
+    if (w.kind === "context") {
+      const p = w.payload as Record<string, unknown>;
+      const boundOwner = typeof p?.owner_open_id === "string" ? p.owner_open_id.trim() : "";
+      if (boundOwner && boundOwner !== this.curOwner) return true;
+      if (!boundOwner && this.prevOwnerOpenId && this.prevOwnerOpenId !== this.curOwner) return true;
+      return false;
+    }
+
+    if (w.kind === "dispatch" || w.kind === "delivery") {
+      if (!this.hasAnyForeignOrigin) return false;
+      if (
+        this.isContextDerivedDispatchBlockedFast(w.id) ||
+        (!!w.ref && this.isContextDerivedDispatchBlockedFast(w.ref))
+      ) {
+        return true;
+      }
+      return false;
+    }
+
+    if (w.kind === "effect") {
+      const e = w.payload as unknown as Partial<Effect>;
+      const boundRecipient =
+        e.args && "owner_open_id" in e.args && typeof e.args.owner_open_id === "string"
+          ? e.args.owner_open_id.trim()
+          : "";
+      if (boundRecipient && boundRecipient !== this.curOwner) return true;
+      const isBriefEffect =
+        w.ref === "brief" ||
+        w.ref.startsWith("card:brief:") ||
+        (e.op === "card.upsert" && typeof e.args?.key === "string" && e.args.key.startsWith("brief:"));
+      if (isBriefEffect && !boundRecipient && this.ownerMismatch) return true;
+      if (w.ref.startsWith("card:failure:")) {
+        if (this.isWorkBlocked(w.ref.slice("card:failure:".length), visited)) return true;
+      }
+      if (e.op === "card.upsert" && typeof e.args?.key === "string" && e.args.key.startsWith("failure:")) {
+        if (this.isWorkBlocked(e.args.key.slice("failure:".length), visited)) return true;
+      }
+      if (!this.hasAnyForeignOrigin) return false;
+      const candidates = [
+        w.ref,
+        e.op === "card.upsert" && typeof e.args?.key === "string" ? e.args.key : "",
+        e.args && "guid" in e.args && typeof e.args.guid === "string" ? e.args.guid : "",
+      ].filter(Boolean);
+      if (candidates.some((c) => this.isContextOwnedTaskBlockedFast(c))) return true;
+      return false;
+    }
+
+    return !!w.ref && this.isContextOwnedTaskBlockedFast(w.ref);
+  }
+}
+
+function buildHealthItem(w: WorkItem, isolated: boolean): HealthItem {
+  if (isolated) {
     // 隔离记录不含任何可操作按钮，使用哈希脱敏展示 ID，绝不经 ledger key 泄漏旧主人的原生群/私聊 ID 或消息 ID
     const opaqueId = `isolated:${createHash("sha256").update(w.id).digest("hex").slice(0, 16)}`;
     return {
@@ -787,17 +1097,22 @@ function healthItem(app: App, w: WorkItem, ownerMismatch = false): HealthItem {
 
 export function health(app: App): Health {
   const { ledger, store, cfg } = app;
-  const ownerMismatch = hasWorkspaceOwnerMismatch(store, cfg.owner.open_id);
+  const ownerBatch = new HealthOwnerBatch(app);
   const kinds = ["event", "effect", "job", "delivery", "context"] as const;
-  const retrying = kinds.flatMap((k) => ledger.active(k)).filter((w) => w.attempts > 1 || !!w.error).map((w) => healthItem(app, w, ownerMismatch));
+  const retryingRaw = kinds.flatMap((k) => ledger.active(k)).filter((w) => w.attempts > 1 || !!w.error);
+  ownerBatch.preloadPage(retryingRaw);
+  const retrying = retryingRaw.map((w) =>
+    buildHealthItem(w, (ownerBatch.ownerMismatch && isContextHealthWork(w)) || ownerBatch.isWorkBlocked(w)),
+  );
 
-  // 在 14 天报告窗口内分页扫描全部失败项：
-  //   1. 精确累计当前主人未确认的可操作失败总数（actionable_failures），不受 200 条展示上限截断；
-  //   2. 展示列表（最多 200 条）按优先级依次保留：未确认当前主人失败 → 已确认当前主人失败 → 旧主人隔离记录，
-  //      确保已确认的历史失败或旧主人隔离记录绝不会把可操作的当前故障挤出 Health 页面。
+  // 在 14 天报告窗口内分页批量扫描全部失败项：
+  //   1. 通过 HealthOwnerBatch 预加载归属映射与每页关联 work 行，避免逐行同步 SQLite 查询阻塞事件循环；
+  //   2. 精确累计当前主人未确认的可操作失败总数（actionable_failures），不受 200 条展示上限截断；
+  //   3. 展示列表（最多 200 条）按优先级依次保留：未确认当前主人失败 → 已确认当前主人失败 → 旧主人隔离记录，
+  //      并在展示桶已满后跳过不必要的摘要构造与 SHA-256 脱敏计算。
   const cutoff = Date.now() - 14 * DAY;
   const DISPLAY_LIMIT = 200;
-  const PAGE_SIZE = 500;
+  const PAGE_SIZE = 1000;
   const actionableOwnFailed: HealthItem[] = [];
   const acknowledgedOwnFailed: HealthItem[] = [];
   const isolatedFailed: HealthItem[] = [];
@@ -812,15 +1127,23 @@ export function health(app: App): Health {
       before,
     });
     if (!page.length) break;
+    ownerBatch.preloadPage(page);
     for (const w of page) {
-      const item = healthItem(app, w, ownerMismatch);
-      if (item.isolated) {
-        if (isolatedFailed.length < DISPLAY_LIMIT) isolatedFailed.push(item);
-      } else if (!item.acknowledged) {
+      const acked = w.outcome === "acknowledged";
+      // 未确认当前主人失败桶已满 200 条时，已确认失败既不计入 actionable_failures 也不会进入展示列表，直接跳过
+      if (acked && actionableOwnFailed.length >= DISPLAY_LIMIT) continue;
+      const isolated = (ownerBatch.ownerMismatch && isContextHealthWork(w)) || ownerBatch.isWorkBlocked(w);
+      if (isolated) {
+        if (actionableOwnFailed.length + acknowledgedOwnFailed.length + isolatedFailed.length < DISPLAY_LIMIT) {
+          isolatedFailed.push(buildHealthItem(w, true));
+        }
+      } else if (!acked) {
         actionableFailures++;
-        if (actionableOwnFailed.length < DISPLAY_LIMIT) actionableOwnFailed.push(item);
-      } else {
-        if (acknowledgedOwnFailed.length < DISPLAY_LIMIT) acknowledgedOwnFailed.push(item);
+        if (actionableOwnFailed.length < DISPLAY_LIMIT) {
+          actionableOwnFailed.push(buildHealthItem(w, false));
+        }
+      } else if (actionableOwnFailed.length + acknowledgedOwnFailed.length < DISPLAY_LIMIT) {
+        acknowledgedOwnFailed.push(buildHealthItem(w, false));
       }
     }
     if (page.length < PAGE_SIZE) break;

@@ -909,7 +909,21 @@ export class Connectors {
         return r.id === me || r.open_id === me || r.user_id === me;
       });
     };
-    const rowEffectiveAtMe = (m: Raw, k: string): boolean => k === "at_me" || rowMentionsMe(m) === true;
+    // 当抓回的消息正文明确带有 mentions 列表时，以正文的真实 mentions 列表为准，
+    // 防止 `--is-at-me` 先按旧索引命中 ID、随后抓正文期间对方已编辑移除 @我 时，旧搜索流标签绕过白名单/群范围约束。
+    const rowEffectiveAtMe = (m: Raw, k: string): boolean => {
+      const explicit = rowMentionsMe(m);
+      if (explicit !== undefined) return explicit;
+      return k === "at_me";
+    };
+    const fallbackKindWithoutAtMe = (m: Raw, origKind: string): string => {
+      if (origKind !== "at_me") return origKind;
+      const ct = String(m.chat_type ?? "").trim().toLowerCase();
+      if (ct === "p2p") return "p2p";
+      const s = m.sender ?? {};
+      const sid = String(s.id ?? s.open_id ?? m.sender_id ?? "");
+      return sid === me ? "mine" : "group";
+    };
     const rowBodyConflict = (aM: Raw, aKind: string, bM: Raw, bKind: string): boolean => {
       const aText = textOf(aM.content ?? aM.text ?? "");
       const bText = textOf(bM.content ?? bM.text ?? "");
@@ -934,6 +948,7 @@ export class Connectors {
         needsVerify: boolean;
         verifyFailed?: boolean;
         deleted?: boolean;
+        authoritativeLive?: boolean;
         candidates: { text: string; kind: string; atMe: boolean }[];
       }
     >();
@@ -945,7 +960,7 @@ export class Connectors {
       const rowText = textOf(row.m.content ?? row.m.text ?? "");
       const rowDeleted = row.m.deleted === true || row.m.is_deleted === true;
       const rowAtMe = rowEffectiveAtMe(row.m, row.kind);
-      const rowEffKind = rowAtMe ? "at_me" : row.kind;
+      const rowEffKind = rowAtMe ? "at_me" : fallbackKindWithoutAtMe(row.m, row.kind);
       const existing = mergedById.get(id);
       if (!existing) {
         mergedById.set(id, {
@@ -1070,6 +1085,10 @@ export class Connectors {
         const mergedParentId = fresh.parent_id || entry.m.parent_id;
         const mergedRootId = fresh.root_id || entry.m.root_id;
         const freshText = textOf(fresh.content ?? fresh.text ?? "");
+        const freshCounter = parseEditCounter(fresh);
+        const freshTimeMs = parseEditTimeMs(fresh, this.cfg.owner.timezone);
+        if (freshCounter !== undefined) entry.editCounter = freshCounter;
+        if (freshTimeMs !== undefined) entry.editTimeMs = freshTimeMs;
         if (fresh.deleted === true || fresh.is_deleted === true || !freshText) {
           entry.deleted = true;
           entry.needsVerify = false;
@@ -1089,6 +1108,7 @@ export class Connectors {
         delete liveMerged.is_deleted;
         entry.m = liveMerged;
         entry.deleted = false;
+        entry.authoritativeLive = true;
         entry.editCounter = parseEditCounter(fresh);
         entry.editTimeMs = parseEditTimeMs(fresh, this.cfg.owner.timezone);
         const sender = fresh.sender ?? entry.m.sender ?? {};
@@ -1194,7 +1214,15 @@ export class Connectors {
 
       let dropped = 0;
       const obs: Obs[] = [];
-      const retiredIds: string[] = [];
+      const retiredEntries: {
+        id: string;
+        editVersion?: number;
+        editTimeMs?: number;
+        pollObservedAt: number;
+        conv?: string;
+        kind?: string;
+        time?: number;
+      }[] = [];
 
       for (const entry of mergedById.values()) {
         const msgId = String(entry.m.message_id ?? entry.m.id ?? "");
@@ -1213,7 +1241,17 @@ export class Connectors {
           continue;
         }
         if (entry.deleted || entry.m.deleted === true || entry.m.is_deleted === true) {
-          if (msgId) retiredIds.push(`im:${msgId}`);
+          if (msgId) {
+            retiredEntries.push({
+              id: `im:${msgId}`,
+              editVersion: entry.editCounter,
+              editTimeMs: entry.editTimeMs,
+              pollObservedAt: now,
+              conv: rawChatId || "im",
+              kind: entry.kind,
+              time: parseTime(entry.m.create_time ?? entry.m.created_at ?? entry.m.timestamp, this.cfg.owner.timezone) || now,
+            });
+          }
           dropped++;
           continue;
         }
@@ -1299,19 +1337,34 @@ export class Connectors {
           }
           continue;
         }
-        // allowlist 模式下，不在当前选中群集合里的非 @我 普通群消息（如本人发在白名单外群的消息）不入库
-        if (
-          this.cfg.context.groups === "allowlist" &&
+        // 范围外群的非 @我 消息（含曾命中 --is-at-me 搜索但正文已被编辑移除 @我 的白名单外/排位外群消息）不入库，
+        // 并按修订水位撤回该 ID 此前可能入库的 @我 待处理记录
+        const outOfScopeGroup =
           entry.kind !== "at_me" &&
           !isP2pFinal &&
           chatId.startsWith("oc_") &&
-          !rankedSet.has(chatId)
-        ) {
+          !rankedSet.has(chatId) &&
+          (this.cfg.context.groups === "allowlist" || entry.kind !== "mine");
+        if (outOfScopeGroup) {
+          if (msgId && entry.streams.has("at_me")) {
+            retiredEntries.push({
+              id: `im:${msgId}`,
+              editVersion: entry.editCounter,
+              editTimeMs: entry.editTimeMs,
+              pollObservedAt: now,
+              conv: chatId,
+              kind: entry.kind,
+              time: parseTime(m.create_time ?? m.created_at ?? m.timestamp, this.cfg.owner.timezone) || now,
+            });
+          }
           dropped++;
           continue;
         }
         const o = this.toObs(m, entry.kind, me, effectiveAtMeWindowStartMs, now);
-        if (o) obs.push(o);
+        if (o) {
+          if (entry.authoritativeLive) o.meta.authoritative_live = true;
+          obs.push(o);
+        }
       }
 
       // 若拉取消息期间学到的新群名导致生效群选排变化（例如群 A 改名命中排除规则，空出名额给群 B），
@@ -1363,7 +1416,17 @@ export class Connectors {
           return { committed: true as const, lostLease: false as const, count: 0 };
         }
         const n = this.store.addObs(obs);
-        for (const rid of retiredIds) this.store.retirePendingObs(rid);
+        for (const r of retiredEntries) {
+          this.store.retirePendingObs(r.id, {
+            editVersion: r.editVersion,
+            editTimeMs: r.editTimeMs,
+            pollObservedAt: r.pollObservedAt,
+            conv: r.conv,
+            source: "im",
+            kind: r.kind,
+            time: r.time,
+          });
+        }
         this.setKv("spoken_groups", JSON.stringify(spoken));
         mergeKnownOpenGroupNames(this.app.store, learnedNames);
         for (const [chatId, st] of chatPollState) {

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Cron } from "croner";
 import { z } from "zod";
 import type { App } from "../app.ts";
+import { isWorkBlockedByOwner } from "../api/queries.ts";
 import type { CtxCycleReport, CtxDraftKind, CtxItemStatus, CtxItemView, CommandResult } from "../api/types.ts";
 import { consoleBaseUrl, serverToken, signLoginTicket } from "../server/index.ts";
 import { CommandError } from "../commands.ts";
@@ -875,6 +876,10 @@ export class ContextService {
       concurrency: 2,
       maxAttempts: 2,
       run: async (item, ctx) => {
+        if (isWorkBlockedByOwner(this.app, item)) {
+          this.app.ledger.transition(item, { state: "skipped", terminal: true });
+          return;
+        }
         const p = item.payload;
         if (p.task === "cycle") {
           const r = await this.cycle(item.id, ctx.signal);
@@ -954,6 +959,9 @@ export class ContextService {
         this.app.ledger.transition(item, { state: "skipped", terminal: true });
       },
       onExhausted: (item, err) => {
+        if (isWorkBlockedByOwner(this.app, item)) {
+          return { patch: { state: "errored" } };
+        }
         const p = item.payload;
         if (p.task === "fast") {
           if (!this.isWorkspaceOwnerMismatched()) {
