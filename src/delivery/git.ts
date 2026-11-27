@@ -51,7 +51,7 @@ const GIT_SAFE_ARGS = [
 const REMOTE_GIT_SUBCMDS = new Set(["push", "fetch", "ls-remote", "pull", "clone", "lfs"]);
 
 export interface GitRunOpts {
-  input?: string;
+  input?: string | Buffer;
   timeoutMs?: number;
   cfg?: Pick<Config, "dataDir" | "context">;
   readOnly?: boolean;
@@ -1087,9 +1087,17 @@ interface HostCredentialState {
   quit?: boolean;
 }
 
+function isCredentialExpiryExpired(rawExpiry?: string, nowSec = Math.floor(Date.now() / 1000)): boolean {
+  const s = (rawExpiry ?? "").trim();
+  if (!s || !/^\d+$/.test(s)) return false;
+  const n = Number(s);
+  return Number.isFinite(n) && n <= nowSec;
+}
+
 function isHostCredentialComplete(state: HostCredentialState): boolean {
+  if (state.quit) return true;
+  if (isCredentialExpiryExpired(state.passwordExpiryUtc)) return false;
   return (
-    !!state.quit ||
     (!!state.username && state.password !== undefined && state.password !== "") ||
     (!!state.authtype && !!state.credential)
   );
@@ -1130,6 +1138,7 @@ async function invokeSingleHostCredentialHelper(
     if (useHttpPath && state.path) lines.push(`path=${state.path}`);
     if (state.username) lines.push(`username=${state.username}`);
     if (state.password) lines.push(`password=${state.password}`);
+    if (state.oauthRefreshToken) lines.push(`oauth_refresh_token=${state.oauthRefreshToken}`);
     const input = `${lines.join("\n")}\n\n`;
     const r = await runProcess("/bin/sh", ["-c", buildGitCredentialHelperShellCommand(helperValue)], {
       cwd: os.tmpdir(),
@@ -1172,6 +1181,13 @@ async function invokeSingleHostCredentialHelper(
           if (u.password) next.password = decodeUrlUser(u.password);
         }
       }
+    }
+    // 对齐 Git credential_read：若 helper 返回的凭据已达 password_expiry_utc 过期时间，丢弃过期密钥（保留 username / oauth_refresh_token）以便后续 helper 续签或提供新凭据
+    if (isCredentialExpiryExpired(next.passwordExpiryUtc)) {
+      delete next.password;
+      delete next.credential;
+      delete next.authtype;
+      delete next.passwordExpiryUtc;
     }
     return next;
   } finally {
@@ -1265,13 +1281,16 @@ export function writeScopedStaticCredentialHelper(
   );
 
   const scriptFile = path.join(dir, `helper-resp-${seq}.sh`);
-  fs.writeFileSync(scriptFile, `${scriptLines.join("\n")}\n`, { mode: 0o700 });
-  return `!${shSingleQuote(scriptFile)}`;
+  // 以 0600 写入并经受信任 /bin/sh 解释执行，避免 /dev/shm 等 tmpfs 挂载 noexec 时直接执行脚本报 EACCES
+  fs.writeFileSync(scriptFile, `${scriptLines.join("\n")}\n`, { mode: 0o600 });
+  const shBin = resolveTrustedSystemBin("sh") ?? "/bin/sh";
+  return `!${shSingleQuote(shBin)} ${shSingleQuote(scriptFile)}`;
 }
 
-function targetCredentialConfigUrl(t: URL, useHttpPath: boolean): string {
+/** 构造 Git `credential.<url>.*` 配置段精确作用域 URL（始终保留完整路径，因为即使 useHttpPath=false，Git 仍按完整远端 URL 匹配 path-scoped 配置段） */
+function targetCredentialConfigUrl(t: URL): string {
   const userPart = t.username ? `${t.username}@` : "";
-  const normPath = useHttpPath ? normalizeCredPath(t.pathname) : "";
+  const normPath = normalizeCredPath(t.pathname);
   return `${t.protocol}//${userPart}${t.host}${normPath}`;
 }
 
@@ -1371,12 +1390,13 @@ async function prepareScopedGitHttpCredentials(
     }
   }
 
-  // 按目标作用域 URL 去重并按从宽到窄排序（无用户名在先、短路径在先），确保后续逐目标 `-c credential.<scopeUrl>.helper=` 重置互不干扰
+  // 按完整目标 URL（含用户名与路径）去重并按从宽到窄排序（无用户名在先、短路径在先），
+  // 确保即使 credential.useHttpPath=false，同主机不同路径的 path-scoped helper/username 配置计划仍严格独立，且逐目标重置互不干扰
   const dedupedTargets: { url: URL; scopeUrl: string; useHttpPath: boolean }[] = [];
   const seenScopeUrls = new Set<string>();
   for (const t of targetUrls) {
     const useHttpPath = useHttpPathByTarget.get(t) === true;
-    const scopeUrl = targetCredentialConfigUrl(t, useHttpPath);
+    const scopeUrl = targetCredentialConfigUrl(t);
     if (seenScopeUrls.has(scopeUrl)) continue;
     seenScopeUrls.add(scopeUrl);
     dedupedTargets.push({ url: t, scopeUrl, useHttpPath });
@@ -1388,6 +1408,19 @@ async function prepareScopedGitHttpCredentials(
     if (pathLenDiff !== 0) return pathLenDiff;
     return a.scopeUrl.localeCompare(b.scopeUrl);
   });
+
+  // 统计同一 (protocol, username, host) 下存在多少个不同路径目标：
+  //   - 仅当存在同主机多路径目标或启用 useHttpPath=true 时，将 `-c` 键限定到完整路径，防止同主机多 pushurl 串号；
+  //   - 单路径且 useHttpPath=false 时使用主机级键 `credential.<proto>://<user@><host>.helper`，兼容 git-lfs 省略 path 查询 `git credential fill`。
+  const hostGroupCount = new Map<string, number>();
+  for (const t of dedupedTargets) {
+    const hk = `${t.url.protocol}//${t.url.username ? `${t.url.username}@` : ""}${t.url.host}`;
+    hostGroupCount.set(hk, (hostGroupCount.get(hk) ?? 0) + 1);
+  }
+  const emitScopeUrlFor = (t: URL, scopeUrl: string, useHttpPath: boolean): string => {
+    const hostScopeUrl = `${t.protocol}//${t.username ? `${t.username}@` : ""}${t.host}`;
+    return useHttpPath || (hostGroupCount.get(hostScopeUrl) ?? 0) > 1 ? scopeUrl : hostScopeUrl;
+  };
 
   const dataDir = opts?.cfg?.dataDir;
   const realData = dataDir && fs.existsSync(dataDir) ? fs.realpathSync(dataDir) : "";
@@ -1546,7 +1579,7 @@ async function prepareScopedGitHttpCredentials(
         // 仓库 local/worktree 作用域自定义 helper 不在宿主机执行，保留到沙箱；若前面宿主机 helper 已提供部分 username，则透传给沙箱
         encounteredLocalHelper = true;
         if (state.username && state.username !== initialUser && !t.username) {
-          const arg = `credential.${scopeUrl}.username=${state.username}`;
+          const arg = `credential.${emitScopeUrlFor(t, scopeUrl, useHttpPath)}.username=${state.username}`;
           if (!seenUsernameArgs.has(arg)) {
             seenUsernameArgs.add(arg);
             extraUsernameArgs.push("-c", arg);
@@ -1577,7 +1610,7 @@ async function prepareScopedGitHttpCredentials(
 
     // 2) 按从宽到窄的目标作用域逐一重置并写入精确重放后的沙箱 helper 链
     for (const plan of planByTarget) {
-      const targetKey = `credential.${plan.scopeUrl}.helper`;
+      const targetKey = `credential.${emitScopeUrlFor(plan.url, plan.scopeUrl, plan.useHttpPath)}.helper`;
       // 显式清空更宽作用域目标可能继承下来的 helper，隔离同主机多用户/多路径目标
       gitConfigArgs.push("-c", `${targetKey}=`);
       const decodedPath = plan.useHttpPath ? decodeCredPath(plan.url.pathname) || undefined : undefined;
@@ -1675,10 +1708,19 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
       shouldSanitizeGitCfg,
     );
     const willIsolate = willIsolateCommand(effectiveRawEnv, baseIsoPlan);
+    const remoteSpec = isRemote ? extractRemoteTargetSpec(args) : undefined;
+    const allowedRemoteNames =
+      remoteSpec?.target &&
+      !remoteSpec.target.includes("://") &&
+      !/^[./~]/.test(remoteSpec.target) &&
+      !parseScpGitUrl(remoteSpec.target, cwd) &&
+      !fs.existsSync(path.resolve(cwd, remoteSpec.target))
+        ? [remoteSpec.target]
+        : [];
     if (willIsolate && shouldSanitizeGitCfg) {
       stagedGitCfg = stageSanitizedGitConfig(effectiveRawEnv, opts?.cfg?.dataDir, {
         cwd,
-        ...(isRemote ? { allowedRemoteUrls: resolvedUrls } : {}),
+        ...(isRemote ? { allowedRemoteUrls: resolvedUrls, allowedRemoteNames } : {}),
       });
     }
     // 仅在启用文件系统隔离且目标为 HTTP(S) 传输时投影目标域凭据，非隔离运行保持宿主机 credential.helper 链原样
@@ -2306,7 +2348,12 @@ export function isGitLfsPointerBlob(content: string | Buffer): boolean {
   return extractGitLfsPointerOid(content) !== undefined;
 }
 
-function collectBatchBufferLfsOids(buf: Buffer, out: Set<string>, stopOnFirst: boolean): boolean {
+function collectBatchBufferLfsOids(
+  buf: Buffer,
+  out: Set<string>,
+  stopOnFirst: boolean,
+  bySha?: Map<string, string>,
+): boolean {
   let offset = 0;
   let found = false;
   while (offset < buf.length) {
@@ -2316,6 +2363,7 @@ function collectBatchBufferLfsOids(buf: Buffer, out: Set<string>, stopOnFirst: b
     offset = nl + 1;
     const parts = header.split(" ");
     if (parts.length < 3 || parts[1] === "missing") continue;
+    const objSha = parts[0];
     const size = Number(parts[2]);
     if (!Number.isFinite(size) || size < 0 || offset + size > buf.length) {
       throw new Error("git cat-file --batch 输出帧长度异常，无法安全确认 LFS 指针");
@@ -2326,6 +2374,7 @@ function collectBatchBufferLfsOids(buf: Buffer, out: Set<string>, stopOnFirst: b
       const oid = extractGitLfsPointerOid(blobBuf);
       if (oid) {
         out.add(oid);
+        if (bySha && objSha) bySha.set(objSha, oid);
         found = true;
         if (stopOnFirst) return true;
       }
@@ -2455,41 +2504,66 @@ async function preparePinnedCheckAttr(
   };
 }
 
-/** 仅筛出目标不可变提交 `targetRev` 中 `filter=lfs` 生效的文件路径（供 checkout LFS 预检排除非 LFS 普通文本指针样本）。 */
-async function filterPathsWithLfsAttr(
+const NUL_BYTE_BUF = Buffer.from([0]);
+const FILTER_ATTR_BUF = Buffer.from("filter", "ascii");
+const LFS_VAL_BUF = Buffer.from("lfs", "ascii");
+
+function splitBufferByByte(buf: Buffer, delim: number): Buffer[] {
+  const parts: Buffer[] = [];
+  let start = 0;
+  let idx = buf.indexOf(delim, start);
+  while (idx !== -1) {
+    parts.push(buf.subarray(start, idx));
+    start = idx + 1;
+    idx = buf.indexOf(delim, start);
+  }
+  if (start < buf.length) parts.push(buf.subarray(start));
+  return parts;
+}
+
+/**
+ * 仅筛出目标不可变提交 `targetRev` 中 `filter=lfs` 生效的原始字节路径集合（键为无损 latin1 字节映射）：
+ * 全程保留 Unix 原始路径字节，不对非 UTF-8 路径做 U+FFFD 替换；支持跨有界批次复用已准备好的 `pinned` 索引。
+ */
+async function filterPathsWithLfsAttrBytes(
   cwd: string,
   targetRev: string,
-  paths: string[],
+  pathBufs: Buffer[],
   roOpts: GitRunOpts,
+  existingPinned?: Awaited<ReturnType<typeof preparePinnedCheckAttr>>,
 ): Promise<Set<string>> {
   const out = new Set<string>();
-  if (paths.length === 0) return out;
-  const pinned = await preparePinnedCheckAttr(cwd, targetRev, roOpts);
+  if (pathBufs.length === 0) return out;
+  const pinned = existingPinned ?? (await preparePinnedCheckAttr(cwd, targetRev, roOpts));
   try {
     const CHUNK = 2000;
-    for (let i = 0; i < paths.length; i += CHUNK) {
-      const slice = paths.slice(i, i + CHUNK);
+    for (let i = 0; i < pathBufs.length; i += CHUNK) {
+      const slice = pathBufs.slice(i, i + CHUNK);
+      const chunks: Buffer[] = [];
+      for (const p of slice) {
+        chunks.push(p, NUL_BYTE_BUF);
+      }
       const res = await tryGitBuffer(cwd, pinned.checkAttrArgs, {
         ...roOpts,
-        input: `${slice.join("\0")}\0`,
+        input: Buffer.concat(chunks),
         extraReadOnlyPaths: [...(roOpts.extraReadOnlyPaths ?? []), ...pinned.attrExtraRo],
         ...(pinned.attrExtraEnv ? { extraEnv: { ...(roOpts.extraEnv ?? {}), ...pinned.attrExtraEnv } } : {}),
       });
       if (res.code !== 0) {
         throw new Error(`git check-attr 过滤目标提交 ${targetRev} LFS 路径失败：${res.stderr.trim()}`);
       }
-      const tokens = res.stdout.toString("utf8").split("\0");
+      const tokens = splitBufferByByte(res.stdout, 0x00);
       for (let j = 0; j + 2 < tokens.length; j += 3) {
-        const filePath = tokens[j];
-        const attr = tokens[j + 1];
-        const val = tokens[j + 2];
-        if (filePath && attr === "filter" && val === "lfs") {
-          out.add(filePath);
+        const filePathBuf = tokens[j];
+        const attrBuf = tokens[j + 1];
+        const valBuf = tokens[j + 2];
+        if (filePathBuf.length > 0 && attrBuf.equals(FILTER_ATTR_BUF) && valBuf.equals(LFS_VAL_BUF)) {
+          out.add(filePathBuf.toString("latin1"));
         }
       }
     }
   } finally {
-    pinned.cleanup();
+    if (!existingPinned) pinned.cleanup();
   }
   return out;
 }
@@ -2499,6 +2573,7 @@ async function filterPathsWithLfsAttr(
  *   - 优先使用 Git >= 2.40 的 `git check-attr --source=<targetRev>`；
  *   - 旧版 Git（如 2.39）不支持 `--source` 时，改用临时独立 `GIT_INDEX_FILE` 执行 `git read-tree <targetRev>` 后跑 `git check-attr --cached`，
  *     严格读取目标提交的 `.gitattributes`，绝不静默回退读取可能变动的工作区 `.gitattributes`；
+ *   - `ls-tree` 与 `check-attr` 共享同一份脱敏全局 Git 配置（保留 `safe.directory` 与 `core.attributesFile`）；
  *   - 以背压管道流式连接 `git ls-tree -r --name-only -z` 与 `git check-attr --stdin -z filter`，保持 O(1) 内存并在命中首个 `filter=lfs` 时立即早停。
  */
 async function targetRevHasLfsAttr(cwd: string, targetRev: string, roOpts: GitRunOpts): Promise<boolean> {
@@ -2515,41 +2590,44 @@ async function targetRevHasLfsAttr(cwd: string, targetRev: string, roOpts: GitRu
       const lsEnv: NodeJS.ProcessEnv = { ...streamEnv.env, ...(roOpts.extraEnv ?? {}), GIT_TERMINAL_PROMPT: "0" };
       delete lsEnv.GIT_EXTERNAL_DIFF;
       const caEnv: NodeJS.ProcessEnv = { ...lsEnv, ...(attrExtraEnv ?? {}) };
-      const lsWrapped = wrapCredentialIsolatedCommand(
-        "git",
-        ["-C", cwd, ...GIT_SAFE_ARGS, "ls-tree", "-r", "--name-only", "-z", targetRev],
-        effectiveRawEnv,
-        buildGitIsolation(cwd, roOpts, streamEnv.env.CREDENTIALS_DIRECTORY, undefined, undefined, effectiveRawEnv, true),
-      );
-      if (lsWrapped.isolated) lsEnv.GIT_CONFIG_GLOBAL = "/dev/null";
       const baseCaOpts: GitRunOpts = {
         ...roOpts,
         extraReadOnlyPaths: [...(roOpts.extraReadOnlyPaths ?? []), ...attrExtraRo],
       };
-      const baseCaIso = buildGitIsolation(
+      const baseIso = buildGitIsolation(
         cwd,
-        baseCaOpts,
+        roOpts,
         streamEnv.env.CREDENTIALS_DIRECTORY,
         undefined,
         undefined,
         effectiveRawEnv,
         true,
       );
-      const willIsolateCa = willIsolateCommand(effectiveRawEnv, baseCaIso);
-      if (willIsolateCa) {
+      const willIsolate = willIsolateCommand(effectiveRawEnv, baseIso);
+      if (willIsolate) {
         stagedGitCfg = stageSanitizedGitConfig(effectiveRawEnv, roOpts.cfg?.dataDir, { cwd });
       }
-      // 复用与隔离检出完全一致的脱敏全局 Git 配置（含 core.attributesFile），避免全局属性标为 filter=lfs 的路径被预检漏判
-      applySanitizedGitConfigEnv(caEnv, stagedGitCfg, willIsolateCa);
-      const caOpts: GitRunOpts = stagedGitCfg
-        ? {
-            ...baseCaOpts,
-            extraReadOnlyPaths: [...(baseCaOpts.extraReadOnlyPaths ?? []), stagedGitCfg.dir, ...stagedGitCfg.extraReadOnlyPaths],
-            ...(stagedGitCfg.symlinks.length
-              ? { extraSymlinks: [...(baseCaOpts.extraSymlinks ?? []), ...stagedGitCfg.symlinks] }
-              : {}),
-          }
-        : baseCaOpts;
+      // ls-tree 与 check-attr 复用同一份脱敏全局配置（保留 safe.directory 与 core.attributesFile），避免异属主仓库或全局属性文件误判
+      applySanitizedGitConfigEnv(lsEnv, stagedGitCfg, willIsolate);
+      applySanitizedGitConfigEnv(caEnv, stagedGitCfg, willIsolate);
+      const withStagedCfg = (base: GitRunOpts): GitRunOpts =>
+        stagedGitCfg
+          ? {
+              ...base,
+              extraReadOnlyPaths: [...(base.extraReadOnlyPaths ?? []), stagedGitCfg.dir, ...stagedGitCfg.extraReadOnlyPaths],
+              ...(stagedGitCfg.symlinks.length
+                ? { extraSymlinks: [...(base.extraSymlinks ?? []), ...stagedGitCfg.symlinks] }
+                : {}),
+            }
+          : base;
+      const lsOpts = withStagedCfg(roOpts);
+      const caOpts = withStagedCfg(baseCaOpts);
+      const lsWrapped = wrapCredentialIsolatedCommand(
+        "git",
+        ["-C", cwd, ...GIT_SAFE_ARGS, ...(roOpts.extraGitConfigArgs ?? []), "ls-tree", "-r", "--name-only", "-z", targetRev],
+        effectiveRawEnv,
+        buildGitIsolation(cwd, lsOpts, streamEnv.env.CREDENTIALS_DIRECTORY, undefined, undefined, effectiveRawEnv, true),
+      );
       const caWrapped = wrapCredentialIsolatedCommand(
         "git",
         ["-C", cwd, ...GIT_SAFE_ARGS, ...(roOpts.extraGitConfigArgs ?? []), ...checkAttrArgs],
@@ -2711,27 +2789,41 @@ async function scanOutgoingGitLfs(
   const revInput = [targetRev, ...validRemoteCommits.map((sha) => `^${sha}`)].join("\n") + "\n";
   const oids = new Set<string>();
 
-  // 将待检查的 1024 条对象分批送入 cat-file --batch-check 与 ≤256 条 cat-file --batch，保持 O(1) 峰值内存
-  const processMetaChunk = async (metaChunk: string[]): Promise<boolean> => {
+  interface OutgoingBlobCandidate {
+    commitSha: string;
+    sha: string;
+    pathBuf: Buffer;
+  }
+
+  // 按有界批次过滤待推送提交中新增/修改的 blob：先筛体积、再验指针语法、仅对真正呈指针形态的 blob 在其所属提交上核验 filter=lfs 属性，
+  // 从而排除普通仓库中的指针格式测试样本，同时完整覆盖历史中先添加后删除的真实 LFS 文件并保持 O(1) 内存。
+  const processCandidateChunk = async (candidates: OutgoingBlobCandidate[]): Promise<boolean> => {
+    const uniqueShas = [...new Set(candidates.map((c) => c.sha))];
+    if (uniqueShas.length === 0) return false;
     const metaCheck = await tryGit(cwd, ["cat-file", "--batch-check=%(objecttype) %(objectsize) %(objectname)"], {
       ...roOpts,
-      input: metaChunk.join("\n") + "\n",
+      input: uniqueShas.join("\n") + "\n",
     });
     if (metaCheck.code !== 0) {
       throw new Error(`git cat-file --batch-check 检查待推送对象元信息失败：${(metaCheck.stderr || metaCheck.stdout).trim()}`);
     }
-    const smallBlobs: string[] = [];
+    const smallShaSet = new Set<string>();
     for (const line of metaCheck.stdout.split("\n")) {
       const parts = line.trim().split(" ");
       if (parts.length < 3) continue;
       const [type, sizeStr, sha] = parts;
       const size = Number(sizeStr);
       if (type === "blob" && Number.isFinite(size) && size >= LFS_POINTER_MIN_BYTES && size <= LFS_POINTER_MAX_BYTES) {
-        smallBlobs.push(sha);
+        smallShaSet.add(sha);
       }
     }
-    for (let j = 0; j < smallBlobs.length; j += LFS_BATCH_CHUNK_SIZE) {
-      const blobChunk = smallBlobs.slice(j, j + LFS_BATCH_CHUNK_SIZE);
+    if (smallShaSet.size === 0) return false;
+
+    const smallShas = [...smallShaSet];
+    const pointerOidBySha = new Map<string, string>();
+    const scratchOids = new Set<string>();
+    for (let j = 0; j < smallShas.length; j += LFS_BATCH_CHUNK_SIZE) {
+      const blobChunk = smallShas.slice(j, j + LFS_BATCH_CHUNK_SIZE);
       const batchRes = await tryGitBuffer(cwd, ["cat-file", "--batch"], {
         ...roOpts,
         input: blobChunk.join("\n") + "\n",
@@ -2739,99 +2831,228 @@ async function scanOutgoingGitLfs(
       if (batchRes.code !== 0) {
         throw new Error(`git cat-file --batch 读取候选 blob 失败：${batchRes.stderr.trim()}`);
       }
-      if (collectBatchBufferLfsOids(batchRes.stdout, oids, stopOnFirst) && stopOnFirst) {
-        return true;
+      collectBatchBufferLfsOids(batchRes.stdout, scratchOids, false, pointerOidBySha);
+    }
+    if (pointerOidBySha.size === 0) return false;
+
+    const byCommit = new Map<string, { pathBuf: Buffer; oid: string }[]>();
+    for (const cand of candidates) {
+      const oid = pointerOidBySha.get(cand.sha);
+      if (!oid) continue;
+      const list = byCommit.get(cand.commitSha) ?? [];
+      list.push({ pathBuf: cand.pathBuf, oid });
+      byCommit.set(cand.commitSha, list);
+    }
+
+    for (const [commitSha, entries] of byCommit) {
+      const lfsKeys = await filterPathsWithLfsAttrBytes(
+        cwd,
+        commitSha,
+        entries.map((e) => e.pathBuf),
+        roOpts,
+      );
+      for (const e of entries) {
+        if (lfsKeys.has(e.pathBuf.toString("latin1"))) {
+          oids.add(e.oid);
+          if (stopOnFirst) return true;
+        }
       }
     }
     return false;
   };
 
-  // 流式消费 `git rev-list --objects --stdin`（配合 async iterator 背压），避免首推或 push-only 远端将整仓历史读入内存
-  const revEnv = prepareHarnessEnv();
+  // 流式串联 `git rev-list --stdin` -> `git diff-tree --stdin -r -m --root --no-abbrev --no-renames -z`，
+  // 复用脱敏全局配置以保留 `safe.directory`，并保留原始非 UTF-8 路径字节与有界内存
+  const effectiveRawEnv: NodeJS.ProcessEnv = roOpts.extraEnv
+    ? { ...process.env, ...roOpts.extraEnv }
+    : process.env;
+  const revEnv = prepareHarnessEnv(process.env);
+  let stagedGitCfg: StagedSanitizedGitConfig | undefined;
   try {
-    const childEnv: NodeJS.ProcessEnv = { ...revEnv.env, GIT_TERMINAL_PROMPT: "0" };
+    const childEnv: NodeJS.ProcessEnv = { ...revEnv.env, ...(roOpts.extraEnv ?? {}), GIT_TERMINAL_PROMPT: "0" };
     delete childEnv.GIT_EXTERNAL_DIFF;
-    const wrapped = wrapCredentialIsolatedCommand(
+    const baseIso = buildGitIsolation(cwd, roOpts, revEnv.env.CREDENTIALS_DIRECTORY, undefined, undefined, effectiveRawEnv, true);
+    const willIsolate = willIsolateCommand(effectiveRawEnv, baseIso);
+    if (willIsolate) {
+      stagedGitCfg = stageSanitizedGitConfig(effectiveRawEnv, roOpts.cfg?.dataDir, { cwd });
+    }
+    applySanitizedGitConfigEnv(childEnv, stagedGitCfg, willIsolate);
+    const streamOpts: GitRunOpts = stagedGitCfg
+      ? {
+          ...roOpts,
+          extraReadOnlyPaths: [...(roOpts.extraReadOnlyPaths ?? []), stagedGitCfg.dir, ...stagedGitCfg.extraReadOnlyPaths],
+          ...(stagedGitCfg.symlinks.length
+            ? { extraSymlinks: [...(roOpts.extraSymlinks ?? []), ...stagedGitCfg.symlinks] }
+            : {}),
+        }
+      : roOpts;
+    const revWrapped = wrapCredentialIsolatedCommand(
       "git",
-      ["-C", cwd, ...GIT_SAFE_ARGS, "rev-list", "--objects", "--stdin"],
-      process.env,
-      buildGitIsolation(cwd, roOpts, revEnv.env.CREDENTIALS_DIRECTORY, undefined, undefined, process.env, true),
+      ["-C", cwd, ...GIT_SAFE_ARGS, ...(roOpts.extraGitConfigArgs ?? []), "rev-list", "--stdin"],
+      effectiveRawEnv,
+      buildGitIsolation(cwd, streamOpts, revEnv.env.CREDENTIALS_DIRECTORY, undefined, undefined, effectiveRawEnv, true),
     );
-    if (wrapped.isolated) childEnv.GIT_CONFIG_GLOBAL = "/dev/null";
-    const child = spawn(wrapped.cmd, wrapped.args, {
+    const dtWrapped = wrapCredentialIsolatedCommand(
+      "git",
+      ["-C", cwd, ...GIT_SAFE_ARGS, ...(roOpts.extraGitConfigArgs ?? []), "diff-tree", "--stdin", "-r", "-m", "--root", "--no-abbrev", "--no-renames", "-z"],
+      effectiveRawEnv,
+      buildGitIsolation(cwd, streamOpts, revEnv.env.CREDENTIALS_DIRECTORY, undefined, undefined, effectiveRawEnv, true),
+    );
+    const revChild = spawn(revWrapped.cmd, revWrapped.args, {
       env: childEnv,
       stdio: ["pipe", "pipe", "pipe"],
       detached: true,
     });
-    let errStr = "";
+    const dtChild = spawn(dtWrapped.cmd, dtWrapped.args, {
+      env: childEnv,
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
+    });
+    let revErr = "";
+    let dtErr = "";
     let timedOut = false;
     let stoppedEarly = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      killChildGroup(child);
+      killChildGroup(revChild);
+      killChildGroup(dtChild);
     }, roOpts.timeoutMs ?? 300_000);
     timer.unref?.();
-    child.stdin.on("error", () => undefined);
-    child.stderr.on("data", (d: Buffer) => {
-      if (errStr.length < 16_384) errStr += d.toString("utf8");
+    revChild.stdin.on("error", () => undefined);
+    dtChild.stdin.on("error", () => undefined);
+    revChild.stderr.on("data", (d: Buffer) => {
+      if (revErr.length < 16_384) revErr += d.toString("utf8");
     });
-    const exitPromise = new Promise<{ code: number; spawnErr?: Error }>((resolve) => {
-      child.on("error", (err) => resolve({ code: 127, spawnErr: err }));
-      child.on("close", (code) => resolve({ code: timedOut ? 124 : (code ?? 1) }));
+    dtChild.stderr.on("data", (d: Buffer) => {
+      if (dtErr.length < 16_384) dtErr += d.toString("utf8");
     });
-    child.stdin.end(revInput);
+    const revExitP = new Promise<{ code: number; spawnErr?: Error }>((resolve) => {
+      revChild.on("error", (err) => resolve({ code: 127, spawnErr: err }));
+      revChild.on("close", (code) => resolve({ code: timedOut ? 124 : (code ?? 1) }));
+    });
+    const dtExitP = new Promise<{ code: number; spawnErr?: Error }>((resolve) => {
+      dtChild.on("error", (err) => resolve({ code: 127, spawnErr: err }));
+      dtChild.on("close", (code) => resolve({ code: timedOut ? 124 : (code ?? 1) }));
+    });
+    revChild.stdin.end(revInput);
 
-    let carry = "";
-    let chunk: string[] = [];
+    const pumpP = (async () => {
+      try {
+        for await (const chunkBuf of revChild.stdout as AsyncIterable<Buffer>) {
+          if (stoppedEarly || dtChild.stdin.destroyed) break;
+          if (!dtChild.stdin.write(chunkBuf)) {
+            await new Promise<void>((resolve) => {
+              const onDone = () => {
+                dtChild.stdin.off("drain", onDone);
+                dtChild.stdin.off("close", onDone);
+                dtChild.stdin.off("error", onDone);
+                resolve();
+              };
+              dtChild.stdin.once("drain", onDone);
+              dtChild.stdin.once("close", onDone);
+              dtChild.stdin.once("error", onDone);
+            });
+          }
+        }
+      } catch {
+        // 早停或子进程退出引起的管道中断由退出码阶段统一裁决
+      } finally {
+        if (!dtChild.stdin.destroyed) dtChild.stdin.end();
+      }
+    })();
+
+    let carry: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    let currentCommitSha = "";
+    let pendingEntry: { commitSha: string; newMode: string; blobSha: string } | undefined;
+    let chunk: OutgoingBlobCandidate[] = [];
+    const seenCommitBlobPath = new Set<string>();
+    const flushChunk = async (): Promise<boolean> => {
+      if (chunk.length === 0) return false;
+      const batch = chunk;
+      chunk = [];
+      return processCandidateChunk(batch);
+    };
+
     try {
-      for await (const raw of child.stdout as AsyncIterable<Buffer>) {
-        carry += raw.toString("utf8");
-        let nl = carry.indexOf("\n");
-        while (nl !== -1) {
-          const line = carry.slice(0, nl).trim();
-          carry = carry.slice(nl + 1);
-          const sha = line.split(/\s+/)[0];
-          if (sha) {
-            chunk.push(sha);
-            if (chunk.length >= LFS_META_CHUNK_SIZE) {
-              const batch = chunk;
-              chunk = [];
-              if (await processMetaChunk(batch)) {
-                stoppedEarly = true;
-                killChildGroup(child);
-                break;
+      for await (const raw of dtChild.stdout as AsyncIterable<Buffer>) {
+        carry = carry.length > 0 ? Buffer.concat([carry, raw]) : raw;
+        let start = 0;
+        let nul = carry.indexOf(0x00, start);
+        while (nul !== -1) {
+          const token = carry.subarray(start, nul);
+          start = nul + 1;
+          if (pendingEntry) {
+            const ent = pendingEntry;
+            pendingEntry = undefined;
+            if (
+              token.length > 0 &&
+              ent.commitSha &&
+              ent.blobSha &&
+              ent.blobSha !== ZERO_OID &&
+              (ent.newMode === "100644" || ent.newMode === "100755")
+            ) {
+              const pathBuf = Buffer.from(token);
+              const dedupeKey = `${ent.commitSha}\0${ent.blobSha}\0${pathBuf.toString("latin1")}`;
+              if (!seenCommitBlobPath.has(dedupeKey)) {
+                seenCommitBlobPath.add(dedupeKey);
+                chunk.push({ commitSha: ent.commitSha, sha: ent.blobSha, pathBuf });
+                if (chunk.length >= LFS_META_CHUNK_SIZE) {
+                  if (await flushChunk()) {
+                    stoppedEarly = true;
+                    killChildGroup(revChild);
+                    killChildGroup(dtChild);
+                    break;
+                  }
+                }
               }
             }
+          } else if (token.length > 0 && token[0] === 0x3a) {
+            const parts = token.subarray(1).toString("ascii").trim().split(/\s+/);
+            pendingEntry = {
+              commitSha: currentCommitSha,
+              newMode: parts[1] ?? "",
+              blobSha: parts[3] ?? "",
+            };
+          } else if (token.length > 0) {
+            const firstTok = token.toString("ascii").trim().split(/\s+/)[0] ?? "";
+            if (/^[0-9a-f]{40,64}$/i.test(firstTok)) {
+              currentCommitSha = firstTok;
+              // 切换提交时清理仅用于同提交 merge -m 去重的集合，防止多提交历史增长占用内存
+              seenCommitBlobPath.clear();
+            }
           }
-          nl = carry.indexOf("\n");
+          nul = carry.indexOf(0x00, start);
         }
+        carry = start > 0 ? Buffer.from(carry.subarray(start)) : carry;
         if (stoppedEarly) break;
       }
-      if (!stoppedEarly) {
-        const lastSha = carry.trim().split(/\s+/)[0];
-        if (lastSha) chunk.push(lastSha);
-        if (chunk.length > 0 && (await processMetaChunk(chunk))) {
-          stoppedEarly = true;
-        }
+      if (!stoppedEarly && (await flushChunk())) {
+        stoppedEarly = true;
       }
     } catch (err) {
-      killChildGroup(child);
-      await exitPromise;
+      killChildGroup(revChild);
+      killChildGroup(dtChild);
+      await Promise.all([pumpP, revExitP, dtExitP]);
       throw err;
     } finally {
       clearTimeout(timer);
     }
-    const exitRes = await exitPromise;
+    await pumpP;
+    const [revExit, dtExit] = await Promise.all([revExitP, dtExitP]);
     if (!stoppedEarly) {
-      if (exitRes.spawnErr) {
-        throw new Error(`git rev-list 启动失败：${exitRes.spawnErr.message}`);
-      }
-      if (exitRes.code !== 0) {
-        const detail = (timedOut ? `${errStr}\n(timeout)` : errStr).trim();
+      if (revExit.spawnErr) throw new Error(`git rev-list 启动失败：${revExit.spawnErr.message}`);
+      if (dtExit.spawnErr) throw new Error(`git diff-tree 启动失败：${dtExit.spawnErr.message}`);
+      if (revExit.code !== 0) {
+        const detail = (timedOut ? `${revErr}\n(timeout)` : revErr).trim();
         throw new Error(`git rev-list 扫描提交 ${branchOrCommit} 待推送对象失败：${detail}`);
+      }
+      if (dtExit.code !== 0) {
+        const detail = (timedOut ? `${dtErr}\n(timeout)` : dtErr).trim();
+        throw new Error(`git diff-tree 扫描提交 ${branchOrCommit} 待推送路径失败：${detail}`);
       }
     }
   } finally {
+    stagedGitCfg?.cleanup();
     revEnv.cleanup();
   }
   return { hasLfsAttr, oids: [...oids] };
@@ -2970,54 +3191,153 @@ export async function ensureGitLfsObjectsForCheckout(
     lfsStorageExternal: lfsStorage.isExternal,
   };
 
-  const lsTree = await tryGitBuffer(repoPath, ["ls-tree", "-r", "-l", "-z", targetSha], roOpts);
-  if (lsTree.code !== 0) {
-    throw new Error(`git ls-tree 检查检出目标 ${targetRev} LFS 对象失败：${lsTree.stderr.trim()}`);
-  }
-  const smallBlobs: { sha: string; filePath: string }[] = [];
-  const rawTree = lsTree.stdout.toString("utf8");
-  for (const rec of rawTree.split("\0")) {
-    if (!rec) continue;
-    const tab = rec.indexOf("\t");
-    if (tab <= 0) continue;
-    const header = rec.slice(0, tab).trim().split(/\s+/);
-    if (header.length < 4) continue;
-    const [, objType, objSha, sizeStr] = header;
-    const filePath = rec.slice(tab + 1);
-    const size = Number(sizeStr);
-    if (
-      objType === "blob" &&
-      filePath &&
-      Number.isFinite(size) &&
-      size >= LFS_POINTER_MIN_BYTES &&
-      size <= LFS_POINTER_MAX_BYTES
-    ) {
-      smallBlobs.push({ sha: objSha, filePath });
-    }
-  }
-  if (smallBlobs.length === 0) return { fetched: false, missingCount: 0, ...storageMeta };
-
-  // 仅检查在目标提交树中实际命中 filter=lfs 的路径，避免未启用 LFS 过滤的普通文本指针样本触发无谓远程拉取
-  const lfsPaths = await filterPathsWithLfsAttr(
-    repoPath,
-    targetSha,
-    smallBlobs.map((b) => b.filePath),
-    roOpts,
-  );
-  const smallBlobShas = [...new Set(smallBlobs.filter((b) => lfsPaths.has(b.filePath)).map((b) => b.sha))];
-  if (smallBlobShas.length === 0) return { fetched: false, missingCount: 0, ...storageMeta };
-
+  // 流式消费 `git ls-tree -r -l -z <targetSha>`，按原始字节保留非 UTF-8 路径，分有界批次做 filter=lfs 核验与 cat-file --batch 指针解析，
+  // 避免大仓库仅含少量 LFS 文件时把整棵目录树缓冲进内存导致 OOM，同时复用脱敏全局配置保留 safe.directory
   const requiredOids = new Set<string>();
-  for (let i = 0; i < smallBlobShas.length; i += LFS_BATCH_CHUNK_SIZE) {
-    const chunk = smallBlobShas.slice(i, i + LFS_BATCH_CHUNK_SIZE);
-    const batchRes = await tryGitBuffer(repoPath, ["cat-file", "--batch"], {
-      ...roOpts,
-      input: chunk.join("\n") + "\n",
-    });
-    if (batchRes.code !== 0) {
-      throw new Error(`git cat-file --batch 读取检出目标 ${targetRev} LFS 指针失败：${batchRes.stderr.trim()}`);
+  const checkedLfsBlobShas = new Set<string>();
+  const pinnedAttr = await preparePinnedCheckAttr(repoPath, targetSha, roOpts);
+  const effectiveRawEnv: NodeJS.ProcessEnv = roOpts.extraEnv
+    ? { ...process.env, ...roOpts.extraEnv }
+    : process.env;
+  const streamEnv = prepareHarnessEnv(process.env);
+  let stagedGitCfg: StagedSanitizedGitConfig | undefined;
+  try {
+    const lsEnv: NodeJS.ProcessEnv = { ...streamEnv.env, ...(roOpts.extraEnv ?? {}), GIT_TERMINAL_PROMPT: "0" };
+    delete lsEnv.GIT_EXTERNAL_DIFF;
+    const baseIso = buildGitIsolation(
+      repoPath,
+      roOpts,
+      streamEnv.env.CREDENTIALS_DIRECTORY,
+      undefined,
+      undefined,
+      effectiveRawEnv,
+      true,
+    );
+    const willIsolate = willIsolateCommand(effectiveRawEnv, baseIso);
+    if (willIsolate) {
+      stagedGitCfg = stageSanitizedGitConfig(effectiveRawEnv, roOpts.cfg?.dataDir, { cwd: repoPath });
     }
-    collectBatchBufferLfsOids(batchRes.stdout, requiredOids, false);
+    applySanitizedGitConfigEnv(lsEnv, stagedGitCfg, willIsolate);
+    const lsOpts: GitRunOpts = stagedGitCfg
+      ? {
+          ...roOpts,
+          extraReadOnlyPaths: [...(roOpts.extraReadOnlyPaths ?? []), stagedGitCfg.dir, ...stagedGitCfg.extraReadOnlyPaths],
+          ...(stagedGitCfg.symlinks.length
+            ? { extraSymlinks: [...(roOpts.extraSymlinks ?? []), ...stagedGitCfg.symlinks] }
+            : {}),
+        }
+      : roOpts;
+    const lsWrapped = wrapCredentialIsolatedCommand(
+      "git",
+      ["-C", repoPath, ...GIT_SAFE_ARGS, ...(roOpts.extraGitConfigArgs ?? []), "ls-tree", "-r", "-l", "-z", targetSha],
+      effectiveRawEnv,
+      buildGitIsolation(repoPath, lsOpts, streamEnv.env.CREDENTIALS_DIRECTORY, undefined, undefined, effectiveRawEnv, true),
+    );
+    const lsChild = spawn(lsWrapped.cmd, lsWrapped.args, {
+      env: lsEnv,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+    });
+    let lsErr = "";
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killChildGroup(lsChild);
+    }, roOpts.timeoutMs ?? 300_000);
+    timer.unref?.();
+    lsChild.stderr.on("data", (d: Buffer) => {
+      if (lsErr.length < 16_384) lsErr += d.toString("utf8");
+    });
+    const lsExitP = new Promise<{ code: number; spawnErr?: Error }>((resolve) => {
+      lsChild.on("error", (err) => resolve({ code: 127, spawnErr: err }));
+      lsChild.on("close", (code) => resolve({ code: timedOut ? 124 : (code ?? 1) }));
+    });
+
+    let smallBatch: { sha: string; pathBuf: Buffer }[] = [];
+    const flushSmallBatch = async (): Promise<void> => {
+      if (smallBatch.length === 0) return;
+      const batch = smallBatch;
+      smallBatch = [];
+      const lfsKeys = await filterPathsWithLfsAttrBytes(
+        repoPath,
+        targetSha,
+        batch.map((b) => b.pathBuf),
+        roOpts,
+        pinnedAttr,
+      );
+      const toRead: string[] = [];
+      for (const b of batch) {
+        if (!lfsKeys.has(b.pathBuf.toString("latin1"))) continue;
+        if (checkedLfsBlobShas.has(b.sha)) continue;
+        checkedLfsBlobShas.add(b.sha);
+        toRead.push(b.sha);
+      }
+      if (toRead.length === 0) return;
+      const batchRes = await tryGitBuffer(repoPath, ["cat-file", "--batch"], {
+        ...roOpts,
+        input: toRead.join("\n") + "\n",
+      });
+      if (batchRes.code !== 0) {
+        throw new Error(`git cat-file --batch 读取检出目标 ${targetRev} LFS 指针失败：${batchRes.stderr.trim()}`);
+      }
+      collectBatchBufferLfsOids(batchRes.stdout, requiredOids, false);
+    };
+
+    let carry: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    try {
+      for await (const raw of lsChild.stdout as AsyncIterable<Buffer>) {
+        carry = carry.length > 0 ? Buffer.concat([carry, raw]) : raw;
+        let start = 0;
+        let nul = carry.indexOf(0x00, start);
+        while (nul !== -1) {
+          const rec = carry.subarray(start, nul);
+          start = nul + 1;
+          if (rec.length > 0) {
+            const tab = rec.indexOf(0x09);
+            if (tab > 0 && tab + 1 < rec.length) {
+              const header = rec.subarray(0, tab).toString("ascii").trim().split(/\s+/);
+              if (header.length >= 4) {
+                const [, objType, objSha, sizeStr] = header;
+                const size = Number(sizeStr);
+                if (
+                  objType === "blob" &&
+                  objSha &&
+                  Number.isFinite(size) &&
+                  size >= LFS_POINTER_MIN_BYTES &&
+                  size <= LFS_POINTER_MAX_BYTES
+                ) {
+                  smallBatch.push({ sha: objSha, pathBuf: Buffer.from(rec.subarray(tab + 1)) });
+                  if (smallBatch.length >= LFS_BATCH_CHUNK_SIZE) {
+                    await flushSmallBatch();
+                  }
+                }
+              }
+            }
+          }
+          nul = carry.indexOf(0x00, start);
+        }
+        carry = start > 0 ? Buffer.from(carry.subarray(start)) : carry;
+      }
+      await flushSmallBatch();
+    } catch (err) {
+      killChildGroup(lsChild);
+      await lsExitP;
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+    const lsExit = await lsExitP;
+    if (lsExit.spawnErr) {
+      throw new Error(`git ls-tree 启动失败：${lsExit.spawnErr.message}`);
+    }
+    if (lsExit.code !== 0) {
+      const detail = (timedOut ? `${lsErr}\n(timeout)` : lsErr).trim();
+      throw new Error(`git ls-tree 检查检出目标 ${targetRev} LFS 对象失败：${detail}`);
+    }
+  } finally {
+    stagedGitCfg?.cleanup();
+    streamEnv.cleanup();
+    pinnedAttr.cleanup();
   }
   if (requiredOids.size === 0) return { fetched: false, missingCount: 0, ...storageMeta };
 

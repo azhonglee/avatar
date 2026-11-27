@@ -329,25 +329,55 @@ export class Connectors {
     return j.data?.result?.structuredContent ?? j.data;
   }
 
-  /** 核验当前 lark-cli 登录用户 open_id 与工作区主人一致，防止切换 CLI 账号后跨账号拉取私聊/任务/妙记/日历 */
-  async verifyActiveLarkOwner(actionLabel = "用户态来源采集"): Promise<
-    { ok: true; status: Record<string, unknown> } | { ok: false; error: string }
-  > {
+  private isBoundWorkspaceOwnerMismatch(ownerOpenId: string): boolean {
+    const boundNative = (this.app.store.get("ctx.pw.bound_owner_id") ?? "").trim();
+    const boundWs = (this.app.store.get("ctx.pw.bound_workspace_owner_id") ?? "").trim();
+    if (!boundNative && !boundWs) return false;
+    return boundWs !== ownerOpenId.trim();
+  }
+
+  private assertPinnedOwnerSync(actionLabel: string, pinnedOwnerOpenId: string): void {
+    if (this.syncDiskPolicy && !this.syncDiskPolicy()) {
+      throw new Error(`磁盘隐私配置无法核验，已中止${actionLabel}`);
+    }
+    const currentOwner = this.cfg.owner.open_id.trim();
+    if (currentOwner !== pinnedOwnerOpenId) {
+      throw new Error(`工作区 owner.open_id 在采集期间发生变化，已中止${actionLabel}`);
+    }
+    if (this.isBoundWorkspaceOwnerMismatch(pinnedOwnerOpenId)) {
+      throw new Error(`工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已阻断${actionLabel}`);
+    }
+  }
+
+  /** 核验当前 lark-cli 登录用户 open_id 与本轮锁定的工作区主人一致，防止切换配置或 CLI 账号后跨账号拉取私聊/任务/妙记/日历 */
+  async verifyActiveLarkOwner(
+    actionLabel = "用户态来源采集",
+    pinnedOwnerOpenId?: string,
+  ): Promise<{ ok: true; status: Record<string, unknown> } | { ok: false; error: string }> {
     try {
-      const { status } = await verifyActiveLarkUser(this.app.lark, this.cfg.owner.open_id, actionLabel);
+      const targetOwner = pinnedOwnerOpenId ?? this.cfg.owner.open_id.trim();
+      this.assertPinnedOwnerSync(actionLabel, targetOwner);
+      const { status } = await verifyActiveLarkUser(this.app.lark, targetOwner, actionLabel);
+      this.assertPinnedOwnerSync(actionLabel, targetOwner);
       return { ok: true, status };
     } catch (err) {
       return { ok: false, error: errMsg(err) };
     }
   }
 
-  private async assertActiveLarkOwner(actionLabel: string): Promise<Record<string, unknown>> {
-    const { status } = await verifyActiveLarkUser(this.app.lark, this.cfg.owner.open_id, actionLabel);
+  private async assertActiveLarkOwner(actionLabel: string, pinnedOwnerOpenId: string): Promise<Record<string, unknown>> {
+    this.assertPinnedOwnerSync(actionLabel, pinnedOwnerOpenId);
+    const { status } = await verifyActiveLarkUser(this.app.lark, pinnedOwnerOpenId, actionLabel);
+    this.assertPinnedOwnerSync(actionLabel, pinnedOwnerOpenId);
     return status;
   }
 
-  /** 跑一轮所有启用的来源（各来源相互隔离；所有用户态 lark-cli 来源均在拉取前与提交前双次核验当前活跃 CLI 账号） */
-  async pullAll(): Promise<SourceReport[]> {
+  /** 跑一轮所有启用的来源（各来源相互隔离；整轮锁定初始工作区主人并在每个用户态来源的拉取前、提交前及写事务内校验同一主人身份） */
+  async pullAll(pinnedOwnerOpenId?: string): Promise<SourceReport[]> {
+    if (this.syncDiskPolicy && !this.syncDiskPolicy()) {
+      return [{ source: "config", count: 0, error: "磁盘隐私配置无法核验，已暂缓本轮采集" }];
+    }
+    const pinnedOwner = (pinnedOwnerOpenId ?? this.cfg.owner.open_id).trim();
     const s = this.cfg.context.sources;
     const out: SourceReport[] = [];
     const step = async (name: string, enabled: boolean, fn: () => Promise<Omit<SourceReport, "source" | "error">>) => {
@@ -361,10 +391,10 @@ export class Connectors {
       this.setKv(`source.${name}`, JSON.stringify({ at: Date.now(), ...out.at(-1) }));
     };
     await step("meego", s.meego, () => this.pullMeego());
-    await step("tasks", s.tasks, () => this.pullTasks());
-    await step("im", s.im, () => this.pullIm());
-    await step("minutes", s.minutes, () => this.pullMinutes());
-    await step("calendar", s.calendar, () => this.pullCalendar());
+    await step("tasks", s.tasks, () => this.pullTasks(pinnedOwner));
+    await step("im", s.im, () => this.pullIm(0, pinnedOwner));
+    await step("minutes", s.minutes, () => this.pullMinutes(pinnedOwner));
+    await step("calendar", s.calendar, () => this.pullCalendar(pinnedOwner));
     await step("docs", s.docs, async () => this.pullComments());
     return out;
   }
@@ -463,44 +493,48 @@ export class Connectors {
 
   // ───────── 飞书任务 → 事项 ─────────
 
-  async pullTasks(): Promise<{ count: number }> {
-    await this.assertActiveLarkOwner("拉取飞书任务");
+  async pullTasks(pinnedOwnerOpenId?: string): Promise<{ count: number }> {
+    const pinnedOwner = (pinnedOwnerOpenId ?? this.cfg.owner.open_id).trim();
+    await this.assertActiveLarkOwner("拉取飞书任务", pinnedOwner);
     const data = await this.lark(["task", "+get-my-tasks", "--complete=false", "--page-all"]);
-    // 提交前再次核验活跃 lark-cli 用户，防止拉取期间账号被切换导致他人任务落入本工作区
-    await this.assertActiveLarkOwner("提交飞书任务");
+    // 提交前再次核验活跃 lark-cli 用户与锁定的工作区主人身份，防止拉取期间配置或账号同时切换导致他人任务落入本工作区
+    await this.assertActiveLarkOwner("提交飞书任务", pinnedOwner);
     const tasks = arr(data, "items");
     const now = Date.now();
     const legacyCut = now - this.cfg.context.legacy_days * DAY;
-    const active = this.store.upsertProject({ id: "sys_tasks", name: "飞书任务", description: "分配给你的飞书任务" });
-    const legacy = this.store.upsertProject({ id: "sys_tasks_legacy", name: "飞书任务（历史）", description: "很久以前创建、长期未处理的飞书任务", status: "legacy", muted: this.cfg.context.autonomy.mute_legacy });
-    const seen = new Set<string>();
-    for (const t of tasks) {
-      const key = `task:${t.guid}`;
-      seen.add(key);
-      const created = parseTime(t.created_at);
-      const due = parseTime(t.due_at) || null;
-      const isLegacy = created > 0 && created < legacyCut && (!due || due < now - 30 * DAY);
-      const oid = `task:${t.guid}`;
-      this.store.addObs([{ id: oid, source: "task", kind: "task", conv: oid, conv_name: String(t.summary ?? ""), actor_id: "", actor_name: "飞书任务", is_me: false, time: created || now, text: String(t.summary ?? ""), url: String(t.url ?? ""), meta: {} }]);
-      this.store.markProcessed([oid]);
-      const linked = this.store.findProject(key);
-      const { item } = this.store.upsertItem({
-        strong_key: key,
-        title: String(t.summary ?? "(无标题任务)"),
-        kind: "todo",
-        source: "task",
-        project_id: linked?.id ?? (isLegacy ? legacy.id : active.id),
-        due,
-        priority: due && due < now + 2 * DAY && !isLegacy ? "high" : "medium",
-        confidence: 1,
-        status: "open",
-        meta: { url: t.url, legacy: isLegacy },
-      });
-      this.store.addEvidence("item", item.id, oid, `飞书任务：${t.summary}`, created || now);
-    }
-    for (const it of this.store.items({ status: ["open", "snoozed"], source: "task" })) {
-      if (it.strong_key.startsWith("task:") && !seen.has(it.strong_key)) this.store.upsertItem({ ...it, status: "done", close_reason: "飞书任务已完成" });
-    }
+    this.store.tx(() => {
+      this.assertPinnedOwnerSync("提交飞书任务", pinnedOwner);
+      const active = this.store.upsertProject({ id: "sys_tasks", name: "飞书任务", description: "分配给你的飞书任务" });
+      const legacy = this.store.upsertProject({ id: "sys_tasks_legacy", name: "飞书任务（历史）", description: "很久以前创建、长期未处理的飞书任务", status: "legacy", muted: this.cfg.context.autonomy.mute_legacy });
+      const seen = new Set<string>();
+      for (const t of tasks) {
+        const key = `task:${t.guid}`;
+        seen.add(key);
+        const created = parseTime(t.created_at);
+        const due = parseTime(t.due_at) || null;
+        const isLegacy = created > 0 && created < legacyCut && (!due || due < now - 30 * DAY);
+        const oid = `task:${t.guid}`;
+        this.store.addObs([{ id: oid, source: "task", kind: "task", conv: oid, conv_name: String(t.summary ?? ""), actor_id: "", actor_name: "飞书任务", is_me: false, time: created || now, text: String(t.summary ?? ""), url: String(t.url ?? ""), meta: {} }]);
+        this.store.markProcessed([oid]);
+        const linked = this.store.findProject(key);
+        const { item } = this.store.upsertItem({
+          strong_key: key,
+          title: String(t.summary ?? "(无标题任务)"),
+          kind: "todo",
+          source: "task",
+          project_id: linked?.id ?? (isLegacy ? legacy.id : active.id),
+          due,
+          priority: due && due < now + 2 * DAY && !isLegacy ? "high" : "medium",
+          confidence: 1,
+          status: "open",
+          meta: { url: t.url, legacy: isLegacy },
+        });
+        this.store.addEvidence("item", item.id, oid, `飞书任务：${t.summary}`, created || now);
+      }
+      for (const it of this.store.items({ status: ["open", "snoozed"], source: "task" })) {
+        if (it.strong_key.startsWith("task:") && !seen.has(it.strong_key)) this.store.upsertItem({ ...it, status: "done", close_reason: "飞书任务已完成" });
+      }
+    });
     return { count: tasks.length };
   }
 
@@ -674,7 +708,8 @@ export class Connectors {
     };
   }
 
-  async pullIm(restartAttempt = 0): Promise<{ count: number; dropped: number }> {
+  async pullIm(restartAttempt = 0, pinnedOwnerOpenId?: string): Promise<{ count: number; dropped: number }> {
+    const pinnedOwner = (pinnedOwnerOpenId ?? this.cfg.owner.open_id).trim();
     const procOwner = this.app.ledger.owner;
     const pollToken = `poll_im:${randomUUID().slice(0, 8)}`;
     // 通过跨进程 SQLite 租约串行化 IM 轮询，防止并发轮询中较慢的旧快照后提交覆盖较新的消息编辑或回退游标
@@ -686,7 +721,7 @@ export class Connectors {
     }, 30_000);
     heartbeat.unref?.();
     try {
-      return await this.pullImInner(restartAttempt, { token: pollToken, procOwner });
+      return await this.pullImInner(restartAttempt, { token: pollToken, procOwner }, pinnedOwner);
     } finally {
       clearInterval(heartbeat);
       this.store.releaseConv(IM_POLL_CLAIM_KEY, pollToken, procOwner);
@@ -696,9 +731,10 @@ export class Connectors {
   private async pullImInner(
     restartAttempt: number,
     lease: { token: string; procOwner: string },
+    pinnedOwner: string,
   ): Promise<{ count: number; dropped: number }> {
-    await this.assertActiveLarkOwner("拉取飞书消息");
-    const me = this.cfg.owner.open_id;
+    await this.assertActiveLarkOwner("拉取飞书消息", pinnedOwner);
+    const me = pinnedOwner;
     const now = Date.now();
     const lookback = this.cfg.context.lookback_days * DAY;
     const baseCursor = Number(this.kv("cursor.im") ?? 0) || now - lookback;
@@ -1229,7 +1265,7 @@ export class Connectors {
       }
       if (scopeSelectionChanged(nativeExcl)) {
         if (restartAttempt < 1) {
-          return this.pullImInner(restartAttempt + 1, lease);
+          return this.pullImInner(restartAttempt + 1, lease, pinnedOwner);
         }
         return { count: 0, dropped: 0 };
       }
@@ -1413,10 +1449,10 @@ export class Connectors {
           }).map(([id]) => id),
         );
         if (learnedRankedKey !== initialRankedKey) {
-          await this.assertActiveLarkOwner("保存学到的群名");
+          await this.assertActiveLarkOwner("保存学到的群名", pinnedOwner);
           mergeKnownOpenGroupNames(this.app.store, learnedNames);
           if (restartAttempt < 1) {
-            return this.pullImInner(restartAttempt + 1, lease);
+            return this.pullImInner(restartAttempt + 1, lease, pinnedOwner);
           }
           return { count: 0, dropped: 0 };
         }
@@ -1432,15 +1468,16 @@ export class Connectors {
         }
       }
 
-      // 落库提交前再次核验活跃 lark-cli 用户，防止拉取分页期间切换账号导致他人消息写入本工作区或推进游标
-      await this.assertActiveLarkOwner("提交飞书消息");
+      // 落库提交前再次核验活跃 lark-cli 用户与锁定工作区主人，防止拉取分页期间切换配置或账号导致他人消息写入本工作区或推进游标
+      await this.assertActiveLarkOwner("提交飞书消息", pinnedOwner);
 
-      // 原子事务提交前最后一次核对轮询租约、策略签名与群选择集合：
-      // 若租约丢失则立刻中止（防过期慢轮询覆写新编辑）；若策略变更则重试/重启，绝不提交过期观测或游标
+      // 原子事务提交前最后一次核对轮询租约、锁定主人、策略签名与群选择集合：
+      // 若租约丢失则立刻中止（防过期慢轮询覆写新编辑）；若主人或策略变更则中止/重启，绝不提交过期或跨账号观测与游标
       const commitRes = this.store.tx(() => {
         if (!this.store.isConvClaimedBy(IM_POLL_CLAIM_KEY, lease.token, lease.procOwner)) {
           return { committed: false as const, lostLease: true as const, count: 0 };
         }
+        this.assertPinnedOwnerSync("提交飞书消息", pinnedOwner);
         if (this.pollingPolicySignature() !== policySig || scopeSelectionChanged(nativeExcl)) {
           return { committed: false as const, lostLease: false as const, count: 0 };
         }
@@ -1500,8 +1537,9 @@ export class Connectors {
 
   // ───────── 妙记 → 观测 ─────────
 
-  async pullMinutes(): Promise<{ count: number }> {
-    await this.assertActiveLarkOwner("拉取飞书妙记");
+  async pullMinutes(pinnedOwnerOpenId?: string): Promise<{ count: number }> {
+    const pinnedOwner = (pinnedOwnerOpenId ?? this.cfg.owner.open_id).trim();
+    await this.assertActiveLarkOwner("拉取飞书妙记", pinnedOwner);
     const now = Date.now();
     const since = Number(this.kv("cursor.minutes") ?? 0) || now - this.cfg.context.lookback_days * DAY;
     const list: Raw[] = [];
@@ -1541,9 +1579,13 @@ export class Connectors {
         });
       }
     }
-    await this.assertActiveLarkOwner("提交飞书妙记");
-    const n = this.store.addObs(obs);
-    this.setKv("cursor.minutes", String(now));
+    await this.assertActiveLarkOwner("提交飞书妙记", pinnedOwner);
+    const n = this.store.tx(() => {
+      this.assertPinnedOwnerSync("提交飞书妙记", pinnedOwner);
+      const added = this.store.addObs(obs);
+      this.setKv("cursor.minutes", String(now));
+      return added;
+    });
     return { count: n };
   }
 
@@ -1576,12 +1618,13 @@ export class Connectors {
 
   // ───────── 日历：今天和接下来两天的会议（只用于展示） ─────────
 
-  async pullCalendar(): Promise<{ count: number }> {
-    await this.assertActiveLarkOwner("拉取飞书日历");
+  async pullCalendar(pinnedOwnerOpenId?: string): Promise<{ count: number }> {
+    const pinnedOwner = (pinnedOwnerOpenId ?? this.cfg.owner.open_id).trim();
+    await this.assertActiveLarkOwner("拉取飞书日历", pinnedOwner);
     const now = Date.now();
     const startOfDay = parseTime(new Intl.DateTimeFormat("en-CA", { timeZone: this.cfg.owner.timezone }).format(new Date(now)), this.cfg.owner.timezone);
     const data = await this.lark(["calendar", "+agenda", "--start", isoLocal(startOfDay), "--end", isoLocal(startOfDay + 3 * DAY)]);
-    await this.assertActiveLarkOwner("提交飞书日历");
+    await this.assertActiveLarkOwner("提交飞书日历", pinnedOwner);
     const events = arr(data, "items").length ? arr(data, "items") : arr(data, "events");
     const t = (x: Raw) => parseTime(x?.datetime ?? x?.timestamp ?? x?.date ?? x, this.cfg.owner.timezone);
     const meetings = events
@@ -1589,7 +1632,10 @@ export class Connectors {
       .map((e) => ({ start: t(e.start_time), end: t(e.end_time), summary: String(e.summary ?? "(无标题)"), url: String(e.app_link ?? "") }))
       .filter((m) => m.start > 0)
       .sort((a, b) => a.start - b.start);
-    this.setKv("calendar", JSON.stringify(meetings));
+    this.store.tx(() => {
+      this.assertPinnedOwnerSync("提交飞书日历", pinnedOwner);
+      this.setKv("calendar", JSON.stringify(meetings));
+    });
     return { count: meetings.length };
   }
 }

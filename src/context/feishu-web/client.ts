@@ -933,11 +933,16 @@ export class FeishuWebClient {
     hbTimer.unref?.();
 
     // Session keepalive loop (30m): touches profile so rotated cookies are persisted,
-    // and escalates definitive credential denials or owner mismatches out of the socket loop.
+    // recovers cookie rotations on transient non-auth errors (e.g. HTTP 503), and escalates
+    // definitive credential denials or owner mismatches out of the socket loop.
     let keepaliveFatal: Error | null = null;
+    let keepaliveInFlight = false;
     const kaTimer = setInterval(() => {
-      void readNativeProfile(this.jar, this.endpoints, { signal: loopCtrl.signal })
-        .then((p) => {
+      if (keepaliveInFlight || loopCtrl.signal.aborted) return;
+      keepaliveInFlight = true;
+      void (async () => {
+        try {
+          const p = await readNativeProfile(this.jar, this.endpoints, { signal: loopCtrl.signal });
           if (p.id !== this.ownerId) {
             keepaliveFatal = new WebHttpError("credential_denied", "保活核验发现个人 Web 账号与已授权账号不一致");
             ws.close();
@@ -954,13 +959,35 @@ export class FeishuWebClient {
             keepaliveFatal = persistErr instanceof Error ? persistErr : new WebHttpError("transport", "保活持久化个人 Web 会话凭据失败");
             ws.close();
           }
-        })
-        .catch((err: unknown) => {
+        } catch (err: unknown) {
           if (isCredentialDenied(err)) {
             keepaliveFatal = err as Error;
             ws.close();
+            return;
           }
-        });
+          // 非认证失败（如 503）前若已收到 Set-Cookie 轮换，在同一内存 jar 上有界重试身份核验，核验通过后立即落盘避免重启丢 Cookie
+          if (!loopCtrl.signal.aborted && this.hasPendingCookieDelta()) {
+            try {
+              await this.verifyOwnerWithTransientRetry(2, Math.min(this.opts.reconnectBaseMs, 250), loopCtrl.signal);
+              if (!this.notifySessionConfirmed()) {
+                keepaliveFatal = new WebHttpError("aborted", "本地凭据已被登出或更新");
+                ws.close();
+              }
+            } catch (retryErr: unknown) {
+              if (isCredentialDenied(retryErr)) {
+                keepaliveFatal = retryErr as Error;
+                ws.close();
+              } else if (!loopCtrl.signal.aborted) {
+                onWarn?.(
+                  `保活遇到瞬态故障，轮换 Cookie 暂留内存等待下次核验落盘：${retryErr instanceof Error ? retryErr.message : String(retryErr)}`,
+                );
+              }
+            }
+          }
+        } finally {
+          keepaliveInFlight = false;
+        }
+      })();
     }, this.opts.keepaliveIntervalMs);
     kaTimer.unref?.();
 

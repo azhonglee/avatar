@@ -178,13 +178,17 @@ export class ContextService {
     }
     if (this.running) return { ...rep, skipped: true };
     this.running = true;
+    const pinnedCycleOwner = this.cfg.owner.open_id.trim();
     const kv = this.app.store;
     try {
       this.store.wakeSnoozed();
-      // 各来源按采集契约相互隔离：即使 lark-cli 认证失败或账号不匹配，独立来源（Meego / 文档评论）仍正常执行并上报各自状态；
-      // 每个用户态 lark-cli 来源均在拉取前与提交前双次校验活跃账号，确保他人数据绝不落库。
-      rep.sources = await this.connectors.pullAll();
+      // 各来源按采集契约相互隔离：整轮周期锁定初始工作区主人身份 pinnedCycleOwner；
+      // 即使运行中途外部磁盘配置与 CLI 账号同时切换，后续采集与提交也会立即拒绝跨账号写入。
+      rep.sources = await this.connectors.pullAll(pinnedCycleOwner);
       for (const s of rep.sources) if (s.error) rep.errors.push(`${s.source}: ${s.error}`);
+      if (this.personalWeb.hasDiskPolicyError() || this.cfg.owner.open_id.trim() !== pinnedCycleOwner || this.isWorkspaceOwnerMismatched()) {
+        return { ...rep, skipped: true };
+      }
       const larkAuthBlocked = rep.sources.some(
         (s) =>
           (s.source === "tasks" || s.source === "im" || s.source === "minutes" || s.source === "calendar") &&
@@ -210,7 +214,14 @@ export class ContextService {
         const skippedInCycle = new Set<string>();
         let policyRestarts = 0;
         while (budget > 0 && !signal?.aborted) {
-          if (this.isWorkspaceOwnerMismatched() || !this.cfg.context.understand) break;
+          if (
+            this.personalWeb.hasDiskPolicyError() ||
+            this.cfg.owner.open_id.trim() !== pinnedCycleOwner ||
+            this.isWorkspaceOwnerMismatched() ||
+            !this.cfg.context.understand
+          ) {
+            break;
+          }
           // 每轮动态重算启用的来源，防止运行中途关闭文档/妙记开关后后续批次仍选中已停用来源；
           // 若本轮 lark-cli 用户身份未通过核验，跳过依赖 lark-cli 的妙记与 CLI 轮询 IM 观测，
           // 但仍保留本地文档评论与已通过独立个人 Web 认证且绑定当前主人的 `pw:*` IM 观测
@@ -486,7 +497,7 @@ export class ContextService {
       this.personalWeb.hasDiskPolicyError() ||
       !this.cfg.context.understand ||
       !this.cfg.context.sources.im ||
-      !this.cfg.context.personal_web.enabled ||
+      !this.personalWeb.isEffectivePersonalWebEnabled() ||
       !this.cfg.context.personal_web.fast_lane
     ) {
       return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
@@ -532,7 +543,7 @@ export class ContextService {
       !this.isWorkspaceOwnerMismatched() &&
       this.cfg.context.understand &&
       this.cfg.context.sources.im &&
-      this.cfg.context.personal_web.enabled &&
+      this.personalWeb.isEffectivePersonalWebEnabled() &&
       this.cfg.context.personal_web.fast_lane;
     try {
       await this.ensureOwnerName();
@@ -765,7 +776,7 @@ export class ContextService {
   private canAutoPreDraft(it: ItemRow | undefined): it is ItemRow {
     if (this.personalWeb.hasDiskPolicyError()) return false;
     const pw = this.cfg.context.personal_web;
-    if (!this.cfg.context.understand || !this.cfg.context.sources.im || !pw.enabled || !pw.fast_lane || !pw.pre_draft) {
+    if (!this.cfg.context.understand || !this.cfg.context.sources.im || !this.personalWeb.isEffectivePersonalWebEnabled() || !pw.fast_lane || !pw.pre_draft) {
       return false;
     }
     if (!it || it.status !== "open" || it.kind !== "ask_me" || it.priority !== "high") return false;

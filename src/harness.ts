@@ -711,7 +711,12 @@ function escapeGitConfigValue(val: string): string {
   return `"${escaped}"`;
 }
 
-function isAllowedRemoteGitConfigEntry(key: string, value: string, allowedRemoteUrls: string[]): boolean {
+function isAllowedRemoteGitConfigEntry(
+  key: string,
+  value: string,
+  allowedRemoteUrls: string[],
+  allowedRemoteNames: string[] = [],
+): boolean {
   if (/[\r\n\0]/.test(value)) return false;
   const trimmedKey = key.trim();
   const lk = trimmedKey.toLowerCase();
@@ -734,12 +739,27 @@ function isAllowedRemoteGitConfigEntry(key: string, value: string, allowedRemote
   const varName = trimmedKey.slice(lastDot + 1).toLowerCase();
 
   if (section === "lfs") {
-    if (!isSafeGitConfigValue(value)) return false;
+    const valAllowed =
+      isSafeGitConfigValue(value) ||
+      ((varName === "url" || varName === "pushurl") &&
+        allowedRemoteUrls.some((u) => u.trim() === value.trim()));
+    if (!valAllowed) return false;
     if (!subsection) return true;
     return allowedRemoteUrls.some((u) => gitUrlPrefixMatchesTarget(subsection, u));
   }
   if (!subsection) return false;
 
+  if (
+    section === "remote" &&
+    allowedRemoteNames.includes(subsection) &&
+    (varName === "url" || varName === "pushurl" || varName === "lfsurl" || varName === "lfspushurl")
+  ) {
+    // 严格仅保留本次受信任远程操作选中远端名的端点覆盖（例如全局 includeIf 配置的 pushurl/lfspushurl/lfsurl），绝不暴露其他无关远端配置或无关凭据
+    return (
+      isSafeGitConfigValue(value) ||
+      allowedRemoteUrls.some((u) => u.trim() === value.trim())
+    );
+  }
   if (section === "http") {
     if (!hasHttpRemote) return false;
     // 严格仅保留命中目标远端 URL 的 http.<url>.*（如目标域名的 extraHeader / sslVerify / proxy），绝不暴露其他主机的 extraHeader
@@ -763,13 +783,14 @@ function isAllowedRemoteGitConfigEntry(key: string, value: string, allowedRemote
 /**
  * 仅保留全局 Git 配置中的非敏感本地偏好（`user.name/email`、`core.autocrlf`、`color.*`、`init.defaultBranch`、`safe.directory`、标准 `filter.lfs.*` 等），
  * 彻底剥离 `http.*`（含 `extraHeader`）、`credential.*`、`url.*`（可能含带令牌的 `insteadOf`）、`alias.*`、`core.sshCommand`、`include*` 等一切凭据或命令注入项。
- * 若传入 `opts.allowedRemoteUrls`（仅限受信任远程 Git 传输），按目标 URL 窄范围附加匹配目标域的 `http.<url>.*`、`credential.<url>.username/useHttpPath` 与 `url.*` 重写。
+ * 若传入 `opts.allowedRemoteUrls`（仅限受信任远程 Git 传输），按目标 URL 窄范围附加匹配目标域的 `http.<url>.*`、`credential.<url>.username/useHttpPath`、`url.*` 与指定远端名的端点覆盖。
  */
 export function sanitizeGitConfigEntries(
   entries: { key: string; value: string }[],
-  opts?: { allowedRemoteUrls?: string[] },
+  opts?: { allowedRemoteUrls?: string[]; allowedRemoteNames?: string[] },
 ): string {
   const allowedRemoteUrls = (opts?.allowedRemoteUrls ?? []).filter(Boolean);
+  const allowedRemoteNames = (opts?.allowedRemoteNames ?? []).filter(Boolean);
   const bySection = new Map<string, { name: string; value: string }[]>();
   for (const { key, value } of entries) {
     const trimmedKey = key.trim();
@@ -777,8 +798,8 @@ export function sanitizeGitConfigEntries(
       (isSafeGitConfigKey(trimmedKey) && isSafeGitConfigValue(value)) || isSafeGitLfsFilterEntry(trimmedKey, value);
     const keepRemote =
       !keepLocal &&
-      allowedRemoteUrls.length > 0 &&
-      isAllowedRemoteGitConfigEntry(trimmedKey, value, allowedRemoteUrls);
+      (allowedRemoteUrls.length > 0 || allowedRemoteNames.length > 0) &&
+      isAllowedRemoteGitConfigEntry(trimmedKey, value, allowedRemoteUrls, allowedRemoteNames);
     if (!keepLocal && !keepRemote) continue;
     const firstDot = trimmedKey.indexOf(".");
     const lastDot = trimmedKey.lastIndexOf(".");
@@ -1236,7 +1257,7 @@ function resolveValidatedGitAuxMount(
 export function stageSanitizedGitConfig(
   rawEnv: NodeJS.ProcessEnv = process.env,
   dataDir?: string,
-  opts?: { cwd?: string; allowedRemoteUrls?: string[] },
+  opts?: { cwd?: string; allowedRemoteUrls?: string[]; allowedRemoteNames?: string[] },
 ): StagedSanitizedGitConfig | undefined {
   const discovered = discoverEffectiveGlobalGitConfig(rawEnv, dataDir, {
     cwd: opts?.cwd,
@@ -1246,6 +1267,7 @@ export function stageSanitizedGitConfig(
 
   const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
   const allowedRemoteUrls = (opts?.allowedRemoteUrls ?? []).filter(Boolean);
+  const allowedRemoteNames = (opts?.allowedRemoteNames ?? []).filter(Boolean);
   const extraReadOnlyPaths: string[] = [];
   const symlinks: { dest: string; target: string }[] = [];
   const seenRo = new Set<string>();
@@ -1320,6 +1342,7 @@ export function stageSanitizedGitConfig(
 
   const sanitized = sanitizeGitConfigEntries(filteredEntries, {
     allowedRemoteUrls: opts?.allowedRemoteUrls,
+    allowedRemoteNames,
   });
   if (!sanitized) return undefined;
   const scoped = createScopedSecretDir("pa-git-cfg-", rawEnv);

@@ -344,10 +344,17 @@ export class ContextStore {
           if (!hasNewerRevision && curPollAt !== undefined && nextPollAt !== undefined && nextPollAt < curPollAt) {
             continue;
           }
-          // 若已有带修订标尺的撤回墓碑（如轮询收到 rev=3 的 deleted=true），除非新到达的副本具备更高修订或经服务端权威回读确认存活，
-          // 否则绝不允许同修订/无修订标尺的陈旧副本重新激活已撤回观测
+          // 若观测已被撤回或为墓碑（无论是否带服务端修订号，或仅带本地 poll_observed_at），
+          // 除非新到达的副本具备严格更高的可比服务端修订号，或经服务端权威回读确认存活（authoritative_live=true），
+          // 否则绝不允许旧搜索副本凭较新的本地轮询时间戳重新激活已撤回观测
           const incomingAuthoritativeLive = o.meta?.authoritative_live === true;
-          if (wasWithdrawn && (curVer !== undefined || curEditTime !== undefined) && !hasNewerRevision && !incomingAuthoritativeLive) {
+          const isCliIm = o.id.startsWith("im:");
+          if (
+            wasWithdrawn &&
+            (curVer !== undefined || curEditTime !== undefined || curPollAt !== undefined || wasTombstone || isCliIm) &&
+            !hasNewerRevision &&
+            !incomingAuthoritativeLive
+          ) {
             continue;
           }
           const curEffectiveMeta =

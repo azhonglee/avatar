@@ -3,7 +3,7 @@ import fs from "node:fs";
 import YAML from "yaml";
 import type { App } from "../app.ts";
 import type { CtxPersonalWebStatus } from "../api/types.ts";
-import { ContextScopeConfigSchema } from "../config.ts";
+import { ConfigSchema } from "../config.ts";
 import { extractOwnerOpenId } from "../lark.ts";
 import type { Store } from "../store.ts";
 import { deepFind, errMsg, log } from "../util.ts";
@@ -139,7 +139,13 @@ function loadRevokedSessionIds(store: Store): Set<string> {
  *     确保即使本地凭据目录只读、文件锁超时或常驻进程使用不同的 `PA_FEISHU_WEB_CRED_FILE`，监听、入库与 pw.reply 发送也会立刻中止；
  *   - 随后尽力清理当前进程解析到的本地凭据文件，并将文件清理异常作为 `fileError` 独立返回而非阻断吊销。
  */
-export function revokeWorkspacePersonalWebSession(app: App): { fileRemoved: boolean; credFile: string; fileError?: string } {
+export function revokeWorkspacePersonalWebSession(app: App): {
+  fileRemoved: boolean;
+  fileRetained: boolean;
+  isExternal: boolean;
+  credFile: string;
+  fileError?: string;
+} {
   const loginStore = new WebLoginStore(app.cfg.dataDir);
   let existingOnDisk: WebLogin | undefined;
   if (!loginStore.isExternal) {
@@ -219,9 +225,12 @@ export function revokeWorkspacePersonalWebSession(app: App): { fileRemoved: bool
   }
 
   let fileRemoved = false;
+  let fileRetained = false;
   let fileError: string | undefined;
   try {
+    let sawExistingMainFile = false;
     const res = loginStore.clearIf((curRes, stagedRes) => {
+      if (curRes.status !== "missing") sawExistingMainFile = true;
       const workspaceStillRevoked = () =>
         !!(app.store.get(REVOKED_AT_KV_KEY) ?? "").trim() && !(app.store.get(ACTIVE_SESSION_KV_KEY) ?? "").trim();
       const shouldRemoveWorkspaceOwnedEntry = (entry: typeof curRes): boolean => {
@@ -254,10 +263,17 @@ export function revokeWorkspacePersonalWebSession(app: App): { fileRemoved: bool
       };
     });
     fileRemoved = res.fileRemoved;
+    fileRetained = !fileRemoved && sawExistingMainFile;
   } catch (err) {
     fileError = errMsg(err);
   }
-  return { fileRemoved, credFile: loginStore.file, ...(fileError ? { fileError } : {}) };
+  return {
+    fileRemoved,
+    fileRetained,
+    isExternal: loginStore.isExternal,
+    credFile: loginStore.file,
+    ...(fileError ? { fileError } : {}),
+  };
 }
 
 /**
@@ -479,6 +495,8 @@ export class PersonalWebBridge {
   private readonly hadInitialCfgFile: boolean;
   private lastSyncedCfgRaw: string | undefined;
   private diskPolicyError = "";
+  private diskPersonalWebVeto = false;
+  private lifecycleStarted = false;
   private state: PersistedState;
 
   constructor(app: App, store: ContextStore, hooks: PersonalWebBridgeHooks) {
@@ -507,10 +525,17 @@ export class PersonalWebBridge {
     return this.app.cfg;
   }
 
+  /** 个人 Web 通道当前是否有效启用：启动时已启用且未被磁盘热配置关闭（启动时关闭则遵循 settings.ts 需重启生效，绝不在未起监听时虚报已启用） */
+  isEffectivePersonalWebEnabled(): boolean {
+    return this.cfg.context.personal_web.enabled && !this.diskPersonalWebVeto;
+  }
+
   /**
-   * 同步检测并重载被外部进程修改的磁盘 `config.yaml` 隐私与采集策略（直接比对原始文本，避免粗粒度文件系统 mtime 漏检同毫秒/等长修改；未变时零 YAML 解析）：
-   *   - 复用 `ContextScopeConfigSchema` 严格校验范围/排除列表与隐私开关；
-   *   - 若磁盘配置文件被删、不可读或格式损坏，记录 `diskPolicyError` 并按 fail-closed 阻断推送入库与推理提交。
+   * 同步检测并重载被外部进程修改的磁盘 `config.yaml` 完整配置（直接比对原始文本，避免粗粒度文件系统 mtime 漏检同毫秒/等长修改；未变时零 YAML 解析）：
+   *   - 严格复用启动期完整 `ConfigSchema` 及 harness/acpx 校验：空文件、`{}` 或残缺/损坏配置一律拒绝，按 fail-closed 保留旧策略并阻断采集/理解；
+   *   - `owner.open_id` 在磁盘留空时沿用 `createApp` 口径回退至 SQLite 中 `pa init` 记录的 `owner.open_id`；
+   *   - 移除 `context.bot_allow` 等键时完整恢复 Schema 默认值；
+   *   - `context.personal_web.enabled` 磁盘关闭时立即生效（并断开在跑监听），但启动时关闭的进程不会在未起监听时虚报启用。
    */
   syncDiskPrivacyConfig(opts?: { throwOnError?: boolean }): boolean {
     const cfgFile = this.cfg.file;
@@ -533,95 +558,54 @@ export class PersonalWebBridge {
       return true;
     }
     try {
-      const parsed = YAML.parse(disk.raw) as Record<string, unknown> | null;
-      if (parsed !== null && (typeof parsed !== "object" || Array.isArray(parsed))) {
-        throw new Error("配置文件根节点格式非法");
+      const parsedRaw = YAML.parse(disk.raw) as unknown;
+      if (!parsedRaw || typeof parsedRaw !== "object" || Array.isArray(parsedRaw)) {
+        throw new Error("配置文件为空或根节点格式非法");
       }
-      const root = (parsed ?? {}) as {
-        owner?: { open_id?: unknown };
-        context?: {
-          understand?: unknown;
-          sources?: { im?: unknown; minutes?: unknown; docs?: unknown };
-          groups?: unknown;
-          groups_allow?: unknown;
-          groups_deny?: unknown;
-          max_groups?: unknown;
-          lookback_days?: unknown;
-          bot_allow?: unknown;
-          personal_web?: {
-            enabled?: unknown;
-            fast_lane?: unknown;
-            pre_draft?: unknown;
-            send_replies?: unknown;
-          };
-        };
-      };
-      if (root.owner !== undefined && (typeof root.owner !== "object" || root.owner === null || Array.isArray(root.owner))) {
-        throw new Error("配置文件中的 owner 格式非法");
+      const fullParsed = ConfigSchema.safeParse(parsedRaw);
+      if (!fullParsed.success) {
+        const pathParts = fullParsed.error.issues[0]?.path?.filter((p): p is string => typeof p === "string") ?? [];
+        const firstPath = pathParts.join(".") || "config";
+        throw new Error(`配置文件中的 ${firstPath} 格式非法`);
       }
-      if (root.owner?.open_id !== undefined && typeof root.owner.open_id !== "string") {
-        throw new Error("配置文件中的 owner.open_id 格式非法");
+      const nextCfg = fullParsed.data;
+      for (const name of [nextCfg.roles.brain, nextCfg.roles.reviewer, nextCfg.dispatch.default_harness].filter(Boolean)) {
+        if (!nextCfg.harnesses[name]) {
+          throw new Error(`配置文件引用了未定义的 harness：${name}`);
+        }
       }
-      const ctx = root.context;
-      if (ctx !== undefined && (typeof ctx !== "object" || ctx === null || Array.isArray(ctx))) {
-        throw new Error("配置文件中的 context 格式非法");
+      for (const h of Object.values(nextCfg.harnesses)) {
+        if (h.type === "acpx" && !h.agent === !h.agentCommand) {
+          throw new Error("配置文件中 acpx harness 必须且只能设置 agent 或 agentCommand 之一");
+        }
       }
-      const scopeParsed = ContextScopeConfigSchema.safeParse({
-        lookback_days: ctx?.lookback_days,
-        groups: ctx?.groups,
-        groups_allow: ctx?.groups_allow,
-        groups_deny: ctx?.groups_deny,
-        max_groups: ctx?.max_groups,
-      });
-      if (!scopeParsed.success) {
-        const badField = String(scopeParsed.error.issues[0]?.path[0] ?? "groups");
-        throw new Error(`配置文件中的 context.${badField} 格式非法`);
-      }
-      const parseOptBool = (val: unknown, fallback: boolean, name: string): boolean => {
-        if (val === undefined) return fallback;
-        if (typeof val !== "boolean") throw new Error(`配置文件中的 ${name} 格式非法`);
-        return val;
-      };
-      if (ctx?.sources !== undefined && (typeof ctx.sources !== "object" || ctx.sources === null || Array.isArray(ctx.sources))) {
-        throw new Error("配置文件中的 context.sources 格式非法");
-      }
-      if (
-        ctx?.personal_web !== undefined &&
-        (typeof ctx.personal_web !== "object" || ctx.personal_web === null || Array.isArray(ctx.personal_web))
-      ) {
-        throw new Error("配置文件中的 context.personal_web 格式非法");
-      }
-      if (ctx?.bot_allow !== undefined && (!Array.isArray(ctx.bot_allow) || !ctx.bot_allow.every((x) => typeof x === "string"))) {
-        throw new Error("配置文件中的 context.bot_allow 格式非法");
-      }
-      const nextUnderstand = parseOptBool(ctx?.understand, true, "context.understand");
-      const nextIm = parseOptBool(ctx?.sources?.im, true, "context.sources.im");
-      const nextMinutes = parseOptBool(ctx?.sources?.minutes, true, "context.sources.minutes");
-      const nextDocs = parseOptBool(ctx?.sources?.docs, true, "context.sources.docs");
-      const nextPwEnabled = parseOptBool(ctx?.personal_web?.enabled, false, "context.personal_web.enabled");
-      const nextPwFast = parseOptBool(ctx?.personal_web?.fast_lane, true, "context.personal_web.fast_lane");
-      const nextPwPreDraft = parseOptBool(ctx?.personal_web?.pre_draft, false, "context.personal_web.pre_draft");
-      const nextPwSend = parseOptBool(ctx?.personal_web?.send_replies, false, "context.personal_web.send_replies");
 
-      if (typeof root.owner?.open_id === "string") {
-        this.cfg.owner.open_id = root.owner.open_id;
+      // 与 createApp 保持完全一致：磁盘 owner.open_id 留空时回退至 pa init 写入 SQLite 的 owner.open_id
+      const resolvedOwner = nextCfg.owner.open_id.trim() || (this.app.store.get("owner.open_id") ?? "").trim();
+      this.cfg.owner.open_id = resolvedOwner;
+      this.cfg.context.groups = nextCfg.context.groups;
+      this.cfg.context.groups_allow = nextCfg.context.groups_allow;
+      this.cfg.context.groups_deny = nextCfg.context.groups_deny;
+      this.cfg.context.max_groups = nextCfg.context.max_groups;
+      this.cfg.context.lookback_days = nextCfg.context.lookback_days;
+      this.cfg.context.understand = nextCfg.context.understand;
+      this.cfg.context.sources.im = nextCfg.context.sources.im;
+      this.cfg.context.sources.minutes = nextCfg.context.sources.minutes;
+      this.cfg.context.sources.docs = nextCfg.context.sources.docs;
+      this.cfg.context.bot_allow = nextCfg.context.bot_allow;
+      this.cfg.context.personal_web.fast_lane = nextCfg.context.personal_web.fast_lane;
+      this.cfg.context.personal_web.pre_draft = nextCfg.context.personal_web.pre_draft;
+      this.cfg.context.personal_web.send_replies = nextCfg.context.personal_web.send_replies;
+
+      // 保持 personal_web.enabled 生命周期一致：磁盘关闭时立即可否决并停掉活跃监听；启动时为 false 的进程不虚报启用
+      const nextPwEnabled = nextCfg.context.personal_web.enabled;
+      this.diskPersonalWebVeto = !nextPwEnabled;
+      if (this.diskPersonalWebVeto && this.stopCtrl) {
+        this.stop();
+      } else if (!this.diskPersonalWebVeto && this.lifecycleStarted && this.cfg.context.personal_web.enabled && !this.stopCtrl) {
+        this.start();
       }
-      this.cfg.context.groups = scopeParsed.data.groups;
-      this.cfg.context.groups_allow = scopeParsed.data.groups_allow;
-      this.cfg.context.groups_deny = scopeParsed.data.groups_deny;
-      this.cfg.context.max_groups = scopeParsed.data.max_groups;
-      this.cfg.context.lookback_days = scopeParsed.data.lookback_days;
-      this.cfg.context.understand = nextUnderstand;
-      this.cfg.context.sources.im = nextIm;
-      this.cfg.context.sources.minutes = nextMinutes;
-      this.cfg.context.sources.docs = nextDocs;
-      if (ctx?.bot_allow !== undefined) {
-        this.cfg.context.bot_allow = ctx.bot_allow as string[];
-      }
-      this.cfg.context.personal_web.enabled = nextPwEnabled;
-      this.cfg.context.personal_web.fast_lane = nextPwFast;
-      this.cfg.context.personal_web.pre_draft = nextPwPreDraft;
-      this.cfg.context.personal_web.send_replies = nextPwSend;
+
       this.diskPolicyError = "";
       this.lastSyncedCfgRaw = disk.raw;
       return true;
@@ -675,7 +659,7 @@ export class PersonalWebBridge {
       this.cfg.context.sources.minutes ? 1 : 0,
       this.cfg.context.sources.docs ? 1 : 0,
       this.cfg.context.understand ? 1 : 0,
-      pw.enabled ? 1 : 0,
+      this.isEffectivePersonalWebEnabled() ? 1 : 0,
       pw.fast_lane ? 1 : 0,
       this.cfg.context.groups,
       this.cfg.context.max_groups,
@@ -736,11 +720,12 @@ export class PersonalWebBridge {
   }
 
   status(now = Date.now()): CtxPersonalWebStatus {
+    this.syncDiskPrivacyConfig({ throwOnError: false });
     this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
     const inspected = this.loginStore.inspect();
     const login = inspected.status === "ok" ? inspected.login : undefined;
     const saved = this.loadSavedState() ?? this.state;
-    const enabled = this.cfg.context.personal_web.enabled;
+    const enabled = this.isEffectivePersonalWebEnabled();
     const daemonLive = this.isDaemonLive(now);
     const localKeyMissing = inspected.status === "missing_key";
     const localCredUnavailable = inspected.status === "missing_key" || inspected.status === "missing";
@@ -828,6 +813,8 @@ export class PersonalWebBridge {
   /** 启动个人 Web 长连接监听（异步后台运行，不阻塞常驻进程启动；所有内部异常均在守护边界内消化退避，绝不产生未捕获拒绝拖垮主进程）。 */
   start(): { stop(): void } {
     if (!this.cfg.context.personal_web.enabled) return { stop: () => undefined };
+    this.lifecycleStarted = true;
+    if (this.diskPersonalWebVeto) return { stop: () => { this.lifecycleStarted = false; this.stop(); } };
     try {
       this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
     } catch (err) {
@@ -841,7 +828,12 @@ export class PersonalWebBridge {
         log("error", "个人 Web 监听守护循环异常退出（已隔离，不影响常驻进程）", { err: errMsg(err) });
       }
     });
-    return { stop: () => this.stop() };
+    return {
+      stop: () => {
+        this.lifecycleStarted = false;
+        this.stop();
+      },
+    };
   }
 
   stop(): void {
@@ -1844,7 +1836,7 @@ export class PersonalWebBridge {
   async handleMessage(msg: WebMessage, client?: FeishuWebClient, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) return;
     this.syncDiskPrivacyConfig({ throwOnError: true });
-    if (!this.cfg.context.sources.im || !this.cfg.context.personal_web.enabled) return;
+    if (!this.cfg.context.sources.im || !this.isEffectivePersonalWebEnabled()) return;
     if (!msg.id) return;
 
     const activeClient = client ?? this.client;
@@ -2117,7 +2109,7 @@ export class PersonalWebBridge {
         this.validateBoundOwner(diskNow);
       }
       this.syncDiskPrivacyConfig({ throwOnError: true });
-      if (!this.cfg.context.sources.im || !this.cfg.context.personal_web.enabled) return false;
+      if (!this.cfg.context.sources.im || !this.isEffectivePersonalWebEnabled()) return false;
       if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(effectiveMsg.conversationId)) return false;
       if (this.isDirectlyDenied(pwConv, chatName || convName, undefined, convKind)) return false;
       return true;
@@ -2173,6 +2165,7 @@ export class PersonalWebBridge {
         thread_id: effectiveMsg.threadId,
         position: effectiveMsg.position,
         chat_type: effectiveMsg.conversationKind === "dm" ? "p2p" : "group",
+        ...(authoritativeRead ? { authoritative_live: true } : {}),
         sender_type: "user",
         at_me: isAtMe,
         mentions: effectiveMsg.mentions,
@@ -2235,7 +2228,7 @@ export class PersonalWebBridge {
   }
 
   private fireFastTrigger(trigger: FastTrigger): void {
-    if (!this.cfg.context.personal_web.enabled || !this.cfg.context.personal_web.fast_lane || !this.cfg.context.understand) {
+    if (!this.isEffectivePersonalWebEnabled() || !this.cfg.context.personal_web.fast_lane || !this.cfg.context.understand) {
       return;
     }
     try {
@@ -2394,11 +2387,12 @@ export class PersonalWebBridge {
         }
       }
       if (!collected.size) return 0;
-      // 落库前重新核验会话代际与全部采集策略（含最后一次异步复核之后在写事务锁内的无 await 同步终检）
+      // 落库前重新核验磁盘隐私策略、会话代际与全部采集策略（含最后一次异步复核之后在写事务锁内的无 await 同步终检）
       const checkHydrateFinalSync = (): boolean => {
         if (signal?.aborted) return false;
+        if (!this.syncDiskPrivacyConfig({ throwOnError: false })) return false;
         if (!sessionStillValid()) return false;
-        if (!this.cfg.context.sources.im || !this.cfg.context.personal_web.enabled) return false;
+        if (!this.cfg.context.sources.im || !this.isEffectivePersonalWebEnabled()) return false;
         if (this.store.isConvMutedById(conv) || this.store.isConvMutedById(primary.conversationId)) return false;
         if (this.isDirectlyDenied(conv, chatName || convName, undefined, isDm ? "dm" : "group")) return false;
         if (!isDm && !this.isGroupInScope(primary.conversationId, conv, clientOwnerId)) return false;

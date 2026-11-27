@@ -9010,10 +9010,11 @@ test("Codex 第十二轮回归：无密钥壳工作区隔离判定、Codex 账�
     fs.mkdirSync(histObjDir, { recursive: true });
     fs.writeFileSync(path.join(histObjDir, histOid), histPayload);
     const histHawserPtr = `version https://hawser.github.com/spec/v1\noid sha256:${histOid}\nsize ${histPayload.length}\n`;
+    fs.writeFileSync(path.join(splitRepo, ".gitattributes"), "*.dat filter=lfs diff=lfs merge=lfs -text\n");
     fs.writeFileSync(path.join(splitRepo, "legacy.dat"), histHawserPtr);
-    await tryGit(splitRepo, ["add", "legacy.dat"]);
+    await tryGit(splitRepo, ["add", ".gitattributes", "legacy.dat"]);
     await tryGit(splitRepo, ["commit", "-m", "add legacy hawser lfs object"]);
-    await tryGit(splitRepo, ["rm", "legacy.dat"]);
+    await tryGit(splitRepo, ["rm", "legacy.dat", ".gitattributes"]);
     // 再加 >260 个小非 LFS 文件，跨过 256-blob 分块边界验证有界分块扫描仍能检出历史指针
     for (let k = 0; k < 270; k++) {
       fs.writeFileSync(path.join(splitRepo, `note_${k}.txt`), `small non-lfs file payload number ${k} padding to exceed eighty bytes easily 0123456789abcdef\n`);
@@ -10584,10 +10585,11 @@ test("Codex 第十四轮回归：宿主控制套接字隔离、共享 Git 元数
       const curBranch = (await runProcess("git", ["-C", bigRepo, "rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
       assert.equal(await branchUsesGitLfs(bigRepo, curBranch), false, "超过单批上限的纯文本仓库流式扫描应返回 false");
 
-      // 再提交一个有效 LFS 指针，流式扫描必须命中返回 true
+      // 再提交一个带 filter=lfs 属性的有效 LFS 指针，流式扫描必须命中返回 true
       const validPtr = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 42\n`;
+      fs.writeFileSync(path.join(bigRepo, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
       fs.writeFileSync(path.join(bigRepo, "model.bin"), validPtr);
-      assert.equal((await runProcess("git", ["-C", bigRepo, "add", "model.bin"], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", bigRepo, "add", ".gitattributes", "model.bin"], { env: gitEnv })).code, 0);
       assert.equal((await runProcess("git", ["-C", bigRepo, "commit", "-q", "-m", "add lfs ptr"], { env: gitEnv })).code, 0);
       assert.equal(await branchUsesGitLfs(bigRepo, curBranch), true, "跨批流式扫描必须准确检出新增的 LFS 指针");
     }
@@ -15829,11 +15831,13 @@ test("Codex 第十九轮回归：仓库工人默认隔离、可信沙箱引导�
         GIT_COMMITTER_EMAIL: "r19@test",
       };
       assert.equal((await runProcess("git", ["init", "-q", "-b", "main", lfsRepo], { env: gitEnv })).code, 0);
+      fs.writeFileSync(path.join(lfsRepo, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
       fs.writeFileSync(path.join(lfsRepo, "asset.bin"), gitMediaPtr);
       assert.equal((await runProcess("git", ["-C", lfsRepo, "add", "-A"], { env: gitEnv })).code, 0);
       assert.equal((await runProcess("git", ["-C", lfsRepo, "commit", "-q", "-m", "add git-media ptr"], { env: gitEnv })).code, 0);
-      // 下一个提交删除该文件且没有 .gitattributes，验证仅靠历史扫描仍能检出 git-media 指针
+      // 下一个提交同时删除该文件与 .gitattributes，验证仅靠历史提交属性与扫描仍能检出 git-media 指针
       fs.rmSync(path.join(lfsRepo, "asset.bin"));
+      fs.rmSync(path.join(lfsRepo, ".gitattributes"));
       assert.equal((await runProcess("git", ["-C", lfsRepo, "add", "-A"], { env: gitEnv })).code, 0);
       assert.equal((await runProcess("git", ["-C", lfsRepo, "commit", "-q", "-m", "rm asset"], { env: gitEnv })).code, 0);
       assert.equal(await branchUsesGitLfs(lfsRepo, "main"), true, "历史提交中的 git-media.io/v/2 指针必须被 LFS 扫描检出");
@@ -21130,7 +21134,7 @@ test("Codex 第二十六轮回归：拒绝 .lfsconfig lfs.storage、非 SSH 强�
         const curStat = fs.statSync(app.cfg.file);
         fs.writeFileSync(
           app.cfg.file,
-          `owner:\n  open_id: ou_r26_owner\ncontext:\n  groups: spoken\n  groups_allow: []\n  groups_deny:\n    - chat: pw_chat:555001\n  personal_web:\n    enabled: true\n    send_replies: true\n`,
+          `data_dir: ${JSON.stringify(app.cfg.dataDir)}\nharnesses:\n  cx:\n    type: codex-exec\n    cmd: /bin/true\nroles:\n  brain: cx\nowner:\n  open_id: ou_r26_owner\ncontext:\n  groups: spoken\n  groups_allow: []\n  groups_deny:\n    - chat: pw_chat:555001\n  personal_web:\n    enabled: true\n    send_replies: true\n`,
           "utf8",
         );
         const future = new Date(curStat.mtimeMs + 2000);
@@ -22463,24 +22467,33 @@ test("Codex 第二十七轮回归：磁盘隐私热重检、Git URL 通配与用
         assert.equal(w2?.state, "pending");
         assert.ok((w2?.payload.trigger_keys ?? []).some((k) => k.startsWith("pw:m_r27_aba#g2:")));
 
-        // #17: 后台 supervisor / onNeedsLogin 抛出瞬态 SQLite 错误时绝不得产生未捕获 Promise 拒绝
+        // #17: 后台 supervisor / onNeedsLogin 抛出瞬态 SQLite 错误时绝不得产生未捕获 Promise 拒绝（真实触发 onNeedsLogin 回调）
         const unhandled: unknown[] = [];
         const onUnhandled = (reason: unknown) => unhandled.push(reason);
         process.on("unhandledRejection", onUnhandled);
         try {
+          let needsLoginHookCalls = 0;
           const crashBridge = new PersonalWebBridge(app, ctxSvc.store, {
             onFastTrigger: () => undefined,
             onReconnect: () => undefined,
             onNeedsLogin: () => {
+              needsLoginHookCalls++;
               throw new Error("SQLITE_BUSY: database is locked");
             },
           });
-          // 清空登录态使 supervisor 立即进入 onNeedsLogin 分支并触发异常
-          crashBridge.loginStore.clear();
+          // 写入与当前绑定账号（777001）不匹配的登录态，令 runSupervisor 真实进入 notify=true 的 needs_login 分支并调用抛错的 onNeedsLogin
+          crashBridge.loginStore.save({
+            owner_id: "999888",
+            owner_name: "异号",
+            session_id: "sess_mismatch_r27",
+            updated_at: new Date().toISOString(),
+            cookies: [{ name: "session", value: "s_bad", domain: ".larkoffice.com", path: "/" }],
+          });
           const handle = crashBridge.start();
-          await new Promise((r) => setTimeout(r, 80));
+          await waitUntil(() => needsLoginHookCalls >= 1, 2_000);
           handle.stop();
           await new Promise((r) => setTimeout(r, 40));
+          assert.ok(needsLoginHookCalls >= 1, "必须真实执行了抛错的 onNeedsLogin 回调");
           assert.equal(unhandled.length, 0, `后台守护循环异常必须被隔离，不得泄漏 unhandledRejection: ${String(unhandled[0])}`);
         } finally {
           process.off("unhandledRejection", onUnhandled);
@@ -23004,6 +23017,691 @@ test("Codex 第二十七轮回归：磁盘隐私热重检、Git URL 通配与用
   } finally {
     if (prevPwKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
     else process.env.PA_FEISHU_WEB_KEY = prevPwKey;
+    for (const s of serversToClose) {
+      if ("closeAllConnections" in s && typeof s.closeAllConnections === "function") {
+        s.closeAllConnections();
+      }
+      await new Promise<void>((resolve) => s.close(() => resolve()));
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex 第二十八轮回归：完整配置校验与推断主人保留、轮询整周期锁主人、补读磁盘策略终检、全局 includeIf pushurl/lfspushurl 一致性、无版本墓碑防复活、bot_allow 恢复默认、personal_web.enabled 生命周期、同主机多路径凭据计划分离、凭据过期继续链、noexec 受信任 sh 执行、非 LFS 指针样本排除、非 UTF-8 路径流式 LFS 预检、保活 503 轮换 Cookie 恢复、委派主键查询与共享凭据保留区分", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-r28-"));
+  const serversToClose: (http.Server | net.Server)[] = [];
+  const prevPwKey = process.env.PA_FEISHU_WEB_KEY;
+  const prevCredEnv = process.env.PA_FEISHU_WEB_CRED_FILE;
+  process.env.PA_FEISHU_WEB_KEY = "r28-test-key";
+
+  const makeR28Config = (
+    dataDir: string,
+    opts?: {
+      ownerOpenId?: string;
+      pwEnabled?: boolean;
+      groupsDeny?: string[];
+      botAllow?: string[];
+      imEnabled?: boolean;
+      understand?: boolean;
+      tasksEnabled?: boolean;
+    },
+  ) => ({
+    data_dir: dataDir,
+    owner: { open_id: opts?.ownerOpenId ?? "ou_r28_owner" },
+    harnesses: { cx: { type: "codex-exec", cmd: "/bin/true" } },
+    roles: { brain: "cx" },
+    context: {
+      understand: opts?.understand ?? true,
+      groups: "spoken",
+      groups_deny: opts?.groupsDeny ?? [],
+      ...(opts?.botAllow !== undefined ? { bot_allow: opts.botAllow } : {}),
+      sources: {
+        im: opts?.imEnabled ?? true,
+        minutes: false,
+        docs: false,
+        meego: false,
+        tasks: opts?.tasksEnabled ?? false,
+        calendar: false,
+      },
+      personal_web: {
+        enabled: opts?.pwEnabled ?? true,
+        fast_lane: true,
+        pre_draft: false,
+        send_replies: false,
+      },
+    },
+  });
+
+  const makeR28App = (name: string, opts?: Parameters<typeof makeR28Config>[1]) => {
+    const dataDir = path.join(dir, name);
+    fs.mkdirSync(dataDir, { recursive: true });
+    const cfgFile = path.join(dataDir, "config.yaml");
+    const rawCfg = makeR28Config(dataDir, opts);
+    fs.writeFileSync(cfgFile, JSON.stringify(rawCfg, null, 2), "utf8");
+    const app = createApp(loadConfig(cfgFile));
+    return { app, cfgFile, rawCfg, dataDir };
+  };
+
+  const runHostGit = async (cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env) => {
+    const r = await runProcess("git", ["-C", cwd, ...args], { env, timeoutMs: 20_000 });
+    assert.equal(r.code, 0, `git ${args.join(" ")} 失败: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+
+  try {
+    // 1) [R28 #1 P1 + #2 P1 + #7 P2 + #8 P2] 完整 ConfigSchema 校验、pa init 推断主人保留、bot_allow 恢复默认与 personal_web.enabled 生命周期一致性
+    {
+      const { app, cfgFile, dataDir } = makeR28App("r28-cfg-reload", {
+        ownerOpenId: "",
+        pwEnabled: false,
+        groupsDeny: ["机密群"],
+        botAllow: [".*"],
+        imEnabled: false,
+        understand: false,
+      });
+      try {
+        // 模拟 pa init 把推断出的 owner.open_id 存入 SQLite（磁盘 config.yaml 中 owner.open_id 为空）
+        app.store.set("owner.open_id", "ou_inferred_by_init");
+        app.cfg.owner.open_id = "ou_inferred_by_init";
+        const ctxSvc = new ContextService(app);
+
+        // #1: 截断为空文件或写为 {} 都必须按完整 ConfigSchema 拒绝，绝不把 understand/im 恢复为默认 true 或清空 groups_deny
+        for (const badContent of ["", "{}\n"]) {
+          fs.writeFileSync(cfgFile, badContent, "utf8");
+          assert.equal(ctxSvc.personalWeb.syncDiskPrivacyConfig({ throwOnError: false }), false, `非法残缺配置 ${JSON.stringify(badContent)} 必须被拒绝`);
+          assert.equal(ctxSvc.personalWeb.hasDiskPolicyError(), true);
+          assert.deepEqual(app.cfg.context.groups_deny, ["机密群"], "残缺配置不得清空既有 groups_deny");
+          assert.equal(app.cfg.context.sources.im, false, "残缺配置不得重新开启 sources.im");
+          assert.equal(app.cfg.context.understand, false, "残缺配置不得重新开启 understand");
+        }
+
+        // #2 + #7 + #8: 无关编辑磁盘配置（留空 owner.open_id、移除 bot_allow、把 personal_web.enabled 改为 true）
+        const nextValid = makeR28Config(dataDir, {
+          ownerOpenId: "",
+          pwEnabled: true,
+          groupsDeny: ["机密群"],
+          imEnabled: true,
+          understand: true,
+        });
+        fs.writeFileSync(cfgFile, JSON.stringify(nextValid, null, 2), "utf8");
+        assert.equal(ctxSvc.personalWeb.syncDiskPrivacyConfig({ throwOnError: false }), true);
+        assert.equal(app.cfg.owner.open_id, "ou_inferred_by_init", "磁盘 owner.open_id 留空时必须保留 pa init 推断的 SQLite owner.open_id");
+        assert.ok(!app.cfg.context.bot_allow.includes(".*"), "移除磁盘 context.bot_allow 后必须恢复 Schema 默认列表，不再残留 .*");
+        assert.ok(app.cfg.context.bot_allow.includes("Meego"), "恢复后的默认 bot_allow 应包含默认机器人");
+        // 启动时 personal_web.enabled=false，热修改磁盘为 true 不得在未启监听时虚报已启用
+        assert.equal(ctxSvc.personalWeb.isEffectivePersonalWebEnabled(), false);
+        assert.equal(ctxSvc.personalWeb.status().enabled, false, "启动时关闭的进程未重启前 status().enabled 必须保持 false");
+      } finally {
+        app.store.db.close();
+      }
+
+      // 反向验证 #8：启动时 personal_web.enabled=true，运行中外部磁盘改为 false 必须立即否决并停掉监听
+      const { app: appOn, cfgFile: cfgOn, dataDir: dirOn } = makeR28App("r28-pw-veto", { pwEnabled: true });
+      try {
+        const ctxOn = new ContextService(appOn);
+        saveWorkspaceBinding(appOn.store, "778001", "ou_r28_owner");
+        assert.equal(ctxOn.personalWeb.isEffectivePersonalWebEnabled(), true);
+        fs.writeFileSync(cfgOn, JSON.stringify(makeR28Config(dirOn, { pwEnabled: false }), null, 2), "utf8");
+        assert.equal(ctxOn.personalWeb.syncDiskPrivacyConfig({ throwOnError: false }), true);
+        assert.equal(ctxOn.personalWeb.isEffectivePersonalWebEnabled(), false, "磁盘关闭 personal_web.enabled 必须立即生效否决");
+        assert.equal(ctxOn.personalWeb.status().enabled, false);
+      } finally {
+        appOn.store.db.close();
+      }
+    }
+
+    // 2) [R28 #3 P1] 整轮 cycle / pullAll / pullTasks 锁定初始主人：拉取途中磁盘配置与 CLI 账号同时从 A 切到 B 必须拒绝提交
+    {
+      const { app, cfgFile, dataDir } = makeR28App("r28-owner-pin", {
+        ownerOpenId: "ou_owner_A",
+        tasksEnabled: true,
+        imEnabled: false,
+        understand: false,
+      });
+      try {
+        const ctxSvc = new ContextService(app);
+        // 预先为 A 存一条待办任务
+        const pSys = ctxSvc.store.upsertProject({ id: "sys_tasks", name: "飞书任务" }, Date.now());
+        ctxSvc.store.upsertItem(
+          {
+            strong_key: "task:task_of_A",
+            title: "A 的原有任务",
+            kind: "todo",
+            source: "task",
+            project_id: pSys.id,
+            priority: "medium",
+            confidence: 1,
+            status: "open",
+            meta: {},
+          },
+          Date.now(),
+        );
+        let activeCliUser = "ou_owner_A";
+        const fakeLark = app.lark as unknown as {
+          authStatus: () => Promise<unknown>;
+          run: (argv: string[]) => Promise<unknown>;
+        };
+        fakeLark.authStatus = async () => ({ identity: "user", user: { open_id: activeCliUser, name: activeCliUser } });
+        fakeLark.run = async (argv: string[]) => {
+          if (argv[0] === "task" && argv[1] === "+get-my-tasks") {
+            // 模拟拉取任务中途，外部把磁盘 config.yaml 的 owner.open_id 和活跃 CLI 账号同时切到 B！
+            activeCliUser = "ou_owner_B";
+            fs.writeFileSync(
+              cfgFile,
+              JSON.stringify(makeR28Config(dataDir, { ownerOpenId: "ou_owner_B", tasksEnabled: true, imEnabled: false, understand: false }), null, 2),
+              "utf8",
+            );
+            return { items: [{ guid: "task_of_B", summary: "B 的私密任务", created_at: String(Date.now()) }] };
+          }
+          return {};
+        };
+        const rep = await ctxSvc.cycle("w_r28_pin");
+        const taskRep = rep.sources.find((s) => s.source === "tasks");
+        assert.ok(taskRep?.error && /owner\.open_id|发生变化/.test(taskRep.error), `中途切换主人后 pullTasks 必须报错中止（实际=${taskRep?.error}）`);
+        assert.equal(ctxSvc.store.obs("task:task_of_B"), undefined, "B 的任务绝不得写入 A 的数据库");
+        const itemA = ctxSvc.store.items({ status: ["open"], source: "task" }).find((i) => i.strong_key === "task:task_of_A");
+        assert.ok(itemA, "A 的原有任务绝不得被错误标为已完成");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 3) [R28 #4 P1] readContext 飞行途中 config.yaml 损坏不可读 -> hydrateContext 必须拒存私密历史
+    {
+      const { app, cfgFile } = makeR28App("r28-hydrate-disk", { pwEnabled: true });
+      const mock = await startMockFeishuWebServer();
+      try {
+        const ctxSvc = new ContextService(app);
+        saveWorkspaceBinding(app.store, "7001", "ou_r28_owner");
+        const login = {
+          owner_id: "7001",
+          owner_name: "张三",
+          session_id: "sess_r28_hyd",
+          updated_at: new Date().toISOString(),
+          cookies: [
+            { name: "session", value: "sess_live_1", domain: "127.0.0.1", path: "/" },
+            { name: "passport_web_did", value: "did_test_123", domain: "127.0.0.1", path: "/" },
+          ],
+        };
+        ctxSvc.personalWeb.loginStore.save(login);
+        app.store.set(ACTIVE_SESSION_KV_KEY, "sess_r28_hyd");
+        const client = await FeishuWebClient.connect(login, { endpoints: mock.endpoints });
+        (ctxSvc.personalWeb as unknown as { client?: FeishuWebClient }).client = client;
+
+        const histMsg = new ProtoWriter()
+          .str(1, "hist_r28_1")
+          .uint(2, MSG_TEXT)
+          .str(3, "dm_99")
+          .bytes(4, new ProtoWriter().bytes(3, encodeRichText([{ text: "敏感历史消息" }])).finish())
+          .str(8, "8002")
+          .uint(12, USER_SENDER_TYPE)
+          .uint(13, 1)
+          .finish();
+        mock.setHistory("dm_99", { 1: histMsg });
+        mock.setOnHistory(() => {
+          // readContext 飞行途中把磁盘 config.yaml 截断损坏
+          fs.writeFileSync(cfgFile, "", "utf8");
+        });
+        const added = await ctxSvc.personalWeb.hydrateContext(
+          [{ id: "trig_1", conversationId: "dm_99", rootId: "", parentId: "", threadId: "", position: 2, createdAtMs: Date.now() }],
+          "pw_chat:dm_99",
+          "私聊：测试",
+        );
+        assert.equal(added, 0, "readContext 期间磁盘配置损坏时 hydrateContext 必须拒存历史消息");
+        assert.equal(ctxSvc.store.obs("pw:hist_r28_1"), undefined, "损坏配置期间绝不得落盘背景观测");
+      } finally {
+        await mock.close();
+        app.store.db.close();
+      }
+    }
+
+    // 4) [R28 #6 P2] 仅含 poll_observed_at 的 CLI 撤回墓碑绝不得被后续无服务端修订号的旧搜索副本复活
+    {
+      const { app } = makeR28App("r28-tombstone");
+      try {
+        const store = new ContextStore(app.store.db);
+        const t0 = Date.now() - 10_000;
+        // 写入一条仅带本地 poll_observed_at 的 CLI 撤回墓碑
+        assert.equal(
+          store.retirePendingObs("im:om_r28_tomb", {
+            pollObservedAt: t0,
+            conv: "oc_r28",
+            source: "im",
+            kind: "group",
+            time: t0 - 5000,
+          }),
+          true,
+        );
+        // 后续重叠搜索返回无 edit_version/edit_time、仅带更新 poll_observed_at 的旧正文 -> 绝不得复活
+        store.addObs([
+          {
+            id: "im:om_r28_tomb",
+            source: "im",
+            kind: "group",
+            conv: "oc_r28",
+            conv_name: "测试群",
+            actor_id: "ou_a",
+            actor_name: "Alice",
+            is_me: false,
+            time: t0 - 5000,
+            text: "已撤回的旧正文",
+            url: "",
+            meta: { poll_observed_at: t0 + 5_000 },
+          },
+        ]);
+        const afterStale = store.obs("im:om_r28_tomb");
+        assert.equal(afterStale?.meta.withdrawn, true, "无修订号旧搜索副本绝不得仅凭更新的 poll_observed_at 复活 CLI 墓碑");
+        assert.equal(store.obsPending("im:om_r28_tomb"), false);
+
+        // 仅当权威回读确认存活（authoritative_live=true）时才允许复活
+        store.addObs([
+          {
+            id: "im:om_r28_tomb",
+            source: "im",
+            kind: "group",
+            conv: "oc_r28",
+            conv_name: "测试群",
+            actor_id: "ou_a",
+            actor_name: "Alice",
+            is_me: false,
+            time: t0 - 5000,
+            text: "权威回读确认存活的正文",
+            url: "",
+            meta: { poll_observed_at: t0 + 6_000, authoritative_live: true },
+          },
+        ]);
+        const afterAuth = store.obs("im:om_r28_tomb");
+        assert.equal(afterAuth?.meta.withdrawn, undefined, "权威回读确认存活后应允许复活");
+        assert.equal(afterAuth?.text, "权威回读确认存活的正文");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 5) [R28 #15 P2] keepalive 遭遇 HTTP 503 但已收到 Set-Cookie 轮换 -> 必须在同内存 jar 重试核验并持久化新 Cookie
+    {
+      const mock = await startMockFeishuWebServer();
+      try {
+        const persistedSessions: string[] = [];
+        const login = {
+          owner_id: "7001",
+          owner_name: "张三",
+          session_id: "sess_ka_r28",
+          cookies: [
+            { name: "session", value: "sess_live_1", domain: "127.0.0.1", path: "/" },
+            { name: "passport_web_did", value: "did_test_123", domain: "127.0.0.1", path: "/" },
+          ],
+        };
+        const client = await FeishuWebClient.connect(login, {
+          endpoints: mock.endpoints,
+          keepaliveIntervalMs: 35,
+          heartbeatIntervalMs: 5_000,
+          socketIdleTimeoutMs: 5_000,
+          reconnectBaseMs: 15,
+          onSessionConfirmed: (l) => {
+            const s = l.cookies.find((c) => c.name === "session")?.value ?? "";
+            if (s) persistedSessions.push(s);
+          },
+        });
+        persistedSessions.length = 0;
+        // 下一次 profile 返回 503 并伴随 Set-Cookie 轮换（mock 对 503 也下发 Set-Cookie），随后的重试返回 200
+        mock.setProfileStatuses([503, 200]);
+        // 触发一个不同于当前 sess_rotated_2 的轮换值
+        mock.setGatewayRotateCookie("sess_ka_rotated_503");
+        const ctrl = new AbortController();
+        const runP = client.listen({
+          signal: ctrl.signal,
+          onMessage: async () => undefined,
+          onState: () => undefined,
+        });
+        await waitUntil(() => persistedSessions.length >= 1, 2_000);
+        ctrl.abort();
+        await runP.catch(() => undefined);
+        assert.ok(persistedSessions.length >= 1, "keepalive 503 后的重试核验必须触发 onSessionConfirmed 落盘轮换 Cookie");
+      } finally {
+        await mock.close();
+      }
+    }
+
+    // 6) [R28 #16 P2 + #17 P2] HealthOwnerBatch 主键查询阻塞旧委派 + revokeWorkspacePersonalWebSession 区分保留的共享文件与缺失文件
+    {
+      const { app } = makeR28App("r28-q-cli", { ownerOpenId: "ou_owner_A" });
+      try {
+        const ctxStore = new ContextStore(app.store.db);
+        saveWorkspaceBinding(app.store, "778002", "ou_owner_A");
+        const p = ctxStore.upsertProject({ id: "p_del", name: "旧委派项目" }, Date.now());
+        ctxStore.upsertItem(
+          {
+            strong_key: "del:1",
+            title: "旧委派事项",
+            kind: "todo",
+            source: "im",
+            project_id: p.id,
+            priority: "high",
+            confidence: 1,
+            status: "open",
+            meta: { delegated: "dispatch:g_legacy_del:1" },
+          },
+          Date.now(),
+        );
+        app.ledger.enqueue({
+          id: "dispatch:g_legacy_del:1",
+          kind: "dispatch",
+          ref: "g_legacy_del",
+          payload: {
+            guid: "g_legacy_del",
+            summary: "旧委派派单",
+            description: "",
+            cwd: dir,
+            harness: "cx",
+            round: 1,
+            checkpoints: {},
+          },
+        });
+        // 切换工作区主人到 B，验证 dispatches / overview 均通过主键查询正确屏蔽旧委派派单及同 ref
+        app.cfg.owner.open_id = "ou_owner_B";
+        const ds = Q.listDispatches(app, { limit: 50 });
+        assert.equal(ds.some((d) => d.id === "dispatch:g_legacy_del:1"), false, "切换主人后旧委派派单必须被屏蔽");
+        const ov = Q.overview(app);
+        assert.equal(ov.running.some((d) => d.id === "dispatch:g_legacy_del:1"), false);
+
+        // #17: 外部共享凭据文件归属其他工作区时，revokeWorkspacePersonalWebSession 返回 fileRemoved=false 且 fileRetained=true
+        const sharedCred = path.join(dir, "shared-other-ws.json");
+        process.env.PA_FEISHU_WEB_CRED_FILE = sharedCred;
+        const otherStore = new WebLoginStore(path.join(dir, "other-ws-data"));
+        otherStore.save({
+          owner_id: "999001",
+          owner_name: "另一工作区",
+          session_id: "sess_other_ws_only",
+          updated_at: new Date().toISOString(),
+          cookies: [{ name: "session", value: "other_tok", domain: ".larkoffice.com", path: "/" }],
+        });
+        const revRetained = revokeWorkspacePersonalWebSession(app);
+        assert.equal(revRetained.fileRemoved, false, "归属其他工作区的共享凭据文件绝不得删除");
+        assert.equal(revRetained.fileRetained, true, "未删除但磁盘仍存在的共享凭据文件必须标为 fileRetained=true");
+        assert.equal(fs.existsSync(sharedCred), true);
+
+        const missingCred = path.join(dir, "does-not-exist.json");
+        process.env.PA_FEISHU_WEB_CRED_FILE = missingCred;
+        const revMissing = revokeWorkspacePersonalWebSession(app);
+        assert.equal(revMissing.fileRemoved, false);
+        assert.equal(revMissing.fileRetained, false, "文件本就不存在时 fileRetained 必须为 false");
+      } finally {
+        if (prevCredEnv === undefined) delete process.env.PA_FEISHU_WEB_CRED_FILE;
+        else process.env.PA_FEISHU_WEB_CRED_FILE = prevCredEnv;
+        app.store.db.close();
+      }
+    }
+
+    // 7) [R28 #5 P1 + #9 P2 + #10 P2 + #11 P2] 全局 includeIf pushurl 一致性、同主机多路径凭据计划分离、过期凭据继续链与 0600 noexec sh 执行
+    {
+      const { app: appGit } = makeR28App("r28-git");
+      try {
+        // #5: 全局 includeIf 为 origin 配置 pushurl（指向 pushBare），而 .git/config 的 origin.url 指向 fetchBare；
+        //     同时全局配置还含另一个无关远端 secret-other -> 必须推到 pushBare 且不泄露 secret-other
+        {
+          const fetchBare = path.join(dir, "r28-5-fetch.git");
+          const pushBare = path.join(dir, "r28-5-push.git");
+          const repo5 = path.join(dir, "r28-5-repo");
+          const home5 = path.join(dir, "r28-5-home");
+          fs.mkdirSync(fetchBare, { recursive: true });
+          fs.mkdirSync(pushBare, { recursive: true });
+          fs.mkdirSync(repo5, { recursive: true });
+          fs.mkdirSync(home5, { recursive: true });
+          const incFile = path.join(home5, "inc-push.gitconfig");
+          fs.writeFileSync(
+            incFile,
+            `[remote "origin"]\n\tpushurl = ${pushBare}\n[remote "secret-other"]\n\turl = https://tok:secret@evil.example/priv.git\n`,
+            "utf8",
+          );
+          fs.writeFileSync(
+            path.join(home5, ".gitconfig"),
+            `[includeIf "gitdir:${repo5}/"]\n\tpath = ${incFile}\n`,
+            "utf8",
+          );
+          const env5: NodeJS.ProcessEnv = { ...process.env, HOME: home5, XDG_CONFIG_HOME: path.join(home5, ".config") };
+          delete env5.GIT_CONFIG_GLOBAL;
+          await runHostGit(fetchBare, ["init", "--bare", "-q"], env5);
+          await runHostGit(pushBare, ["init", "--bare", "-q"], env5);
+          await runHostGit(repo5, ["init", "-q", "-b", "main"], env5);
+          await runHostGit(repo5, ["config", "user.name", "T"], env5);
+          await runHostGit(repo5, ["config", "user.email", "t@t"], env5);
+          await runHostGit(repo5, ["remote", "add", "origin", fetchBare], env5);
+          fs.writeFileSync(path.join(repo5, "a.txt"), "hello\n");
+          await runHostGit(repo5, ["add", "."], env5);
+          await runHostGit(repo5, ["commit", "-q", "-m", "init"], env5);
+
+          // 校验 stageSanitizedGitConfig 仅保留 origin 而不泄露 secret-other
+          const staged5 = stageSanitizedGitConfig(env5, appGit.cfg.dataDir, {
+            cwd: repo5,
+            allowedRemoteUrls: [pushBare],
+            allowedRemoteNames: ["origin"],
+          });
+          try {
+            assert.ok(staged5, "应生成脱敏全局 Git 配置");
+            const cfgText = fs.readFileSync(staged5!.file, "utf8");
+            assert.ok(cfgText.includes(pushBare), "脱敏配置必须保留选中远端 origin 的 includeIf pushurl");
+            assert.ok(!cfgText.includes("secret-other") && !cfgText.includes("tok:secret"), "脱敏配置绝不得暴露无关远端 secret-other");
+          } finally {
+            staged5?.cleanup();
+          }
+
+          const pushRes = await pushBranch(repo5, "origin", "main", {
+            cfg: appGit.cfg,
+            trustedRepoRoot: repo5,
+            extraEnv: { HOME: home5, XDG_CONFIG_HOME: path.join(home5, ".config") },
+          });
+          assert.equal(pushRes.ok, true, `pushBranch 应成功推送至 includeIf pushurl：${pushRes.ok ? "" : pushRes.message}`);
+          assert.equal((await tryGit(pushBare, ["rev-parse", "--verify", "refs/heads/main"])).code, 0, "分支必须推送到了 includeIf 指定的 pushBare");
+          assert.notEqual((await tryGit(fetchBare, ["rev-parse", "--verify", "refs/heads/main"])).code, 0, "分支绝不得错推到仅作 fetch 的 fetchBare");
+        }
+
+        // #9 + #10 + #11: 同主机多路径凭据计划分离（useHttpPath=false）、已过期 password_expiry_utc 继续链、与 0600 非可执行脚本运行
+        {
+          let mainSha9 = "";
+          const authByPath = new Map<string, string[]>();
+          const srv = http.createServer((req, res) => {
+            req.resume();
+            const p = (req.url ?? "").split("?")[0];
+            const auth = req.headers.authorization ?? "";
+            if (auth) {
+              const list = authByPath.get(p) ?? [];
+              list.push(auth);
+              authByPath.set(p, list);
+              if (p.startsWith("/org/") && mainSha9) {
+                // 返回智能 HTTP 广告表明 refs/heads/main 已最新，令 git push 顺利完成 pushurl A 并继续推送 pushurl B
+                const refLine = `${mainSha9} refs/heads/main\0report-status\n`;
+                const refPkt = `${(refLine.length + 4).toString(16).padStart(4, "0")}${refLine}`;
+                res.statusCode = 200;
+                res.setHeader("Content-Type", "application/x-git-receive-pack-advertisement");
+                res.setHeader("Connection", "close");
+                res.end(`001f# service=git-receive-pack\n0000${refPkt}0000`);
+                return;
+              }
+              res.statusCode = 404;
+              res.setHeader("Connection", "close");
+              res.end("not found");
+              return;
+            }
+            res.statusCode = 401;
+            res.setHeader("WWW-Authenticate", 'Basic realm="r28"');
+            res.setHeader("Connection", "close");
+            res.end("auth required");
+          });
+          await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
+          serversToClose.push(srv);
+          const port = (srv.address() as net.AddressInfo).port;
+          const base = `http://127.0.0.1:${port}`;
+
+          // #9: 同主机两条 pushurl（/org/a.git 与 /org/b.git），useHttpPath=false，各配置 path-scoped helper
+          const h9 = path.join(dir, "r28-9-home");
+          fs.mkdirSync(h9, { recursive: true });
+          const ha = path.join(h9, "ha.sh");
+          const hb = path.join(h9, "hb.sh");
+          fs.writeFileSync(ha, `#!/bin/sh\ncat >/dev/null\nprintf "username=userA\\npassword=passA\\n"\n`, { mode: 0o755 });
+          fs.writeFileSync(hb, `#!/bin/sh\ncat >/dev/null\nprintf "username=userB\\npassword=passB\\n"\n`, { mode: 0o755 });
+          fs.writeFileSync(
+            path.join(h9, ".gitconfig"),
+            [
+              `[credential]`,
+              `\tuseHttpPath = false`,
+              `[credential "${base}/org/a.git"]`,
+              `\thelper = !${ha}`,
+              `[credential "${base}/org/b.git"]`,
+              `\thelper = !${hb}`,
+              "",
+            ].join("\n"),
+            "utf8",
+          );
+          const repo9 = path.join(dir, "r28-9-repo");
+          fs.mkdirSync(repo9, { recursive: true });
+          await runHostGit(repo9, ["init", "-q", "-b", "main"]);
+          await runHostGit(repo9, ["config", "user.name", "T"]);
+          await runHostGit(repo9, ["config", "user.email", "t@t"]);
+          fs.writeFileSync(path.join(repo9, "x.txt"), "x\n");
+          await runHostGit(repo9, ["add", "."]);
+          await runHostGit(repo9, ["commit", "-q", "-m", "x"]);
+          mainSha9 = await runHostGit(repo9, ["rev-parse", "HEAD"]);
+          await runHostGit(repo9, ["remote", "add", "origin", `${base}/org/a.git`]);
+          await runHostGit(repo9, ["remote", "set-url", "--push", "--add", "origin", `${base}/org/a.git`]);
+          await runHostGit(repo9, ["remote", "set-url", "--push", "--add", "origin", `${base}/org/b.git`]);
+          authByPath.clear();
+          await tryGit(repo9, ["push", "origin", "main"], {
+            cfg: appGit.cfg,
+            trustedRepoRoot: repo9,
+            extraEnv: { HOME: h9, XDG_CONFIG_HOME: path.join(h9, ".config") },
+          });
+          const authA = authByPath.get("/org/a.git/info/refs") ?? [];
+          const authB = authByPath.get("/org/b.git/info/refs") ?? [];
+          assert.ok(authA.includes(`Basic ${Buffer.from("userA:passA").toString("base64")}`), "pushurl A 必须使用 userA:passA");
+          assert.ok(authB.includes(`Basic ${Buffer.from("userB:passB").toString("base64")}`), "pushurl B 必须使用 userB:passB 而非被折叠成 A 的凭据");
+
+          // #10: 第一个 helper 返回已过期 password_expiry_utc -> 丢弃过期密码并继续调用第二个 helper 拿到新鲜密码
+          const h10 = path.join(dir, "r28-10-home");
+          fs.mkdirSync(h10, { recursive: true });
+          const hExp = path.join(h10, "expired.sh");
+          const hFresh = path.join(h10, "fresh.sh");
+          fs.writeFileSync(
+            hExp,
+            `#!/bin/sh\ncat >/dev/null\nprintf "username=expu\\npassword=stale_pass\\npassword_expiry_utc=1000\\n"\n`,
+            { mode: 0o755 },
+          );
+          fs.writeFileSync(
+            hFresh,
+            `#!/bin/sh\ncat >/dev/null\nprintf "username=expu\\npassword=fresh_pass\\npassword_expiry_utc=4102444800\\n"\n`,
+            { mode: 0o755 },
+          );
+          fs.writeFileSync(
+            path.join(h10, ".gitconfig"),
+            `[credential]\n\thelper = !${hExp}\n\thelper = !${hFresh}\n`,
+            "utf8",
+          );
+          const repo10 = path.join(dir, "r28-10-repo");
+          fs.mkdirSync(repo10, { recursive: true });
+          await runHostGit(repo10, ["init", "-q"]);
+          authByPath.clear();
+          await tryGit(repo10, ["ls-remote", `${base}/exp/repo.git`], {
+            cfg: appGit.cfg,
+            trustedRepoRoot: repo10,
+            extraEnv: { HOME: h10, XDG_CONFIG_HOME: path.join(h10, ".config") },
+          });
+          const expAuths = authByPath.get("/exp/repo.git/info/refs") ?? [];
+          assert.ok(expAuths.includes(`Basic ${Buffer.from("expu:fresh_pass").toString("base64")}`), "过期凭据必须被丢弃并由后续 helper 补齐新鲜密码");
+          assert.ok(!expAuths.includes(`Basic ${Buffer.from("expu:stale_pass").toString("base64")}`), "绝不得向远端发送已过期密码");
+
+          // #11: writeScopedStaticCredentialHelper 生成的脚本为 0600（无执行位），经受信任 sh 解释执行兼容 noexec 挂载
+          const noexecDir = path.join(dir, "r28-11-noexec");
+          fs.mkdirSync(noexecDir, { recursive: true, mode: 0o700 });
+          const cmd11 = writeScopedStaticCredentialHelper(
+            noexecDir,
+            0,
+            { protocol: "https", hostname: "noexec.example", port: "", useHttpPath: false, rejectNonEmptyUser: true },
+            ["quit=1"],
+          );
+          const scriptPath11 = path.join(noexecDir, "helper-resp-0.sh");
+          assert.equal(fs.statSync(scriptPath11).mode & 0o111, 0, "暂存响应脚本不得依赖可执行位（兼容 noexec tmpfs）");
+          assert.ok(cmd11.startsWith("!'/") && cmd11.includes("sh' '"), `应通过受信任 shell 解释器调用脚本（实际=${cmd11}）`);
+          const res11 = await runProcess("/bin/sh", ["-c", `${cmd11.slice(1)} get`], {
+            input: "protocol=https\nhost=noexec.example\n\n",
+          });
+          assert.equal(res11.code, 0);
+          assert.equal(res11.stdout, "quit=1\n");
+        }
+      } finally {
+        appGit.store.db.close();
+      }
+    }
+
+    // 8) [R28 #12 P2 + #13 P2 + #14 P2 + #18 P3] 普通指针样本不误触发 LFS 上传、流式非 UTF-8 路径 LFS 预检与 safe.directory 保留
+    {
+      const { app: appLfs } = makeR28App("r28-lfs");
+      try {
+        // #13: 普通 Git 仓库包含合法 LFS 指针格式的测试样本（无 filter=lfs 属性）-> branchUsesGitLfs 必须为 false 且 pushBranch 成功
+        const bare13 = path.join(dir, "r28-13-bare.git");
+        const repo13 = path.join(dir, "r28-13-repo");
+        fs.mkdirSync(bare13, { recursive: true });
+        fs.mkdirSync(repo13, { recursive: true });
+        await runHostGit(bare13, ["init", "--bare", "-q"]);
+        await runHostGit(repo13, ["init", "-q", "-b", "main"]);
+        await runHostGit(repo13, ["config", "user.name", "T"]);
+        await runHostGit(repo13, ["config", "user.email", "t@t"]);
+        await runHostGit(repo13, ["remote", "add", "origin", bare13]);
+        await runHostGit(repo13, ["config", "lfs.url", "http://127.0.0.1:1/must-not-upload"]);
+        const fixturePtr = `version https://git-lfs.github.com/spec/v1\noid sha256:${"e".repeat(64)}\nsize 512\n`;
+        fs.mkdirSync(path.join(repo13, "fixtures"), { recursive: true });
+        fs.writeFileSync(path.join(repo13, "fixtures", "sample.pointer"), fixturePtr);
+        await runHostGit(repo13, ["add", "."]);
+        await runHostGit(repo13, ["commit", "-q", "-m", "add plain pointer fixture"]);
+        assert.equal(
+          await branchUsesGitLfs(repo13, "main", undefined, undefined, { cfg: appLfs.cfg, trustedRepoRoot: repo13 }),
+          false,
+          "未受 filter=lfs 管理的普通指针测试样本绝不得被误判为 LFS 对象",
+        );
+        const push13 = await pushBranch(repo13, "origin", "main", { cfg: appLfs.cfg, trustedRepoRoot: repo13 });
+        assert.equal(push13.ok, true, `普通指针测试样本不应阻断正常推送：${push13.ok ? "" : push13.message}`);
+
+        // #14 + #18: 非 UTF-8 字节目录名中的 .gitattributes 标为 filter=lfs -> ensureGitLfsObjectsForCheckout 流式原始字节预检必须识别并预拉取
+        if (resolveTrustedSystemBin("git-lfs")) {
+          const lfsHome18 = path.join(dir, "r28-18-home");
+          fs.mkdirSync(lfsHome18, { recursive: true });
+          const lfsEnv18: NodeJS.ProcessEnv = { ...process.env, HOME: lfsHome18, XDG_CONFIG_HOME: path.join(lfsHome18, ".config") };
+          delete lfsEnv18.GIT_CONFIG_GLOBAL;
+          await runProcess("git", ["lfs", "install", "--skip-repo"], { env: lfsEnv18, timeoutMs: 15_000 });
+          const bare18 = path.join(dir, "r28-18-bare.git");
+          const repo18 = path.join(dir, "r28-18-repo");
+          fs.mkdirSync(bare18, { recursive: true });
+          fs.mkdirSync(repo18, { recursive: true });
+          await runHostGit(bare18, ["init", "--bare", "-q"], lfsEnv18);
+          await runHostGit(repo18, ["init", "-q", "-b", "main"], lfsEnv18);
+          await runHostGit(repo18, ["config", "user.name", "T"], lfsEnv18);
+          await runHostGit(repo18, ["config", "user.email", "t@t"], lfsEnv18);
+          await runHostGit(repo18, ["remote", "add", "origin", bare18], lfsEnv18);
+          const nonUtf8Dir = Buffer.concat([Buffer.from(`${repo18}/dir_`), Buffer.from([0xff, 0xfe])]);
+          fs.mkdirSync(nonUtf8Dir, { recursive: true });
+          fs.writeFileSync(Buffer.concat([nonUtf8Dir, Buffer.from("/.gitattributes")]), "*.raw filter=lfs diff=lfs merge=lfs -text\n");
+          fs.writeFileSync(Buffer.concat([nonUtf8Dir, Buffer.from("/data.raw")]), "r28-18-non-utf8-dir-lfs-payload");
+          await runHostGit(repo18, ["add", "-A"], lfsEnv18);
+          await runHostGit(repo18, ["commit", "-q", "-m", "non-utf8 dir lfs"], lfsEnv18);
+          await runHostGit(repo18, ["push", "-q", "-u", "origin", "main"], lfsEnv18);
+          fs.rmSync(path.join(repo18, ".git", "lfs", "objects"), { recursive: true, force: true });
+
+          const res18 = await ensureGitLfsObjectsForCheckout(repo18, "HEAD", {
+            cfg: appLfs.cfg,
+            trustedRepoRoot: repo18,
+            extraEnv: { HOME: lfsHome18, XDG_CONFIG_HOME: path.join(lfsHome18, ".config") },
+          });
+          assert.equal(res18.missingCount, 1, "非 UTF-8 目录名下的 LFS 文件必须按原始字节通过 check-attr 识别");
+          assert.equal(res18.fetched, true, "流式预检必须成功拉取非 UTF-8 路径下的缺失 LFS 对象");
+        }
+      } finally {
+        appLfs.store.db.close();
+      }
+    }
+  } finally {
+    if (prevPwKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevPwKey;
+    if (prevCredEnv === undefined) delete process.env.PA_FEISHU_WEB_CRED_FILE;
+    else process.env.PA_FEISHU_WEB_CRED_FILE = prevCredEnv;
     for (const s of serversToClose) {
       if ("closeAllConnections" in s && typeof s.closeAllConnections === "function") {
         s.closeAllConnections();

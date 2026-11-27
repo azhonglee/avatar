@@ -822,15 +822,18 @@ class HealthOwnerBatch {
             if (typeof r.d === "string" && r.d) this.legacyDelegatedIds.add(r.d);
           }
           if (this.legacyDelegatedIds.size > 0) {
-            const refRows = app.store.db
-              .prepare(
-                `SELECT DISTINCT w.ref AS ref FROM work w
-                 WHERE w.kind = 'dispatch'
-                   AND EXISTS (SELECT 1 FROM ctx_item ci WHERE json_extract(ci.meta, '$.delegated') = w.id)`,
-              )
-              .all() as { ref: string }[];
-            for (const r of refRows) {
-              if (r.ref) this.legacyDelegatedDispatchRefs.add(r.ref);
+            // 直接按上面已收集的委派 work 主键分块查询，避免对每条 dispatch 扫描整张无索引 ctx_item 表
+            const delIds = [...this.legacyDelegatedIds];
+            const CHUNK = 500;
+            for (let i = 0; i < delIds.length; i += CHUNK) {
+              const slice = delIds.slice(i, i + CHUNK);
+              const placeholders = slice.map(() => "?").join(",");
+              const refRows = app.store.db
+                .prepare(`SELECT DISTINCT ref FROM work WHERE kind = 'dispatch' AND id IN (${placeholders})`)
+                .all(...slice) as { ref: string }[];
+              for (const r of refRows) {
+                if (r.ref) this.legacyDelegatedDispatchRefs.add(r.ref);
+              }
             }
           }
         }

@@ -150,16 +150,20 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
   const [sub, ...more] = rest;
   // 个人 Web 凭据管理不依赖 context.enabled（关闭模块后仍必须能 web-logout / 查看状态 / 重新登录）
   if (sub === "web-logout") {
-    const { fileRemoved, credFile, fileError } = revokeWorkspacePersonalWebSession(app);
+    const { fileRemoved, fileRetained, credFile, fileError } = revokeWorkspacePersonalWebSession(app);
     if (fileError) {
       console.log("已写入工作区个人 Web 会话吊销标记，正在运行的常驻监听与回复发送将立即中止。");
       console.error(`⚠️ 清理本地凭据文件失败（${credFile}）：${fileError}；请手动删除该文件。`);
       process.exitCode = 1;
     } else if (fileRemoved) {
       console.log(`已清除个人 Web 登录凭据（${credFile}）并写入工作区吊销标记。若 pa run 正在运行，将在数秒内自动断开会话且不会回写旧凭据。`);
+    } else if (fileRetained) {
+      console.log(
+        `已写入本工作区个人 Web 会话吊销标记，正在运行的常驻监听与回复发送将立即中止；检测到共享/未核验归属的凭据文件（${credFile}），为避免影响其他工作区已原样保留未删除。`,
+      );
     } else {
       console.log(
-        `已写入工作区个人 Web 会话吊销标记，正在运行的常驻监听与回复发送将立即中止（当前默认路径 ${credFile} 无本地文件；如常驻进程使用了自定义 PA_FEISHU_WEB_CRED_FILE，请同步清理对应凭据文件）。`,
+        `已写入工作区个人 Web 会话吊销标记，正在运行的常驻监听与回复发送将立即中止（当前默认路径 ${credFile} 无本地文件；如常驻进程使用了自定义 PA_FEISHU_WEB_CRED_FILE，请核实归属后按需处理）。`,
       );
     }
     return;
