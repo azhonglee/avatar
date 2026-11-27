@@ -77,7 +77,7 @@ import {
   type WebMessage,
 } from "../src/context/feishu-web/index.ts";
 import { loadKnownOpenGroupNames, rememberOpenGroupName, selectEffectiveOpenGroups } from "../src/context/connectors.ts";
-import { DraftTargetUncertainError } from "../src/context/drafts.ts";
+import { DraftTargetIneligibleError, DraftTargetUncertainError } from "../src/context/drafts.ts";
 import { ContextService, registerContext } from "../src/context/index.ts";
 import {
   ACTIVE_SESSION_KV_KEY,
@@ -24328,6 +24328,608 @@ test("Codex 第二十九轮回归：热刷新不改写运行期主人、首跳�
       }
       await new Promise<void>((resolve) => s.close(() => resolve()));
     }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ───────── 35. Codex 第三十轮专项回归测试 ─────────
+
+test("Codex 第三十轮回归：自动预起草不覆盖待确认回复、命名AWS SSO按会话匹配不串门户、采集器复用真实工作区绑定校验、编辑刷新证据摘录、撤回剔除冲突说法并拦截旧卡片选择、首刷不跳过loadConfig后磁盘变更并重载全6来源、妙记提交事务复检来源开关、旧监听退出不覆盖新监听、Cookie持久化保序、AWS软链挂载与config-only易失盘、含密Git配置易失盘与校验步骤准备阶段清理边界", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "avatar-r30-"));
+  const prevPwKey = process.env.PA_FEISHU_WEB_KEY;
+  const prevCredEnv = process.env.PA_FEISHU_WEB_CRED_FILE;
+  const testKeyHex = crypto.randomBytes(32).toString("hex");
+  process.env.PA_FEISHU_WEB_KEY = testKeyHex;
+  delete process.env.PA_FEISHU_WEB_CRED_FILE;
+
+  const makeR30Config = (
+    dataDir: string,
+    opts: {
+      ownerOpenId?: string;
+      pwEnabled?: boolean;
+      groupsDeny?: string[];
+      sources?: Partial<{ meego: boolean; tasks: boolean; im: boolean; minutes: boolean; calendar: boolean; docs: boolean }>;
+    } = {},
+  ) => ({
+    owner: { open_id: opts.ownerOpenId ?? "ou_r30_owner_A", timezone: "Asia/Shanghai" },
+    data_dir: dataDir,
+    roles: { brain: "stub", reviewer: "stub" },
+    harnesses: { stub: { type: "codex-exec", bin: "echo" } },
+    dispatch: { default_harness: "stub" },
+    context: {
+      enabled: true,
+      understand: true,
+      groups_deny: opts.groupsDeny ?? [],
+      sources: {
+        meego: opts.sources?.meego ?? true,
+        tasks: opts.sources?.tasks ?? true,
+        im: opts.sources?.im ?? true,
+        minutes: opts.sources?.minutes ?? true,
+        calendar: opts.sources?.calendar ?? true,
+        docs: opts.sources?.docs ?? true,
+      },
+      personal_web: {
+        enabled: opts.pwEnabled ?? true,
+        fast_lane: true,
+        pre_draft: true,
+        send_replies: true,
+      },
+    },
+  });
+
+  const makeR30App = (
+    name: string,
+    opts?: Parameters<typeof makeR30Config>[1],
+  ) => {
+    const dataDir = path.join(dir, `${name}-data`);
+    fs.mkdirSync(dataDir, { recursive: true });
+    const cfgFile = path.join(dir, `${name}-config.yaml`);
+    fs.writeFileSync(cfgFile, JSON.stringify(makeR30Config(dataDir, opts), null, 2), "utf8");
+    const app = createApp(loadConfig(cfgFile));
+    return { app, cfgFile, dataDir };
+  };
+
+  try {
+    // 1) [R30 #1 P1] 自动预起草绝不得替换已有待确认回复（含并发落库事务内复检），手动重新起草则废弃旧草稿并签发新 ID 防止旧卡片误发他群
+    {
+      const { app } = makeR30App("r30-draft-replace");
+      try {
+        const ctxSvc = registerContext(app)!;
+        const now = Date.now();
+        ctxSvc.store.addObs([
+          {
+            id: "im:r30_msg_a",
+            source: "im",
+            kind: "p2p",
+            conv: "oc_r30_conv_A",
+            conv_name: "私聊：甲",
+            actor_id: "ou_a",
+            actor_name: "甲",
+            is_me: false,
+            time: now - 10_000,
+            text: "请确认 A 会话方案",
+            url: "",
+            meta: { chat_type: "p2p", message_id: "om_r30_a" },
+          },
+          {
+            id: "im:r30_msg_b",
+            source: "im",
+            kind: "p2p",
+            conv: "oc_r30_conv_B",
+            conv_name: "私聊：乙",
+            actor_id: "ou_b",
+            actor_name: "乙",
+            is_me: false,
+            time: now - 1_000,
+            text: "请确认 B 会话方案",
+            url: "",
+            meta: { chat_type: "p2p", message_id: "om_r30_b" },
+          },
+        ]);
+        const { item } = ctxSvc.store.upsertItem({
+          title: "确认方案",
+          kind: "ask_me",
+          project_id: "",
+          status: "open",
+          priority: "high",
+          counterpart: "甲",
+          next_step: "回复",
+          source: "im",
+        });
+        ctxSvc.store.addEvidence("item", item.id, "im:r30_msg_a", "请确认 A 会话方案", now - 10_000);
+        const existingDraft = ctxSvc.store.addDraft({
+          item_id: item.id,
+          project_id: "",
+          kind: "reply",
+          target: { chat_id: "oc_r30_conv_A", message_id: "om_r30_a" },
+          target_label: "私聊：甲",
+          content: "原定发给甲的回复",
+        });
+
+        // 新增来自会话 B 的最新证据后，自动预起草绝不能覆盖或替换正在等待确认的 existingDraft
+        ctxSvc.store.addEvidence("item", item.id, "im:r30_msg_b", "请确认 B 会话方案", now - 1_000);
+        let llmCalled = false;
+        ctxSvc.drafter.runner = async () => {
+          llmCalled = true;
+          return { ok: true, aborted: false, text: "新生成的给乙的回复", exitCode: 0, timedOut: false, durationMs: 1 };
+        };
+        await assert.rejects(
+          () => ctxSvc.drafter.forItem(item.id, "reply", { auto: true }),
+          (err: unknown) => err instanceof DraftTargetIneligibleError,
+          "已有 proposed 草稿时自动预起草必须直接跳过",
+        );
+        assert.equal(llmCalled, false, "已有 proposed 草稿时自动预起草不应浪费模型调用");
+        const stillSame = ctxSvc.store.draft(existingDraft.id)!;
+        assert.equal(stillSame.status, "proposed");
+        assert.equal(stillSame.target.chat_id, "oc_r30_conv_A");
+        assert.equal(stillSame.content, "原定发给甲的回复");
+
+        // 模拟推理期间另一处落库了 proposed 草稿：自动预起草在落库事务内同样跳过，绝不覆盖
+        ctxSvc.store.casDraft(existingDraft.id, ["proposed"], "discarded");
+        let racedDraftId = "";
+        ctxSvc.drafter.runner = async () => {
+          const raced = ctxSvc.store.addDraft({
+            item_id: item.id,
+            project_id: "",
+            kind: "reply",
+            target: { chat_id: "oc_r30_conv_A", message_id: "om_r30_a" },
+            target_label: "私聊：甲",
+            content: "并发产生的待审草稿",
+          });
+          racedDraftId = raced.id;
+          return { ok: true, aborted: false, text: "试图覆盖的自动回复", exitCode: 0, timedOut: false, durationMs: 1 };
+        };
+        await assert.rejects(
+          () => ctxSvc.drafter.forItem(item.id, "reply", { auto: true }),
+          (err: unknown) => err instanceof DraftTargetIneligibleError,
+          "推理期间并发出现 proposed 草稿时自动预起草必须在事务内放弃覆盖",
+        );
+        assert.equal(ctxSvc.store.draft(racedDraftId)?.content, "并发产生的待审草稿");
+        assert.equal(ctxSvc.store.draft(racedDraftId)?.target.chat_id, "oc_r30_conv_A");
+
+        // 手动重新起草（auto=false）必须废弃旧 ID 并签发新 ID，旧卡片拿旧 ID 确认时必须被 409 拒绝
+        ctxSvc.drafter.runner = async () => ({ ok: true, aborted: false, text: "手动新起草给乙的回复", exitCode: 0, timedOut: false, durationMs: 1 });
+        const manualNew = await ctxSvc.drafter.forItem(item.id, "reply");
+        assert.notEqual(manualNew.id, racedDraftId, "手动重新起草必须签发全新草稿 ID");
+        assert.equal(ctxSvc.store.draft(racedDraftId)?.status, "discarded", "旧草稿必须标记为 discarded");
+        await assert.rejects(
+          () => app.commands.exec("context.draft_approve", { id: racedDraftId }, { source: "web", actor: "owner" }),
+          /丢弃/,
+          "拿着旧卡片 ID 审批已被替换的草稿必须被拒绝，绝不能发往新会话",
+        );
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 2) [R30 #2 P1 + #11 P2 + #12 P2] AWS SSO 按命名会话键严格隔离（同企业门户不串号）、软链 token/CA 绑定到逻辑路径、config-only 静态密钥要求易失盘
+    {
+      const awsHome = path.join(dir, "r30-aws-home");
+      const awsDir = path.join(awsHome, ".aws");
+      const ssoCacheDir = path.join(awsDir, "sso", "cache");
+      const externalSecretDir = path.join(dir, "r30-aws-ext");
+      const symlinkDir = path.join(dir, "r30-aws-links");
+      fs.mkdirSync(ssoCacheDir, { recursive: true });
+      fs.mkdirSync(externalSecretDir, { recursive: true });
+      fs.mkdirSync(symlinkDir, { recursive: true });
+
+      const realTokenFile = path.join(externalSecretDir, "real-web-identity-token");
+      const realCaFile = path.join(externalSecretDir, "real-ca-bundle.pem");
+      fs.writeFileSync(realTokenFile, "jwt.token.payload", { mode: 0o600 });
+      fs.writeFileSync(realCaFile, "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+      const linkTokenFile = path.join(symlinkDir, "token");
+      const linkCaFile = path.join(symlinkDir, "ca.pem");
+      fs.symlinkSync(realTokenFile, linkTokenFile);
+      fs.symlinkSync(realCaFile, linkCaFile);
+
+      const sharedStartUrl = "https://corp-shared.awsapps.com/start";
+      fs.writeFileSync(
+        path.join(awsDir, "config"),
+        [
+          "[profile alice-sso]",
+          "sso_session = corp-alice",
+          "sso_account_id = 111111111111",
+          "sso_role_name = Dev",
+          `web_identity_token_file = ${linkTokenFile}`,
+          `ca_bundle = ${linkCaFile}`,
+          "",
+          "[sso-session corp-alice]",
+          `sso_start_url = ${sharedStartUrl}`,
+          "sso_region = us-east-1",
+          "",
+          "[profile bob-sso]",
+          "sso_session = corp-bob",
+          "sso_account_id = 222222222222",
+          "sso_role_name = Admin",
+          "",
+          "[sso-session corp-bob]",
+          `sso_start_url = ${sharedStartUrl}`,
+          "sso_region = us-east-1",
+          "",
+          "[profile legacy-sso]",
+          `sso_start_url = ${sharedStartUrl}`,
+          "sso_region = us-east-1",
+          "sso_account_id = 333333333333",
+          "sso_role_name = LegacyRole",
+          "",
+          "[profile config-only-static]",
+          "region = us-east-1",
+          "aws_access_key_id = AKIAEXAMPLECONFIGONLY",
+          "aws_secret_access_key = SECRET_IN_CONFIG_FILE_ONLY",
+          "aws_session_token = SESSION_TOKEN_IN_CONFIG",
+        ].join("\n") + "\n",
+        { mode: 0o600 },
+      );
+
+      const sha1 = (s: string) => crypto.createHash("sha1").update(s, "utf8").digest("hex");
+      const aliceFile = `${sha1("corp-alice")}.json`;
+      const bobFile = `${sha1("corp-bob")}.json`;
+      const legacyFile = `${sha1(sharedStartUrl)}.json`;
+      fs.writeFileSync(path.join(ssoCacheDir, aliceFile), JSON.stringify({ startUrl: sharedStartUrl, accessToken: "ALICE_TOK" }), { mode: 0o600 });
+      fs.writeFileSync(path.join(ssoCacheDir, bobFile), JSON.stringify({ startUrl: sharedStartUrl, accessToken: "BOB_ADMIN_TOK" }), { mode: 0o600 });
+      fs.writeFileSync(path.join(ssoCacheDir, legacyFile), JSON.stringify({ startUrl: sharedStartUrl, accessToken: "LEGACY_TOK" }), { mode: 0o600 });
+
+      // 2a: 命名 SSO 会话 corp-alice 绝不得混入同门户 URL 的 corp-bob 或 legacy 令牌，且软链 token/CA 必须绑定到配置路径
+      const stagedAlice = stageIsolatedAwsProfile("alice-sso", { HOME: awsHome });
+      try {
+        assert.ok(stagedAlice);
+        const ssoMount = stagedAlice!.bindMounts.find((m) => m.dest.endsWith(path.join(".aws", "sso", "cache")));
+        assert.ok(ssoMount);
+        const files = fs.readdirSync(ssoMount!.src).sort();
+        assert.deepEqual(files, [aliceFile], "命名 sso_session 必须只包含自身会话哈希文件，绝不按共享 startUrl 泄漏他人令牌");
+        assert.ok(
+          stagedAlice!.bindMounts.some((m) => m.src === fs.realpathSync(realTokenFile) && m.dest === path.resolve(linkTokenFile) && m.mode === "ro"),
+          "符号链接 web_identity_token_file 必须只读绑定到配置文件声明的逻辑路径",
+        );
+        assert.ok(
+          stagedAlice!.bindMounts.some((m) => m.src === fs.realpathSync(realCaFile) && m.dest === path.resolve(linkCaFile) && m.mode === "ro"),
+          "符号链接 ca_bundle 必须只读绑定到配置文件声明的逻辑路径",
+        );
+      } finally {
+        stagedAlice?.cleanup();
+      }
+
+      // 2b: 无 sso_session 的 legacy SSO profile 仅匹配 startUrl 哈希文件，绝不混入命名会话令牌
+      const stagedLegacy = stageIsolatedAwsProfile("legacy-sso", { HOME: awsHome });
+      try {
+        assert.ok(stagedLegacy);
+        const ssoMount = stagedLegacy!.bindMounts.find((m) => m.dest.endsWith(path.join(".aws", "sso", "cache")));
+        assert.ok(ssoMount);
+        assert.deepEqual(fs.readdirSync(ssoMount!.src).sort(), [legacyFile], "legacy SSO 只能匹配 startUrl 哈希文件");
+      } finally {
+        stagedLegacy?.cleanup();
+      }
+
+      // 2c: 仅在 ~/.aws/config 里带静态密钥（无 ~/.aws/credentials）时，无易失 tmpfs 必须拒绝落盘
+      const diskOnlyAws = path.join(dir, "r30-aws-disk-only");
+      fs.mkdirSync(diskOnlyAws, { recursive: true });
+      assert.throws(
+        () => stageIsolatedAwsProfile("config-only-static", { HOME: awsHome }, undefined, { tmpfsCandidates: [diskOnlyAws] }),
+        /易失内存|tmpfs|落盘/,
+        "仅在 config 中含静态密钥的 AWS profile 同样必须要求易失内存存储",
+      );
+      assert.deepEqual(fs.readdirSync(diskOnlyAws), []);
+    }
+
+    // 3) [R30 #3 P1] Connectors 必须复用真实 hasWorkspaceOwnerMismatch()（ctx.personal_web.*），绑定他人时立刻阻断 verifyActiveLarkOwner 与提交
+    {
+      const { app } = makeR30App("r30-conn-binding", { ownerOpenId: "ou_old_owner" });
+      try {
+        const ctxSvc = registerContext(app)!;
+        saveWorkspaceBinding(app.store, "7001", "ou_other_bound");
+        const fakeLark = app.lark as unknown as { authStatus: () => Promise<unknown> };
+        fakeLark.authStatus = async () => ({ identities: { user: { openId: "ou_old_owner" } } });
+        const vr = await ctxSvc.connectors.verifyActiveLarkOwner("测试采集");
+        assert.equal(vr.ok, false, "工作区已绑定至他人时 verifyActiveLarkOwner 必须失败");
+        assert.match(!vr.ok ? vr.error : "", /不一致|阻断/);
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 4) [R30 #4 P2 + #5 P2] 编辑消息立刻刷新证据摘录（含 addEvidence 覆写）；撤回消息从冲突视图与旧卡片裁决中彻底剔除且保留存活说法索引
+    {
+      const { app } = makeR30App("r30-edit-ev-conflict");
+      try {
+        const ctxSvc = registerContext(app)!;
+        ctxSvc.store.addObs([
+          {
+            id: "pw:r30_ev_1",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:c1",
+            conv_name: "私聊：甲",
+            actor_id: "2",
+            actor_name: "甲",
+            is_me: false,
+            time: 100,
+            text: "ship Friday",
+            url: "",
+            meta: { edit_version: 1 },
+          },
+          {
+            id: "pw:r30_ev_2",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:c1",
+            conv_name: "私聊：乙",
+            actor_id: "3",
+            actor_name: "乙",
+            is_me: false,
+            time: 110,
+            text: "on Monday",
+            url: "",
+            meta: { edit_version: 1 },
+          },
+        ]);
+        const { item } = ctxSvc.store.upsertItem({ title: "发布排期", kind: "todo", source: "im" });
+        ctxSvc.store.addEvidence("item", item.id, "pw:r30_ev_1", "ship Friday", 100);
+
+        // 编辑原文 -> 立刻刷新已有证据摘录，绝不再返回 "ship Friday"
+        ctxSvc.store.addObs([
+          {
+            id: "pw:r30_ev_1",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:c1",
+            conv_name: "私聊：甲",
+            actor_id: "2",
+            actor_name: "甲",
+            is_me: false,
+            time: 100,
+            text: "hold the release",
+            url: "",
+            meta: { edit_version: 2 },
+          },
+        ]);
+        assert.equal(ctxSvc.views.evidence("item", item.id)[0]?.quote, "hold the release", "编辑消息后证据摘录必须立刻更新");
+        // 再次 addEvidence 新摘录也必须覆写而非 INSERT OR IGNORE
+        ctxSvc.store.addEvidence("item", item.id, "pw:r30_ev_1", "hold the release (confirmed)", 200);
+        assert.equal(ctxSvc.views.evidence("item", item.id)[0]?.quote, "hold the release (confirmed)");
+
+        // #5: 冲突中首条说法被撤回 -> 视图隐藏该说法并保留存活说法的原始 index=1，旧卡片选 choice=0 必须报错，新卡片选 choice=1 正常裁决
+        const cf = ctxSvc.store.addConflict({
+          project_id: "",
+          topic: "发布日期",
+          claims: [
+            { claim: "周五发布", quote: "ship Friday", obs_id: "pw:r30_ev_1", time: 100 },
+            { claim: "周一发布", quote: "on Monday", obs_id: "pw:r30_ev_2", time: 110 },
+          ],
+        });
+        ctxSvc.store.retirePendingObs("pw:r30_ev_1");
+        const cv = ctxSvc.views.conflictView(ctxSvc.store.conflict(cf.id)!);
+        assert.equal(cv.claims.length, 1, "已撤回的说法绝不得出现在冲突视图中");
+        assert.equal(cv.claims[0].claim, "周一发布");
+        assert.equal(cv.claims[0].index, 1, "存活说法必须保留原始索引供按钮精准裁决");
+
+        await assert.rejects(
+          () => app.commands.exec("context.conflict_resolve", { id: cf.id, choice: 0 }, { source: "card", actor: "owner" }),
+          /撤回/,
+          "旧卡片提交已撤回说法的 choice=0 必须被拒绝",
+        );
+        const resolved = await app.commands.exec(
+          "context.conflict_resolve",
+          { id: cf.id, choice: cv.claims[0].index },
+          { source: "card", actor: "owner" },
+        );
+        assert.equal(resolved.ok, true);
+        assert.equal(ctxSvc.store.conflict(cf.id)?.resolution, "周一发布");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 5) [R30 #6 P2 + #7 P2 + #8 P2] loadConfig 与构造之间磁盘配置变化不被跳过、全 6 个 sources 开关热重载、minutes 飞行途中关闭不落库不推进游标
+    {
+      const dataDir = path.join(dir, "r30-src-reload-data");
+      fs.mkdirSync(dataDir, { recursive: true });
+      const cfgFile = path.join(dir, "r30-src-reload-config.yaml");
+      fs.writeFileSync(cfgFile, JSON.stringify(makeR30Config(dataDir, { groupsDeny: [] }), null, 2), "utf8");
+      const loaded = loadConfig(cfgFile);
+      // 模拟在 loadConfig() 之后、构造 ContextService/PersonalWebBridge 之前外部已修改磁盘 config.yaml！
+      fs.writeFileSync(
+        cfgFile,
+        JSON.stringify(
+          makeR30Config(dataDir, {
+            groupsDeny: ["刚新增排除群"],
+            sources: { meego: false, tasks: false, im: false, minutes: true, calendar: false, docs: false },
+          }),
+          null,
+          2,
+        ),
+        "utf8",
+      );
+      const app = createApp(loaded);
+      try {
+        const ctxSvc = registerContext(app)!;
+        assert.equal(ctxSvc.personalWeb.syncDiskPrivacyConfig({ throwOnError: false }), true);
+        assert.deepEqual(app.cfg.context.groups_deny, ["刚新增排除群"], "loadConfig 与构造桥接之间的磁盘修改绝不得被缓存跳过");
+        assert.equal(app.cfg.context.sources.meego, false, "sources.meego 必须热重载");
+        assert.equal(app.cfg.context.sources.tasks, false, "sources.tasks 必须热重载");
+        assert.equal(app.cfg.context.sources.im, false, "sources.im 必须热重载");
+        assert.equal(app.cfg.context.sources.calendar, false, "sources.calendar 必须热重载");
+        assert.equal(app.cfg.context.sources.docs, false, "sources.docs 必须热重载");
+        assert.equal(app.cfg.context.sources.minutes, true);
+
+        // #8: pullMinutes 拉取 +detail 飞行途中外部关闭 sources.minutes -> 事务内复检跳过写入观测且不推进 cursor.minutes
+        const fakeLark = app.lark as unknown as {
+          authStatus: () => Promise<unknown>;
+          run: (argv: string[]) => Promise<unknown>;
+        };
+        fakeLark.authStatus = async () => ({ identity: "user", user: { open_id: "ou_r30_owner_A" } });
+        fakeLark.run = async (argv: string[]) => {
+          if (argv[0] === "minutes" && argv[1] === "+search") {
+            return { items: [{ token: "min_tok_r30", meta_data: {} }], has_more: false };
+          }
+          if (argv[0] === "minutes" && argv[1] === "+detail") {
+            fs.writeFileSync(
+              cfgFile,
+              JSON.stringify(
+                makeR30Config(dataDir, {
+                  groupsDeny: ["刚新增排除群"],
+                  sources: { meego: false, tasks: false, im: false, minutes: false, calendar: false, docs: false },
+                }),
+                null,
+                2,
+              ),
+              "utf8",
+            );
+            return { minutes: [{ minute_token: "min_tok_r30", title: "机密会议", artifacts: { summary: "敏感会议纪要", todos: [] } }] };
+          }
+          return {};
+        };
+        const minRes = await ctxSvc.connectors.pullMinutes("ou_r30_owner_A");
+        assert.equal(minRes.count, 0, "飞行途中关闭 minutes 后必须跳过落库");
+        assert.equal(ctxSvc.store.obs("minutes:min_tok_r30"), undefined, "关闭 minutes 后绝不得写入妙记观测");
+        assert.equal(app.store.get("ctx.cursor.minutes"), undefined, "关闭 minutes 后绝不得推进 cursor.minutes");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 6) [R30 #9 P2] 旧 supervisor 收到停机信号后延迟退出时，绝不得清掉继任监听的 live client 或把状态覆写为 stopped
+    {
+      const mock = await startMockFeishuWebServer();
+      const { app } = makeR30App("r30-supervisor-gen");
+      let ctl: { stop(): void } | undefined;
+      try {
+        const ctxStore = new ContextStore(app.store.db);
+        const loginStore = new WebLoginStore(app.cfg.dataDir);
+        const saved = loginStore.save({
+          cookies: [{ name: "session", value: "r30_gen_sess", domain: "127.0.0.1", path: "/" }],
+          owner_id: "7001",
+          owner_name: "测试主人",
+          session_id: "r30-gen-s1",
+          cookie_version: 1,
+          updated_at: new Date().toISOString(),
+        });
+        saveWorkspaceBinding(app.store, saved.owner_id, "ou_r30_owner_A");
+        app.store.set(ACTIVE_SESSION_KV_KEY, saved.session_id ?? "");
+
+        const bridge = new PersonalWebBridge(app, ctxStore, {
+          onFastTrigger: () => undefined,
+          onReconnect: () => undefined,
+          onNeedsLogin: () => undefined,
+          credentialWatchIntervalMs: 30,
+          clientOptions: { endpoints: mock.endpoints },
+        });
+        // 连续多次快速启停重启（模拟旧代 supervisor 退出与新代 start() 交错竞争）
+        ctl = bridge.start();
+        await waitUntil(() => bridge.status().state === "listening", 5_000);
+        bridge.stop();
+        ctl = bridge.start();
+        await waitUntil(() => bridge.status().state === "listening", 5_000);
+        await new Promise((r) => setTimeout(r, 120));
+        assert.equal(bridge.status().state, "listening", "旧代 supervisor 退出绝不得把新代健康监听覆写为 stopped");
+        assert.ok(
+          (bridge as unknown as { client?: FeishuWebClient }).client !== undefined,
+          "旧代 supervisor 退出绝不得清空新代活跃 client 引用",
+        );
+      } finally {
+        ctl?.stop();
+        app.store.db.close();
+        await mock.close();
+      }
+    }
+
+    // 7) [R30 #10 P2] 同名 host-only Cookie 与父域 Cookie 经 records() 持久化/恢复后必须严格保持插入先后顺序
+    {
+      const jar = new RecordingCookieJar();
+      jar.setFromHeaders(new URL("https://www.feishu.cn/"), "session=host_val; Path=/");
+      jar.setFromHeaders(new URL("https://www.feishu.cn/"), "session=parent_val; Domain=feishu.cn; Path=/");
+      const reqUrl = new URL("https://www.feishu.cn/messenger/");
+      assert.equal(jar.cookieHeader(reqUrl), "session=host_val; session=parent_val");
+      assert.equal(jar.cookieValue(reqUrl, "session"), "host_val");
+
+      const restored = RecordingCookieJar.fromRecords(jar.records());
+      assert.equal(
+        restored.cookieHeader(reqUrl),
+        "session=host_val; session=parent_val",
+        "持久化恢复后同名 host Cookie 必须仍排在父域 Cookie 之前",
+      );
+      assert.equal(restored.cookieValue(reqUrl, "session"), "host_val");
+    }
+
+    // 8) [R30 #13 P2] 含凭据的脱敏 Git 配置（extraHeader / 内嵌凭据 URL）在无 tmpfs 时必须拒绝落盘，非敏感配置正常放行
+    {
+      const gitHome = path.join(dir, "r30-git-vol-home");
+      const diskOnlyGit = path.join(dir, "r30-git-disk-only");
+      fs.mkdirSync(gitHome, { recursive: true });
+      fs.mkdirSync(diskOnlyGit, { recursive: true });
+      const credGitCfg = path.join(gitHome, ".gitconfig");
+      fs.writeFileSync(
+        credGitCfg,
+        ['[user]', '\tname = Tester', '[http "https://git.corp.example/org/repo.git"]', '\textraHeader = Authorization: Bearer r30_top_secret'].join("\n") + "\n",
+        { mode: 0o600 },
+      );
+      assert.throws(
+        () =>
+          stageSanitizedGitConfig(
+            { HOME: gitHome, GIT_CONFIG_GLOBAL: credGitCfg },
+            undefined,
+            { allowedRemoteUrls: ["https://git.corp.example/org/repo.git"], tmpfsCandidates: [diskOnlyGit] },
+          ),
+        /易失内存|tmpfs|落盘/,
+        "保留了目标域 extraHeader 凭据的 Git 配置暂存在无易失 tmpfs 时必须拒绝落盘",
+      );
+      assert.deepEqual(fs.readdirSync(diskOnlyGit), []);
+
+      // 无凭据的普通本地脱敏配置（不包含 allowedRemoteUrls）仍可正常暂存
+      const safeStaged = stageSanitizedGitConfig(
+        { HOME: gitHome, GIT_CONFIG_GLOBAL: credGitCfg },
+        undefined,
+        { tmpfsCandidates: [diskOnlyGit] },
+      );
+      try {
+        assert.ok(safeStaged, "不含凭据的普通脱敏 Git 配置不应受阻");
+      } finally {
+        safeStaged?.cleanup();
+      }
+    }
+
+    // 9) [R30 #14 P2] runVerifyCommand 准备阶段失败（如非法软链 .git 导致 stageSanitizedGitConfig/隔离失败）必须正常收尾步骤并返回 error 结果
+    {
+      const { app } = makeR30App("r30-verify-cleanup");
+      try {
+        const badWt = path.join(dir, "r30-bad-verify-wt");
+        fs.mkdirSync(badWt, { recursive: true });
+        fs.symlinkSync(path.join(dir, "no-such-gitdir"), path.join(badWt, ".git"));
+        const workId = "dispatch:r30_verify_1:1";
+        app.ledger.enqueue({
+          id: workId,
+          kind: "dispatch",
+          ref: "r30_verify_1",
+          payload: {
+            guid: "r30_verify_1",
+            summary: "verify cleanup",
+            description: "desc",
+            cwd: badWt,
+            branch: "feat/r30",
+            base: "main",
+            verify: "echo should-not-run",
+            round: 1,
+          },
+        });
+        const workItem = app.ledger.get(workId)!;
+        const ac = new AbortController();
+        const check = await (
+          app.dispatcher as unknown as {
+            runVerifyCommand: (it: typeof workItem, ctx: { attempt: number; signal: AbortSignal }) => Promise<{ status: string; detail: string }>;
+          }
+        ).runVerifyCommand(workItem, { attempt: 1, signal: ac.signal });
+        assert.equal(check.status, "error", "准备阶段抛出异常时 runVerifyCommand 必须返回 error 结果而非未捕获异常");
+        const steps = app.ledger.steps(workId);
+        assert.equal(steps.length, 1);
+        assert.equal(steps[0].status, "failed", "准备阶段失败后账本 step 必须被结束为 failed，绝不能永久卡在 running");
+      } finally {
+        app.store.db.close();
+      }
+    }
+  } finally {
+    if (prevPwKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevPwKey;
+    if (prevCredEnv === undefined) delete process.env.PA_FEISHU_WEB_CRED_FILE;
+    else process.env.PA_FEISHU_WEB_CRED_FILE = prevCredEnv;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

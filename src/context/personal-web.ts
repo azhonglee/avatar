@@ -501,6 +501,7 @@ export class PersonalWebBridge {
   private diskOwnerOpenId: string | undefined;
   private diskPersonalWebVeto = false;
   private lifecycleStarted = false;
+  private supervisorGen = 0;
   private state: PersistedState;
 
   constructor(app: App, store: ContextStore, hooks: PersonalWebBridgeHooks) {
@@ -509,9 +510,10 @@ export class PersonalWebBridge {
     this.hooks = hooks;
     this.loginStore = new WebLoginStore(app.cfg.dataDir);
     this.loginStore.reconcilePendingCommit(app.store, PENDING_CRED_COMMIT_KV_KEY);
-    const initDisk = app.cfg.file ? readDiskConfigRaw(app.cfg.file) : { exists: false };
-    this.hadInitialCfgFile = initDisk.exists;
-    this.lastSyncedCfgRaw = initDisk.raw;
+    this.hadInitialCfgFile = !!app.cfg.file && (app.cfg.loadedRaw !== undefined || readDiskConfigRaw(app.cfg.file).exists);
+    // 仅缓存 loadConfig() 实际解析并应用过的磁盘原始字节（绝不把未解析的新文件直接标为已同步）；
+    // 若 loadConfig() 与构造桥接之间磁盘已被外部修改，首次 syncDiskPrivacyConfig() 会立刻检测到差异并应用最新策略。
+    this.lastSyncedCfgRaw = app.cfg.loadedRaw;
     const saved = this.loadSavedState();
     const login = this.loginStore.load();
     this.state = saved ?? {
@@ -595,8 +597,11 @@ export class PersonalWebBridge {
       this.cfg.context.max_groups = nextCfg.context.max_groups;
       this.cfg.context.lookback_days = nextCfg.context.lookback_days;
       this.cfg.context.understand = nextCfg.context.understand;
+      this.cfg.context.sources.meego = nextCfg.context.sources.meego;
+      this.cfg.context.sources.tasks = nextCfg.context.sources.tasks;
       this.cfg.context.sources.im = nextCfg.context.sources.im;
       this.cfg.context.sources.minutes = nextCfg.context.sources.minutes;
+      this.cfg.context.sources.calendar = nextCfg.context.sources.calendar;
       this.cfg.context.sources.docs = nextCfg.context.sources.docs;
       this.cfg.context.bot_allow = nextCfg.context.bot_allow;
       this.cfg.context.personal_web.fast_lane = nextCfg.context.personal_web.fast_lane;
@@ -681,8 +686,11 @@ export class PersonalWebBridge {
     const pw = this.cfg.context.personal_web;
     return JSON.stringify([
       this.diskPolicyError ? `err:${this.diskPolicyError}` : "ok",
+      this.cfg.context.sources.meego ? 1 : 0,
+      this.cfg.context.sources.tasks ? 1 : 0,
       this.cfg.context.sources.im ? 1 : 0,
       this.cfg.context.sources.minutes ? 1 : 0,
+      this.cfg.context.sources.calendar ? 1 : 0,
       this.cfg.context.sources.docs ? 1 : 0,
       this.cfg.context.understand ? 1 : 0,
       this.isEffectivePersonalWebEnabled() ? 1 : 0,
@@ -856,9 +864,10 @@ export class PersonalWebBridge {
       log("warn", "启动个人 Web 通道时恢复暂存凭据失败（将在守护循环中重试）", { err: errMsg(err) });
     }
     this.stop();
+    const gen = ++this.supervisorGen;
     const ctrl = new AbortController();
     this.stopCtrl = ctrl;
-    void this.runSupervisor(ctrl.signal).catch((err) => {
+    void this.runSupervisor(ctrl.signal, gen).catch((err) => {
       if (!ctrl.signal.aborted) {
         log("error", "个人 Web 监听守护循环异常退出（已隔离，不影响常驻进程）", { err: errMsg(err) });
       }
@@ -937,7 +946,7 @@ export class PersonalWebBridge {
     }
   }
 
-  private async runSupervisor(signal: AbortSignal): Promise<void> {
+  private async runSupervisor(signal: AbortSignal, gen: number): Promise<void> {
     let connectDelayMs = 2_000;
     let supervisorErrDelayMs = 2_000;
     let connectDenials = 0;
@@ -945,8 +954,10 @@ export class PersonalWebBridge {
     let wasDegraded = false;
     let everConnected = false;
     const watchInterval = this.hooks.credentialWatchIntervalMs ?? 5_000;
+    const isCurrentGen = () => this.supervisorGen === gen;
 
     const handleState = (next: ListenerState, detail = "", notifyLogin = true, sessionIdOverride?: string) => {
+      if (!isCurrentGen()) return;
       try {
         if (next === "reconnecting" || next === "reverifying") wasDegraded = true;
         if (next === "listening") {
@@ -1021,8 +1032,13 @@ export class PersonalWebBridge {
         const onOuterAbort = () => sessionCtrl.abort();
         signal.addEventListener("abort", onOuterAbort, { once: true });
         let invalidatedByDisk = false;
+        let activeClient: FeishuWebClient | undefined;
         const credWatcher = setInterval(() => {
           try {
+            if (!isCurrentGen()) {
+              sessionCtrl.abort();
+              return;
+            }
             this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
             const latest = this.loginStore.load();
             if (!latest || this.sessionKeyOf(latest) !== activeSessionKey) {
@@ -1037,8 +1053,8 @@ export class PersonalWebBridge {
               sessionCtrl.abort();
               return;
             }
-            if (this.client && (latest.cookie_version ?? 1) > this.client.currentCookieVersion()) {
-              this.client.syncFromDisk(latest);
+            if (activeClient && (latest.cookie_version ?? 1) > activeClient.currentCookieVersion()) {
+              activeClient.syncFromDisk(latest);
               lastObservedWatchKey = this.credentialWatchKey(latest);
               lastAttemptedKey = lastObservedWatchKey;
             }
@@ -1055,6 +1071,10 @@ export class PersonalWebBridge {
             {
               ...this.hooks.clientOptions,
               onSessionConfirmed: (updated, delta) => {
+                if (!isCurrentGen()) {
+                  sessionCtrl.abort();
+                  return null;
+                }
                 try {
                   this.validateBoundOwner(updated);
                 } catch {
@@ -1083,8 +1103,9 @@ export class PersonalWebBridge {
             },
             sessionCtrl.signal,
           );
-          if (invalidatedByDisk || sessionCtrl.signal.aborted) continue;
+          if (!isCurrentGen() || invalidatedByDisk || sessionCtrl.signal.aborted) continue;
 
+          activeClient = client;
           this.client = client;
           // 严禁在常驻监听中静默创建或修改工作区账号绑定（仅允许经 pa context web-login 人工确认后绑定）
           connectDelayMs = 2_000;
@@ -1111,8 +1132,8 @@ export class PersonalWebBridge {
             onWarn: (m) => log("warn", m),
           });
         } catch (err) {
-          if (signal.aborted) break;
-          this.client = undefined;
+          if (signal.aborted || !isCurrentGen()) break;
+          if (activeClient && this.client === activeClient) this.client = undefined;
           if (invalidatedByDisk) {
             connectDenials = 0;
             connectDelayMs = 2_000;
@@ -1147,21 +1168,25 @@ export class PersonalWebBridge {
         } finally {
           clearInterval(credWatcher);
           signal.removeEventListener("abort", onOuterAbort);
-          this.client = undefined;
+          if (activeClient && this.client === activeClient) {
+            this.client = undefined;
+          }
         }
         supervisorErrDelayMs = 2_000;
       } catch (outerErr) {
-        if (signal.aborted) break;
-        this.client = undefined;
+        if (signal.aborted || !isCurrentGen()) break;
+        if (isCurrentGen()) this.client = undefined;
         log("warn", "个人 Web 守护循环发生未预期异常，退避重试", { err: errMsg(outerErr), delayMs: supervisorErrDelayMs });
         await waitAbortable(supervisorErrDelayMs, signal);
         supervisorErrDelayMs = Math.min(supervisorErrDelayMs * 2, 30_000);
       }
     }
-    try {
-      this.persistState({ state: "stopped", since: Date.now(), last_error: "" });
-    } catch {
-      // ignore stop-time persistence failure
+    if (isCurrentGen()) {
+      try {
+        this.persistState({ state: "stopped", since: Date.now(), last_error: "" });
+      } catch {
+        // ignore stop-time persistence failure
+      }
     }
   }
 

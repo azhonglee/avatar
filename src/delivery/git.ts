@@ -2005,6 +2005,7 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
       stagedGitCfg = stageSanitizedGitConfig(effectiveRawEnv, opts?.cfg?.dataDir, {
         cwd,
         ...(isRemote ? { allowedRemoteUrls: resolvedUrls, allowedRemoteNames } : {}),
+        ...(opts?.volatileTmpfsCandidates ? { tmpfsCandidates: opts.volatileTmpfsCandidates } : {}),
       });
     }
     // 仅在启用文件系统隔离且目标为 HTTP(S) 传输时投影目标域凭据，非隔离运行保持宿主机 credential.helper 链原样

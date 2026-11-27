@@ -397,6 +397,10 @@ export class ContextStore {
               JSON.stringify(mergedMeta),
               o.id,
             );
+            // 原消息正文被编辑或撤回后复活为新正文时，立即刷新已引用该观测的证据摘录，防止旧卡片/详情/委派继续展示过期原文
+            if (String(cur.text ?? "") !== o.text) {
+              this.db.prepare("UPDATE ctx_evidence SET quote = ? WHERE obs_id = ?").run(o.text.slice(0, 300), o.id);
+            }
             n++;
           } else {
             // 内容与 @mention 均未变化但收到更高的排序水位（edit_version / edit_time / poll_observed_at）：
@@ -1058,7 +1062,10 @@ export class ContextStore {
 
   addEvidence(entity: string, entityId: string, obsId: string, quote: string, time: number): void {
     this.db
-      .prepare("INSERT OR IGNORE INTO ctx_evidence (entity, entity_id, obs_id, quote, time) VALUES (?, ?, ?, ?, ?)")
+      .prepare(
+        `INSERT INTO ctx_evidence (entity, entity_id, obs_id, quote, time) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(entity, entity_id, obs_id) DO UPDATE SET quote = excluded.quote, time = MAX(time, excluded.time)`,
+      )
       .run(entity, entityId, obsId, quote.slice(0, 300), time);
   }
 
@@ -1219,13 +1226,21 @@ export class ContextStore {
     return { ...(r as unknown as DraftRow), target: j(r.target, {}) };
   }
 
+  hasProposedDraft(itemId: string, kind: CtxDraftKind): boolean {
+    if (!itemId) return false;
+    return !!this.db
+      .prepare("SELECT 1 FROM ctx_draft WHERE item_id = ? AND kind = ? AND status = 'proposed' LIMIT 1")
+      .get(itemId, kind);
+  }
+
   addDraft(d: Omit<DraftRow, "id" | "created" | "updated" | "status" | "error">): DraftRow {
     const now = Date.now();
-    // 同一事项同一类型只保留一份待确认草稿
-    const old = this.db.prepare("SELECT id FROM ctx_draft WHERE item_id = ? AND kind = ? AND status = 'proposed'").get(d.item_id, d.kind) as { id: string } | undefined;
-    if (old && d.item_id) {
-      this.db.prepare("UPDATE ctx_draft SET content = ?, target = ?, target_label = ?, updated = ? WHERE id = ?").run(d.content, JSON.stringify(d.target), d.target_label, now, old.id);
-      return this.draft(old.id)!;
+    // 同一事项同一类型已有待确认草稿时，先将旧草稿标为 discarded 再签发新 ID（绝不复用旧 ID 原地替换目标与正文，
+    // 防止用户从尚未刷新的旧卡片/标签页点击确认时，把审阅过的正文错发到新会话）
+    if (d.item_id) {
+      this.db
+        .prepare("UPDATE ctx_draft SET status = 'discarded', updated = ? WHERE item_id = ? AND kind = ? AND status = 'proposed'")
+        .run(now, d.item_id, d.kind);
     }
     const id = newId("drf");
     this.db

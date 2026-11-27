@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { App } from "../app.ts";
 import { verifyActiveLarkUser } from "../lark.ts";
 import { deepFind, errMsg, runProcess } from "../util.ts";
+import { hasWorkspaceOwnerMismatch } from "./personal-web.ts";
 import { hashId, norm, type ContextStore, type Obs } from "./store.ts";
 
 /**
@@ -332,13 +333,6 @@ export class Connectors {
     return j.data?.result?.structuredContent ?? j.data;
   }
 
-  private isBoundWorkspaceOwnerMismatch(ownerOpenId: string): boolean {
-    const boundNative = (this.app.store.get("ctx.pw.bound_owner_id") ?? "").trim();
-    const boundWs = (this.app.store.get("ctx.pw.bound_workspace_owner_id") ?? "").trim();
-    if (!boundNative && !boundWs) return false;
-    return boundWs !== ownerOpenId.trim();
-  }
-
   private assertPinnedOwnerSync(actionLabel: string, pinnedOwnerOpenId: string): void {
     if (this.syncDiskPolicy && !this.syncDiskPolicy()) {
       throw new Error(`磁盘隐私配置无法核验，已中止${actionLabel}`);
@@ -348,7 +342,7 @@ export class Connectors {
     if (currentOwner !== pinnedOwnerOpenId || diskOwner !== pinnedOwnerOpenId) {
       throw new Error(`工作区 owner.open_id 在采集期间发生变化，已中止${actionLabel}`);
     }
-    if (this.isBoundWorkspaceOwnerMismatch(pinnedOwnerOpenId) || this.isBoundWorkspaceOwnerMismatch(diskOwner)) {
+    if (hasWorkspaceOwnerMismatch(this.app.store, pinnedOwnerOpenId) || hasWorkspaceOwnerMismatch(this.app.store, diskOwner)) {
       throw new Error(`工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已阻断${actionLabel}`);
     }
   }
@@ -382,10 +376,10 @@ export class Connectors {
       return [{ source: "config", count: 0, error: "磁盘隐私配置无法核验，已暂缓本轮采集" }];
     }
     const pinnedOwner = (pinnedOwnerOpenId ?? this.cfg.owner.open_id).trim();
-    const s = this.cfg.context.sources;
     const out: SourceReport[] = [];
-    const step = async (name: string, enabled: boolean, fn: () => Promise<Omit<SourceReport, "source" | "error">>) => {
-      if (!enabled) return;
+    const step = async (name: string, isEnabled: () => boolean, fn: () => Promise<Omit<SourceReport, "source" | "error">>) => {
+      if (this.syncDiskPolicy && !this.syncDiskPolicy()) return;
+      if (!isEnabled()) return;
       try {
         const r = await fn();
         out.push({ source: name, error: "", ...r });
@@ -394,18 +388,21 @@ export class Connectors {
       }
       this.setKv(`source.${name}`, JSON.stringify({ at: Date.now(), ...out.at(-1) }));
     };
-    await step("meego", s.meego, () => this.pullMeego());
-    await step("tasks", s.tasks, () => this.pullTasks(pinnedOwner));
-    await step("im", s.im, () => this.pullIm(0, pinnedOwner));
-    await step("minutes", s.minutes, () => this.pullMinutes(pinnedOwner));
-    await step("calendar", s.calendar, () => this.pullCalendar(pinnedOwner));
-    await step("docs", s.docs, async () => this.pullComments());
+    await step("meego", () => this.cfg.context.sources.meego, () => this.pullMeego(pinnedOwner));
+    await step("tasks", () => this.cfg.context.sources.tasks, () => this.pullTasks(pinnedOwner));
+    await step("im", () => this.cfg.context.sources.im, () => this.pullIm(0, pinnedOwner));
+    await step("minutes", () => this.cfg.context.sources.minutes, () => this.pullMinutes(pinnedOwner));
+    await step("calendar", () => this.cfg.context.sources.calendar, () => this.pullCalendar(pinnedOwner));
+    await step("docs", () => this.cfg.context.sources.docs, async () => this.pullComments(pinnedOwner));
     return out;
   }
 
   // ───────── Meego：待办快照 → 事项 ─────────
 
-  async pullMeego(): Promise<{ count: number }> {
+  async pullMeego(pinnedOwnerOpenId?: string): Promise<{ count: number }> {
+    const pinnedOwner = (pinnedOwnerOpenId ?? this.cfg.owner.open_id).trim();
+    this.assertPinnedOwnerSync("拉取 Meego 待办", pinnedOwner);
+    if (!this.cfg.context.sources.meego) return { count: 0 };
     const all: Raw[] = [];
     let total = 0;
     for (let page = 1; page <= 20; page++) {
@@ -419,80 +416,85 @@ export class Connectors {
     const complete = all.length >= total;
     const now = Date.now();
     const legacyCut = now - this.cfg.context.legacy_days * DAY;
-    const seen = new Set<string>();
-    const obs: Obs[] = [];
-    const bySpace = new Map<string, Raw[]>();
-    for (const x of all) {
-      const k = String(x.project_name ?? x.project_key ?? "Meego");
-      if (!bySpace.has(k)) bySpace.set(k, []);
-      bySpace.get(k)!.push(x);
-    }
-    for (const [space, items] of bySpace) {
-      // 空间内最近的排期时间：太久以前的空间视为历史遗留
-      const latest = Math.max(0, ...items.map((x) => Math.max(parseTime(x.schedule?.end_time), parseTime(x.schedule?.start_time))));
-      const legacy = latest > 0 ? latest < legacyCut : items.length > 30;
-      const spaceProject = this.store.upsertProject(
-        { id: hashId("sys_meego", space), name: `Meego · ${space}`, description: `Meego 空间「${space}」里分配给你的节点待办`, status: legacy ? "legacy" : "active", muted: legacy && this.cfg.context.autonomy.mute_legacy },
-        latest || now,
-      );
-      // 每次按最新快照重新判断（你手动静音 / 恢复过的不再自动改）
-      if (!spaceProject.pinned) {
-        if (legacy && this.cfg.context.autonomy.mute_legacy) this.store.setProject(spaceProject.id, { status: "legacy", muted: true });
-        else if (!legacy && spaceProject.status === "legacy") this.store.setProject(spaceProject.id, { status: "active", muted: false });
+    const count = this.store.tx(() => {
+      this.assertPinnedOwnerSync("提交 Meego 待办", pinnedOwner);
+      if (!this.cfg.context.sources.meego) return 0;
+      const seen = new Set<string>();
+      const obs: Obs[] = [];
+      const bySpace = new Map<string, Raw[]>();
+      for (const x of all) {
+        const k = String(x.project_name ?? x.project_key ?? "Meego");
+        if (!bySpace.has(k)) bySpace.set(k, []);
+        bySpace.get(k)!.push(x);
       }
-      for (const x of items) {
-        const w = x.work_item_info ?? {};
-        const node = x.node_info?.node_name ?? "";
-        const key = `meego:${w.work_item_id}:${x.node_info?.node_state_key ?? node}`;
-        seen.add(key);
-        const end = parseTime(x.schedule?.end_time);
-        const url = `https://meego.larkoffice.com/${x.project_key}/${w.work_item_type_key ?? "story"}/detail/${w.work_item_id}`;
-        // 已被理解层归到具体项目（refs 里有这个工作项）的，用具体项目
-        const linked = this.store.findProject(`meego:${w.work_item_id}`);
-        const oid = `meego_todo:${w.work_item_id}:${x.node_info?.node_state_key ?? node}`;
-        obs.push({
-          id: oid,
-          source: "meego",
-          kind: "meego_todo",
-          conv: `meego:${w.work_item_id}`,
-          conv_name: String(w.work_item_name ?? ""),
-          actor_id: "",
-          actor_name: "Meego",
-          is_me: false,
-          time: end || now,
-          text: `[${w.work_item_type_key}#${w.work_item_id}] ${w.work_item_name}｜节点:${node}${end ? `｜截止 ${x.schedule?.end_time}` : ""}`,
-          url,
-          meta: { project_key: x.project_key, space },
-        });
-        const { item } = this.store.upsertItem(
-          {
-            strong_key: key,
-            title: `${w.work_item_name}｜${node}`,
-            kind: "todo",
-            source: "meego",
-            project_id: linked?.id ?? spaceProject.id,
-            due: end || null,
-            // 临近截止的加分由排序规则按到期时间给（避免和优先级重复计分）；只有逾期才算高优先级
-            priority: end && end < now ? "high" : "medium",
-            confidence: 1,
-            status: "open",
-            meta: { project_key: x.project_key, work_item_id: String(w.work_item_id), work_item_type: w.work_item_type_key, node, url, space, legacy },
-          },
-          now,
+      for (const [space, items] of bySpace) {
+        // 空间内最近的排期时间：太久以前的空间视为历史遗留
+        const latest = Math.max(0, ...items.map((x) => Math.max(parseTime(x.schedule?.end_time), parseTime(x.schedule?.start_time))));
+        const legacy = latest > 0 ? latest < legacyCut : items.length > 30;
+        const spaceProject = this.store.upsertProject(
+          { id: hashId("sys_meego", space), name: `Meego · ${space}`, description: `Meego 空间「${space}」里分配给你的节点待办`, status: legacy ? "legacy" : "active", muted: legacy && this.cfg.context.autonomy.mute_legacy },
+          latest || now,
         );
-        this.store.addEvidence("item", item.id, oid, `Meego 待办：${w.work_item_name}｜${node}`, now);
-      }
-    }
-    this.store.addObs(obs);
-    this.store.markProcessed(obs.map((o) => o.id));
-    if (complete) {
-      for (const it of this.store.items({ status: ["open", "snoozed"], source: "meego" })) {
-        if (it.strong_key.startsWith("meego:") && !seen.has(it.strong_key)) {
-          this.store.upsertItem({ ...it, status: "done", close_reason: "Meego 节点已不在你的待办里（已完成或已流转）" });
+        // 每次按最新快照重新判断（你手动静音 / 恢复过的不再自动改）
+        if (!spaceProject.pinned) {
+          if (legacy && this.cfg.context.autonomy.mute_legacy) this.store.setProject(spaceProject.id, { status: "legacy", muted: true });
+          else if (!legacy && spaceProject.status === "legacy") this.store.setProject(spaceProject.id, { status: "active", muted: false });
+        }
+        for (const x of items) {
+          const w = x.work_item_info ?? {};
+          const node = x.node_info?.node_name ?? "";
+          const key = `meego:${w.work_item_id}:${x.node_info?.node_state_key ?? node}`;
+          seen.add(key);
+          const end = parseTime(x.schedule?.end_time);
+          const url = `https://meego.larkoffice.com/${x.project_key}/${w.work_item_type_key ?? "story"}/detail/${w.work_item_id}`;
+          // 已被理解层归到具体项目（refs 里有这个工作项）的，用具体项目
+          const linked = this.store.findProject(`meego:${w.work_item_id}`);
+          const oid = `meego_todo:${w.work_item_id}:${x.node_info?.node_state_key ?? node}`;
+          obs.push({
+            id: oid,
+            source: "meego",
+            kind: "meego_todo",
+            conv: `meego:${w.work_item_id}`,
+            conv_name: String(w.work_item_name ?? ""),
+            actor_id: "",
+            actor_name: "Meego",
+            is_me: false,
+            time: end || now,
+            text: `[${w.work_item_type_key}#${w.work_item_id}] ${w.work_item_name}｜节点:${node}${end ? `｜截止 ${x.schedule?.end_time}` : ""}`,
+            url,
+            meta: { project_key: x.project_key, space },
+          });
+          const { item } = this.store.upsertItem(
+            {
+              strong_key: key,
+              title: `${w.work_item_name}｜${node}`,
+              kind: "todo",
+              source: "meego",
+              project_id: linked?.id ?? spaceProject.id,
+              due: end || null,
+              // 临近截止的加分由排序规则按到期时间给（避免和优先级重复计分）；只有逾期才算高优先级
+              priority: end && end < now ? "high" : "medium",
+              confidence: 1,
+              status: "open",
+              meta: { project_key: x.project_key, work_item_id: String(w.work_item_id), work_item_type: w.work_item_type_key, node, url, space, legacy },
+            },
+            now,
+          );
+          this.store.addEvidence("item", item.id, oid, `Meego 待办：${w.work_item_name}｜${node}`, now);
         }
       }
-    }
-    return { count: all.length };
+      this.store.addObs(obs);
+      this.store.markProcessed(obs.map((o) => o.id));
+      if (complete) {
+        for (const it of this.store.items({ status: ["open", "snoozed"], source: "meego" })) {
+          if (it.strong_key.startsWith("meego:") && !seen.has(it.strong_key)) {
+            this.store.upsertItem({ ...it, status: "done", close_reason: "Meego 节点已不在你的待办里（已完成或已流转）" });
+          }
+        }
+      }
+      return all.length;
+    });
+    return { count };
   }
 
   // ───────── 飞书任务 → 事项 ─────────
@@ -506,8 +508,9 @@ export class Connectors {
     const tasks = arr(data, "items");
     const now = Date.now();
     const legacyCut = now - this.cfg.context.legacy_days * DAY;
-    this.store.tx(() => {
+    const committedCount = this.store.tx(() => {
       this.assertPinnedOwnerSync("提交飞书任务", pinnedOwner);
+      if (!this.cfg.context.sources.tasks) return 0;
       const active = this.store.upsertProject({ id: "sys_tasks", name: "飞书任务", description: "分配给你的飞书任务" });
       const legacy = this.store.upsertProject({ id: "sys_tasks_legacy", name: "飞书任务（历史）", description: "很久以前创建、长期未处理的飞书任务", status: "legacy", muted: this.cfg.context.autonomy.mute_legacy });
       const seen = new Set<string>();
@@ -538,8 +541,9 @@ export class Connectors {
       for (const it of this.store.items({ status: ["open", "snoozed"], source: "task" })) {
         if (it.strong_key.startsWith("task:") && !seen.has(it.strong_key)) this.store.upsertItem({ ...it, status: "done", close_reason: "飞书任务已完成" });
       }
+      return tasks.length;
     });
-    return { count: tasks.length };
+    return { count: committedCount };
   }
 
   // ───────── 飞书消息 → 观测 ─────────
@@ -1586,6 +1590,7 @@ export class Connectors {
     await this.assertActiveLarkOwner("提交飞书妙记", pinnedOwner);
     const n = this.store.tx(() => {
       this.assertPinnedOwnerSync("提交飞书妙记", pinnedOwner);
+      if (!this.cfg.context.sources.minutes) return 0;
       const added = this.store.addObs(obs);
       this.setKv("cursor.minutes", String(now));
       return added;
@@ -1595,28 +1600,34 @@ export class Connectors {
 
   // ───────── 文档评论 @我：事件已落在 signals 表（capture.onComment），这里转成观测 ─────────
 
-  pullComments(): { count: number } {
-    const since = Number(this.kv("cursor.comments") ?? 0);
-    const rows = this.store.db
-      .prepare("SELECT id, text, link, at FROM signals WHERE id LIKE 'comment:%' AND at > ? ORDER BY at LIMIT 200")
-      .all(since) as { id: string; text: string; link: string; at: number }[];
-    if (!rows.length) return { count: 0 };
-    const obs: Obs[] = rows.map((r) => ({
-      id: `doc:${r.id}`,
-      source: "doc",
-      kind: "doc_comment",
-      conv: `doc:${r.link}`,
-      conv_name: `文档评论：${r.link.split("/").slice(-2).join("/")}`,
-      actor_id: "",
-      actor_name: "文档评论@我",
-      is_me: false,
-      time: r.at,
-      text: textOf(r.text).slice(0, 2000),
-      url: r.link,
-      meta: {},
-    }));
-    const n = this.store.addObs(obs);
-    this.setKv("cursor.comments", String(Math.max(...rows.map((r) => r.at))));
+  pullComments(pinnedOwnerOpenId?: string): { count: number } {
+    const pinnedOwner = (pinnedOwnerOpenId ?? this.cfg.owner.open_id).trim();
+    const n = this.store.tx(() => {
+      this.assertPinnedOwnerSync("提交文档评论", pinnedOwner);
+      if (!this.cfg.context.sources.docs) return 0;
+      const since = Number(this.kv("cursor.comments") ?? 0);
+      const rows = this.store.db
+        .prepare("SELECT id, text, link, at FROM signals WHERE id LIKE 'comment:%' AND at > ? ORDER BY at LIMIT 200")
+        .all(since) as { id: string; text: string; link: string; at: number }[];
+      if (!rows.length) return 0;
+      const obs: Obs[] = rows.map((r) => ({
+        id: `doc:${r.id}`,
+        source: "doc",
+        kind: "doc_comment",
+        conv: `doc:${r.link}`,
+        conv_name: `文档评论：${r.link.split("/").slice(-2).join("/")}`,
+        actor_id: "",
+        actor_name: "文档评论@我",
+        is_me: false,
+        time: r.at,
+        text: textOf(r.text).slice(0, 2000),
+        url: r.link,
+        meta: {},
+      }));
+      const added = this.store.addObs(obs);
+      this.setKv("cursor.comments", String(Math.max(...rows.map((r) => r.at))));
+      return added;
+    });
     return { count: n };
   }
 
@@ -1636,11 +1647,13 @@ export class Connectors {
       .map((e) => ({ start: t(e.start_time), end: t(e.end_time), summary: String(e.summary ?? "(无标题)"), url: String(e.app_link ?? "") }))
       .filter((m) => m.start > 0)
       .sort((a, b) => a.start - b.start);
-    this.store.tx(() => {
+    const committed = this.store.tx(() => {
       this.assertPinnedOwnerSync("提交飞书日历", pinnedOwner);
+      if (!this.cfg.context.sources.calendar) return 0;
       this.setKv("calendar", JSON.stringify(meetings));
+      return meetings.length;
     });
-    return { count: meetings.length };
+    return { count: committed };
   }
 }
 

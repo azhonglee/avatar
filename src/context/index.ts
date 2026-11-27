@@ -783,6 +783,7 @@ export class ContextService {
     if (!it || it.status !== "open" || it.kind !== "ask_me" || it.priority !== "high") return false;
     if (this.store.hidden(this.store.project(it.project_id))) return false;
     if (it.meta.needs_review || it.feedback === "unimportant" || !this.draftable(it)) return false;
+    if (this.store.hasProposedDraft(it.id, "reply")) return false;
     return true;
   }
 
@@ -1005,6 +1006,7 @@ export class ContextService {
               p.kind,
               p.auto
                 ? {
+                    auto: true,
                     beforeInfer: () =>
                       !this.isWorkspaceOwnerMismatched() && this.canAutoPreDraft(this.store.item(p.item_id)),
                   }
@@ -1361,6 +1363,12 @@ export function registerContext(app: App): ContextService | undefined {
       if (!c) throw new CommandError("not_found", "没有这个冲突");
       if (c.status === "resolved") throw new CommandError("conflict", "已经确认过了");
       const chosen = a.choice !== undefined ? c.claims[a.choice] : undefined;
+      if (a.choice !== undefined && !chosen) {
+        throw new CommandError("invalid", "选择的说法不存在");
+      }
+      if (chosen?.obs_id && svc.store.obs(chosen.obs_id)?.meta.withdrawn === true) {
+        throw new CommandError("conflict", "该说法对应的原消息已被撤回，无法以此为准，请刷新后重新选择或手写结论");
+      }
       const resolution = a.resolution?.trim() || chosen?.claim;
       if (!resolution) throw new CommandError("invalid", "请选择一个说法或写下结论");
       svc.store.resolveConflict(c.id, resolution);
@@ -1467,7 +1475,13 @@ export function registerContext(app: App): ContextService | undefined {
     knowledge: (f) => (svc.assertWorkspaceOwnerMatches(), svc.store.knowledge({ q: f.q, project_id: f.project }).map((k) => svc.views.knowledgeView(k))),
     updates: (f) => (svc.assertWorkspaceOwnerMatches(), svc.store.updates({ since: Date.now() - (f.days ?? 7) * DAY, project_id: f.project, limit: 300 }).map((u) => svc.views.updateView(u))),
     people: () => (svc.assertWorkspaceOwnerMatches(), svc.views.people()),
-    conflicts: (status) => (svc.assertWorkspaceOwnerMatches(), svc.store.conflicts(status).map((c) => svc.views.conflictView(c))),
+    conflicts: (status) => (
+      svc.assertWorkspaceOwnerMatches(),
+      svc.store
+        .conflicts(status)
+        .map((c) => svc.views.conflictView(c))
+        .filter((c) => c.status === "resolved" || c.claims.length > 0)
+    ),
     drafts: (status) => (svc.assertWorkspaceOwnerMatches(), svc.syncDrafts(), svc.store).drafts(status ? { status: status.split(",") as never } : {}).map((d) => svc.views.draftView(d)),
     status: () => svc.views.status(svc.running, svc.personalWeb.status(), svc.isWorkspaceOwnerMismatched()),
     start: () => svc.start(),

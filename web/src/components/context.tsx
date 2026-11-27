@@ -282,7 +282,7 @@ export function ConflictBox({ c }: { c: CtxConflictView }) {
               </div>
             </div>
             {c.status === "open" && (
-              <button className="btn btn-sm" disabled={cmd.isPending(k)} onClick={() => void cmd.run("context.conflict_resolve", { id: c.id, choice: i }, { key: k })}>
+              <button className="btn btn-sm" disabled={cmd.isPending(k)} onClick={() => void cmd.run("context.conflict_resolve", { id: c.id, choice: cl.index ?? i }, { key: k })}>
                 以此为准
               </button>
             )}

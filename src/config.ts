@@ -330,7 +330,12 @@ const Schema = z.object({
     .default({}),
 });
 
-export type Config = z.infer<typeof Schema> & { dataDir: string; file: string };
+export type Config = z.infer<typeof Schema> & {
+  dataDir: string;
+  file: string;
+  /** loadConfig() 实际解析并应用到本配置对象的原始磁盘文本（不可枚举，仅用于热刷新基线比对） */
+  readonly loadedRaw?: string;
+};
 
 /** 解析 `repo:` 引用：配置里的别名（字符串或 {path, verify}），否则当作路径。 */
 export interface RepoSpec {
@@ -354,7 +359,8 @@ export function loadConfig(file = process.env.PA_CONFIG ?? path.join(ROOT, "conf
   if (!fs.existsSync(file)) {
     throw new Error(`找不到配置文件 ${file}。先执行：cp config.example.yaml config.yaml 并按需修改`);
   }
-  const parsed = Schema.safeParse(YAML.parse(fs.readFileSync(file, "utf8")) ?? {});
+  const raw = fs.readFileSync(file, "utf8");
+  const parsed = Schema.safeParse(YAML.parse(raw) ?? {});
   if (!parsed.success) throw new Error(`配置文件 ${file} 有误：\n${z.prettifyError(parsed.error)}`);
   const cfg = parsed.data;
   for (const name of [cfg.roles.brain, cfg.roles.reviewer, cfg.dispatch.default_harness].filter(Boolean)) {
@@ -365,5 +371,7 @@ export function loadConfig(file = process.env.PA_CONFIG ?? path.join(ROOT, "conf
   }
   const dataDir = path.resolve(expandHome(cfg.data_dir));
   for (const sub of ["logs", "runs", "workspace", "worktrees"]) fs.mkdirSync(path.join(dataDir, sub), { recursive: true });
-  return { ...cfg, dataDir, file };
+  const out: Config = { ...cfg, dataDir, file };
+  Object.defineProperty(out, "loadedRaw", { value: raw, enumerable: false, writable: false, configurable: true });
+  return out;
 }

@@ -528,10 +528,13 @@ export class Dispatcher {
     const name = `校验命令 \`${p.verify}\``;
     const logFile = path.join(this.logDir(p.guid), `verify-${p.round}-${ctx.attempt}.log`);
     const step = this.ledger.startStep({ work_id: it.id, name: `verify#${p.round}`, log: logFile });
-    const baseEnv = prepareHarnessEnv();
-    const stagedNpmrc = stageSanitizedNpmrc(process.env, this.cfg.dataDir);
-    const stagedGitCfg = stageSanitizedGitConfig(process.env, this.cfg.dataDir, { cwd: p.cwd });
+    let baseEnv: ReturnType<typeof prepareHarnessEnv> | undefined;
+    let stagedNpmrc: ReturnType<typeof stageSanitizedNpmrc> | undefined;
+    let stagedGitCfg: ReturnType<typeof stageSanitizedGitConfig> | undefined;
     try {
+      baseEnv = prepareHarnessEnv();
+      stagedNpmrc = stageSanitizedNpmrc(process.env, this.cfg.dataDir);
+      stagedGitCfg = stageSanitizedGitConfig(process.env, this.cfg.dataDir, { cwd: p.cwd });
       const wrapped = wrapCredentialIsolatedCommand(
         "bash",
         ["-lc", p.verify],
@@ -579,7 +582,7 @@ export class Dispatcher {
     } finally {
       stagedGitCfg?.cleanup();
       stagedNpmrc?.cleanup();
-      baseEnv.cleanup();
+      baseEnv?.cleanup();
     }
   }
 

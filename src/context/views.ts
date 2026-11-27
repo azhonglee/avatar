@@ -166,12 +166,25 @@ export class ContextViews {
   }
 
   conflictView(c: ReturnType<ContextStore["conflicts"]>[number]): CtxConflictView {
+    const claims: CtxConflictView["claims"] = [];
+    for (let i = 0; i < c.claims.length; i++) {
+      const cl = c.claims[i];
+      const obs = cl.obs_id ? this.store.obs(cl.obs_id) : undefined;
+      if (obs?.meta.withdrawn === true) continue;
+      claims.push({
+        index: i,
+        claim: cl.claim,
+        quote: cl.quote,
+        time: cl.time,
+        url: obs?.url ?? "",
+      });
+    }
     return {
       id: c.id,
       project_id: c.project_id,
       project_name: this.proj(c.project_id)?.name ?? "",
       topic: c.topic,
-      claims: c.claims.map((cl) => ({ claim: cl.claim, quote: cl.quote, time: cl.time, url: this.store.obs(cl.obs_id)?.url ?? "" })),
+      claims,
       status: c.status,
       resolution: c.resolution,
       created: c.created,
@@ -259,7 +272,11 @@ export class ContextViews {
         .sort((a, b) => b.time - a.time)
         .map((u) => this.updateView(u)),
       people,
-      conflicts: this.store.conflicts().filter((c) => ids.includes(c.project_id)).map((c) => this.conflictView(c)),
+      conflicts: this.store
+        .conflicts()
+        .filter((c) => ids.includes(c.project_id))
+        .map((c) => this.conflictView(c))
+        .filter((c) => c.status === "resolved" || c.claims.length > 0),
     };
   }
 
@@ -324,7 +341,10 @@ export class ContextViews {
       risks: by("risk"),
       due_soon: dueSoon,
       needs_review: open.filter((i) => i.needs_review).slice(0, 20),
-      conflicts: this.store.conflicts("open").map((c) => this.conflictView(c)),
+      conflicts: this.store
+        .conflicts("open")
+        .map((c) => this.conflictView(c))
+        .filter((c) => c.claims.length > 0),
       drafts: this.store.drafts({ status: ["proposed", "failed"] }).map((d) => this.draftView(d)),
       meetings: this.meetings(),
       changes: this.store.updates({ since: now - DAY, limit: 30 }).map((u) => this.updateView(u)),

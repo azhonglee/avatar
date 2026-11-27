@@ -264,11 +264,18 @@ export class Drafter {
     return boundNative;
   }
 
-  async forItem(itemId: string, kind?: CtxDraftKind, opts?: { beforeInfer?: () => boolean }): Promise<DraftRow> {
+  async forItem(
+    itemId: string,
+    kind?: CtxDraftKind,
+    opts?: { beforeInfer?: () => boolean; auto?: boolean },
+  ): Promise<DraftRow> {
     const it = this.store.item(itemId);
     if (!it) throw new Error(`没有这个事项：${itemId}`);
     const k = kind ?? defaultDraftKind(it);
     if (!k || k === "weekly_report") throw new Error("这个事项没有合适的草稿类型");
+    if (opts?.auto && this.store.hasProposedDraft(it.id, k)) {
+      throw new DraftTargetIneligibleError("该事项已有待确认草稿，自动预起草跳过替换以保护你正在审阅的回复");
+    }
     const tz = this.cfg.owner.timezone;
     const p = this.store.project(it.project_id);
     const excludedTargets = new Set<string>();
@@ -418,6 +425,9 @@ export class Drafter {
         }
         if (opts?.beforeInfer && !opts.beforeInfer()) {
           throw new DraftTargetIneligibleError("自动预起草资格在落库前已失效，已丢弃过期草稿");
+        }
+        if (opts?.auto && this.store.hasProposedDraft(latestItem.id, k)) {
+          throw new DraftTargetIneligibleError("该事项已有待确认草稿，自动预起草在落库事务内跳过覆盖");
         }
         if (this.activeBoundNativeOwner() !== verifiedOwner) {
           throw new DraftTargetIneligibleError("工作区绑定账号在推理期间已变更，已丢弃过期草稿");

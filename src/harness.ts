@@ -1255,10 +1255,22 @@ function resolveValidatedGitAuxMount(
  *   - 受信任远程 Git（传入 `allowedRemoteUrls`）：按目标 URL 仅投影匹配该目标的 `http.<url>.*`、`credential.<url>.*` 与 `url.*` 重写，
  *     并将生效的 `http.sslCAInfo` / `http.sslCAPath`（含按目标 URL 匹配段）目标以只读方式挂载进隔离沙箱。
  */
+function sanitizedGitConfigContainsCredentials(sanitized: string): boolean {
+  if (/^\s*extraheader\s*=/im.test(sanitized)) return true;
+  if (/^\s*password\s*=/im.test(sanitized)) return true;
+  if (/^\s*(?:insteadof|pushinsteadof|url|pushurl|lfsurl|lfspushurl|proxy)\s*=.*:\/\/[^/\s@"'\\]+@/im.test(sanitized)) {
+    return true;
+  }
+  if (/^\[(?:url|http)\s+"[^"]*:\/\/[^/\s@"\\]+@[^"]*"\]/im.test(sanitized)) {
+    return true;
+  }
+  return false;
+}
+
 export function stageSanitizedGitConfig(
   rawEnv: NodeJS.ProcessEnv = process.env,
   dataDir?: string,
-  opts?: { cwd?: string; allowedRemoteUrls?: string[]; allowedRemoteNames?: string[] },
+  opts?: { cwd?: string; allowedRemoteUrls?: string[]; allowedRemoteNames?: string[]; tmpfsCandidates?: string[] },
 ): StagedSanitizedGitConfig | undefined {
   const discovered = discoverEffectiveGlobalGitConfig(rawEnv, dataDir, {
     cwd: opts?.cwd,
@@ -1346,7 +1358,10 @@ export function stageSanitizedGitConfig(
     allowedRemoteNames,
   });
   if (!sanitized) return undefined;
-  const scoped = createScopedSecretDir("pa-git-cfg-", rawEnv);
+  const scoped = createScopedSecretDir("pa-git-cfg-", rawEnv, {
+    requireVolatile: sanitizedGitConfigContainsCredentials(sanitized),
+    tmpfsCandidates: opts?.tmpfsCandidates,
+  });
   try {
     const file = path.join(scoped.dir, "gitconfig");
     fs.writeFileSync(file, sanitized, { mode: 0o600 });
@@ -6272,6 +6287,7 @@ export function stageIsolatedAwsProfile(
   profileName: string,
   hostEnv: NodeJS.ProcessEnv = process.env,
   dataDir?: string,
+  opts?: { tmpfsCandidates?: string[] },
 ): StagedAwsProfile | undefined {
   const target = profileName.trim();
   if (!target) return undefined;
@@ -6326,15 +6342,36 @@ export function stageIsolatedAwsProfile(
   const visitedSso = new Set<string>();
   const visitedServices = new Set<string>();
   const extraReadOnlyPaths = new Set<string>();
+  const bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[] = [];
+  const seenBindMount = new Set<string>();
   const queue: { name: string; depth: number }[] = [{ name: target, depth: 0 }];
 
   const addRefPath = (rawPath: string | undefined) => {
     if (!rawPath) return;
-    const expanded = rawPath.startsWith("~/") && hostHome ? path.join(hostHome, rawPath.slice(2)) : rawPath;
+    const trimmed = rawPath.trim();
+    if (!trimmed) return;
+    const expanded = trimmed.startsWith("~/") && hostHome ? path.join(hostHome, trimmed.slice(2)) : trimmed;
     if (!path.isAbsolute(expanded)) return;
+    const normalizedDest = path.resolve(expanded);
+    if (
+      resolvedData &&
+      (isPathInsideOrEqual(normalizedDest, resolvedData) || isPathInsideOrEqual(resolvedData, normalizedDest))
+    ) {
+      return;
+    }
     try {
-      if (fs.existsSync(expanded) && isOutsideDataDir(expanded)) {
-        extraReadOnlyPaths.add(safeRealpath(expanded));
+      if (!fs.existsSync(normalizedDest) || !isOutsideDataDir(normalizedDest)) return;
+      if (!fs.statSync(normalizedDest).isFile()) return;
+      const real = safeRealpath(normalizedDest);
+      extraReadOnlyPaths.add(real);
+      // 若配置文件中引用的是符号链接（如 Kubernetes projected service-account token 或自定义软链 CA 证书），
+      // 必须将校验后的真实文件精确只读绑定到配置所写的逻辑路径，避免沙箱内路径不存在
+      if (real !== normalizedDest) {
+        const key = `${real}=>${normalizedDest}`;
+        if (!seenBindMount.has(key)) {
+          seenBindMount.add(key);
+          bindMounts.push({ src: real, dest: normalizedDest, mode: "ro" });
+        }
       }
     } catch {
       // ignore
@@ -6343,15 +6380,7 @@ export function stageIsolatedAwsProfile(
 
   let needsSsoCache = false;
   const selectedSsoSessions = new Set<string>();
-  const selectedSsoStartUrls = new Set<string>();
-  const normStartUrl = (u: string) => u.trim().replace(/\/+$/, "").toLowerCase();
-  const recordStartUrl = (u: string | undefined) => {
-    const clean = u?.trim();
-    if (clean) {
-      selectedSsoStartUrls.add(clean);
-      selectedSsoStartUrls.add(normStartUrl(clean));
-    }
-  };
+  const legacySsoStartUrls = new Set<string>();
 
   while (queue.length > 0) {
     const { name, depth } = queue.shift()!;
@@ -6369,22 +6398,27 @@ export function stageIsolatedAwsProfile(
       if (srcProfile && !visitedProfiles.has(srcProfile)) {
         queue.push({ name: srcProfile, depth: depth + 1 });
       }
-      const ssoSession = sec.props.get("sso_session");
+      const ssoSession = sec.props.get("sso_session")?.trim();
       if (ssoSession) {
         needsSsoCache = true;
-        selectedSsoSessions.add(ssoSession.trim());
+        selectedSsoSessions.add(ssoSession);
         if (!visitedSso.has(ssoSession)) {
           visitedSso.add(ssoSession);
           const ssoSec = findConfigTagged("sso-session", ssoSession);
           if (ssoSec) {
             selectedConfig.push(ssoSec);
-            recordStartUrl(ssoSec.props.get("sso_start_url"));
           }
         }
-      }
-      if (sec.props.has("sso_start_url") || sec.props.has("sso_account_id")) {
+      } else if (sec.props.has("sso_start_url") || sec.props.has("sso_account_id")) {
+        // 仅对未绑定命名 sso_session 的旧版 legacy SSO profile 按 sso_start_url 派生缓存键，
+        // 绝不用共享企业门户 startUrl 去匹配其他用户的命名 SSO 会话令牌
         needsSsoCache = true;
-        recordStartUrl(sec.props.get("sso_start_url"));
+        const rawUrl = sec.props.get("sso_start_url")?.trim();
+        if (rawUrl) {
+          legacySsoStartUrls.add(rawUrl);
+          const trimmedSlash = rawUrl.replace(/\/+$/, "");
+          if (trimmedSlash) legacySsoStartUrls.add(trimmedSlash);
+        }
       }
       const svc = sec.props.get("services");
       if (svc && !visitedServices.has(svc)) {
@@ -6399,12 +6433,17 @@ export function stageIsolatedAwsProfile(
 
   if (selectedConfig.length === 0 && selectedCreds.length === 0) return undefined;
 
+  const AWS_STATIC_SECRET_KEYS = new Set(["aws_access_key_id", "aws_secret_access_key", "aws_session_token"]);
+  const hasStaticCredentials = [...selectedConfig, ...selectedCreds].some((sec) =>
+    [...sec.props.entries()].some(([k, v]) => AWS_STATIC_SECRET_KEYS.has(k.toLowerCase()) && v.trim().length > 0),
+  );
+
   const scoped = createScopedSecretDir("pa-aws-profile-", hostEnv, {
-    requireVolatile: selectedCreds.length > 0 || needsSsoCache,
+    requireVolatile: selectedCreds.length > 0 || needsSsoCache || hasStaticCredentials,
+    tmpfsCandidates: opts?.tmpfsCandidates,
   });
   const configFile = path.join(scoped.dir, "config");
   const credentialsFile = path.join(scoped.dir, "credentials");
-  const bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[] = [];
   try {
     fs.writeFileSync(configFile, serializeAwsIniSections(selectedConfig), { mode: 0o600 });
     fs.writeFileSync(credentialsFile, serializeAwsIniSections(selectedCreds), { mode: 0o600 });
@@ -6418,7 +6457,7 @@ export function stageIsolatedAwsProfile(
         for (const sess of selectedSsoSessions) {
           if (sess) expectedFilenames.add(`${sha1(sess)}.json`);
         }
-        for (const url of selectedSsoStartUrls) {
+        for (const url of legacySsoStartUrls) {
           if (url) expectedFilenames.add(`${sha1(url)}.json`);
         }
         const stagedSsoDir = path.join(scoped.dir, "sso-cache");
@@ -6458,22 +6497,20 @@ export function stageIsolatedAwsProfile(
         const matchedNames = new Set<string>();
         const referencedClientIds = new Set<string>();
         for (const c of candidates) {
-          const entryStartUrl = typeof c.json?.startUrl === "string" ? normStartUrl(c.json.startUrl) : "";
-          const matchesByHash = expectedFilenames.has(c.name);
-          const matchesByUrl = !!entryStartUrl && selectedSsoStartUrls.has(entryStartUrl);
-          if (matchesByHash || matchesByUrl) {
+          if (expectedFilenames.has(c.name)) {
             matchedNames.add(c.name);
             if (typeof c.json?.clientId === "string" && c.json.clientId.trim()) {
               referencedClientIds.add(c.json.clientId.trim());
             }
           }
         }
-        // 附带所选会话 token 引用的 OIDC 客户端注册缓存（无 startUrl，但 clientId 匹配）
+        // 附带所选会话 token 引用的 OIDC 客户端注册缓存（无 startUrl 且无 accessToken，仅 clientId 匹配）
         for (const c of candidates) {
           if (matchedNames.has(c.name)) continue;
           const entryStartUrl = typeof c.json?.startUrl === "string" ? c.json.startUrl.trim() : "";
+          const entryAccessToken = typeof c.json?.accessToken === "string" ? c.json.accessToken.trim() : "";
           const entryClientId = typeof c.json?.clientId === "string" ? c.json.clientId.trim() : "";
-          if (!entryStartUrl && entryClientId && referencedClientIds.has(entryClientId)) {
+          if (!entryStartUrl && !entryAccessToken && entryClientId && referencedClientIds.has(entryClientId)) {
             matchedNames.add(c.name);
           }
         }

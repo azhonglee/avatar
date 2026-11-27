@@ -442,7 +442,7 @@ export interface CtxConflictView {
   project_id: string;
   project_name: string;
   topic: string;
-  claims: { claim: string; quote: string; time: number; url: string }[];
+  claims: { index?: number; claim: string; quote: string; time: number; url: string }[];
   status: "open" | "resolved";
   resolution: string;
   created: number;

@@ -388,18 +388,17 @@ export class RecordingCookieJar {
     return this.matching(requestUrl, nowMs).find((c) => c.name === name)?.value ?? "";
   }
 
-  /** Deterministic snapshot of live non-expired cookies for durable persistence. */
+  /** Ordered snapshot of live non-expired cookies preserving insertion order (RFC 6265 §5.4 same-path tie-breaking). */
   records(nowMs = Date.now()): CookieRecord[] {
-    const keys: string[] = [];
+    const out: CookieRecord[] = [];
     for (const [key, rec] of this.values) {
       if (isExpired(rec, nowMs)) {
         this.values.delete(key);
         continue;
       }
-      keys.push(key);
+      out.push({ ...rec });
     }
-    keys.sort();
-    return keys.map((k) => ({ ...this.values.get(k)! }));
+    return out;
   }
 }
 
