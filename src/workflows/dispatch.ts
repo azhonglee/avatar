@@ -536,8 +536,9 @@ export class Dispatcher {
           extraReadOnlyPaths: [
             ...(baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : []),
             ...(stagedNpmrc ? [stagedNpmrc.dir] : []),
-            ...(stagedGitCfg ? [stagedGitCfg.dir] : []),
+            ...(stagedGitCfg ? [stagedGitCfg.dir, ...stagedGitCfg.extraReadOnlyPaths] : []),
           ],
+          ...(stagedGitCfg?.symlinks.length ? { extraSymlinks: stagedGitCfg.symlinks } : {}),
           extraBindMounts: [
             ...(stagedNpmrc ? [{ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" as const }] : []),
             ...(stagedGitCfg ? stagedGitCfg.bindMounts : []),
@@ -689,17 +690,14 @@ export class Dispatcher {
         const head = (
           await git(spec.path, ["rev-parse", "HEAD"], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path })
         ).trim();
-        const hasBranch = (await tryGit(spec.path, ["rev-parse", "--verify", "--quiet", branch], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path })).code === 0;
-        const checkoutTarget = hasBranch ? branch : head;
-        const lfsPre = await ensureGitLfsObjectsForCheckout(spec.path, checkoutTarget, {
-          cfg: this.cfg,
-          trustedRepoRoot: spec.path,
-        });
-        // 新分支必须显式以已预拉取的 head 作为起点，防止预拉取期间宿主机仓库切换分支或推进 HEAD 导致检出树与基线错位
-        await git(
-          spec.path,
-          hasBranch ? ["worktree", "add", cwd, branch] : ["worktree", "add", "-b", branch, cwd, head],
-          {
+        const hasBranch = (await tryGit(spec.path, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path })).code === 0;
+        if (!hasBranch) {
+          const lfsPre = await ensureGitLfsObjectsForCheckout(spec.path, head, {
+            cfg: this.cfg,
+            trustedRepoRoot: spec.path,
+          });
+          // 新分支必须显式以已预拉取的 head 作为起点，防止预拉取期间宿主机仓库切换分支或推进 HEAD 导致检出树与基线错位
+          await git(spec.path, ["worktree", "add", "-b", branch, cwd, head], {
             cfg: this.cfg,
             trustedRepoRoot: spec.path,
             extraWritablePaths: [
@@ -709,8 +707,72 @@ export class Dispatcher {
             ...(lfsPre.lfsStorageExternal && lfsPre.lfsStorageDir
               ? { extraGitConfigArgs: ["-c", `lfs.storage=${lfsPre.lfsStorageDir}`] }
               : {}),
-          },
-        );
+          });
+        } else {
+          // 已有分支：先锁定当前 tip SHA 预拉取缺失 LFS 对象，再复核分支尖端未在预检期间推进；若推进则自动重跑预检，避免无凭据检出沙箱缺少新提交的 LFS 对象
+          let checkedOut = false;
+          const MAX_EXISTING_BRANCH_PREFLIGHT = 3;
+          for (let attempt = 0; attempt < MAX_EXISTING_BRANCH_PREFLIGHT; attempt++) {
+            const beforeSha = (
+              await git(spec.path, ["rev-parse", "--verify", `refs/heads/${branch}`], {
+                cfg: this.cfg,
+                readOnly: true,
+                trustedRepoRoot: spec.path,
+              })
+            ).trim();
+            const lfsPre = await ensureGitLfsObjectsForCheckout(spec.path, beforeSha, {
+              cfg: this.cfg,
+              trustedRepoRoot: spec.path,
+              branchHint: branch,
+            });
+            const afterPreSha = (
+              await git(spec.path, ["rev-parse", "--verify", `refs/heads/${branch}`], {
+                cfg: this.cfg,
+                readOnly: true,
+                trustedRepoRoot: spec.path,
+              })
+            ).trim();
+            if (afterPreSha !== beforeSha) {
+              continue;
+            }
+            try {
+              await git(spec.path, ["worktree", "add", cwd, branch], {
+                cfg: this.cfg,
+                trustedRepoRoot: spec.path,
+                extraWritablePaths: [
+                  cwd,
+                  ...(lfsPre.lfsStorageExternal && lfsPre.lfsStorageDir ? [lfsPre.lfsStorageDir] : []),
+                ],
+                ...(lfsPre.lfsStorageExternal && lfsPre.lfsStorageDir
+                  ? { extraGitConfigArgs: ["-c", `lfs.storage=${lfsPre.lfsStorageDir}`] }
+                  : {}),
+              });
+              checkedOut = true;
+              break;
+            } catch (wtErr) {
+              const postErrSha = (
+                await tryGit(spec.path, ["rev-parse", "--verify", `refs/heads/${branch}`], {
+                  cfg: this.cfg,
+                  readOnly: true,
+                  trustedRepoRoot: spec.path,
+                })
+              ).stdout.trim();
+              if (postErrSha && postErrSha !== beforeSha && attempt + 1 < MAX_EXISTING_BRANCH_PREFLIGHT) {
+                fs.rmSync(cwd, { recursive: true, force: true });
+                fs.mkdirSync(cwd, { recursive: true });
+                await removeStaleWorktreeAdminRecord(spec.path, cwd, {
+                  cfg: this.cfg,
+                  trustedRepoRoot: spec.path,
+                });
+                continue;
+              }
+              throw wtErr;
+            }
+          }
+          if (!checkedOut) {
+            throw new Error(`分支 ${branch} 在 LFS 预检期间持续推进，已中止工作树检出以避免缺失 LFS 对象`);
+          }
+        }
         if (!this.store.get(baseKey)) this.store.set(baseKey, head);
         ready = true;
       } catch (err) {

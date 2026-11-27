@@ -12,7 +12,6 @@ import {
   prepareHarnessEnv,
   resolveBin,
   resolveTrustedBwrapBin,
-  workspaceRequiresIsolation,
   wrapCredentialIsolatedCommand,
 } from "./harness.ts";
 import { consoleBaseUrl, isLoopbackHost } from "./server/index.ts";
@@ -131,28 +130,25 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
   });
 
   add("worker_isolation", "沙箱隔离", async () => {
-    if (!workspaceRequiresIsolation(cfg, env)) {
-      return ok("当前平台非强制内核隔离模式");
-    }
     const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-doctor-iso-"));
     const baseEnv = prepareHarnessEnv(env);
     try {
       const trueBin = resolveBin("true");
-      const wrapped = wrapCredentialIsolatedCommand(
-        trueBin,
-        [],
+      // 直接构造与实际派单工人一致的 worker-write 隔离计划，确保全新 Linux 工作区（尚无个人 Web 密钥或观测）也会真正探测内核命名空间
+      const plan = buildWorkspaceIsolation(
+        cfg,
+        {
+          mode: "worker-write",
+          cwd: probeDir,
+          cmdPath: trueBin,
+          disableGitWorktreeMounts: true,
+        },
         env,
-        buildWorkspaceIsolation(
-          cfg,
-          {
-            mode: "llm-none",
-            cwd: probeDir,
-            cmdPath: trueBin,
-            disableGitWorktreeMounts: true,
-          },
-          env,
-        ),
       );
+      if (!plan.requireIsolation) {
+        return ok("当前平台非强制内核隔离模式");
+      }
+      const wrapped = wrapCredentialIsolatedCommand(trueBin, [], env, plan);
       if (!wrapped.isolated) {
         return fail(
           "当前环境要求强制沙箱隔离，但未启用任何内核命名空间后端",

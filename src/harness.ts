@@ -557,6 +557,8 @@ export interface StagedSanitizedGitConfig {
   file: string;
   homeMountDest: string;
   bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[];
+  extraReadOnlyPaths: string[];
+  symlinks: { dest: string; target: string }[];
   cleanup: () => void;
 }
 
@@ -566,6 +568,8 @@ const SAFE_GIT_CONFIG_EXACT_KEYS = new Set([
   "user.useconfigonly",
   "core.autocrlf",
   "core.eol",
+  "core.excludesfile",
+  "core.attributesfile",
   "core.filemode",
   "core.ignorecase",
   "core.quotepath",
@@ -647,6 +651,23 @@ function gitUrlPrefixMatchesTarget(sectionPattern: string, targetRaw: string): b
     return tgt.toLowerCase().startsWith(pat.toLowerCase());
   }
   if (patUrl.protocol !== tgtUrl.protocol) return false;
+  // 按 Git urlmatch 规则校验用户名：配置段含用户名时仅匹配同一用户名目标，绝不把 A 账号的 extraHeader 投影给 B 账号或无用户名请求
+  if (patUrl.username) {
+    if (!tgtUrl.username) return false;
+    let patUser = patUrl.username;
+    let tgtUser = tgtUrl.username;
+    try {
+      patUser = decodeURIComponent(patUser);
+    } catch {
+      // keep raw
+    }
+    try {
+      tgtUser = decodeURIComponent(tgtUser);
+    } catch {
+      // keep raw
+    }
+    if (patUser !== tgtUser) return false;
+  }
   const patHost = patUrl.hostname.toLowerCase();
   const tgtHost = tgtUrl.hostname.toLowerCase();
   if (patHost.startsWith("*.")) {
@@ -1054,10 +1075,159 @@ function discoverEffectiveGlobalGitConfig(
   };
 }
 
+const SENSITIVE_GIT_AUX_HOME_SUBDIRS = [
+  ".ssh",
+  ".gnupg",
+  ".aws",
+  ".codex",
+  ".claude",
+  ".gemini",
+  ".acpx",
+  ".doubao",
+  ".lark-cli",
+  path.join(".config", "opencode"),
+  path.join(".local", "share", "opencode"),
+];
+
+const SENSITIVE_GIT_AUX_BASENAMES = new Set([
+  ".git-credentials",
+  ".netrc",
+  ".npmrc",
+  ".gitconfig",
+  "auth.json",
+  ".credentials.json",
+  "credentials.json",
+]);
+
+function isSafeGitAuxTargetPath(
+  realPath: string,
+  resolvedHome: string,
+  resolvedData: string,
+  kind: "file" | "dir",
+): boolean {
+  if (!isSafeGitConfigIncludeTarget(realPath, resolvedData)) return false;
+  if (kind === "dir") {
+    if (realPath === path.parse(realPath).root) return false;
+    if (resolvedHome) {
+      const forbiddenAncestors = [
+        resolvedHome,
+        path.join(resolvedHome, ".config"),
+        path.join(resolvedHome, ".local"),
+        path.join(resolvedHome, ".config", "git"),
+      ];
+      for (const anc of forbiddenAncestors) {
+        if (isPathInsideOrEqual(anc, realPath)) return false;
+      }
+      for (const sub of SENSITIVE_GIT_AUX_HOME_SUBDIRS) {
+        const sensitive = path.join(resolvedHome, sub);
+        if (isPathInsideOrEqual(realPath, sensitive) || isPathInsideOrEqual(sensitive, realPath)) return false;
+      }
+    }
+    return true;
+  }
+  const base = path.basename(realPath).toLowerCase();
+  if (SENSITIVE_GIT_AUX_BASENAMES.has(base)) return false;
+  if (resolvedHome) {
+    for (const sub of SENSITIVE_GIT_AUX_HOME_SUBDIRS) {
+      const sensitive = path.join(resolvedHome, sub);
+      if (isPathInsideOrEqual(realPath, sensitive)) return false;
+    }
+  }
+  return true;
+}
+
+function resolveValidatedGitAuxMount(
+  rawValue: string,
+  resolvedHome: string,
+  resolvedData: string,
+  kind: "file" | "dir",
+  maxBytes: number,
+): { safe: boolean; rewriteValue?: string; readOnlyPaths: string[]; symlinks: { dest: string; target: string }[] } {
+  const trimmed = rawValue.trim();
+  if (!trimmed) return { safe: true, readOnlyPaths: [], symlinks: [] };
+  if (/[\r\n\0]/.test(trimmed)) return { safe: false, readOnlyPaths: [], symlinks: [] };
+  let logicalPath: string;
+  if (trimmed === "~") {
+    return { safe: false, readOnlyPaths: [], symlinks: [] };
+  } else if (trimmed.startsWith("~/")) {
+    if (!resolvedHome) return { safe: false, readOnlyPaths: [], symlinks: [] };
+    logicalPath = path.join(resolvedHome, trimmed.slice(2));
+  } else if (path.isAbsolute(trimmed)) {
+    logicalPath = path.resolve(trimmed);
+  } else {
+    // 相对路径（如仓库内路径）不需要宿主机外部挂载
+    return { safe: true, readOnlyPaths: [], symlinks: [] };
+  }
+
+  let lst: fs.Stats;
+  try {
+    lst = fs.lstatSync(logicalPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return {
+        safe: isSafeGitAuxTargetPath(path.resolve(logicalPath), resolvedHome, resolvedData, kind),
+        readOnlyPaths: [],
+        symlinks: [],
+      };
+    }
+    return { safe: false, readOnlyPaths: [], symlinks: [] };
+  }
+
+  let st: fs.Stats;
+  let real: string;
+  try {
+    st = fs.statSync(logicalPath);
+    real = fs.realpathSync(logicalPath);
+  } catch {
+    return { safe: false, readOnlyPaths: [], symlinks: [] };
+  }
+  if (kind === "file") {
+    if (!st.isFile() || st.size > maxBytes) return { safe: false, readOnlyPaths: [], symlinks: [] };
+  } else {
+    if (!st.isDirectory()) return { safe: false, readOnlyPaths: [], symlinks: [] };
+  }
+  if (!isSafeGitAuxTargetPath(real, resolvedHome, resolvedData, kind)) {
+    return { safe: false, readOnlyPaths: [], symlinks: [] };
+  }
+
+  const readOnlyPaths = [real];
+  const symlinks: { dest: string; target: string }[] = [];
+  if (lst.isSymbolicLink()) {
+    const logicalDest = path.join(safeRealpath(path.dirname(logicalPath)), path.basename(logicalPath));
+    if (logicalDest !== real) symlinks.push({ dest: logicalDest, target: real });
+  }
+  if (kind === "dir") {
+    // 若 CA 目录内含指向外部单个证书文件的符号链接（如 openssl rehash），仅安全投影合规只读目标文件
+    try {
+      const ents = fs.readdirSync(real, { withFileTypes: true }).slice(0, 256);
+      for (const ent of ents) {
+        if (!ent.isSymbolicLink()) continue;
+        const p = path.join(real, ent.name);
+        try {
+          const tSt = fs.statSync(p);
+          if (!tSt.isFile() || tSt.size > maxBytes) continue;
+          const tReal = fs.realpathSync(p);
+          if (isPathInsideOrEqual(tReal, real)) continue;
+          if (!isSafeGitAuxTargetPath(tReal, resolvedHome, resolvedData, "file")) continue;
+          readOnlyPaths.push(tReal);
+        } catch {
+          // ignore broken cert symlink
+        }
+      }
+    } catch {
+      // ignore readdir failure
+    }
+  }
+  return { safe: true, rewriteValue: real, readOnlyPaths, symlinks };
+}
+
 /**
  * 为不可信仓库工人、代码审查、校验命令及本地/受控远程 Git 投影脱敏的全局 Git 配置（遵守 `GIT_CONFIG_GLOBAL`）：
  *   - 默认（无 `allowedRemoteUrls`）：彻底剥离 `http.extraHeader`、带令牌 `url.*.insteadOf` 与 `credential.*`，避免仓库 clean/smudge 过滤器或不可信工人读取无关凭据；
- *   - 受信任远程 Git（传入 `allowedRemoteUrls`）：按目标 URL 仅投影匹配该目标的 `http.<url>.*`、`credential.<url>.*` 与 `url.*` 重写。
+ *     同时保留经校验的全局 `core.excludesFile` / `core.attributesFile` 并只读挂载其目标文件，确保 `git add -A` 遵守宿主机全局忽略规则；
+ *   - 受信任远程 Git（传入 `allowedRemoteUrls`）：按目标 URL 仅投影匹配该目标的 `http.<url>.*`、`credential.<url>.*` 与 `url.*` 重写，
+ *     并将生效的 `http.sslCAInfo` / `http.sslCAPath`（含按目标 URL 匹配段）目标以只读方式挂载进隔离沙箱。
  */
 export function stageSanitizedGitConfig(
   rawEnv: NodeJS.ProcessEnv = process.env,
@@ -1070,7 +1240,81 @@ export function stageSanitizedGitConfig(
   });
   if (!discovered) return undefined;
 
-  const sanitized = sanitizeGitConfigEntries(discovered.entries, {
+  const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
+  const allowedRemoteUrls = (opts?.allowedRemoteUrls ?? []).filter(Boolean);
+  const extraReadOnlyPaths: string[] = [];
+  const symlinks: { dest: string; target: string }[] = [];
+  const seenRo = new Set<string>();
+  const seenSym = new Set<string>();
+  const addAuxMounts = (ro: string[], syms: { dest: string; target: string }[]) => {
+    for (const p of ro) {
+      if (!seenRo.has(p)) {
+        seenRo.add(p);
+        extraReadOnlyPaths.push(p);
+      }
+    }
+    for (const s of syms) {
+      const k = `${s.dest}=>${s.target}`;
+      if (!seenSym.has(k)) {
+        seenSym.add(k);
+        symlinks.push(s);
+      }
+    }
+  };
+
+  // 预扫各辅助路径键的最后生效下标（Git 单值配置遵循后写覆盖），避免把被覆盖的旧路径也挂载进沙箱
+  const lastAuxIdx = new Map<string, number>();
+  const auxSpecForEntry = (key: string, value: string): { kind: "file" | "dir"; maxBytes: number; dedupKey: string } | undefined => {
+    const trimmed = key.trim();
+    const lk = trimmed.toLowerCase();
+    if (lk === "core.excludesfile" || lk === "core.attributesfile") {
+      return { kind: "file", maxBytes: 512 * 1024, dedupKey: lk };
+    }
+    if (allowedRemoteUrls.length > 0 && isAllowedRemoteGitConfigEntry(trimmed, value, allowedRemoteUrls)) {
+      const firstDot = trimmed.indexOf(".");
+      const lastDot = trimmed.lastIndexOf(".");
+      if (firstDot > 0) {
+        const section = trimmed.slice(0, firstDot).toLowerCase();
+        const varName = trimmed.slice(lastDot + 1).toLowerCase();
+        if (section === "http" && varName === "sslcainfo") {
+          return { kind: "file", maxBytes: 4 * 1024 * 1024, dedupKey: lk };
+        }
+        if (section === "http" && varName === "sslcapath") {
+          return { kind: "dir", maxBytes: 4 * 1024 * 1024, dedupKey: lk };
+        }
+      }
+    }
+    return undefined;
+  };
+  discovered.entries.forEach((entry, idx) => {
+    const spec = auxSpecForEntry(entry.key, entry.value);
+    if (spec) lastAuxIdx.set(spec.dedupKey, idx);
+  });
+
+  const filteredEntries: { key: string; value: string }[] = [];
+  discovered.entries.forEach((entry, idx) => {
+    const spec = auxSpecForEntry(entry.key, entry.value);
+    if (!spec) {
+      filteredEntries.push(entry);
+      return;
+    }
+    if (lastAuxIdx.get(spec.dedupKey) !== idx) return;
+    const validated = resolveValidatedGitAuxMount(
+      entry.value,
+      discovered.resolvedHome,
+      resolvedData,
+      spec.kind,
+      spec.maxBytes,
+    );
+    if (!validated.safe) return;
+    addAuxMounts(validated.readOnlyPaths, validated.symlinks);
+    filteredEntries.push({
+      key: entry.key,
+      value: validated.rewriteValue ?? entry.value,
+    });
+  });
+
+  const sanitized = sanitizeGitConfigEntries(filteredEntries, {
     allowedRemoteUrls: opts?.allowedRemoteUrls,
   });
   if (!sanitized) return undefined;
@@ -1090,6 +1334,8 @@ export function stageSanitizedGitConfig(
       file,
       homeMountDest,
       bindMounts,
+      extraReadOnlyPaths,
+      symlinks,
       cleanup: scoped.cleanup,
     };
   } catch (err) {
@@ -1204,13 +1450,32 @@ export function collectSafeGitConfigMounts(
   dataDir?: string,
   opts?: { cwd?: string },
 ): { readOnlyPaths: string[]; symlinks: { dest: string; target: string }[] } {
-  const discovered = discoverEffectiveGlobalGitConfig(rawEnv, dataDir, { cwd: opts?.cwd });
+  const discovered = discoverEffectiveGlobalGitConfig(rawEnv, dataDir, {
+    cwd: opts?.cwd,
+    includeStaticFallbackEntries: true,
+  });
   if (!discovered) return { readOnlyPaths: [], symlinks: [] };
+  const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
   const rules = collectSafeGitIgnoreAndAttrMounts(rawEnv, dataDir);
-  const readOnlyPaths = [...new Set([...discovered.readOnlyPaths, ...rules.readOnlyPaths])];
+  const auxRo: string[] = [];
+  const auxSym: { dest: string; target: string }[] = [];
+  for (const key of ["core.excludesfile", "core.attributesfile"] as const) {
+    let lastVal: string | undefined;
+    for (const e of discovered.entries) {
+      if (e.key.trim().toLowerCase() === key) lastVal = e.value;
+    }
+    if (lastVal) {
+      const validated = resolveValidatedGitAuxMount(lastVal, discovered.resolvedHome, resolvedData, "file", 512 * 1024);
+      if (validated.safe) {
+        auxRo.push(...validated.readOnlyPaths);
+        auxSym.push(...validated.symlinks);
+      }
+    }
+  }
+  const readOnlyPaths = [...new Set([...discovered.readOnlyPaths, ...rules.readOnlyPaths, ...auxRo])];
   const seenSym = new Set<string>();
   const symlinks: { dest: string; target: string }[] = [];
-  for (const s of [...discovered.symlinks, ...rules.symlinks]) {
+  for (const s of [...discovered.symlinks, ...rules.symlinks, ...auxSym]) {
     if (seenSym.has(s.dest)) continue;
     seenSym.add(s.dest);
     symlinks.push(s);
@@ -1855,6 +2120,8 @@ export interface StagedClaudeState {
   origCreds?: ClaudeCredsOrigSnapshot;
   bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[];
   symlinks: { dest: string; target: string }[];
+  /** 写回宿主机发生可重试 I/O 或锁错误且暂存目录含已轮换令牌时置为 true，cleanup() 将保留受保护恢复副本 */
+  retainScratchForRecovery?: boolean;
   cleanup: () => void;
 }
 
@@ -2142,6 +2409,36 @@ function applyValidatedClaudeAuthSyncLocked(meta: ClaudeSyncTargetMeta, scratchC
   }
 }
 
+function hasRotatedClaudeScratchAuth(staged: StagedClaudeState): boolean {
+  const snap = staged.origCreds;
+  if (!snap || !snap.canSyncBack || !hasClaudeOAuthRefreshToken(snap.origJson)) return false;
+  const scratchCredPath = path.join(staged.dir, snap.credFileName);
+  try {
+    const st = fs.lstatSync(scratchCredPath);
+    if (st.isSymbolicLink() || !st.isFile() || st.size === 0 || st.size > 512 * 1024) return false;
+    const raw = fs.readFileSync(scratchCredPath);
+    if (sha256Hex(raw) === sha256Hex(snap.origBytes)) return false;
+    const parsed = JSON.parse(raw.toString("utf8")) as unknown;
+    if (!isPlainJsonRecord(parsed) || !isPlainJsonRecord(parsed.claudeAiOauth)) return false;
+    const nextOauth = parsed.claudeAiOauth;
+    if (typeof nextOauth.accessToken !== "string" || !nextOauth.accessToken.trim()) return false;
+    if (typeof nextOauth.refreshToken !== "string" || !nextOauth.refreshToken.trim()) return false;
+    const origOauth = isPlainJsonRecord(snap.origJson.claudeAiOauth) ? snap.origJson.claudeAiOauth : undefined;
+    if (!origOauth) return false;
+    const origOrg = typeof origOauth.organizationUuid === "string" && origOauth.organizationUuid ? origOauth.organizationUuid : undefined;
+    if (origOrg && typeof nextOauth.organizationUuid === "string" && nextOauth.organizationUuid && nextOauth.organizationUuid !== origOrg) {
+      return false;
+    }
+    const nextExp = parseClaudeExpiresAtMs(nextOauth);
+    const origExp = parseClaudeExpiresAtMs(origOauth);
+    const tokensChanged = nextOauth.accessToken !== origOauth.accessToken || nextOauth.refreshToken !== origOauth.refreshToken;
+    const expAdvanced = nextExp !== undefined && (origExp === undefined || nextExp > origExp);
+    return tokensChanged || expAdvanced;
+  } catch {
+    return false;
+  }
+}
+
 function recoverOrphanedClaudeAuthLocked(
   db: DatabaseSync,
   resolvedCredPath: string,
@@ -2154,9 +2451,10 @@ function recoverOrphanedClaudeAuthLocked(
     .all() as unknown as CodexPendingRecoveryRow[];
   let recoveredAny = false;
   for (const rec of rows) {
-    const dead = !isPidAlive(rec.pid);
+    const dead = !isOAuthHolderActive(rec.pid, rec.holder);
     const isExpiredHolder = !!expiredLeaseHolder && rec.holder === expiredLeaseHolder;
     if (!dead && !isExpiredHolder) continue;
+    let writeFailed = false;
     try {
       const origExpMs = rec.orig_last_refresh ? Number(rec.orig_last_refresh) : undefined;
       const ok = applyValidatedClaudeAuthSyncLocked(
@@ -2174,18 +2472,19 @@ function recoverOrphanedClaudeAuthLocked(
       );
       if (ok) {
         recoveredAny = true;
-        log("info", "已从崩溃遗留的暂存 Claude 目录原子恢复刷新后的 OAuth 凭据", {
+        log("info", "已从遗留暂存 Claude 目录原子恢复刷新后的 OAuth 凭据", {
           holder: rec.holder,
           resolvedCredPath,
         });
       }
     } catch (err) {
-      log("warn", "恢复崩溃遗留的 Claude OAuth 凭据失败（保留原文件）", {
+      writeFailed = true;
+      log("warn", "恢复遗留 Claude OAuth 凭据失败（保留恢复副本与原文件）", {
         holder: rec.holder,
         err: errMsg(err),
       });
     }
-    if (dead) {
+    if (dead && !writeFailed) {
       if (isSafeClaudeScratchDirForCleanup(rec.scratch_dir)) {
         try {
           fs.rmSync(rec.scratch_dir, { recursive: true, force: true });
@@ -2203,7 +2502,7 @@ export interface ClaudeOAuthRefreshLease {
   held: boolean;
   resolvedCredPath?: string;
   attachScratch?: (staged: StagedClaudeState) => void;
-  release: () => void;
+  release: (opts?: { keepRecoveryRow?: boolean }) => void;
 }
 
 /** 跨进程协调 Claude 文件态 OAuth（`.credentials.json`）刷新与崩溃恢复，避免单次 refreshToken 被隔离清理丢弃 */
@@ -2243,6 +2542,7 @@ export async function coordinateClaudeOAuthRefresh(
   const makeAttachScratch = (): ((staged: StagedClaudeState) => void) => (staged: StagedClaudeState) => {
     const snap = staged.origCreds;
     if (!snap || !snap.canSyncBack || !hasClaudeOAuthRefreshToken(snap.origJson)) return;
+    activeOAuthLeaseHolders.add(holder);
     const oauth = isPlainJsonRecord(snap.origJson.claudeAiOauth) ? snap.origJson.claudeAiOauth : undefined;
     const expMs = parseClaudeExpiresAtMs(oauth);
     try {
@@ -2279,7 +2579,7 @@ export async function coordinateClaudeOAuthRefresh(
       const row = db
         .prepare("SELECT holder, pid, expires_at FROM refresh_lease WHERE id = 1")
         .get() as { holder: string; pid: number; expires_at: number } | undefined;
-      if (row && row.expires_at > now && isPidAlive(row.pid)) {
+      if (row && row.expires_at > now && isOAuthHolderActive(row.pid, row.holder)) {
         return { action: "wait" as const };
       }
       recoverOrphanedClaudeAuthLocked(db, resolvedCredPath, row?.holder);
@@ -2307,22 +2607,29 @@ export async function coordinateClaudeOAuthRefresh(
 
     if (attempt.action === "proceed_unlocked") {
       let released = false;
-      const release = () => {
+      const release = (relOpts?: { keepRecoveryRow?: boolean }) => {
         if (released) return;
         released = true;
-        process.off("exit", release);
+        activeOAuthLeaseHolders.delete(holder);
+        process.off("exit", onExit);
         try {
           withCodexAuthSyncLock(resolvedCredPath, (db) => {
-            db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+            if (relOpts?.keepRecoveryRow) {
+              db.prepare("UPDATE pending_recovery SET pid = 0 WHERE holder = ?").run(holder);
+            } else {
+              db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+            }
           });
         } catch {
           // ignore
         }
       };
-      process.once("exit", release);
+      const onExit = () => release({ keepRecoveryRow: true });
+      process.once("exit", onExit);
       return { held: false, resolvedCredPath, attachScratch: makeAttachScratch(), release };
     }
     if (attempt.action === "acquired") {
+      activeOAuthLeaseHolders.add(holder);
       let released = false;
       const heartbeat = setInterval(() => {
         if (released) return;
@@ -2338,21 +2645,27 @@ export async function coordinateClaudeOAuthRefresh(
         }
       }, Math.max(500, Math.floor(leaseTtlMs / 3)));
       heartbeat.unref?.();
-      const release = () => {
+      const release = (relOpts?: { keepRecoveryRow?: boolean }) => {
         if (released) return;
         released = true;
+        activeOAuthLeaseHolders.delete(holder);
         clearInterval(heartbeat);
-        process.off("exit", release);
+        process.off("exit", onExit);
         try {
           withCodexAuthSyncLock(resolvedCredPath, (db) => {
-            db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+            if (relOpts?.keepRecoveryRow) {
+              db.prepare("UPDATE pending_recovery SET pid = 0 WHERE holder = ?").run(holder);
+            } else {
+              db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+            }
             db.prepare("DELETE FROM refresh_lease WHERE id = 1 AND holder = ?").run(holder);
           });
         } catch {
           // ignore
         }
       };
-      process.once("exit", release);
+      const onExit = () => release({ keepRecoveryRow: true });
+      process.once("exit", onExit);
       return { held: true, resolvedCredPath, attachScratch: makeAttachScratch(), release };
     }
 
@@ -2363,7 +2676,7 @@ export async function coordinateClaudeOAuthRefresh(
   }
 }
 
-/** 在清理暂存 Claude 目录前，条件验证并原子写回旋转后的 Claude OAuth `.credentials.json`（绝不覆盖更新的宿主机登录） */
+/** 在清理暂存 Claude 目录前，条件验证并原子写回旋转后的 Claude OAuth `.credentials.json`（绝不覆盖更新的宿主机登录）；遇可重试写回错误且暂存含已轮换令牌时保留受保护恢复副本 */
 export function syncRefreshedClaudeAuth(staged: StagedClaudeState): boolean {
   const snap = staged.origCreds;
   if (!snap || !snap.canSyncBack || !hasClaudeOAuthRefreshToken(snap.origJson)) return false;
@@ -2387,7 +2700,15 @@ export function syncRefreshedClaudeAuth(staged: StagedClaudeState): boolean {
       ),
     );
   } catch (err) {
-    log("warn", "写回刷新后的 Claude .credentials.json 失败（保留原文件）", { err: errMsg(err) });
+    if (hasRotatedClaudeScratchAuth(staged)) {
+      staged.retainScratchForRecovery = true;
+      log("warn", "写回刷新后的 Claude .credentials.json 失败，已保留受保护恢复副本待后续自动重试", {
+        scratchDir: path.dirname(staged.dir),
+        err: errMsg(err),
+      });
+    } else {
+      log("warn", "写回刷新后的 Claude .credentials.json 失败（保留原文件）", { err: errMsg(err) });
+    }
     return false;
   }
 }
@@ -2442,7 +2763,7 @@ export function stageIsolatedClaudeState(
           const row = db
             .prepare("SELECT holder, pid, expires_at FROM refresh_lease WHERE id = 1")
             .get() as { holder: string; pid: number; expires_at: number } | undefined;
-          if (row && row.expires_at > Date.now() && isPidAlive(row.pid)) return false;
+          if (row && row.expires_at > Date.now() && isOAuthHolderActive(row.pid, row.holder)) return false;
           return recoverOrphanedClaudeAuthLocked(db, targetResolved, row?.holder);
         });
         if (recovered) {
@@ -2602,7 +2923,7 @@ export function stageIsolatedClaudeState(
       // not a symlink
     }
 
-    return {
+    const state: StagedClaudeState = {
       hostClaudeDir,
       hostClaudeJson,
       dir: stageDir,
@@ -2610,8 +2931,13 @@ export function stageIsolatedClaudeState(
       origCreds,
       bindMounts,
       symlinks,
-      cleanup: cleanupScoped,
+      retainScratchForRecovery: false,
+      cleanup: () => {
+        if (state.retainScratchForRecovery) return;
+        cleanupScoped();
+      },
     };
+    return state;
   } catch (err) {
     cleanupScoped();
     throw err;
@@ -2899,13 +3225,15 @@ interface OpenCodeAuthOrigSnapshot {
 export interface StagedOpenCodeState extends StagedAgentState {
   stageDataDir: string;
   origAuth?: OpenCodeAuthOrigSnapshot;
+  /** 写回宿主机发生可重试 I/O 或锁错误且暂存目录含已轮换令牌时置为 true，cleanup() 将保留受保护恢复副本 */
+  retainScratchForRecovery?: boolean;
 }
 
 export interface OpenCodeOAuthRefreshLease {
   held: boolean;
   resolvedAuthPath?: string;
   attachScratch?: (staged: StagedOpenCodeState) => void;
-  release: () => void;
+  release: (opts?: { keepRecoveryRow?: boolean }) => void;
 }
 
 function applyValidatedOpenCodeAuthSyncLocked(
@@ -3066,6 +3394,31 @@ function applyValidatedOpenCodeAuthSyncLocked(
   }
 }
 
+function hasRotatedOpenCodeScratchAuth(staged: StagedOpenCodeState): boolean {
+  const snap = staged.origAuth;
+  if (!snap || !snap.canSyncBack || !hasOpenCodeOAuthRefreshToken(snap.origJson)) return false;
+  const scratchAuthPath = path.join(staged.stageDataDir, "auth.json");
+  try {
+    const st = fs.lstatSync(scratchAuthPath);
+    if (st.isSymbolicLink() || !st.isFile() || st.size === 0 || st.size > 512 * 1024) return false;
+    const raw = fs.readFileSync(scratchAuthPath);
+    if (sha256Hex(raw) === sha256Hex(snap.origBytes)) return false;
+    const parsed = JSON.parse(raw.toString("utf8")) as unknown;
+    if (!isPlainJsonRecord(parsed)) return false;
+    for (const [pid, nextVal] of Object.entries(parsed)) {
+      if (!isPlainJsonRecord(nextVal) || nextVal.type !== "oauth") continue;
+      if (typeof nextVal.refresh !== "string" || !nextVal.refresh.trim()) continue;
+      if (typeof nextVal.access !== "string" || !nextVal.access.trim()) continue;
+      const origVal = snap.origJson[pid];
+      if (!isPlainJsonRecord(origVal) || origVal.type !== "oauth") continue;
+      if (JSON.stringify(origVal) !== JSON.stringify(nextVal)) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function recoverOrphanedOpenCodeAuthLocked(
   db: DatabaseSync,
   resolvedAuthPath: string,
@@ -3078,9 +3431,10 @@ function recoverOrphanedOpenCodeAuthLocked(
     .all() as unknown as CodexPendingRecoveryRow[];
   let recoveredAny = false;
   for (const rec of rows) {
-    const dead = !isPidAlive(rec.pid);
+    const dead = !isOAuthHolderActive(rec.pid, rec.holder);
     const isExpiredHolder = !!expiredLeaseHolder && rec.holder === expiredLeaseHolder;
     if (!dead && !isExpiredHolder) continue;
+    let writeFailed = false;
     try {
       const origSnapFile = path.join(rec.scratch_dir, "orig-auth.json");
       if (fs.existsSync(origSnapFile)) {
@@ -3100,17 +3454,23 @@ function recoverOrphanedOpenCodeAuthLocked(
           if (ok) recoveredAny = true;
         }
       }
-    } catch {
-      // ignore invalid orphan scratch
+    } catch (err) {
+      writeFailed = true;
+      log("warn", "恢复遗留 OpenCode OAuth 凭据失败（保留恢复副本与原文件）", {
+        holder: rec.holder,
+        err: errMsg(err),
+      });
     }
-    try {
-      if (rec.scratch_dir && path.basename(rec.scratch_dir).startsWith(".pa-opencode-state-")) {
-        fs.rmSync(rec.scratch_dir, { recursive: true, force: true });
+    if (dead && !writeFailed) {
+      try {
+        if (rec.scratch_dir && path.basename(rec.scratch_dir).startsWith(".pa-opencode-state-")) {
+          fs.rmSync(rec.scratch_dir, { recursive: true, force: true });
+        }
+      } catch {
+        // ignore cleanup error
       }
-    } catch {
-      // ignore cleanup error
+      db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(rec.holder);
     }
-    db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(rec.holder);
   }
   return recoveredAny;
 }
@@ -3152,6 +3512,7 @@ export async function coordinateOpenCodeOAuthRefresh(
   const makeAttachScratch = (): ((staged: StagedOpenCodeState) => void) => (staged: StagedOpenCodeState) => {
     const snap = staged.origAuth;
     if (!snap || !snap.canSyncBack || !hasOpenCodeOAuthRefreshToken(snap.origJson)) return;
+    activeOAuthLeaseHolders.add(holder);
     try {
       const scratchRoot = path.dirname(staged.stageDataDir);
       fs.writeFileSync(path.join(scratchRoot, "orig-auth.json"), snap.origBytes, { mode: 0o600 });
@@ -3188,7 +3549,7 @@ export async function coordinateOpenCodeOAuthRefresh(
       const row = db
         .prepare("SELECT holder, pid, expires_at FROM refresh_lease WHERE id = 1")
         .get() as { holder: string; pid: number; expires_at: number } | undefined;
-      if (row && row.expires_at > now && isPidAlive(row.pid)) {
+      if (row && row.expires_at > now && isOAuthHolderActive(row.pid, row.holder)) {
         return { action: "wait" as const };
       }
       recoverOrphanedOpenCodeAuthLocked(db, resolvedAuthPath, row?.holder);
@@ -3216,22 +3577,29 @@ export async function coordinateOpenCodeOAuthRefresh(
 
     if (attempt.action === "proceed_unlocked") {
       let released = false;
-      const release = () => {
+      const release = (relOpts?: { keepRecoveryRow?: boolean }) => {
         if (released) return;
         released = true;
-        process.off("exit", release);
+        activeOAuthLeaseHolders.delete(holder);
+        process.off("exit", onExit);
         try {
           withCodexAuthSyncLock(resolvedAuthPath, (db) => {
-            db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+            if (relOpts?.keepRecoveryRow) {
+              db.prepare("UPDATE pending_recovery SET pid = 0 WHERE holder = ?").run(holder);
+            } else {
+              db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+            }
           });
         } catch {
           // ignore
         }
       };
-      process.once("exit", release);
+      const onExit = () => release({ keepRecoveryRow: true });
+      process.once("exit", onExit);
       return { held: false, resolvedAuthPath, attachScratch: makeAttachScratch(), release };
     }
     if (attempt.action === "acquired") {
+      activeOAuthLeaseHolders.add(holder);
       let released = false;
       const heartbeat = setInterval(() => {
         if (released) return;
@@ -3247,21 +3615,27 @@ export async function coordinateOpenCodeOAuthRefresh(
         }
       }, Math.max(500, Math.floor(leaseTtlMs / 3)));
       heartbeat.unref?.();
-      const release = () => {
+      const release = (relOpts?: { keepRecoveryRow?: boolean }) => {
         if (released) return;
         released = true;
+        activeOAuthLeaseHolders.delete(holder);
         clearInterval(heartbeat);
-        process.off("exit", release);
+        process.off("exit", onExit);
         try {
           withCodexAuthSyncLock(resolvedAuthPath, (db) => {
-            db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+            if (relOpts?.keepRecoveryRow) {
+              db.prepare("UPDATE pending_recovery SET pid = 0 WHERE holder = ?").run(holder);
+            } else {
+              db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+            }
             db.prepare("DELETE FROM refresh_lease WHERE id = 1 AND holder = ?").run(holder);
           });
         } catch {
           // ignore
         }
       };
-      process.once("exit", release);
+      const onExit = () => release({ keepRecoveryRow: true });
+      process.once("exit", onExit);
       return { held: true, resolvedAuthPath, attachScratch: makeAttachScratch(), release };
     }
 
@@ -3272,7 +3646,7 @@ export async function coordinateOpenCodeOAuthRefresh(
   }
 }
 
-/** 在清理暂存 OpenCode 目录前，逐供应商条件验证并原子写回旋转后的 OAuth `auth.json`（绝不写回会话数据库或覆盖宿主机更新登录） */
+/** 在清理暂存 OpenCode 目录前，逐供应商条件验证并原子写回旋转后的 OAuth `auth.json`（绝不写回会话数据库或覆盖宿主机更新登录）；遇可重试写回错误且暂存含已轮换令牌时保留受保护恢复副本 */
 export function syncRefreshedOpenCodeAuth(staged: StagedOpenCodeState): boolean {
   const snap = staged.origAuth;
   if (!snap || !snap.canSyncBack || !hasOpenCodeOAuthRefreshToken(snap.origJson)) return false;
@@ -3292,7 +3666,15 @@ export function syncRefreshedOpenCodeAuth(staged: StagedOpenCodeState): boolean 
       ),
     );
   } catch (err) {
-    log("warn", "写回刷新后的 OpenCode auth.json 失败（保留原文件）", { err: errMsg(err) });
+    if (hasRotatedOpenCodeScratchAuth(staged)) {
+      staged.retainScratchForRecovery = true;
+      log("warn", "写回刷新后的 OpenCode auth.json 失败，已保留受保护恢复副本待后续自动重试", {
+        scratchDir: path.dirname(staged.stageDataDir),
+        err: errMsg(err),
+      });
+    } else {
+      log("warn", "写回刷新后的 OpenCode auth.json 失败（保留原文件）", { err: errMsg(err) });
+    }
     return false;
   }
 }
@@ -3342,7 +3724,7 @@ export function stageIsolatedOpenCodeState(
           const row = db
             .prepare("SELECT holder, pid, expires_at FROM refresh_lease WHERE id = 1")
             .get() as { holder: string; pid: number; expires_at: number } | undefined;
-          if (row && row.expires_at > Date.now() && isPidAlive(row.pid)) return false;
+          if (row && row.expires_at > Date.now() && isOAuthHolderActive(row.pid, row.holder)) return false;
           return recoverOrphanedOpenCodeAuthLocked(db, targetResolved, row?.holder);
         });
         if (recovered) {
@@ -3486,7 +3868,7 @@ export function stageIsolatedOpenCodeState(
       }
     }
 
-    return {
+    const state: StagedOpenCodeState = {
       hostDirsToSkip: [...new Set([hostConfigDir, hostDataDir])],
       stageDataDir,
       origAuth,
@@ -3494,8 +3876,13 @@ export function stageIsolatedOpenCodeState(
         { src: stageConfigDir, dest: logicalConfigDir, mode: "rw" },
         { src: stageDataDir, dest: logicalDataDir, mode: "rw" },
       ],
-      cleanup: cleanupScoped,
+      retainScratchForRecovery: false,
+      cleanup: () => {
+        if (state.retainScratchForRecovery) return;
+        cleanupScoped();
+      },
     };
+    return state;
   } catch (err) {
     cleanupScoped();
     throw err;
@@ -6886,8 +7273,9 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       acpxExtraBindMounts.push({ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" });
     }
     if (stagedGitCfg) {
-      acpxExtraRo.push(stagedGitCfg.dir);
+      acpxExtraRo.push(stagedGitCfg.dir, ...stagedGitCfg.extraReadOnlyPaths);
       acpxExtraBindMounts.push(...stagedGitCfg.bindMounts);
+      acpxExtraSymlinks.push(...stagedGitCfg.symlinks);
     }
     if (stagedCodexHome) {
       acpxExtraRw.push(stagedCodexHome.scratchDir);
@@ -7022,16 +7410,16 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       syncRefreshedOpenCodeAuth(stagedOpenCode);
     }
     stagedCodexHome?.cleanup();
-    oauthLease?.release();
+    oauthLease?.release({ keepRecoveryRow: !!stagedCodexHome?.retainScratchForRecovery });
     stagedAws?.cleanup();
     stagedGitCfg?.cleanup();
     stagedNpmrc?.cleanup();
     stagedDoubao?.cleanup();
     stagedOpenCode?.cleanup();
-    openCodeOAuthLease?.release();
+    openCodeOAuthLease?.release({ keepRecoveryRow: !!stagedOpenCode?.retainScratchForRecovery });
     stagedGemini?.cleanup();
     stagedClaude?.cleanup();
-    claudeOAuthLease?.release();
+    claudeOAuthLease?.release({ keepRecoveryRow: !!stagedClaude?.retainScratchForRecovery });
     stagedAcpx?.cleanup();
     baseEnv.cleanup();
   }
@@ -7099,6 +7487,8 @@ export interface StagedCodexHome {
   origAuth?: CodexAuthOrigSnapshot;
   /** 保留兼容字段（已废弃：所有工作区统一按规范化目标路径使用跨工作区共享锁目录） */
   lockDir?: string;
+  /** 写回宿主机发生可重试 I/O 或锁错误且暂存目录含已轮换令牌时置为 true，cleanup() 将保留受保护恢复副本 */
+  retainScratchForRecovery?: boolean;
   cleanup: () => void;
 }
 
@@ -7156,6 +7546,8 @@ function isCurrentUidOwner(st: fs.Stats): boolean {
   return typeof process.getuid !== "function" || st.uid === process.getuid();
 }
 
+const activeOAuthLeaseHolders = new Set<string>();
+
 function isPidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -7164,6 +7556,13 @@ function isPidAlive(pid: number): boolean {
   } catch (err) {
     return (err as NodeJS.ErrnoException)?.code === "EPERM";
   }
+}
+
+/** 判断 OAuth 刷新租约或待恢复记录持有者是否仍活跃：pid<=0 表示显式保留待恢复；同进程内以 activeOAuthLeaseHolders 精确判定 */
+function isOAuthHolderActive(pid: number, holder: string): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return activeOAuthLeaseHolders.has(holder);
+  return isPidAlive(pid);
 }
 
 /**
@@ -7493,8 +7892,47 @@ function applyValidatedCodexAuthSyncLocked(meta: CodexSyncTargetMeta, scratchAut
   }
 }
 
+function hasRotatedCodexScratchAuth(staged: StagedCodexHome): boolean {
+  const snap = staged.origAuth;
+  if (!snap || !snap.canSyncBack) return false;
+  const origTokens = isPlainJsonRecord(snap.origJson.tokens) ? snap.origJson.tokens : undefined;
+  if (!origTokens) return false;
+  const scratchAuthPath = path.join(staged.scratchDir, "auth.json");
+  try {
+    const st = fs.lstatSync(scratchAuthPath);
+    if (st.isSymbolicLink() || !st.isFile() || st.size === 0 || st.size > 512 * 1024) return false;
+    const raw = fs.readFileSync(scratchAuthPath);
+    if (sha256Hex(raw) === sha256Hex(snap.origBytes)) return false;
+    const parsed = JSON.parse(raw.toString("utf8")) as unknown;
+    if (!isPlainJsonRecord(parsed) || !isPlainJsonRecord(parsed.tokens)) return false;
+    const nextTokens = parsed.tokens;
+    if (typeof nextTokens.access_token !== "string" || !nextTokens.access_token.trim()) return false;
+    if (typeof nextTokens.refresh_token !== "string" || !nextTokens.refresh_token.trim()) return false;
+    if (typeof snap.origJson.auth_mode === "string" && snap.origJson.auth_mode && parsed.auth_mode !== snap.origJson.auth_mode) {
+      return false;
+    }
+    const origAcc = typeof origTokens.account_id === "string" && origTokens.account_id ? origTokens.account_id : undefined;
+    if (origAcc && typeof nextTokens.account_id === "string" && nextTokens.account_id && nextTokens.account_id !== origAcc) {
+      return false;
+    }
+    const nextRefreshMs = typeof parsed.last_refresh === "string" ? Date.parse(parsed.last_refresh) : NaN;
+    const origRefreshMs = typeof snap.origJson.last_refresh === "string" ? Date.parse(snap.origJson.last_refresh) : NaN;
+    if (Number.isFinite(origRefreshMs) && Number.isFinite(nextRefreshMs) && nextRefreshMs < origRefreshMs) {
+      return false;
+    }
+    const tokensChanged =
+      nextTokens.access_token !== origTokens.access_token ||
+      nextTokens.refresh_token !== origTokens.refresh_token ||
+      (typeof nextTokens.id_token === "string" && nextTokens.id_token !== origTokens.id_token);
+    const refreshAdvanced = Number.isFinite(nextRefreshMs) && (!Number.isFinite(origRefreshMs) || nextRefreshMs > origRefreshMs);
+    return tokensChanged || refreshAdvanced;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * 在持锁状态下扫描并恢复已死亡进程或已过期租约持有者遗留的暂存 `auth.json` 轮换结果，
+ * 在持锁状态下扫描并恢复已死亡进程、写回失败保留或已过期租约持有者遗留的暂存 `auth.json` 轮换结果，
  * 确保后续工作进程不会重新读取并消费已作废的旧单次 refresh_token。
  */
 function recoverOrphanedCodexAuthLocked(
@@ -7509,9 +7947,10 @@ function recoverOrphanedCodexAuthLocked(
     .all() as unknown as CodexPendingRecoveryRow[];
   let recoveredAny = false;
   for (const rec of rows) {
-    const dead = !isPidAlive(rec.pid);
+    const dead = !isOAuthHolderActive(rec.pid, rec.holder);
     const isExpiredHolder = !!expiredLeaseHolder && rec.holder === expiredLeaseHolder;
     if (!dead && !isExpiredHolder) continue;
+    let writeFailed = false;
     try {
       const ok = applyValidatedCodexAuthSyncLocked(
         {
@@ -7529,18 +7968,19 @@ function recoverOrphanedCodexAuthLocked(
       );
       if (ok) {
         recoveredAny = true;
-        log("info", "已从崩溃遗留的暂存 CODEX_HOME 原子恢复刷新后的 OAuth 凭据", {
+        log("info", "已从遗留暂存 CODEX_HOME 原子恢复刷新后的 OAuth 凭据", {
           holder: rec.holder,
           resolvedAuthPath,
         });
       }
     } catch (err) {
-      log("warn", "恢复崩溃遗留的 Codex OAuth 凭据失败（保留原文件）", {
+      writeFailed = true;
+      log("warn", "恢复遗留 Codex OAuth 凭据失败（保留恢复副本与原文件）", {
         holder: rec.holder,
         err: errMsg(err),
       });
     }
-    if (dead) {
+    if (dead && !writeFailed) {
       if (isSafeCodexScratchDirForCleanup(rec.scratch_dir)) {
         try {
           fs.rmSync(rec.scratch_dir, { recursive: true, force: true });
@@ -7740,9 +8180,9 @@ function sleepAbortableMs(ms: number, signal?: AbortSignal): Promise<void> {
 export interface CodexOAuthRefreshLease {
   held: boolean;
   resolvedAuthPath?: string;
-  /** 在启动隔离子进程前登记暂存目录，确保若常驻进程在轮换单次 refresh_token 后异常崩溃，下次调用先原子恢复新令牌再复用宿主机凭据 */
+  /** 在启动隔离子进程前登记暂存目录，确保若常驻进程在轮换单次 refresh_token 后异常崩溃或写回失败，下次调用先原子恢复新令牌再复用宿主机凭据 */
   attachScratch?: (staged: StagedCodexHome) => void;
-  release: () => void;
+  release: (opts?: { keepRecoveryRow?: boolean }) => void;
 }
 
 /**
@@ -7790,6 +8230,7 @@ export async function coordinateCodexOAuthRefresh(
   const makeAttachScratch = (): ((staged: StagedCodexHome) => void) => (staged: StagedCodexHome) => {
     const snap = staged.origAuth;
     if (!snap || !snap.canSyncBack || !hasOAuthRefreshToken(snap.origJson)) return;
+    activeOAuthLeaseHolders.add(holder);
     const origTokens = isPlainJsonRecord(snap.origJson.tokens) ? snap.origJson.tokens : undefined;
     try {
       withCodexAuthSyncLock(snap.resolvedAuthPath, (db) => {
@@ -7825,10 +8266,10 @@ export async function coordinateCodexOAuthRefresh(
       const row = db
         .prepare("SELECT holder, pid, expires_at FROM refresh_lease WHERE id = 1")
         .get() as { holder: string; pid: number; expires_at: number } | undefined;
-      if (row && row.expires_at > now && isPidAlive(row.pid)) {
+      if (row && row.expires_at > now && isOAuthHolderActive(row.pid, row.holder)) {
         return { action: "wait" as const };
       }
-      // 在重新检查宿主机 auth.json 前，先从死亡进程或过期租约遗留的暂存目录原子恢复已轮换的新令牌
+      // 在重新检查宿主机 auth.json 前，先从死亡进程、写回失败保留或过期租约遗留的暂存目录原子恢复已轮换的新令牌
       recoverOrphanedCodexAuthLocked(db, resolvedAuthPath, row?.holder);
 
       const cur = inspectHostCodexAuth(hostAuthPath);
@@ -7856,22 +8297,29 @@ export async function coordinateCodexOAuthRefresh(
 
     if (attempt.action === "proceed_unlocked") {
       let released = false;
-      const release = () => {
+      const release = (relOpts?: { keepRecoveryRow?: boolean }) => {
         if (released) return;
         released = true;
-        process.off("exit", release);
+        activeOAuthLeaseHolders.delete(holder);
+        process.off("exit", onExit);
         try {
           withCodexAuthSyncLock(resolvedAuthPath, (db) => {
-            db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+            if (relOpts?.keepRecoveryRow) {
+              db.prepare("UPDATE pending_recovery SET pid = 0 WHERE holder = ?").run(holder);
+            } else {
+              db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+            }
           });
         } catch {
           // ignore cleanup failure on exit
         }
       };
-      process.once("exit", release);
+      const onExit = () => release({ keepRecoveryRow: true });
+      process.once("exit", onExit);
       return { held: false, resolvedAuthPath, attachScratch: makeAttachScratch(), release };
     }
     if (attempt.action === "acquired") {
+      activeOAuthLeaseHolders.add(holder);
       let released = false;
       const heartbeat = setInterval(() => {
         if (released) return;
@@ -7888,21 +8336,27 @@ export async function coordinateCodexOAuthRefresh(
       }, Math.max(500, Math.floor(leaseTtlMs / 3)));
       heartbeat.unref?.();
 
-      const release = () => {
+      const release = (relOpts?: { keepRecoveryRow?: boolean }) => {
         if (released) return;
         released = true;
+        activeOAuthLeaseHolders.delete(holder);
         clearInterval(heartbeat);
-        process.off("exit", release);
+        process.off("exit", onExit);
         try {
           withCodexAuthSyncLock(resolvedAuthPath, (db) => {
-            db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+            if (relOpts?.keepRecoveryRow) {
+              db.prepare("UPDATE pending_recovery SET pid = 0 WHERE holder = ?").run(holder);
+            } else {
+              db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+            }
             db.prepare("DELETE FROM refresh_lease WHERE id = 1 AND holder = ?").run(holder);
           });
         } catch {
           // ignore release failure on exit
         }
       };
-      process.once("exit", release);
+      const onExit = () => release({ keepRecoveryRow: true });
+      process.once("exit", onExit);
       return { held: true, resolvedAuthPath, attachScratch: makeAttachScratch(), release };
     }
 
@@ -8015,7 +8469,7 @@ export function stageIsolatedCodexHome(
             const row = db
               .prepare("SELECT holder, pid, expires_at FROM refresh_lease WHERE id = 1")
               .get() as { holder: string; pid: number; expires_at: number } | undefined;
-            if (row && row.expires_at > Date.now() && isPidAlive(row.pid)) return false;
+            if (row && row.expires_at > Date.now() && isOAuthHolderActive(row.pid, row.holder)) return false;
             return recoverOrphanedCodexAuthLocked(db, resolvedAuthForRecovery, row?.holder);
           });
           if (recovered) {
@@ -8131,12 +8585,17 @@ export function stageIsolatedCodexHome(
       }
     }
 
-    return {
+    const state: StagedCodexHome = {
       scratchDir,
       origAuth,
       lockDir: opts.lockDir,
-      cleanup,
+      retainScratchForRecovery: false,
+      cleanup: () => {
+        if (state.retainScratchForRecovery) return;
+        cleanup();
+      },
     };
+    return state;
   } catch (err) {
     cleanup();
     throw err;
@@ -8203,7 +8662,15 @@ export function syncRefreshedCodexAuth(staged: StagedCodexHome): boolean {
       ),
     );
   } catch (err) {
-    log("warn", "写回刷新后的 Codex auth.json 失败（保留原文件）", { err: errMsg(err) });
+    if (hasRotatedCodexScratchAuth(staged)) {
+      staged.retainScratchForRecovery = true;
+      log("warn", "写回刷新后的 Codex auth.json 失败，已保留受保护恢复副本待后续自动重试", {
+        scratchDir: staged.scratchDir,
+        err: errMsg(err),
+      });
+    } else {
+      log("warn", "写回刷新后的 Codex auth.json 失败（保留原文件）", { err: errMsg(err) });
+    }
     return false;
   }
 }
@@ -8358,7 +8825,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       ...(baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : []),
       ...(stagedAws ? [stagedAws.dir, ...stagedAws.extraReadOnlyPaths] : []),
       ...(stagedNpmrc ? [stagedNpmrc.dir] : []),
-      ...(stagedGitCfg ? [stagedGitCfg.dir] : []),
+      ...(stagedGitCfg ? [stagedGitCfg.dir, ...stagedGitCfg.extraReadOnlyPaths] : []),
     ];
     const extraRw = [
       ...(isolatedTmp ? [isolatedTmp] : []),
@@ -8370,6 +8837,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       ...(stagedNpmrc ? [{ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" as const }] : []),
       ...(stagedGitCfg ? stagedGitCfg.bindMounts : []),
     ];
+    const extraSymlinks = [...(stagedGitCfg ? stagedGitCfg.symlinks : [])];
     const wrapped = wrapCredentialIsolatedCommand(
       cmd,
       args,
@@ -8384,6 +8852,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
           disableGitWorktreeMounts: run.disableGitWorktreeMounts,
           extraWritablePaths: extraRw,
           extraReadOnlyPaths: extraRo,
+          ...(extraSymlinks.length ? { extraSymlinks } : {}),
           extraBindMounts,
         },
         codexIsolationEnv,
@@ -8414,7 +8883,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       syncRefreshedCodexAuth(stagedCodexHome);
     }
     stagedCodexHome?.cleanup();
-    oauthLease?.release();
+    oauthLease?.release({ keepRecoveryRow: !!stagedCodexHome?.retainScratchForRecovery });
     baseEnv.cleanup();
     stagedGitCfg?.cleanup();
     stagedNpmrc?.cleanup();
@@ -8491,9 +8960,10 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       doubaoExtraBindMounts.push({ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" });
     }
     if (stagedGitCfg) {
-      doubaoExtraRo.push(stagedGitCfg.dir);
+      doubaoExtraRo.push(stagedGitCfg.dir, ...stagedGitCfg.extraReadOnlyPaths);
       doubaoExtraBindMounts.push(...stagedGitCfg.bindMounts);
     }
+    const doubaoExtraSymlinks = [...(stagedGitCfg ? stagedGitCfg.symlinks : [])];
     const doubaoPaths = [
       ...selectDoubaoRuntimePaths(doubaoIsolationEnv),
       ...(run.lark !== "none" ? selectLarkCliAuthPaths(doubaoIsolationEnv) : []),
@@ -8524,6 +8994,7 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
           disableGitWorktreeMounts: run.disableGitWorktreeMounts,
           allowGuardLog: run.lark !== "none",
           extraReadOnlyPaths: doubaoExtraRo,
+          ...(doubaoExtraSymlinks.length ? { extraSymlinks: doubaoExtraSymlinks } : {}),
           extraBindMounts: doubaoExtraBindMounts,
         },
         doubaoIsolationEnv,

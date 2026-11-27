@@ -27,6 +27,18 @@ const Harness = z.object({
 });
 export type Harness = z.infer<typeof Harness>;
 
+/** 上下文采集范围与群过滤共用校验规则（供 Schema 与个人 Web 发送前磁盘复核复用） */
+export const ContextScopeConfigSchema = z.object({
+  /** 首次采集回看天数 */
+  lookback_days: z.number().int().min(1).max(30).default(7),
+  /** 群消息范围：spoken = @我、私聊和我发言过的群；allowlist = 只看 groups_allow 里的群（加上 @我、私聊） */
+  groups: z.enum(["spoken", "allowlist"]).default("spoken"),
+  groups_allow: z.array(z.string()).default([]),
+  /** 永远不读的会话（chat_id 或群名关键字） */
+  groups_deny: z.array(z.string()).default([]),
+  max_groups: z.number().int().min(1).max(200).default(40),
+});
+
 const Schema = z.object({
   owner: z
     .object({
@@ -193,8 +205,7 @@ const Schema = z.object({
       harness: z.string().default(""),
       /** 是否把消息内容发给模型做理解；关闭时只做确定性采集（Meego / 飞书任务直接成为事项） */
       understand: z.boolean().default(true),
-      /** 首次采集回看天数 */
-      lookback_days: z.number().int().min(1).max(30).default(7),
+      lookback_days: ContextScopeConfigSchema.shape.lookback_days,
       /** 采集 + 理解的周期 */
       schedule: z.string().default("*/10 * * * *"),
       morning: z.string().default("30 8 * * 1-5"),
@@ -212,12 +223,10 @@ const Schema = z.object({
           docs: z.boolean().default(true),
         })
         .prefault({}),
-      /** 群消息范围：spoken = @我、私聊和我发言过的群；allowlist = 只看 groups_allow 里的群（加上 @我、私聊） */
-      groups: z.enum(["spoken", "allowlist"]).default("spoken"),
-      groups_allow: z.array(z.string()).default([]),
-      /** 永远不读的会话（chat_id 或群名关键字） */
-      groups_deny: z.array(z.string()).default([]),
-      max_groups: z.number().int().min(1).max(200).default(40),
+      groups: ContextScopeConfigSchema.shape.groups,
+      groups_allow: ContextScopeConfigSchema.shape.groups_allow,
+      groups_deny: ContextScopeConfigSchema.shape.groups_deny,
+      max_groups: ContextScopeConfigSchema.shape.max_groups,
       /** 保留哪些机器人的通知（名字或内容匹配任一正则即保留；其余机器人消息当噪音丢弃） */
       bot_allow: z.array(z.string()).default(["Meego", "项目管理", "Codebase", "云文档", "审批", "智能纪要", "MLOps", "Bits"]),
       /** Meego / 飞书任务创建超过这么多天且没有近期动静的，视为历史遗留 */

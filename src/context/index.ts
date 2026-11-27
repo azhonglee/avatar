@@ -15,7 +15,7 @@ import { draftCard, eveningCard, itemCard, KIND_LABEL, morningCard, type CtxRend
 import { Connectors, relinkMeegoItems } from "./connectors.ts";
 import { defaultDraftKind, Drafter, DraftTargetIneligibleError, DraftTargetUncertainError } from "./drafts.ts";
 import { hasWorkspaceOwnerMismatch, PersonalWebBridge, type FastAnchor } from "./personal-web.ts";
-import { ContextStore, type ItemRow } from "./store.ts";
+import { ContextStore, obsRevision, type ItemRow } from "./store.ts";
 import { splitProject, Understander, UnderstandParseError, type SplitResult } from "./understand.ts";
 import { ContextViews, startOfDay } from "./views.ts";
 
@@ -36,7 +36,7 @@ const DAY = 24 * HOUR;
 type CtxPayload = (
   | { task: "cycle" }
   | { task: "fast"; conv: string; conv_name: string; trigger_obs_id: string; anchor?: FastAnchor; anchors?: FastAnchor[] }
-  | { task: "draft"; item_id: string; kind?: CtxDraftKind; auto?: boolean }
+  | { task: "draft"; item_id: string; kind?: CtxDraftKind; auto?: boolean; trigger_keys?: string[] }
   | { task: "weekly"; days: number }
   | { task: "split"; project_id: string }
 ) & { owner_open_id?: string };
@@ -188,6 +188,7 @@ export class ContextService {
       }
       const created: ItemRow[] = [];
       const touched: ItemRow[] = [];
+      const touchedFreshObsByItem: Record<string, string[]> = {};
       const ctxHarnessName = this.cfg.context.harness || this.cfg.roles.brain;
       const keyringConflict = this.cfg.context.understand
         ? detectIsolatedCodexKeyringConflict(this.cfg, process.env, ctxHarnessName)
@@ -392,6 +393,10 @@ export class ContextService {
               rep.rejected += r.rejected;
               created.push(...r.created);
               touched.push(...r.touched);
+              for (const [itemId, oids] of Object.entries(r.touchedFreshObsByItem)) {
+                const dst = touchedFreshObsByItem[itemId] ?? (touchedFreshObsByItem[itemId] = []);
+                for (const oid of oids) if (!dst.includes(oid)) dst.push(oid);
+              }
               for (const c of r.convs) kv.db.prepare("DELETE FROM kv WHERE k = ?").run(`ctx.fail.${c}`);
               return;
             }
@@ -410,8 +415,8 @@ export class ContextService {
       rep.nudged = this.nudge(created);
       this.autonomy(created);
       // 若周期理解在快通道防抖窗口内抢先消费了原生私聊或 @本人 触发消息，无论是新建高优 ask_me 事项还是把原生证据补充到已有事项上，
-      // 均以与快通道相同的幂等作业 ID 补入自动预起草（无需二次理解，也绝不丢失预起草）
-      this.enqueueAutoPreDrafts([...created, ...touched], true);
+      // 均以与快通道相同的幂等作业 ID 补入自动预起草（严格限定仅本批新鲜原生触发证据可触发，避免陈旧历史 DM 被无关群消息误触发）
+      this.enqueueAutoPreDrafts([...created, ...touched], true, touchedFreshObsByItem);
       kv.set("ctx.last_cycle", String(Date.now()));
       kv.set("ctx.last_error", rep.errors.join("\n").slice(0, 1000));
       kv.set("ctx.last_report", JSON.stringify(rep));
@@ -637,11 +642,12 @@ export class ContextService {
       this.autonomy(r.created);
 
       // 可选：为高优先级「别人在等你」自动预起草回复草稿（标记 auto: true，入队与执行复用同一资格判据；永远不自动发送）；
-      // 除本批新建事项外，对被新原生私聊/@本人 证据更新的已有 open 事项同样以幂等 ID 补入预起草
+      // 除本批新建事项外，对被本批新鲜原生私聊/@本人 证据更新的已有 open 事项同样以幂等 ID 补入预起草
       const createdIds = new Set(r.created.map((c) => c.id));
       const updatedTouched = r.touched.filter((t) => !createdIds.has(t.id));
       const preDrafted =
-        this.enqueueAutoPreDrafts(r.created, false) + this.enqueueAutoPreDrafts(updatedTouched, true);
+        this.enqueueAutoPreDrafts(r.created, false, r.touchedFreshObsByItem, selectedAfter.targetObsId) +
+        this.enqueueAutoPreDrafts(updatedTouched, true, r.touchedFreshObsByItem);
       if (r.fresh > 0 && !this.isWorkspaceOwnerMismatched() && (this.app.store.get("ctx.last_error") ?? "").startsWith("快通道")) {
         this.app.store.set("ctx.last_error", "");
       }
@@ -653,38 +659,88 @@ export class ContextService {
     }
   }
 
-  /** 为刚产出或被新原生证据更新的高优 ask_me 事项以幂等 ID 入队自动预起草；requireNativeTriggerEvidence=true 时要求事项确实关联当前绑定账号的原生私聊或 @本人 触发证据 */
-  private enqueueAutoPreDrafts(items: ItemRow[], requireNativeTriggerEvidence: boolean): number {
+  /**
+   * 为刚产出或被本批新鲜原生证据更新的高优 ask_me 事项以幂等 ID 入队自动预起草：
+   *   - requireNativeTriggerEvidence=true 时，严格要求本批新绑定到该事项的观测中至少有一条属于当前绑定账号的原生私聊或 @本人；
+   *   - 若该事项此前已生成的幂等预起草作业曾因开关关闭或临时不可达而进入 skipped 终态，当本批带来新的触发观测/修订时原子重新武装为 pending。
+   */
+  private enqueueAutoPreDrafts(
+    items: ItemRow[],
+    requireNativeTriggerEvidence: boolean,
+    freshObsByItem: Record<string, string[]> = {},
+    fallbackTriggerObsId?: string,
+  ): number {
     if (!items.length) return 0;
     const activeNativeOwner = requireNativeTriggerEvidence ? this.personalWeb.activeBoundNativeOwner() : null;
     if (requireNativeTriggerEvidence && !activeNativeOwner) return 0;
     const seen = new Set<string>();
-    const pwEvStmt = requireNativeTriggerEvidence
-      ? this.store.db.prepare("SELECT obs_id FROM ctx_evidence WHERE entity = 'item' AND entity_id = ? AND obs_id LIKE 'pw:%'")
-      : undefined;
+    const isQualifyingNativeTrigger = (oid: string): boolean => {
+      if (!oid.startsWith("pw:")) return false;
+      const o = this.store.obs(oid);
+      if (!o || o.is_me || o.meta.withdrawn === true) return false;
+      if (activeNativeOwner && String(o.meta.native_owner_id ?? "").trim() !== activeNativeOwner) return false;
+      const isDm = String(o.meta.chat_type ?? "").trim().toLowerCase() === "p2p" || o.kind === "p2p";
+      const isAtMe =
+        (o.kind === "at_me" || o.meta.at_me === true) &&
+        o.meta.at_me !== false &&
+        o.meta.is_mention_me !== false;
+      return isDm || isAtMe;
+    };
+    const obsKey = (oid: string): string => {
+      const o = this.store.obs(oid);
+      return o ? `${oid}@${obsRevision(o)}` : oid;
+    };
     let count = 0;
     for (const c of items) {
       if (seen.has(c.id)) continue;
       seen.add(c.id);
       const it = this.store.item(c.id);
       if (!this.canAutoPreDraft(it)) continue;
-      if (requireNativeTriggerEvidence && pwEvStmt) {
-        const pwRows = pwEvStmt.all(it.id) as { obs_id: string }[];
-        const hasNativeTrigger = pwRows.some((e) => {
-          const o = this.store.obs(e.obs_id);
-          if (!o || !o.id.startsWith("pw:") || o.is_me || o.meta.withdrawn === true) return false;
-          if (String(o.meta.native_owner_id ?? "").trim() !== activeNativeOwner) return false;
-          const isDm = String(o.meta.chat_type ?? "").trim().toLowerCase() === "p2p" || o.kind === "p2p";
-          const isAtMe =
-            (o.kind === "at_me" || o.meta.at_me === true) &&
-            o.meta.at_me !== false &&
-            o.meta.is_mention_me !== false;
-          return isDm || isAtMe;
-        });
-        if (!hasNativeTrigger) continue;
+      const batchObsIds = freshObsByItem[it.id] ?? [];
+      let triggerKeys: string[];
+      if (requireNativeTriggerEvidence) {
+        const qualifyingIds = batchObsIds.filter(isQualifyingNativeTrigger);
+        if (!qualifyingIds.length) continue;
+        triggerKeys = [...new Set(qualifyingIds.map(obsKey))];
+      } else {
+        const ids = batchObsIds.length ? batchObsIds : fallbackTriggerObsId ? [fallbackTriggerObsId] : [];
+        triggerKeys = [...new Set(ids.map(obsKey))];
       }
-      if (this.enqueue(`draft:${it.id}:reply:fast`, { task: "draft", item_id: it.id, kind: "reply", auto: true })) {
+      const key = `draft:${it.id}:reply:fast`;
+      const payload: CtxPayload = {
+        task: "draft",
+        item_id: it.id,
+        kind: "reply",
+        auto: true,
+        ...(triggerKeys.length ? { trigger_keys: triggerKeys } : {}),
+      };
+      if (this.enqueue(key, payload)) {
         count++;
+        continue;
+      }
+      // 已被跳过（如先前执行前关闭了 pre_draft）的同一事项幂等预起草作业：收到新触发证据/修订后原子重新武装
+      if (triggerKeys.length > 0) {
+        const workId = `context:${key}`;
+        const existingJob = this.app.ledger.get<CtxPayload>(workId);
+        if (existingJob && existingJob.terminal && existingJob.state === "skipped") {
+          const prevKeys = new Set(existingJob.payload.task === "draft" ? (existingJob.payload.trigger_keys ?? []) : []);
+          const hasNewTrigger = triggerKeys.some((k) => !prevKeys.has(k));
+          if (hasNewTrigger) {
+            const mergedKeys = [...new Set([...prevKeys, ...triggerKeys])].slice(-50);
+            const ownerOpenId = this.cfg.owner.open_id || existingJob.payload.owner_open_id;
+            const nextPayload: CtxPayload = {
+              task: "draft",
+              item_id: it.id,
+              kind: "reply",
+              auto: true,
+              trigger_keys: mergedKeys,
+              ...(ownerOpenId ? { owner_open_id: ownerOpenId } : {}),
+            };
+            if (this.app.ledger.rearmSkipped(workId, nextPayload)) {
+              count++;
+            }
+          }
+        }
       }
     }
     return count;

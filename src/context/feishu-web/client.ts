@@ -8,7 +8,7 @@ import {
 } from "./auth.ts";
 import { RecordingCookieJar, type CookieDelta, type WebLogin } from "./cookies.ts";
 import { fetchWithJar, WEB_USER_AGENT, WebHttpError } from "./http.ts";
-import { MAX_WIRE_BYTES, parseProto, ProtoWriter } from "./proto.ts";
+import { MAX_WIRE_BYTES, parseProto, ProtoWriter, WIRE_BYTES } from "./proto.ts";
 import {
   ACCESS_KEY_SALT,
   CHAT_KIND_P2P,
@@ -26,6 +26,7 @@ import {
   encodeHistoryWindowPayload,
   encodePacket,
   encodeReplyPacket,
+  GatewayError,
   isGroupChat,
   replyInThread,
   unwrapGatewayPayload,
@@ -480,7 +481,11 @@ export class FeishuWebClient {
     }
     let unpacked: Buffer;
     try {
-      unpacked = unwrapGatewayPayload(res.body, { allowEmptyPayload: opts.allowEmptyPayload });
+      unpacked = unwrapGatewayPayload(res.body, {
+        allowEmptyPayload: opts.allowEmptyPayload,
+        expectedCommand: command,
+        expectedCid: cid,
+      });
     } catch (err) {
       this.flushVerifiedCookieDeltaBestEffort();
       throw err;
@@ -505,11 +510,14 @@ export class FeishuWebClient {
   /** Fetch one native message by its numeric message ID (command 8). */
   async readMessage(id: string, signal?: AbortSignal): Promise<WebMessage> {
     const req = new ProtoWriter().str(1, id).finish();
-    // Protobuf 中空的 GetMessagesByIdsResponse 载荷合法编码为 0 字节（位于非空且 status=0 的网关包内），表示确认未查到该消息
+    // Protobuf 中空的 GetMessagesByIdsResponse 载荷合法编码为 0 字节（位于非空、含有效信封头且 status=0 的网关包内），表示确认未查到该消息
     const data = await this.gateway(CMD_READ_MESSAGE, req, { signal, allowEmptyPayload: true });
     const fields = parseProto(data, MAX_WIRE_BYTES);
-    for (const entry of fields.allBytes(1)) {
-      const pair = parseProto(entry, MAX_WIRE_BYTES);
+    for (const v of fields.allFields(1)) {
+      if (v.type !== WIRE_BYTES || !v.bytes) {
+        throw new GatewayError("个人 Web 消息查询响应条目线型非法");
+      }
+      const pair = parseProto(v.bytes, MAX_WIRE_BYTES);
       if (pair.str(1) === id) {
         return decodeMessage(pair.bytes(2), this.ownerId);
       }

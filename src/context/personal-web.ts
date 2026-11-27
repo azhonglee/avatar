@@ -3,6 +3,7 @@ import fs from "node:fs";
 import YAML from "yaml";
 import type { App } from "../app.ts";
 import type { CtxPersonalWebStatus } from "../api/types.ts";
+import { ContextScopeConfigSchema } from "../config.ts";
 import { extractOwnerOpenId } from "../lark.ts";
 import type { Store } from "../store.ts";
 import { deepFind, errMsg, log } from "../util.ts";
@@ -1675,10 +1676,55 @@ export class PersonalWebBridge {
     let effectiveMsg = msg;
     let authoritativeRead = false;
 
+    const isDirectNativeExcluded = (convId: string, rawChatId = ""): boolean => {
+      const id = rawChatId || (convId.startsWith("pw_chat:") ? convId.slice("pw_chat:".length) : "");
+      return (
+        (!!convId && (this.store.isConvMutedById(convId) || this.matchesDirectNativeIdDeny(convId))) ||
+        (!!id && this.store.isConvMutedById(id))
+      );
+    };
+    const rawMsgPwConv = msg.conversationId ? `pw_chat:${msg.conversationId}` : "";
+    // 0) 任何服务端回读（含空正文/不支持消息编辑回读）之前，先按当前原生 ID 静音与 groups_deny 规则拦截已排除会话（零网络开销）
+    if (isDirectNativeExcluded(rawMsgPwConv, msg.conversationId)) return;
+    if (existing && isDirectNativeExcluded(existing.conv)) return;
+
+    const isStoredConvExcludedBeforeRead = async (): Promise<boolean> => {
+      if (!existing) return false;
+      const targetPwConv = existing.conv.startsWith("pw_chat:") ? existing.conv : rawMsgPwConv;
+      const targetChatId = targetPwConv.startsWith("pw_chat:")
+        ? targetPwConv.slice("pw_chat:".length)
+        : msg.conversationId;
+      if (!targetPwConv || !targetChatId) return false;
+      if (isDirectNativeExcluded(targetPwConv, targetChatId)) return true;
+      if (this.nameDenyPatterns().length === 0 && this.collectOpenChatExclusions().size === 0) {
+        return false;
+      }
+      const recordedKind = classifyRecordedChatType(existing);
+      const kind: "group" | "dm" =
+        recordedKind === "dm" || msg.conversationKind === "dm" ? "dm" : "group";
+      const cachedName = kind === "group" ? (this.pwGroupNameCache.get(targetPwConv) ?? "") : "";
+      const fallbackName =
+        kind === "group" && existing.conv_name && !/^群聊\(\d+\)$/.test(existing.conv_name)
+          ? existing.conv_name
+          : "";
+      const excl = await this.evaluateChatExclusion({
+        chatId: targetChatId,
+        pwConv: targetPwConv,
+        kind,
+        chatName: cachedName || fallbackName,
+        convName: existing.conv_name || "",
+        activeClient,
+        chatNameFromCache: true,
+        signal,
+      });
+      return excl.excluded;
+    };
+
     if (!hasUsableBody(effectiveMsg)) {
       // 全新空正文/不支持消息直接丢弃；若该 ID 此前已入库（含待处理/已处理观测以及补读背景消息）且尚未撤回，
-      // 必须权威回读确认并撤回旧正文，防止已撤回/清空的原文继续进入后续理解窗口或触发起草
+      // 先确认所属会话未被新加入排除规则，再权威回读确认并撤回旧正文，防止已撤回/清空的原文继续进入后续理解窗口或触发起草
       if (!existing || existing.meta.withdrawn === true) return;
+      if (await isStoredConvExcludedBeforeRead()) return;
       if (activeClient) {
         try {
           effectiveMsg = await activeClient.readMessage(msg.id, signal);
@@ -1715,11 +1761,10 @@ export class PersonalWebBridge {
     let { text, clippedText, isMe, isAtMe, pwConv } = derive(effectiveMsg);
 
     // 1) 纯本地快速过滤：原生 ID 静音/禁用直接丢弃（零网络开销）
-    if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(effectiveMsg.conversationId)) return;
-    if (this.matchesDirectNativeIdDeny(pwConv)) return;
+    if (isDirectNativeExcluded(pwConv, effectiveMsg.conversationId)) return;
 
     // 2) 若同 ID 观测已存在（含 hydrateContext 写入的 background_only 行）且本次推送与之冲突（文本/@mention 变化、已撤回或触发范围外撤回），
-    //    先向服务端权威回读 readMessage(id)，避免未 ACK 旧推送包重放回滚更新后的编辑、把已被移除的 @我 错误晋升为待处理，或复活已撤回消息
+    //    先核验已存会话是否已被排除，再向服务端权威回读 readMessage(id)，避免未 ACK 旧推送包重放回滚更新后的编辑、把已被移除的 @我 错误晋升为待处理，或复活已撤回消息
     if (existing) {
       const existingBackgroundOnly = existing.meta.background_only === true;
       const existingWithdrawn = existing.meta.withdrawn === true;
@@ -1733,6 +1778,7 @@ export class PersonalWebBridge {
       if (revDiffers || existingWithdrawn || incomingOutOfScope) {
         if (activeClient) {
           if (!authoritativeRead) {
+            if (await isStoredConvExcludedBeforeRead()) return;
             try {
               effectiveMsg = await activeClient.readMessage(effectiveMsg.id, signal);
             } catch (err) {
@@ -2316,49 +2362,26 @@ export class PersonalWebBridge {
             };
           };
           const ctx = parsed?.context;
-          if (ctx?.personal_web?.send_replies !== true) {
+          if (!ctx || typeof ctx !== "object" || ctx.personal_web?.send_replies !== true) {
             throw new Error("检测到配置文件已关闭 context.personal_web.send_replies，已中止发送");
           }
-          if (ctx?.groups !== undefined) {
-            if (ctx.groups !== "spoken" && ctx.groups !== "allowlist") {
-              throw new Error("检测到配置文件中的 context.groups 格式非法，已中止发送");
-            }
-            groups = ctx.groups;
-          } else {
-            groups = "spoken";
+          // 复用 ConfigSchema 同一组范围与排除列表校验，严禁将 YAML mapping/非字符串隐式 String() 化为 "[object Object]"
+          const scopeParsed = ContextScopeConfigSchema.safeParse({
+            lookback_days: ctx.lookback_days,
+            groups: ctx.groups,
+            groups_allow: ctx.groups_allow,
+            groups_deny: ctx.groups_deny,
+            max_groups: ctx.max_groups,
+          });
+          if (!scopeParsed.success) {
+            const badField = String(scopeParsed.error.issues[0]?.path[0] ?? "groups");
+            throw new Error(`检测到配置文件中的 context.${badField} 格式非法，已中止发送`);
           }
-          if (ctx?.groups_allow !== undefined) {
-            if (!Array.isArray(ctx.groups_allow)) {
-              throw new Error("检测到配置文件中的 context.groups_allow 格式非法，已中止发送");
-            }
-            groupsAllow = ctx.groups_allow.map((x) => String(x));
-          } else {
-            groupsAllow = [];
-          }
-          if (ctx?.groups_deny !== undefined) {
-            if (!Array.isArray(ctx.groups_deny)) {
-              throw new Error("检测到配置文件中的 context.groups_deny 格式非法，已中止发送");
-            }
-            groupsDeny = ctx.groups_deny.map((x) => String(x));
-          } else {
-            groupsDeny = [];
-          }
-          if (ctx?.max_groups !== undefined) {
-            if (typeof ctx.max_groups !== "number" || !Number.isInteger(ctx.max_groups) || ctx.max_groups < 1 || ctx.max_groups > 200) {
-              throw new Error("检测到配置文件中的 context.max_groups 格式非法，已中止发送");
-            }
-            maxGroups = ctx.max_groups;
-          } else {
-            maxGroups = 40;
-          }
-          if (ctx?.lookback_days !== undefined) {
-            if (typeof ctx.lookback_days !== "number" || !Number.isInteger(ctx.lookback_days) || ctx.lookback_days < 1 || ctx.lookback_days > 30) {
-              throw new Error("检测到配置文件中的 context.lookback_days 格式非法，已中止发送");
-            }
-            lookbackDays = ctx.lookback_days;
-          } else {
-            lookbackDays = 7;
-          }
+          groups = scopeParsed.data.groups;
+          groupsAllow = scopeParsed.data.groups_allow;
+          groupsDeny = scopeParsed.data.groups_deny;
+          maxGroups = scopeParsed.data.max_groups;
+          lookbackDays = scopeParsed.data.lookback_days;
         } catch (err) {
           if (
             err instanceof Error &&

@@ -892,36 +892,39 @@ export function rewriteGitCredentialHelperChain(
   return gitConfigArgs;
 }
 
-async function readLfsConfigKeys(
+/**
+ * 按精确优先级读取单个生效的 Git LFS 端点 URL：
+ *   - 逐键按顺序先查受信任 Git 配置（`--includes --get`，尊重后写覆盖），未命中时仅对 `git-lfs` 允许的安全键回退查 `.lfsconfig`；
+ *   - 命中首个非空键即停止，绝不把被更高优先级覆盖的旧端点或下载端点暴露给上传操作。
+ */
+async function readFirstLfsEndpointKey(
   cwd: string,
-  keys: string[],
+  specs: { key: string; allowLfsConfig: boolean }[],
   opts?: GitRunOpts,
-): Promise<string[]> {
-  if (keys.length === 0) return [];
-  const rawCandidates = new Set<string>();
-  const readKey = async (extraCfgArgs: string[], key: string) => {
-    const r = await tryGit(cwd, ["config", ...extraCfgArgs, "--get-all", key], { ...opts, readOnly: true });
-    if (r.code !== 0 || !r.stdout) return;
-    for (const line of r.stdout.split(/\r?\n/)) {
-      const v = line.trim();
-      if (v) rawCandidates.add(v);
-    }
-  };
-  for (const key of keys) {
-    await readKey(["--includes"], key);
-  }
+): Promise<string | undefined> {
+  if (specs.length === 0) return undefined;
   const lfsConfigPath = path.join(cwd, ".lfsconfig");
+  let hasLfsConfig = false;
   try {
     const st = fs.statSync(lfsConfigPath);
-    if (st.isFile() && st.size <= 256 * 1024) {
-      for (const key of keys) {
-        await readKey(["--file", lfsConfigPath], key);
-      }
-    }
+    hasLfsConfig = st.isFile() && st.size <= 256 * 1024;
   } catch {
-    // no .lfsconfig
+    hasLfsConfig = false;
   }
-  return [...rawCandidates];
+  const readSingle = async (extraCfgArgs: string[], key: string): Promise<string> => {
+    const r = await tryGit(cwd, ["config", ...extraCfgArgs, "--get", key], { ...opts, readOnly: true });
+    if (r.code !== 0 || !r.stdout) return "";
+    return r.stdout.trim();
+  };
+  for (const spec of specs) {
+    const fromGit = await readSingle(["--includes"], spec.key);
+    if (fromGit) return fromGit;
+    if (spec.allowLfsConfig && hasLfsConfig) {
+      const fromFile = await readSingle(["--file", lfsConfigPath], spec.key);
+      if (fromFile) return fromFile;
+    }
+  }
+  return undefined;
 }
 
 function looksLikeRemoteName(cwd: string, target: string | undefined): target is string {
@@ -937,7 +940,7 @@ function looksLikeRemoteName(cwd: string, target: string | undefined): target is
   );
 }
 
-/** 读取命名远端自身的显式 LFS 覆盖配置（`remote.<name>.lfspushurl` / `remote.<name>.lfsurl`，含 `--includes` 与 `.lfsconfig`）。 */
+/** 读取命名远端自身的单一显式 LFS 覆盖配置（严格按 `git-lfs` 优先级返回首位命中；`.lfsconfig` 仅允许 `remote.<name>.lfsurl`）。 */
 async function resolveNamedRemoteLfsOverrides(
   cwd: string,
   remote: string,
@@ -945,13 +948,22 @@ async function resolveNamedRemoteLfsOverrides(
   opts?: GitRunOpts,
 ): Promise<string[]> {
   if (!looksLikeRemoteName(cwd, remote)) return [];
-  const keys = mode === "push" ? [`remote.${remote}.lfspushurl`, `remote.${remote}.lfsurl`] : [`remote.${remote}.lfsurl`];
-  return readLfsConfigKeys(cwd, keys, opts);
+  const specs =
+    mode === "push"
+      ? [
+          { key: `remote.${remote}.lfspushurl`, allowLfsConfig: false },
+          { key: `remote.${remote}.lfsurl`, allowLfsConfig: true },
+        ]
+      : [{ key: `remote.${remote}.lfsurl`, allowLfsConfig: true }];
+  const selected = await readFirstLfsEndpointKey(cwd, specs, opts);
+  return selected ? [selected] : [];
 }
 
 /**
- * 解析 `git lfs` 实际生效的 LFS 服务端点 URL（按 `git-lfs` 优先级检查 `remote.<target>.lfspushurl`/`lfsurl`、`lfs.pushurl`、`lfs.url`，
- * 同时覆盖 Git 配置（含 `--includes`）与仓库根目录 `.lfsconfig`），避免 SSH origin 搭配独立 HTTPS `lfs.url`/`lfs.pushurl` 时漏授 HTTPS 凭据。
+ * 按 `git-lfs` 实际端点优先级解析唯一生效的 LFS 传输端点 URL：
+ *   - push：`lfs.pushurl` > `lfs.url` > `remote.<target>.lfspushurl`（仅受信任 Git 配置）> `remote.<target>.lfsurl`；
+ *   - fetch：`lfs.url` > `remote.<target>.lfsurl`；
+ * 仅返回本次传输真正选中的单个端点，避免在独立下载/上传镜像配置下为未被选中的下载主机授权凭据或可写挂载。
  */
 async function resolveEffectiveLfsUrls(
   cwd: string,
@@ -959,32 +971,39 @@ async function resolveEffectiveLfsUrls(
   baseUrls: Iterable<string>,
   opts?: GitRunOpts,
 ): Promise<string[]> {
-  const keys: string[] = [];
-  if (looksLikeRemoteName(cwd, spec.target)) {
-    if (spec.mode === "push") keys.push(`remote.${spec.target}.lfspushurl`);
-    keys.push(`remote.${spec.target}.lfsurl`);
-  }
+  const keySpecs: { key: string; allowLfsConfig: boolean }[] = [];
   if (spec.mode === "push") {
-    keys.push("lfs.pushurl");
+    keySpecs.push({ key: "lfs.pushurl", allowLfsConfig: true });
   }
-  keys.push("lfs.url");
+  keySpecs.push({ key: "lfs.url", allowLfsConfig: true });
+  if (looksLikeRemoteName(cwd, spec.target)) {
+    if (spec.mode === "push") {
+      keySpecs.push({ key: `remote.${spec.target}.lfspushurl`, allowLfsConfig: false });
+    }
+    keySpecs.push({ key: `remote.${spec.target}.lfsurl`, allowLfsConfig: true });
+  }
 
-  const rawCandidates = await readLfsConfigKeys(cwd, keys, opts);
+  const selected = await readFirstLfsEndpointKey(cwd, keySpecs, opts);
+  if (!selected) return [];
 
   const baseHttpUrl = [...baseUrls].find((u) => /^https?:\/\//i.test(u.trim()));
-  const out = new Set<string>();
-  for (const cand of rawCandidates) {
-    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(cand) || cand.startsWith("/") || cand.startsWith("./") || cand.startsWith("../") || parseScpGitUrl(cand, cwd)) {
-      out.add(cand);
-    } else if (baseHttpUrl) {
-      try {
-        out.add(new URL(cand, baseHttpUrl.endsWith("/") ? baseHttpUrl : `${baseHttpUrl}/`).href);
-      } catch {
-        // ignore invalid relative LFS URL
-      }
+  if (
+    /^[a-z][a-z0-9+.-]*:\/\//i.test(selected) ||
+    selected.startsWith("/") ||
+    selected.startsWith("./") ||
+    selected.startsWith("../") ||
+    parseScpGitUrl(selected, cwd)
+  ) {
+    return [selected];
+  }
+  if (baseHttpUrl) {
+    try {
+      return [new URL(selected, baseHttpUrl.endsWith("/") ? baseHttpUrl : `${baseHttpUrl}/`).href];
+    } catch {
+      return [];
     }
   }
-  return [...out];
+  return [];
 }
 
 async function resolveEffectiveRemoteUrls(
@@ -1019,24 +1038,51 @@ async function resolveEffectiveRemoteUrls(
     }
   }
   if (args[0] === "lfs") {
-    for (const lfsUrl of await resolveEffectiveLfsUrls(cwd, spec, rawUrls, opts)) {
-      rawUrls.add(lfsUrl);
-    }
+    const lfsUrls = await resolveEffectiveLfsUrls(cwd, spec, rawUrls, opts);
+    // 当显式 LFS 端点覆盖生效时，git-lfs 仅访问该选中端点，绝不继续为被覆盖的 Git 远端或下载镜像授凭据
+    if (lfsUrls.length > 0) return lfsUrls;
   }
   return [...rawUrls];
 }
 
+interface HostCredentialState {
+  protocol: string;
+  host: string;
+  path?: string;
+  username?: string;
+  password?: string;
+  authtype?: string;
+  credential?: string;
+  quit?: boolean;
+}
+
+function isHostCredentialComplete(state: HostCredentialState): boolean {
+  return (
+    !!state.quit ||
+    (!!state.username && state.password !== undefined && state.password !== "") ||
+    (!!state.authtype && !!state.credential)
+  );
+}
+
+function buildGitCredentialHelperShellCommand(helperValue: string): string {
+  const hv = helperValue.trim();
+  if (hv.startsWith("!")) return `${hv.slice(1)} get`;
+  const firstToken = hv.split(/\s+/)[0] ?? "";
+  if (firstToken.includes("/")) return `${hv} get`;
+  return `git credential-${hv} get`;
+}
+
 /**
- * 在受信任宿主机上下文中调用单个 global/system 配置的非 store helper（例如 `gh auth setup-git`、`git credential-cache`），
- * 严格隔离仓库级 `.git/config` 与个人 Web 凭据，仅解析目标 URL 的单次用户名与密码（携带 URL 内嵌或 `credential.<url>.username` 生效用户名）。
+ * 在受信任宿主机上下文中按 Git `credential_do(helper, "get")` 协议调用单个 global/system 配置的非 store helper，
+ * 传入当前累积的部分凭据字段（如前面 helper 返回的 `username`）并把本次输出合并回状态，
+ * 允许跨多个 helper 串联补全 `username` + `password`，并在认证已完整或返回 `quit=1` 时立即停止调用后续 helper。
  */
-async function resolveHostCredentialViaHelper(
+async function invokeSingleHostCredentialHelper(
   helperValue: string,
-  target: URL,
+  state: HostCredentialState,
   useHttpPath: boolean,
   rawEnv: NodeJS.ProcessEnv,
-  effectiveUsername?: string,
-): Promise<string | undefined> {
+): Promise<HostCredentialState> {
   const hostPrep = prepareHarnessEnv(rawEnv, { preserveDbusSession: true });
   try {
     const hostEnv: NodeJS.ProcessEnv = {
@@ -1045,65 +1091,77 @@ async function resolveHostCredentialViaHelper(
       GIT_CONFIG_GLOBAL: "/dev/null",
       GIT_CONFIG_NOSYSTEM: "1",
     };
-    const proto = target.protocol.slice(0, -1); // "http" | "https"
-    const cleanPath = target.pathname.replace(/^\/+/, "");
-    const lines = [`protocol=${proto}`, `host=${target.host}`];
-    if (useHttpPath && cleanPath) lines.push(`path=${cleanPath}`);
-    const queryUser = effectiveUsername || (target.username ? decodeUrlUser(target.username) : "");
-    if (queryUser) {
-      lines.push(`username=${queryUser}`);
-    }
+    const lines = [`protocol=${state.protocol}`, `host=${state.host}`];
+    if (useHttpPath && state.path) lines.push(`path=${state.path}`);
+    if (state.username) lines.push(`username=${state.username}`);
+    if (state.password) lines.push(`password=${state.password}`);
     const input = `${lines.join("\n")}\n\n`;
-    const r = await runProcess(
-      "git",
-      [
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "credential.helper=",
-        "-c",
-        `credential.helper=${helperValue}`,
-        "-c",
-        `credential.useHttpPath=${useHttpPath ? "true" : "false"}`,
-        "credential",
-        "fill",
-      ],
-      {
-        cwd: os.tmpdir(),
-        env: hostEnv,
-        input,
-        timeoutMs: 10_000,
-        group: true,
-      },
-    );
-    if (r.code !== 0 || r.timedOut) return undefined;
-    const kv = new Map<string, string>();
+    const r = await runProcess("/bin/sh", ["-c", buildGitCredentialHelperShellCommand(helperValue)], {
+      cwd: os.tmpdir(),
+      env: hostEnv,
+      input,
+      timeoutMs: 10_000,
+      group: true,
+    });
+    if (r.code !== 0 || r.timedOut) return state;
+    const next: HostCredentialState = { ...state };
     for (const rawLine of r.stdout.split(/\r?\n/)) {
       if (!rawLine) break;
       const eq = rawLine.indexOf("=");
       if (eq <= 0) continue;
-      kv.set(rawLine.slice(0, eq).trim(), rawLine.slice(eq + 1));
+      const k = rawLine.slice(0, eq).trim();
+      const v = rawLine.slice(eq + 1);
+      if (k === "protocol") next.protocol = v.trim() || next.protocol;
+      else if (k === "host") next.host = v.trim() || next.host;
+      else if (k === "path") next.path = v.replace(/^\/+/, "") || undefined;
+      else if (k === "username") next.username = v || undefined;
+      else if (k === "password") next.password = v || undefined;
+      else if (k === "authtype") next.authtype = v || undefined;
+      else if (k === "credential") next.credential = v || undefined;
+      else if (k === "quit") {
+        const q = v.trim().toLowerCase();
+        next.quit = q === "1" || q === "true" || q === "yes" || q === "on";
+      } else if (k === "url" && v.trim()) {
+        const u = parseHttpUrlSafe(v.trim());
+        if (u) {
+          next.protocol = u.protocol.slice(0, -1);
+          next.host = u.host;
+          const p = u.pathname.replace(/^\/+/, "");
+          if (p) next.path = p;
+          if (u.username) next.username = decodeUrlUser(u.username);
+          if (u.password) next.password = decodeUrlUser(u.password);
+        }
+      }
     }
-    const username = kv.get("username") ?? queryUser;
-    const password = kv.get("password");
-    if (username === undefined || password === undefined || (!username && !password)) return undefined;
-    const outProto = (kv.get("protocol") || proto).trim();
-    const outHost = (kv.get("host") || target.host).trim();
-    const outPath = useHttpPath ? (kv.get("path") ?? cleanPath).replace(/^\/+/, "") : "";
-    const pathSuffix = outPath ? `/${outPath}` : "";
-    return `${outProto}://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${outHost}${pathSuffix}`;
+    return next;
   } finally {
     hostPrep.cleanup();
   }
 }
 
+function formatCredentialStoreLine(state: HostCredentialState, target: URL, useHttpPath: boolean): string | undefined {
+  if (state.username === undefined || state.password === undefined || (!state.username && !state.password)) {
+    return undefined;
+  }
+  const outProto = (state.protocol || target.protocol.slice(0, -1)).trim();
+  const outHost = (state.host || target.host).trim();
+  const outPath = useHttpPath ? (state.path ?? target.pathname).replace(/^\/+/, "") : "";
+  const pathSuffix = outPath ? `/${outPath}` : "";
+  return `${outProto}://${encodeURIComponent(state.username)}:${encodeURIComponent(state.password)}@${outHost}${pathSuffix}`;
+}
+
+function isCompleteStoreCredentialLine(line: string): boolean {
+  const m = line.trim().match(/^https?:\/\/([^/@]+)@/i);
+  if (!m) return false;
+  return m[1].includes(":");
+}
+
 /**
  * 仅为处于沙箱隔离下的受信任远程 Git HTTP(S) 操作投影目标域作用域内的凭据：
- *   - 每个 `store` 槽位独立过滤并写入各自 `0600` 临时文件（绝不将多个 store 合并到首个槽位，严格保持 `store A -> 中间 helper -> store B` 优先级）；
- *   - 对宿主机 global/system 作用域配置的非 store helper（如 `gh auth setup-git`、`git credential-cache`），在宿主机按槽位预解析目标 URL 凭据并原位替换为单目标临时 store 文件，
- *     绝不把 `~/.config/gh` 或宿主机 cache 套接字暴露进沙箱，也不在宿主机执行仓库级 local helper。
+ *   - 按 Git 原始配置出现顺序为每个目标 URL 依次解析受信任 `store` 与宿主机 `global`/`system` helper 链；
+ *   - 跨 helper 保留部分结果（例如前一个 helper 提供 `username`、后一个 helper 提供 `password`），一旦认证完整或返回 `quit=1` 即停止调用后续 helper；
+ *   - 对每个 `store` 槽位与目标 URL 仅选取 `git-credential-store` 实际会命中的首条有效凭据，绝不把同主机其他账号的令牌一并拷入沙箱；
+ *   - 仓库 `local`/`worktree` 自定义 helper 绝不在宿主机执行，原位保留到沙箱内按原顺序执行。
  */
 async function prepareScopedGitHttpCredentials(
   cwd: string,
@@ -1125,7 +1183,7 @@ async function prepareScopedGitHttpCredentials(
     ...(xdgConfigHome ? [path.join(xdgConfigHome, "git", "credentials")] : []),
   ];
 
-  // 读取宿主机/仓库生效的 credential.helper 与按 URL 限定的 credential.<url>.helper（含 --includes 与作用域）
+  // 读取宿主机/仓库生效的 credential.helper 与按 URL 限定的 credential.<url>.helper（含 --includes 与作用域，保留原始出现顺序）
   const helperCfg = await tryGit(
     cwd,
     ["config", "--includes", "--show-scope", "--null", "--get-regexp", "^credential(\\..+)?\\.helper$"],
@@ -1136,9 +1194,11 @@ async function prepareScopedGitHttpCredentials(
   interface ScopedHelperEntry {
     value: string;
     scope: string;
+    orderIdx: number;
   }
   const activeScopedByKey = new Map<string, ScopedHelperEntry[]>();
   const tokens = helperCfg.stdout.split("\0");
+  let orderSeq = 0;
   for (let i = 0; i + 1 < tokens.length; i += 2) {
     const scope = tokens[i].trim();
     const rec = tokens[i + 1];
@@ -1158,7 +1218,7 @@ async function prepareScopedGitHttpCredentials(
       activeScopedByKey.set(normKey, []);
     } else {
       const list = activeScopedByKey.get(normKey) ?? [];
-      list.push({ value: val, scope });
+      list.push({ value: val, scope, orderIdx: orderSeq++ });
       activeScopedByKey.set(normKey, list);
     }
   }
@@ -1210,6 +1270,122 @@ async function prepareScopedGitHttpCredentials(
     }
   };
 
+  // 预读 store 文件缓存（避免同一文件对多个目标重复读盘）
+  const storeFileLinesCache = new Map<string, string[]>();
+  const readStoreFileLines = (file: string): string[] => {
+    const cached = storeFileLinesCache.get(file);
+    if (cached) return cached;
+    const out: string[] = [];
+    if (file && fs.existsSync(file) && isOutsideDataDir(file)) {
+      try {
+        const st = fs.statSync(file);
+        if (st.isFile() && st.size <= 4 * 1024 * 1024) {
+          for (const rawLine of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
+            const line = rawLine.trim();
+            if (line && !line.startsWith("#")) out.push(line);
+          }
+        }
+      } catch {
+        // ignore unreadable credential file
+      }
+    }
+    storeFileLinesCache.set(file, out);
+    return out;
+  };
+
+  const findFirstMatchingStoreLine = (
+    files: string[],
+    target: URL,
+    useHttpPath: boolean,
+    effectiveUsername?: string,
+  ): string | undefined => {
+    for (const file of files) {
+      for (const line of readStoreFileLines(file)) {
+        if (!isCompleteStoreCredentialLine(line)) continue;
+        if (gitCredentialLineMatchesTarget(line, target, useHttpPath, effectiveUsername)) {
+          return line;
+        }
+      }
+    }
+    return undefined;
+  };
+
+  // 按每个目标 URL 的精确 Git 执行顺序串联解析，保留部分结果、命中首条 store、完备即停
+  const slotLinesByKeyAndIdx = new Map<string, Set<string>>();
+  const extraUsernameArgs: string[] = [];
+  const seenUsernameArgs = new Set<string>();
+  const slotId = (key: string, idx: number) => `${key}\0${idx}`;
+
+  for (const t of targetUrls) {
+    const useHttpPath = useHttpPathByTarget.get(t) === true;
+    const initialUser = effectiveUsernameByTarget.get(t) || "";
+    let state: HostCredentialState = {
+      protocol: t.protocol.slice(0, -1),
+      host: t.host,
+      path: useHttpPath ? t.pathname.replace(/^\/+/, "") || undefined : undefined,
+      username: initialUser || undefined,
+    };
+
+    const orderedSlots: { key: string; idx: number; entry: ScopedHelperEntry }[] = [];
+    for (const [key, keyTargets] of matchingKeys) {
+      if (!keyTargets.includes(t)) continue;
+      const helpers = activeScopedByKey.get(key) ?? [];
+      helpers.forEach((entry, idx) => orderedSlots.push({ key, idx, entry }));
+    }
+    orderedSlots.sort((a, b) => a.entry.orderIdx - b.entry.orderIdx);
+
+    let encounteredLocalHelper = false;
+    for (const slot of orderedSlots) {
+      const parsed = parseStoreHelperFile(slot.entry.value, hostHome);
+      const sk = slotId(slot.key, slot.idx);
+      if (parsed.isStore) {
+        const filesForSlot = parsed.explicitFile ? [parsed.explicitFile] : defaultStoreFiles;
+        const matchedLine = findFirstMatchingStoreLine(filesForSlot, t, useHttpPath, state.username);
+        if (matchedLine) {
+          const set = slotLinesByKeyAndIdx.get(sk) ?? new Set<string>();
+          set.add(matchedLine);
+          slotLinesByKeyAndIdx.set(sk, set);
+          const matchedUrl = parseHttpUrlSafe(matchedLine);
+          if (matchedUrl) {
+            if (matchedUrl.username) state.username = decodeUrlUser(matchedUrl.username);
+            if (matchedUrl.password) state.password = decodeUrlUser(matchedUrl.password);
+          }
+          if (!encounteredLocalHelper && isHostCredentialComplete(state)) {
+            break;
+          }
+        }
+      } else if (slot.entry.scope === "global" || slot.entry.scope === "system") {
+        state = await invokeSingleHostCredentialHelper(slot.entry.value, state, useHttpPath, rawEnv);
+        if (state.quit) {
+          if (!encounteredLocalHelper) break;
+          continue;
+        }
+        if (isHostCredentialComplete(state)) {
+          const line = formatCredentialStoreLine(state, t, useHttpPath);
+          if (line) {
+            const set = slotLinesByKeyAndIdx.get(sk) ?? new Set<string>();
+            set.add(line);
+            slotLinesByKeyAndIdx.set(sk, set);
+          }
+          if (!encounteredLocalHelper) break;
+        }
+      } else {
+        // 仓库 local/worktree 作用域自定义 helper 不在宿主机执行，保留到沙箱；若前面宿主机 helper 已提供部分 username，则透传给沙箱
+        encounteredLocalHelper = true;
+        if (state.username && state.username !== initialUser && !t.username) {
+          const scopeUrl = useHttpPath
+            ? `${t.protocol}//${t.host}${normalizeCredPath(t.pathname)}`
+            : `${t.protocol}//${t.host}`;
+          const arg = `credential.${scopeUrl}.username=${state.username}`;
+          if (!seenUsernameArgs.has(arg)) {
+            seenUsernameArgs.add(arg);
+            extraUsernameArgs.push("-c", arg);
+          }
+        }
+      }
+    }
+  }
+
   let scoped: { dir: string; cleanup: () => void } | undefined;
   let fileSeq = 0;
   let wroteAnyCreds = false;
@@ -1217,78 +1393,32 @@ async function prepareScopedGitHttpCredentials(
   const slotMappings = new Map<string, (string | null | undefined)[]>();
 
   try {
-    for (const [key, keyTargets] of matchingKeys) {
+    for (const [key] of matchingKeys) {
       const helpers = activeScopedByKey.get(key) ?? [];
       const mappedSlots: (string | null | undefined)[] = [];
       let keyRewritten = false;
 
-      for (const entry of helpers) {
+      helpers.forEach((entry, idx) => {
         const parsed = parseStoreHelperFile(entry.value, hostHome);
-        if (parsed.isStore) {
+        const isHostManaged = parsed.isStore || entry.scope === "global" || entry.scope === "system";
+        if (isHostManaged) {
           keyRewritten = true;
-          const filesForSlot = parsed.explicitFile ? [parsed.explicitFile] : defaultStoreFiles;
-          const slotLines = new Set<string>();
-          for (const file of filesForSlot) {
-            if (!file || !fs.existsSync(file) || !isOutsideDataDir(file)) continue;
-            try {
-              const st = fs.statSync(file);
-              if (!st.isFile() || st.size > 4 * 1024 * 1024) continue;
-              const text = fs.readFileSync(file, "utf8");
-              for (const rawLine of text.split(/\r?\n/)) {
-                const line = rawLine.trim();
-                if (!line || line.startsWith("#")) continue;
-                const matches = keyTargets.some((t) =>
-                  gitCredentialLineMatchesTarget(
-                    line,
-                    t,
-                    useHttpPathByTarget.get(t) === true,
-                    effectiveUsernameByTarget.get(t),
-                  ),
-                );
-                if (matches) slotLines.add(line);
-              }
-            } catch {
-              // ignore unreadable credential file
-            }
-          }
-          if (slotLines.size > 0) {
+          const lines = slotLinesByKeyAndIdx.get(slotId(key, idx));
+          if (lines && lines.size > 0) {
             scoped ??= createScopedSecretDir("pa-git-http-cred-", rawEnv);
-            const slotFile = path.join(scoped.dir, `store-${fileSeq++}.creds`);
-            fs.writeFileSync(slotFile, `${[...slotLines].join("\n")}\n`, { mode: 0o600 });
-            mappedSlots.push(`store --file=${slotFile}`);
-            wroteAnyCreds = true;
-          } else {
-            // 该 store 槽位对目标 URL 无命中：原位省略以便 Git 顺序进入下一个 helper（绝不把后续 store 凭据提前到本槽位）
-            mappedSlots.push(null);
-          }
-        } else if (entry.scope === "global" || entry.scope === "system") {
-          // 仅对宿主机 global/system 作用域的非 store helper（如 gh / credential-cache）在受信任宿主机预解析目标凭据
-          keyRewritten = true;
-          const slotLines = new Set<string>();
-          for (const t of keyTargets) {
-            const line = await resolveHostCredentialViaHelper(
-              entry.value,
-              t,
-              useHttpPathByTarget.get(t) === true,
-              rawEnv,
-              effectiveUsernameByTarget.get(t),
-            );
-            if (line) slotLines.add(line);
-          }
-          if (slotLines.size > 0) {
-            scoped ??= createScopedSecretDir("pa-git-http-cred-", rawEnv);
-            const slotFile = path.join(scoped.dir, `helper-${fileSeq++}.creds`);
-            fs.writeFileSync(slotFile, `${[...slotLines].join("\n")}\n`, { mode: 0o600 });
+            const prefix = parsed.isStore ? "store" : "helper";
+            const slotFile = path.join(scoped.dir, `${prefix}-${fileSeq++}.creds`);
+            fs.writeFileSync(slotFile, `${[...lines].join("\n")}\n`, { mode: 0o600 });
             mappedSlots.push(`store --file=${slotFile}`);
             wroteAnyCreds = true;
           } else {
             mappedSlots.push(null);
           }
         } else {
-          // 仓库 local 作用域的自定义 helper 不在宿主机执行，原位保留在沙箱内按原顺序执行
+          // 仓库 local/worktree 作用域的自定义 helper 原位保留在沙箱内按原顺序执行
           mappedSlots.push(undefined);
         }
-      }
+      });
 
       if (keyRewritten) {
         rewrittenKeys.add(key);
@@ -1298,6 +1428,27 @@ async function prepareScopedGitHttpCredentials(
 
     if (!scoped || !wroteAnyCreds || rewrittenKeys.size === 0) {
       scoped?.cleanup();
+      if (extraUsernameArgs.length > 0 && rewrittenKeys.size > 0) {
+        const activeValuesByKey = new Map<string, string[]>();
+        for (const [k, list] of activeScopedByKey) {
+          activeValuesByKey.set(k, list.map((x) => x.value));
+        }
+        const gitConfigArgs = [
+          ...rewriteGitCredentialHelperChain(
+            activeValuesByKey,
+            rewrittenKeys,
+            (key, _hv, idx) => slotMappings.get(key)?.[idx],
+            hostHome,
+          ),
+          ...extraUsernameArgs,
+        ];
+        const fallbackDir = createScopedSecretDir("pa-git-http-cred-", rawEnv);
+        return {
+          credDir: fallbackDir.dir,
+          gitConfigArgs,
+          cleanup: fallbackDir.cleanup,
+        };
+      }
       return undefined;
     }
 
@@ -1305,12 +1456,15 @@ async function prepareScopedGitHttpCredentials(
     for (const [k, list] of activeScopedByKey) {
       activeValuesByKey.set(k, list.map((x) => x.value));
     }
-    const gitConfigArgs = rewriteGitCredentialHelperChain(
-      activeValuesByKey,
-      rewrittenKeys,
-      (key, _hv, idx) => slotMappings.get(key)?.[idx],
-      hostHome,
-    );
+    const gitConfigArgs = [
+      ...rewriteGitCredentialHelperChain(
+        activeValuesByKey,
+        rewrittenKeys,
+        (key, _hv, idx) => slotMappings.get(key)?.[idx],
+        hostHome,
+      ),
+      ...extraUsernameArgs,
+    ];
     return {
       credDir: scoped.dir,
       gitConfigArgs,
@@ -1391,13 +1545,18 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
     const extraRo = [
       ...(opts?.extraReadOnlyPaths ?? []),
       ...(scopedHttpCreds ? [scopedHttpCreds.credDir] : []),
-      ...(stagedGitCfg ? [stagedGitCfg.dir] : []),
+      ...(stagedGitCfg ? [stagedGitCfg.dir, ...stagedGitCfg.extraReadOnlyPaths] : []),
+    ];
+    const extraSymlinks = [
+      ...(opts?.extraSymlinks ?? []),
+      ...(stagedGitCfg ? stagedGitCfg.symlinks : []),
     ];
     const effectiveOpts: GitRunOpts | undefined =
       scopedHttpCreds || stagedGitCfg
         ? {
             ...opts,
             extraReadOnlyPaths: extraRo,
+            ...(extraSymlinks.length ? { extraSymlinks } : {}),
           }
         : opts;
     const wrapped = wrapCredentialIsolatedCommand(
@@ -1533,45 +1692,81 @@ function isSshPrivateKeyEncrypted(filePath: string): boolean {
   }
 }
 
-function parseGitBooleanValue(raw: string): boolean | undefined {
-  const s = raw.trim().toLowerCase();
-  if (s === "" || s === "true" || s === "yes" || s === "on") return true;
-  if (s === "false" || s === "no" || s === "off") return false;
-  if (/^[+-]?\d+$/.test(s)) return Number(s) !== 0;
-  return undefined;
-}
-
 /**
- * 解析仓库/工作树作用域（`local` 与 `worktree`，完整展开仓库内 `[include]`/`[includeIf]`）的生效 `commit.gpgSign` 策略；
- * 刻意忽略宿主机 `global` / `system` 作用域，避免用户个人全局签名默认值阻断隔离代理提交。
+ * 按 Git 官方 `--type=bool` 布尔语义解析仓库/工作树作用域（`local` 与 `worktree`，完整展开仓库内 `[include]`/`[includeIf]`）的生效 `commit.gpgSign` 策略：
+ *   - 正确区分显式置空 `commit.gpgSign =`（`false`）与无值声明 `commit.gpgSign`（`true`）；
+ *   - 刻意忽略宿主机 `global` / `system` 作用域，避免用户个人全局签名默认值阻断隔离代理提交。
  */
 async function resolveRepoOrWorktreeGpgSign(cwd: string, roOpts: GitRunOpts): Promise<boolean> {
-  const res = await tryGit(cwd, ["config", "--includes", "--show-scope", "--null", "--get-all", "commit.gpgSign"], roOpts);
-  if (res.code !== 0 || !res.stdout) return false;
-  const tokens = res.stdout.split("\0");
-  let effective: boolean | undefined;
-  for (let i = 0; i + 1 < tokens.length; i += 2) {
-    const scope = tokens[i];
-    const val = tokens[i + 1];
-    if (scope !== "local" && scope !== "worktree") continue;
-    const parsed = parseGitBooleanValue(val);
-    if (parsed !== undefined) effective = parsed;
+  const res = await tryGit(
+    cwd,
+    ["config", "--includes", "--type=bool", "--show-scope", "--null", "--get-all", "commit.gpgSign"],
+    roOpts,
+  );
+  if (res.code === 0 && res.stdout) {
+    const tokens = res.stdout.split("\0");
+    let effective: boolean | undefined;
+    for (let i = 0; i + 1 < tokens.length; i += 2) {
+      const scope = tokens[i];
+      const val = tokens[i + 1].trim().toLowerCase();
+      if (scope !== "local" && scope !== "worktree") continue;
+      if (val === "true") effective = true;
+      else if (val === "false") effective = false;
+    }
+    return effective === true;
   }
-  return effective === true;
+  // 若配置文件中存在非法布尔值导致 `--type=bool` 返回非 0（如 exit 128），仅当仓库自身 local/worktree 作用域存在该键时 fail-closed 交由 git commit 报错
+  if (res.code !== 1) {
+    const rawRes = await tryGit(cwd, ["config", "--includes", "--show-scope", "--null", "--get-all", "commit.gpgSign"], roOpts);
+    if (rawRes.code === 0 && rawRes.stdout) {
+      const tokens = rawRes.stdout.split("\0");
+      let effective: boolean | undefined;
+      for (let i = 0; i + 1 < tokens.length; i += 2) {
+        const scope = tokens[i];
+        const val = tokens[i + 1].trim().toLowerCase();
+        if (scope !== "local" && scope !== "worktree") continue;
+        if (val === "true" || val === "yes" || val === "on") effective = true;
+        else if (val === "" || val === "false" || val === "no" || val === "off") effective = false;
+        else if (/^[+-]?\d+$/.test(val)) effective = Number(val) !== 0;
+        else effective = true;
+      }
+      return effective === true;
+    }
+  }
+  return false;
 }
 
 /**
  * 有改动就提交（含新文件）；没有改动什么都不做。返回是否提交了。
- *   - 仅当仓库本地 `.git/config`、其 `[include]`/`[includeIf]` 或工作树配置 `config.worktree` 显式要求 `commit.gpgSign=true` 时才保留提交签名策略（支持窄范围 SSH 签名密钥挂载）；
+ *   - 暂存（`git add -A`）时同步挂载受信任本地配置指定的外部 `lfs.storage` 缓存目录，确保修改 LFS 文件时 clean filter 可写入共享缓存；
+ *   - 仅当仓库本地 `.git/config`、其 `[include]`/`[includeIf]` 或工作树配置 `config.worktree` 显式要求 `commit.gpgSign=true` 时才保留提交签名策略（支持窄范围 SSH 签名密钥挂载；非 SSH 路径同样显式传递 `-c commit.gpgSign=true` 杜绝外部 include 不可见时静默产出未签名提交）；
  *   - 其余场景（例如宿主机全局 `~/.gitconfig` 设置了个人 `commit.gpgSign=true`）显式使用 `--no-gpg-sign` 执行无签名代理提交，
  *     与 `personal-agent` 提交身份及 `--no-verify` 保持一致，避免沙箱隐藏宿主机签名代理导致自动提交失败。
  */
 export async function commitAll(cwd: string, message: string, opts?: GitRunOpts): Promise<boolean> {
-  await git(cwd, ["add", "-A"], opts);
-  const dirty = (await tryGit(cwd, ["diff", "--cached", "--quiet"], { ...opts, readOnly: true })).code !== 0;
+  const roOpts: GitRunOpts = { ...opts, readOnly: true };
+  let addOpts: GitRunOpts | undefined = opts;
+  const commonRes = await tryGit(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"], roOpts);
+  let commonGitDir = commonRes.code === 0 ? commonRes.stdout.trim() : "";
+  if (!commonGitDir) {
+    const fb = await tryGit(cwd, ["rev-parse", "--git-common-dir"], roOpts);
+    if (fb.code === 0 && fb.stdout.trim()) commonGitDir = path.resolve(cwd, fb.stdout.trim());
+  }
+  if (commonGitDir) {
+    const lfsStorage = await resolveEffectiveLfsStorageDir(cwd, commonGitDir, roOpts);
+    if (lfsStorage.isExternal) {
+      fs.mkdirSync(lfsStorage.storageDir, { recursive: true });
+      addOpts = {
+        ...opts,
+        extraWritablePaths: [...new Set([...(opts?.extraWritablePaths ?? []), lfsStorage.storageDir])],
+        extraGitConfigArgs: [...(opts?.extraGitConfigArgs ?? []), "-c", `lfs.storage=${lfsStorage.storageDir}`],
+      };
+    }
+  }
+  await git(cwd, ["add", "-A"], addOpts);
+  const dirty = (await tryGit(cwd, ["diff", "--cached", "--quiet"], roOpts)).code !== 0;
   if (!dirty) return false;
 
-  const roOpts: GitRunOpts = { ...opts, readOnly: true };
   const repoRequiresSigning = await resolveRepoOrWorktreeGpgSign(cwd, roOpts);
   if (!repoRequiresSigning) {
     await git(cwd, ["commit", "-q", "--no-verify", "--no-gpg-sign", "-m", message], opts);
@@ -1654,8 +1849,19 @@ export async function commitAll(cwd: string, message: string, opts?: GitRunOpts)
     return true;
   }
 
+  // 非 SSH 签名路径（如 OpenPGP）：显式把已核验的 commit.gpgSign=true（及 gpg.format / user.signingkey）带入提交命令，
+  // 防止 commit.gpgSign 来自沙箱不可见的外部 [include] 时 git commit 静默生成未签名提交
+  const nonSshSignCfg = [
+    "-c",
+    "commit.gpgSign=true",
+    ...(gpgFormat ? ["-c", `gpg.format=${gpgFormat}`] : []),
+    ...(signingKey ? ["-c", `user.signingkey=${signingKey}`] : []),
+  ];
   try {
-    await git(cwd, ["commit", "-q", "--no-verify", "-m", message], opts);
+    await git(cwd, ["commit", "-q", "--no-verify", "-m", message], {
+      ...opts,
+      extraGitConfigArgs: [...(opts?.extraGitConfigArgs ?? []), ...nonSshSignCfg],
+    });
     return true;
   } catch (err) {
     throw new Error(
@@ -1999,29 +2205,31 @@ export function resolveLocalGitRemoteDir(cwd: string, rawUrl: string): string | 
   return resolveLocalGitRemoteMount(cwd, rawUrl)?.realDir;
 }
 
-/**
- * 流式检测目标不可变提交 `targetRev` 的任意树内路径是否命中 `filter=lfs`：
- *   - 优先使用 Git >= 2.40 的 `git check-attr --source=<targetRev>`；
- *   - 旧版 Git（如 2.39）不支持 `--source` 时，改用临时独立 `GIT_INDEX_FILE` 执行 `git read-tree <targetRev>` 后跑 `git check-attr --cached`，
- *     严格读取目标提交的 `.gitattributes`，绝不静默回退读取可能变动的工作区 `.gitattributes`；
- *   - 以背压管道流式连接 `git ls-tree -r --name-only -z` 与 `git check-attr --stdin -z filter`，保持 O(1) 内存并在命中首个 `filter=lfs` 时立即早停。
- */
-async function targetRevHasLfsAttr(cwd: string, targetRev: string, roOpts: GitRunOpts): Promise<boolean> {
+async function preparePinnedCheckAttr(
+  cwd: string,
+  targetRev: string,
+  roOpts: GitRunOpts,
+): Promise<{
+  checkAttrArgs: string[];
+  attrExtraEnv?: Record<string, string>;
+  attrExtraRo: string[];
+  cleanup: () => void;
+}> {
   let checkAttrArgs: string[] = ["check-attr", `--source=${targetRev}`, "--stdin", "-z", "filter"];
   let attrTmpDir: string | undefined;
   let attrExtraEnv: Record<string, string> | undefined;
   let attrExtraRo: string[] = [];
 
-  try {
-    // 强制在 C locale 下探测 --source 支持情况，避免在 zh_CN 等本地化环境下被翻译为“未知选项”而误判失败
-    const probe = await tryGit(cwd, checkAttrArgs, {
-      ...roOpts,
-      input: "",
-      extraEnv: { ...(roOpts.extraEnv ?? {}), LC_ALL: "C", LC_MESSAGES: "C", LANG: "C", LANGUAGE: "C" },
-    });
-    if (probe.code !== 0) {
-      if (probe.code === 129 && /unknown option.*source/i.test(`${probe.stderr}\n${probe.stdout}`)) {
-        attrTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-git-attr-"));
+  // 强制在 C locale 下探测 --source 支持情况，避免在 zh_CN 等本地化环境下被翻译为“未知选项”而误判失败
+  const probe = await tryGit(cwd, checkAttrArgs, {
+    ...roOpts,
+    input: "",
+    extraEnv: { ...(roOpts.extraEnv ?? {}), LC_ALL: "C", LC_MESSAGES: "C", LANG: "C", LANGUAGE: "C" },
+  });
+  if (probe.code !== 0) {
+    if (probe.code === 129 && /unknown option.*source/i.test(`${probe.stderr}\n${probe.stdout}`)) {
+      attrTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-git-attr-"));
+      try {
         const pinnedIndex = path.join(attrTmpDir, "index");
         const rt = await tryGit(cwd, ["read-tree", targetRev], {
           ...roOpts,
@@ -2034,11 +2242,75 @@ async function targetRevHasLfsAttr(cwd: string, targetRev: string, roOpts: GitRu
         checkAttrArgs = ["check-attr", "--cached", "--stdin", "-z", "filter"];
         attrExtraEnv = { GIT_INDEX_FILE: pinnedIndex };
         attrExtraRo = [attrTmpDir];
-      } else {
-        throw new Error(`git check-attr 检查提交 ${targetRev} 失败：${(probe.stderr || probe.stdout).trim()}`);
+      } catch (err) {
+        fs.rmSync(attrTmpDir, { recursive: true, force: true });
+        throw err;
+      }
+    } else {
+      throw new Error(`git check-attr 检查提交 ${targetRev} 失败：${(probe.stderr || probe.stdout).trim()}`);
+    }
+  }
+  return {
+    checkAttrArgs,
+    attrExtraEnv,
+    attrExtraRo,
+    cleanup: () => {
+      if (attrTmpDir) fs.rmSync(attrTmpDir, { recursive: true, force: true });
+    },
+  };
+}
+
+/** 仅筛出目标不可变提交 `targetRev` 中 `filter=lfs` 生效的文件路径（供 checkout LFS 预检排除非 LFS 普通文本指针样本）。 */
+async function filterPathsWithLfsAttr(
+  cwd: string,
+  targetRev: string,
+  paths: string[],
+  roOpts: GitRunOpts,
+): Promise<Set<string>> {
+  const out = new Set<string>();
+  if (paths.length === 0) return out;
+  const pinned = await preparePinnedCheckAttr(cwd, targetRev, roOpts);
+  try {
+    const CHUNK = 2000;
+    for (let i = 0; i < paths.length; i += CHUNK) {
+      const slice = paths.slice(i, i + CHUNK);
+      const res = await tryGitBuffer(cwd, pinned.checkAttrArgs, {
+        ...roOpts,
+        input: `${slice.join("\0")}\0`,
+        extraReadOnlyPaths: [...(roOpts.extraReadOnlyPaths ?? []), ...pinned.attrExtraRo],
+        ...(pinned.attrExtraEnv ? { extraEnv: { ...(roOpts.extraEnv ?? {}), ...pinned.attrExtraEnv } } : {}),
+      });
+      if (res.code !== 0) {
+        throw new Error(`git check-attr 过滤目标提交 ${targetRev} LFS 路径失败：${res.stderr.trim()}`);
+      }
+      const tokens = res.stdout.toString("utf8").split("\0");
+      for (let j = 0; j + 2 < tokens.length; j += 3) {
+        const filePath = tokens[j];
+        const attr = tokens[j + 1];
+        const val = tokens[j + 2];
+        if (filePath && attr === "filter" && val === "lfs") {
+          out.add(filePath);
+        }
       }
     }
+  } finally {
+    pinned.cleanup();
+  }
+  return out;
+}
 
+/**
+ * 流式检测目标不可变提交 `targetRev` 的任意树内路径是否命中 `filter=lfs`：
+ *   - 优先使用 Git >= 2.40 的 `git check-attr --source=<targetRev>`；
+ *   - 旧版 Git（如 2.39）不支持 `--source` 时，改用临时独立 `GIT_INDEX_FILE` 执行 `git read-tree <targetRev>` 后跑 `git check-attr --cached`，
+ *     严格读取目标提交的 `.gitattributes`，绝不静默回退读取可能变动的工作区 `.gitattributes`；
+ *   - 以背压管道流式连接 `git ls-tree -r --name-only -z` 与 `git check-attr --stdin -z filter`，保持 O(1) 内存并在命中首个 `filter=lfs` 时立即早停。
+ */
+async function targetRevHasLfsAttr(cwd: string, targetRev: string, roOpts: GitRunOpts): Promise<boolean> {
+  const pinned = await preparePinnedCheckAttr(cwd, targetRev, roOpts);
+  const { checkAttrArgs, attrExtraEnv, attrExtraRo } = pinned;
+
+  try {
     const streamEnv = prepareHarnessEnv();
     try {
       const lsEnv: NodeJS.ProcessEnv = { ...streamEnv.env, ...(roOpts.extraEnv ?? {}), GIT_TERMINAL_PROMPT: "0" };
@@ -2173,7 +2445,7 @@ async function targetRevHasLfsAttr(cwd: string, targetRev: string, roOpts: GitRu
       streamEnv.cleanup();
     }
   } finally {
-    if (attrTmpDir) fs.rmSync(attrTmpDir, { recursive: true, force: true });
+    pinned.cleanup();
   }
 }
 
@@ -2382,8 +2654,9 @@ async function isGitLfsSmudgeDisabled(repoPath: string, roOpts: GitRunOpts): Pro
 }
 
 /**
- * 按 `git-lfs-config(5)` 语义解析生效的 Git LFS 存储目录（`lfs.storage`，相对路径基于仓库 `commonGitDir`，默认为 `<commonGitDir>/lfs`）；
- * 拒绝指向 `dataDir` 内部，并返回该目录是否位于仓库 `commonGitDir` 外部以供隔离挂载。
+ * 仅从受信任本地 Git 配置解析生效的 Git LFS 存储目录（`lfs.storage`，相对路径基于仓库 `commonGitDir`，默认为 `<commonGitDir>/lfs`）；
+ * 严禁采信受版本控制的 `.lfsconfig` 中的 `lfs.storage`（与 `git-lfs` 自身安全策略一致，防止恶意仓库指定宿主机任意可写目录），
+ * 同时拒绝与 `dataDir` 重叠，并返回该目录是否位于仓库 `commonGitDir` 外部以供隔离挂载。
  */
 async function resolveEffectiveLfsStorageDir(
   repoPath: string,
@@ -2392,19 +2665,7 @@ async function resolveEffectiveLfsStorageDir(
 ): Promise<{ storageDir: string; isExternal: boolean }> {
   const defaultDir = path.join(commonGitDir, "lfs");
   const cfgRes = await tryGit(repoPath, ["config", "--includes", "--get", "lfs.storage"], roOpts);
-  let rawStorage = cfgRes.code === 0 ? cfgRes.stdout.trim() : "";
-  if (!rawStorage) {
-    const lfsConfigPath = path.join(repoPath, ".lfsconfig");
-    try {
-      const st = fs.statSync(lfsConfigPath);
-      if (st.isFile() && st.size <= 256 * 1024) {
-        const fRes = await tryGit(repoPath, ["config", "--file", lfsConfigPath, "--get", "lfs.storage"], roOpts);
-        if (fRes.code === 0) rawStorage = fRes.stdout.trim();
-      }
-    } catch {
-      // no .lfsconfig
-    }
-  }
+  const rawStorage = cfgRes.code === 0 ? cfgRes.stdout.trim() : "";
   if (!rawStorage) {
     return { storageDir: defaultDir, isExternal: false };
   }
@@ -2447,7 +2708,7 @@ async function resolveEffectiveLfsStorageDir(
 export async function ensureGitLfsObjectsForCheckout(
   repoPath: string,
   targetRev: string,
-  opts?: GitRunOpts,
+  opts?: GitRunOpts & { branchHint?: string },
 ): Promise<{
   fetched: boolean;
   missingCount: number;
@@ -2490,7 +2751,7 @@ export async function ensureGitLfsObjectsForCheckout(
   if (lsTree.code !== 0) {
     throw new Error(`git ls-tree 检查检出目标 ${targetRev} LFS 对象失败：${lsTree.stderr.trim()}`);
   }
-  const smallBlobShas: string[] = [];
+  const smallBlobs: { sha: string; filePath: string }[] = [];
   const rawTree = lsTree.stdout.toString("utf8");
   for (const rec of rawTree.split("\0")) {
     if (!rec) continue;
@@ -2499,11 +2760,28 @@ export async function ensureGitLfsObjectsForCheckout(
     const header = rec.slice(0, tab).trim().split(/\s+/);
     if (header.length < 4) continue;
     const [, objType, objSha, sizeStr] = header;
+    const filePath = rec.slice(tab + 1);
     const size = Number(sizeStr);
-    if (objType === "blob" && Number.isFinite(size) && size >= LFS_POINTER_MIN_BYTES && size <= LFS_POINTER_MAX_BYTES) {
-      smallBlobShas.push(objSha);
+    if (
+      objType === "blob" &&
+      filePath &&
+      Number.isFinite(size) &&
+      size >= LFS_POINTER_MIN_BYTES &&
+      size <= LFS_POINTER_MAX_BYTES
+    ) {
+      smallBlobs.push({ sha: objSha, filePath });
     }
   }
+  if (smallBlobs.length === 0) return { fetched: false, missingCount: 0, ...storageMeta };
+
+  // 仅检查在目标提交树中实际命中 filter=lfs 的路径，避免未启用 LFS 过滤的普通文本指针样本触发无谓远程拉取
+  const lfsPaths = await filterPathsWithLfsAttr(
+    repoPath,
+    targetSha,
+    smallBlobs.map((b) => b.filePath),
+    roOpts,
+  );
+  const smallBlobShas = [...new Set(smallBlobs.filter((b) => lfsPaths.has(b.filePath)).map((b) => b.sha))];
   if (smallBlobShas.length === 0) return { fetched: false, missingCount: 0, ...storageMeta };
 
   const requiredOids = new Set<string>();
@@ -2527,7 +2805,7 @@ export async function ensureGitLfsObjectsForCheckout(
   }
   if (missingOids.length === 0) return { fetched: false, missingCount: 0, ...storageMeta };
 
-  // 选择拉取远端：优先目标分支或当前分支配置的 upstream remote，其次 origin，再其次仓库首个 remote
+  // 选择拉取远端：优先目标分支（含 branchHint）或当前分支配置的 upstream remote，其次 origin，再其次仓库首个 remote
   let remote = "";
   const tryBranchRemote = async (branchName: string): Promise<string> => {
     if (!branchName || /^[0-9a-f]{40,64}$/i.test(branchName) || branchName === "HEAD") return "";
@@ -2536,7 +2814,7 @@ export async function ensureGitLfsObjectsForCheckout(
     const v = r.code === 0 ? r.stdout.trim() : "";
     return v && v !== "." ? v : "";
   };
-  remote = await tryBranchRemote(targetRev);
+  remote = await tryBranchRemote(opts?.branchHint || targetRev);
   if (!remote) {
     const cur = await currentBranch(repoPath, roOpts);
     if (cur) remote = await tryBranchRemote(cur);
@@ -2556,9 +2834,10 @@ export async function ensureGitLfsObjectsForCheckout(
     ? [...new Set(remoteUrlRes.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean))]
     : [];
   const effectiveLfsUrls = await resolveEffectiveLfsUrls(repoPath, { mode: "fetch", target: remote }, fetchUrls, roOpts);
+  const mountUrls = effectiveLfsUrls.length > 0 ? effectiveLfsUrls : fetchUrls;
   const localRoDirs: string[] = [];
   const localSyms: { dest: string; target: string }[] = [];
-  for (const u of [...fetchUrls, ...effectiveLfsUrls]) {
+  for (const u of mountUrls) {
     const m = resolveLocalGitRemoteMount(repoPath, u);
     if (!m) continue;
     localRoDirs.push(m.realDir);
@@ -2626,8 +2905,10 @@ export async function pushBranch(
   // 仅在至少存在一个需要更新的目标远端时按需执行一次 .gitattributes 流式扫描（避免已发布相同提交触发无谓扫描与 git-lfs 预检）
   let precomputedHasLfsAttr: boolean | undefined;
   let namedRemoteLfsOverrides: string[] | undefined;
+  let configuredPushLfsUrls: string[] = [];
   let extraLfsLocalDirs: string[] = [];
   let extraLfsLocalSyms: { dest: string; target: string }[] = [];
+  let externalLfsStorageDir: string | undefined;
   const uploadedNamedRemoteLfsOids = new Set<string>();
 
   for (const pushUrl of effectivePushUrls) {
@@ -2686,10 +2967,10 @@ export async function pushBranch(
       if (namedRemoteLfsOverrides === undefined) {
         const roOpts = { ...opts, readOnly: true };
         namedRemoteLfsOverrides = await resolveNamedRemoteLfsOverrides(cwd, remote, "push", roOpts);
-        const configuredLfsUrls = await resolveEffectiveLfsUrls(cwd, { mode: "push", target: remote }, effectivePushUrls, roOpts);
+        configuredPushLfsUrls = await resolveEffectiveLfsUrls(cwd, { mode: "push", target: remote }, effectivePushUrls, roOpts);
         const dirs = new Set<string>();
         const syms: { dest: string; target: string }[] = [];
-        for (const u of configuredLfsUrls) {
+        for (const u of configuredPushLfsUrls) {
           const m = resolveLocalGitRemoteMount(cwd, u);
           if (!m) continue;
           dirs.add(m.realDir);
@@ -2700,22 +2981,29 @@ export async function pushBranch(
         if (commonGitDir) {
           const lfsStorage = await resolveEffectiveLfsStorageDir(cwd, commonGitDir, roOpts);
           if (lfsStorage.isExternal) {
+            externalLfsStorageDir = lfsStorage.storageDir;
             dirs.add(lfsStorage.storageDir);
           }
         }
         extraLfsLocalDirs = [...dirs];
         extraLfsLocalSyms = syms;
       }
+      // 当显式 LFS 上传端点覆盖生效时，仅挂载被选中的上传端点及受信任外部 lfs.storage，绝不把被覆盖的 Git 远端或下载镜像目录挂载为可写
+      const includeGitLocalDirForLfs = configuredPushLfsUrls.length === 0 && !!localDir;
       const lfsWritePaths = [
-        ...new Set([...(opts?.extraWritablePaths ?? []), ...(localDir ? [localDir] : []), ...extraLfsLocalDirs]),
+        ...new Set([...(opts?.extraWritablePaths ?? []), ...(includeGitLocalDirForLfs ? [localDir!] : []), ...extraLfsLocalDirs]),
       ];
-      const lfsSyms = [...(opts?.extraSymlinks ?? []), ...localSyms, ...extraLfsLocalSyms];
+      const lfsSyms = [...(opts?.extraSymlinks ?? []), ...(includeGitLocalDirForLfs ? localSyms : []), ...extraLfsLocalSyms];
+      const lfsExtraCfg = externalLfsStorageDir
+        ? [...(opts?.extraGitConfigArgs ?? []), "-c", `lfs.storage=${externalLfsStorageDir}`]
+        : opts?.extraGitConfigArgs;
       // 1) 始终先运行受信任、感知路径的 `git lfs pre-push`，保留客户端 LFS 文件锁校验（lfs.locksverify）
       const prePush = await tryGit(cwd, ["lfs", "pre-push", remote, pushUrl], {
         ...opts,
         input: `${localRef} ${localSha} ${localRef} ${remoteSha}\n`,
         extraWritablePaths: lfsWritePaths,
         ...(lfsSyms.length ? { extraSymlinks: lfsSyms } : {}),
+        ...(lfsExtraCfg ? { extraGitConfigArgs: lfsExtraCfg } : {}),
       });
       if (prePush.code !== 0) {
         const lfsOut = `${prePush.stdout}\n${prePush.stderr}`.trim();
@@ -2743,6 +3031,7 @@ export async function pushBranch(
             ...opts,
             extraWritablePaths: lfsWritePaths,
             ...(lfsSyms.length ? { extraSymlinks: lfsSyms } : {}),
+            ...(lfsExtraCfg ? { extraGitConfigArgs: lfsExtraCfg } : {}),
           });
           if (lfs.code !== 0) {
             const lfsOut = `${lfs.stdout}\n${lfs.stderr}`.trim();

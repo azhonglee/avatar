@@ -113,6 +113,8 @@ export interface ApplyResult {
   created: ItemRow[];
   /** 本批新建或被新证据更新的仍处于 open 状态的事项（供自动预起草覆盖「先轮询建项、后收到原生 DM/@我 证据补充」场景） */
   touched: ItemRow[];
+  /** 本批实际绑定到各 open 事项的新鲜观测 ID（按 item.id 分组），用于严格限定只有本批新证据才能触发自动预起草 */
+  touchedFreshObsByItem: Record<string, string[]>;
   closed: ItemRow[];
   updated: number;
   knowledge: number;
@@ -488,9 +490,18 @@ export class Understander {
           at,
         );
         for (const e of evs) this.store.addEvidence("item", item.id, e.obs_id, e.quote, byId.get(e.obs_id)!.time);
-        if (item.status === "open" && (created || evs.some((e) => validFreshSet.has(e.obs_id))) && !touchedItemIds.has(item.id)) {
-          touchedItemIds.add(item.id);
-          res.touched.push(item);
+        const freshItemObsIds = evs.map((e) => e.obs_id).filter((id) => validFreshSet.has(id));
+        if (item.status === "open" && (created || freshItemObsIds.length > 0)) {
+          if (!touchedItemIds.has(item.id)) {
+            touchedItemIds.add(item.id);
+            res.touched.push(item);
+          }
+          if (freshItemObsIds.length > 0) {
+            const list = res.touchedFreshObsByItem[item.id] ?? (res.touchedFreshObsByItem[item.id] = []);
+            for (const oid of freshItemObsIds) {
+              if (!list.includes(oid)) list.push(oid);
+            }
+          }
         }
         if (created && item.status === "open") res.created.push(item);
         else if (wantDone && item.status === "done" && existing?.status !== "done") res.closed.push(item);
@@ -647,7 +658,20 @@ export async function splitProject(u: Understander, workId: string, projectId: s
 }
 
 function emptyResult(): ApplyResult {
-  return { projects: 0, created: [], touched: [], closed: [], updated: 0, knowledge: 0, updates: 0, people: 0, conflicts: 0, rejected: 0, processed: 0 };
+  return {
+    projects: 0,
+    created: [],
+    touched: [],
+    touchedFreshObsByItem: {},
+    closed: [],
+    updated: 0,
+    knowledge: 0,
+    updates: 0,
+    people: 0,
+    conflicts: 0,
+    rejected: 0,
+    processed: 0,
+  };
 }
 
 /** 已知项目按两层树列出：顶层在前，子项目缩进在下 */

@@ -37,6 +37,15 @@ export class ProtoFields {
     return (this.map.get(field)?.length ?? 0) > 0;
   }
 
+  lastField(field: number): ProtoValue | undefined {
+    const vals = this.map.get(field);
+    return vals?.length ? vals[vals.length - 1] : undefined;
+  }
+
+  allFields(field: number): readonly ProtoValue[] {
+    return this.map.get(field) ?? [];
+  }
+
   bytes(field: number): Buffer {
     const vals = this.map.get(field);
     if (!vals?.length) return Buffer.alloc(0);

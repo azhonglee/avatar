@@ -49,6 +49,7 @@ import {
   encodeRichText,
   FeishuWebClient,
   fetchWithJar,
+  GatewayError,
   isAllowedFeishuHost,
   MessageNotFoundError,
   MSG_CARD,
@@ -20375,6 +20376,9 @@ test("第 24 轮 Codex review 修复回归：AWS SSO 单会话隔离 / Gemini&Op
     if (prevPwKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
     else process.env.PA_FEISHU_WEB_KEY = prevPwKey;
     for (const s of serversToClose) {
+      if ("closeAllConnections" in s && typeof s.closeAllConnections === "function") {
+        s.closeAllConnections();
+      }
       await new Promise<void>((resolve) => s.close(() => resolve()));
     }
     fs.rmSync(dir, { recursive: true, force: true });
@@ -20964,6 +20968,1251 @@ test("第 25 轮 Codex review 修复回归：新修订省略 mentions 清除陈�
     if (prevPwKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
     else process.env.PA_FEISHU_WEB_KEY = prevPwKey;
     for (const s of serversToClose) {
+      if ("closeAllConnections" in s && typeof s.closeAllConnections === "function") {
+        s.closeAllConnections();
+      }
+      await new Promise<void>((resolve) => s.close(() => resolve()));
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex 第二十六轮回归：拒绝 .lfsconfig lfs.storage、非 SSH 强制签名、全局 excludesFile 投影、LFS 端点单选优先级、YAML 排除列表强校验、已排除会话免回读、OAuth 写回失败保留恢复、checkpoint 挂载外部 lfs.storage、CA 证书只读投影、URL 用户名 extraHeader 匹配、credential helper 部分结果串联与 store 首条匹配、自动预起草新鲜原生证据与跳过重装、网关响应信封校验、富文本展开预算、doctor 真实 worker 探测、仅预拉取 smudge 指针、已有分支 LFS 尖端校验与 Git 布尔签名语义", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-r26-"));
+  const serversToClose: http.Server[] = [];
+  const prevPwKey = process.env.PA_FEISHU_WEB_KEY;
+  const runHostGit = async (cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env) => {
+    const r = await runProcess("git", ["-C", cwd, ...args], { env, timeoutMs: 30_000 });
+    assert.equal(r.code, 0, `git ${args.join(" ")} 失败: ${r.stderr || r.stdout}`);
+    return r.stdout;
+  };
+  const makeR26App = (
+    name: string,
+    opts?: {
+      pwEnabled?: boolean;
+      sendReplies?: boolean;
+      preDraft?: boolean;
+      groupsDeny?: string[];
+      repos?: Record<string, { path: string; default_branch?: string }>;
+    },
+  ) => {
+    const dataDir = path.join(dir, name);
+    fs.mkdirSync(dataDir, { recursive: true });
+    const cfgPath = path.join(dataDir, "config.yaml");
+    fs.writeFileSync(
+      cfgPath,
+      JSON.stringify({
+        data_dir: dataDir,
+        bins: { lark: path.join(STUBS, "ctx-lark"), acpx: path.join(STUBS, "acpx"), bytedcli: path.join(STUBS, "ctx-bytedcli") },
+        harnesses: { codex: { type: "codex-exec", cmd: path.join(STUBS, "ctx-codex") } },
+        roles: { brain: "codex" },
+        owner: { open_id: "ou_r26_owner", timezone: "Asia/Shanghai" },
+        cards: { enabled: false },
+        dispatch: { repos: opts?.repos ?? {} },
+        engine: { retry_base_ms: 20, retry_max_ms: 50, tick_ms: 50, effect_attempts: 1 },
+        context: {
+          enabled: true,
+          understand: true,
+          groups: "spoken",
+          groups_allow: [],
+          groups_deny: opts?.groupsDeny ?? [],
+          sources: { im: true, minutes: false, docs: false, tasks: false, calendar: false, meego: false },
+          personal_web: {
+            enabled: opts?.pwEnabled ?? false,
+            fast_lane: true,
+            debounce_ms: 0,
+            pre_draft: opts?.preDraft ?? false,
+            send_replies: opts?.sendReplies ?? false,
+          },
+        },
+      }),
+    );
+    return createApp(loadConfig(cfgPath));
+  };
+  const noopPwHooks = {
+    onFastTrigger: () => undefined,
+    onReconnect: () => undefined,
+    onNeedsLogin: () => undefined,
+  };
+
+  try {
+    // 1) [R26 #15 P2] 网关响应信封与字段线型校验：畸形或无关 protobuf HTTP 200 必须抛 GatewayError，不得伪装为空 CMD 8 导致撤回观测
+    {
+      // a) status 字段（field 4）为 WIRE_BYTES 而非 varint -> 拒绝
+      const badStatusWire = new ProtoWriter().uint(2, 1).str(4, "not-a-varint").finish();
+      assert.throws(
+        () => unwrapGatewayPayload(badStatusWire, { allowEmptyPayload: true, expectedCommand: CMD_READ_MESSAGE }),
+        GatewayError,
+        "status 字段线型非法时必须抛 GatewayError",
+      );
+      // b) payload 字段（field 5）为 WIRE_VARINT 而非 bytes -> 拒绝
+      const badPayloadWire = new ProtoWriter().uint(2, 1).uint(4, 0).uint(5, 42).finish();
+      assert.throws(
+        () => unwrapGatewayPayload(badPayloadWire, { allowEmptyPayload: true, expectedCommand: CMD_READ_MESSAGE }),
+        GatewayError,
+        "payload 字段线型非法时必须抛 GatewayError",
+      );
+      // c) 无关可解析 protobuf（如 ErrorMessage { string msg = 1 }）-> 缺少有效信封头，拒绝视为空结果
+      const unrelatedProto = new ProtoWriter().str(1, "proxy error page").finish();
+      assert.throws(
+        () => unwrapGatewayPayload(unrelatedProto, { allowEmptyPayload: true, expectedCommand: CMD_READ_MESSAGE }),
+        GatewayError,
+        "无关 protobuf 响应不得被视为合法空 CMD 8 结果",
+      );
+      // d) 命令号不匹配 -> 拒绝
+      const wrongCmd = new ProtoWriter().uint(2, 1).uint(3, CMD_CHAT_MODE).uint(4, 0).finish();
+      assert.throws(
+        () => unwrapGatewayPayload(wrongCmd, { allowEmptyPayload: true, expectedCommand: CMD_READ_MESSAGE }),
+        GatewayError,
+        "命令号不匹配时必须抛 GatewayError",
+      );
+      // e) 合法空 CMD 8 响应（payloadType=1, cmd=8, status=0, 无 field 5）-> 返回空 Buffer
+      const validEmpty = new ProtoWriter().uint(2, 1).uint(3, CMD_READ_MESSAGE).uint(4, 0).finish();
+      assert.equal(
+        unwrapGatewayPayload(validEmpty, { allowEmptyPayload: true, expectedCommand: CMD_READ_MESSAGE }).length,
+        0,
+        "合法空 CMD 8 网关包应返回空 Buffer 供 readMessage 判定消息不存在",
+      );
+    }
+
+    // 2) [R26 #16 P2] 富文本解码必须限制累计展开字符数，防止 DAG 重复引用单个大元素放大内存
+    {
+      const bigChunk = "A".repeat(16 * 1024);
+      const textProp = new ProtoWriter().str(1, bigChunk).finish();
+      const textElem = new ProtoWriter().uint(1, 1).bytes(3, textProp).finish();
+      const dict = new ProtoWriter().bytes(1, new ProtoWriter().str(1, "t1").bytes(2, textElem).finish());
+      const rich = new ProtoWriter();
+      for (let i = 0; i < 100; i++) {
+        rich.str(1, "t1");
+      }
+      rich.bytes(3, dict.finish());
+      const msgContent = new ProtoWriter().bytes(3, rich.finish()).finish();
+      const rawMsg = new ProtoWriter()
+        .str(1, "990001")
+        .uint(2, MSG_TEXT)
+        .str(3, "700111")
+        .uint(4, 1730000000)
+        .bytes(5, msgContent)
+        .uint(7, USER_SENDER_TYPE)
+        .str(10, "880001")
+        .uint(46, CHAT_KIND_P2P)
+        .finish();
+      const decoded = decodeMessage(rawMsg, "700999");
+      assert.equal(decoded.text.length, 64 * 1024, `展开后长度应精确封顶于 64KiB 预算，实际 ${decoded.text.length}`);
+      assert.equal(decoded.partial, true, "触发展开预算截断后必须标记 partial=true");
+    }
+
+    // 3) [R26 #5 P1] 磁盘配置文件中 groups_deny/groups_allow 含 YAML mapping 或非字符串时，发送回复前必须中止
+    {
+      process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
+      const app = makeR26App("r26-5-malformed-deny", { pwEnabled: true, sendReplies: true });
+      try {
+        const ctxStore = new ContextStore(app.store.db);
+        const bridge = new PersonalWebBridge(app, ctxStore, noopPwHooks);
+        // 篡改磁盘配置文件，使 groups_deny 含 YAML 映射对象而非字符串
+        const curStat = fs.statSync(app.cfg.file);
+        fs.writeFileSync(
+          app.cfg.file,
+          `owner:\n  open_id: ou_r26_owner\ncontext:\n  groups: spoken\n  groups_allow: []\n  groups_deny:\n    - chat: pw_chat:555001\n  personal_web:\n    enabled: true\n    send_replies: true\n`,
+          "utf8",
+        );
+        const future = new Date(curStat.mtimeMs + 2000);
+        fs.utimesSync(app.cfg.file, future, future);
+        await assert.rejects(
+          () =>
+            bridge.sendVerifiedReply({
+              owner_id: "700999",
+              chat_id: "555001",
+              message_id: "990002",
+              text: "不应发出",
+              cid: "r26-cid-5",
+            }),
+          /context\.groups_deny 格式非法/,
+          "groups_deny 含 YAML mapping 时必须按 ConfigSchema 拒绝发送而非强转为 [object Object]",
+        );
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 4) [R26 #6 P2] 已静音/已排除会话的空正文或不支持编辑推送，必须在调用 readMessage 前直接忽略并放行 ACK
+    {
+      process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
+      const app = makeR26App("r26-6-excluded-edit", { pwEnabled: true });
+      try {
+        const ctxStore = new ContextStore(app.store.db);
+        const bridge = new PersonalWebBridge(app, ctxStore, noopPwHooks);
+        saveWorkspaceBinding(app.store, "700999", "ou_r26_owner");
+        app.store.set(ACTIVE_SESSION_KV_KEY, "sess-r26-6");
+        ctxStore.addObs([
+          {
+            id: "pw:600001",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:660001",
+            conv_name: "私聊：敏感对象",
+            actor_id: "700222",
+            actor_name: "敏感对象",
+            is_me: false,
+            text: "历史私聊内容",
+            time: Date.now() - 1000,
+            url: "",
+            meta: { native_owner_id: "700999", chat_type: "p2p" },
+          },
+        ]);
+        // 随后用户将该会话静音
+        ctxStore.muteConv("pw_chat:660001", "私聊：敏感对象", true);
+        let readMessageCalls = 0;
+        const fakeClient = {
+          currentSessionId: () => "sess-r26-6",
+          readMessage: async () => {
+            readMessageCalls++;
+            throw new Error("should not call readMessage for excluded chat");
+          },
+        } as unknown as FeishuWebClient;
+        const emptyEditMsg: WebMessage = {
+          id: "600001",
+          ownerId: "700999",
+          actorId: "700222",
+          conversationId: "660001",
+          conversationKind: "dm",
+          rootId: "",
+          parentId: "",
+          threadId: "",
+          cid: "",
+          kind: MSG_TEXT,
+          senderType: USER_SENDER_TYPE,
+          messageType: "text",
+          createdAtMs: Date.now(),
+          position: 1,
+          threadPosition: 0,
+          sendToChat: false,
+          text: "",
+          mentions: [],
+          resources: [],
+          unsupported: false,
+          partial: false,
+        };
+        await bridge.handleMessage(emptyEditMsg, fakeClient);
+        assert.equal(readMessageCalls, 0, "已静音会话的空编辑推送不得触发 readMessage 网络请求");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 5) [R26 #13 P2 + #14 P2] 自动预起草必须要求本批新鲜原生触发证据；且此前被 skipped 的预起草在收到新原生触发证据后必须重新武装重试
+    {
+      process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
+      const app = makeR26App("r26-13-14-predraft", { pwEnabled: true, preDraft: false, sendReplies: true });
+      try {
+        const ctx = new ContextService(app);
+        saveWorkspaceBinding(app.store, "700999", "ou_r26_owner");
+        // 先关闭 pre_draft 时记录一条旧原生 DM 并建成高优 ask_me 事项
+        ctx.store.addObs([
+          {
+            id: "pw:130001",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:13001",
+            conv_name: "私聊：老板",
+            actor_id: "700200",
+            actor_name: "老板",
+            is_me: false,
+            text: "上周私聊请你评估方案",
+            time: Date.now() - 60_000,
+            url: "",
+            meta: {
+              transport: "personal_web",
+              native_owner_id: "700999",
+              native_chat_id: "13001",
+              native_message_id: "130001",
+              chat_type: "p2p",
+            },
+          },
+        ]);
+        const oldDm = ctx.store.obs("pw:130001");
+        assert.ok(oldDm);
+        const { item: openItem } = ctx.store.upsertItem(
+          {
+            title: "评估发布方案",
+            kind: "ask_me",
+            status: "open",
+            priority: "high",
+            counterpart: "老板",
+            source: "im",
+            confidence: 0.95,
+          },
+          Date.now() - 60_000,
+        );
+        ctx.store.addEvidence("item", openItem.id, "pw:130001", "上周私聊请你评估方案", Date.now() - 60_000);
+        ctx.store.markProcessed([{ id: "pw:130001", rev: obsRevision(oldDm!) }]);
+
+        // 现在开启 pre_draft，但只来了一条无关普通群消息（非 DM、非 @我）更新同一事项
+        app.cfg.context.personal_web.pre_draft = true;
+        ctx.store.addObs([
+          {
+            id: "pw:130002",
+            source: "im",
+            kind: "group",
+            conv: "pw_chat:13002",
+            conv_name: "普通讨论群",
+            actor_id: "700201",
+            actor_name: "同事乙",
+            is_me: false,
+            text: "大家顺便提一下方案进度",
+            time: Date.now() - 10_000,
+            url: "",
+            meta: {
+              transport: "personal_web",
+              native_owner_id: "700999",
+              native_chat_id: "13002",
+              native_message_id: "130002",
+              chat_type: "group",
+              at_me: false,
+            },
+          },
+        ]);
+        const plainGroup = ctx.store.obs("pw:130002");
+        assert.ok(plainGroup);
+        const applyRes1 = ctx.understander.apply(
+          {
+            projects: [],
+            items: [
+              {
+                ref: openItem.id,
+                title: "评估发布方案",
+                kind: "ask_me",
+                project: "",
+                status: "open",
+                priority: "high",
+                due: null,
+                counterpart: "老板",
+                next_step: "确认进度",
+                confidence: 0.95,
+                close_reason: "",
+                evidence: [{ obs_id: "pw:130002", quote: "大家顺便提一下方案进度" }],
+              },
+            ],
+            knowledge: [],
+            updates: [],
+            people: [],
+            conflicts: [],
+          },
+          [plainGroup!],
+          ["pw:130002"],
+        );
+        const enqueueFn = (
+          ctx as unknown as {
+            enqueueAutoPreDrafts: (
+              items: typeof applyRes1.touched,
+              requireNative: boolean,
+              freshByItem?: Record<string, string[]>,
+            ) => number;
+          }
+        ).enqueueAutoPreDrafts.bind(ctx);
+        const enqPlain = enqueueFn(applyRes1.touched, true, applyRes1.touchedFreshObsByItem);
+        assert.equal(enqPlain, 0, "旧 DM 存在但本批只有普通群更新时，不得触发自动预起草");
+        assert.equal(app.ledger.get(`context:draft:${openItem.id}:reply:fast`), undefined);
+
+        // #14: 收到新鲜原生 DM #1 -> 入队自动预起草；在执行前关闭 pre_draft 使其进入 skipped 终态
+        ctx.store.addObs([
+          {
+            id: "pw:140001",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:13001",
+            conv_name: "私聊：老板",
+            actor_id: "700200",
+            actor_name: "老板",
+            is_me: false,
+            text: "今天能给方案结论吗？",
+            time: Date.now() - 5_000,
+            url: "",
+            meta: {
+              transport: "personal_web",
+              native_owner_id: "700999",
+              native_chat_id: "13001",
+              native_message_id: "140001",
+              chat_type: "p2p",
+            },
+          },
+        ]);
+        const freshDm1 = ctx.store.obs("pw:140001");
+        assert.ok(freshDm1);
+        const applyRes2 = ctx.understander.apply(
+          {
+            projects: [],
+            items: [
+              {
+                ref: openItem.id,
+                title: "评估发布方案",
+                kind: "ask_me",
+                project: "",
+                status: "open",
+                priority: "high",
+                due: null,
+                counterpart: "老板",
+                next_step: "回复结论",
+                confidence: 0.95,
+                close_reason: "",
+                evidence: [{ obs_id: "pw:140001", quote: "今天能给方案结论吗？" }],
+              },
+            ],
+            knowledge: [],
+            updates: [],
+            people: [],
+            conflicts: [],
+          },
+          [freshDm1!],
+          ["pw:140001"],
+        );
+        assert.equal(enqueueFn(applyRes2.touched, true, applyRes2.touchedFreshObsByItem), 1, "新鲜原生 DM 应入队预起草");
+        const jobId = `context:draft:${openItem.id}:reply:fast`;
+        // 在执行前关闭 pre_draft，使该作业被跳过（terminal=true, state="skipped"）
+        app.cfg.context.personal_web.pre_draft = false;
+        app.engine.register(ctx.handler());
+        await app.engine.drain(["context"]);
+        assert.equal(app.ledger.get(jobId)?.state, "skipped", "关闭 pre_draft 后排队作业应进入 skipped 终态");
+        assert.equal(app.ledger.get(jobId)?.terminal, true);
+
+        // 同一条已跳过旧 DM 再次调用不会重复重装
+        app.cfg.context.personal_web.pre_draft = true;
+        assert.equal(enqueueFn(applyRes2.touched, true, applyRes2.touchedFreshObsByItem), 0, "同一条已跳过触发修订不应重复重装");
+
+        // 重新开启 pre_draft 后收到新的原生 DM #2 -> 原子重新武装同一幂等作业为 pending
+        ctx.store.addObs([
+          {
+            id: "pw:140002",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:13001",
+            conv_name: "私聊：老板",
+            actor_id: "700200",
+            actor_name: "老板",
+            is_me: false,
+            text: "催一下，下班前确认好吗？",
+            time: Date.now(),
+            url: "",
+            meta: {
+              transport: "personal_web",
+              native_owner_id: "700999",
+              native_chat_id: "13001",
+              native_message_id: "140002",
+              chat_type: "p2p",
+            },
+          },
+        ]);
+        const freshDm2 = ctx.store.obs("pw:140002");
+        assert.ok(freshDm2);
+        const applyRes3 = ctx.understander.apply(
+          {
+            projects: [],
+            items: [
+              {
+                ref: openItem.id,
+                title: "评估发布方案",
+                kind: "ask_me",
+                project: "",
+                status: "open",
+                priority: "high",
+                due: null,
+                counterpart: "老板",
+                next_step: "下班前回复",
+                confidence: 0.95,
+                close_reason: "",
+                evidence: [{ obs_id: "pw:140002", quote: "催一下，下班前确认好吗？" }],
+              },
+            ],
+            knowledge: [],
+            updates: [],
+            people: [],
+            conflicts: [],
+          },
+          [freshDm2!],
+          ["pw:140002"],
+        );
+        assert.equal(
+          enqueueFn(applyRes3.touched, true, applyRes3.touchedFreshObsByItem),
+          1,
+          "新原生 DM 必须重新武装此前被 skipped 的预起草作业",
+        );
+        const rearmed = app.ledger.get(jobId);
+        assert.equal(rearmed?.state, "pending", "重装后作业应回到 pending 可执行状态");
+        assert.equal(rearmed?.terminal, false);
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 6) [R26 #10 P2 + #9 P2 + #3 P1] Git HTTP header 用户名匹配、HTTPS CA bundle 只读挂载与自定义 core.excludesFile 在隔离 commitAll 中生效
+    {
+      const fakeHome = path.join(dir, "r26-home");
+      const dataDir = path.join(dir, "r26-data");
+      fs.mkdirSync(fakeHome, { recursive: true });
+      fs.mkdirSync(dataDir, { recursive: true });
+      fs.mkdirSync(path.join(fakeHome, ".ssh"), { recursive: true });
+      fs.writeFileSync(path.join(fakeHome, ".ssh", "id_rsa"), "SECRET-KEY\n", { mode: 0o600 });
+
+      const customIgnore = path.join(fakeHome, ".gitignore_global");
+      fs.writeFileSync(customIgnore, "*.secret-local\n", "utf8");
+      const corpCaFile = path.join(fakeHome, "corp-ca.pem");
+      fs.writeFileSync(corpCaFile, "-----BEGIN CERTIFICATE-----\nDUMMY\n-----END CERTIFICATE-----\n", "utf8");
+      const corpCaDir = path.join(fakeHome, "corp-ca-dir");
+      fs.mkdirSync(corpCaDir, { recursive: true });
+      fs.writeFileSync(path.join(corpCaDir, "root.pem"), "DUMMY-ROOT\n", "utf8");
+
+      const globalGitCfg = path.join(fakeHome, ".gitconfig");
+      fs.writeFileSync(
+        globalGitCfg,
+        [
+          "[user]",
+          "\tname = R26 Tester",
+          "\temail = r26@example.com",
+          "[core]",
+          "\texcludesFile = ~/.gitignore_global",
+          '[http "https://alice@forge.example/org"]',
+          "\textraHeader = Authorization: Bearer ALICE-ONLY",
+          '[http "https://bob@forge.example/org"]',
+          "\textraHeader = Authorization: Bearer BOB-ONLY",
+          '[http "https://forge.example/org"]',
+          "\textraHeader = X-Shared: SHARED",
+          `\tsslCAInfo = ${corpCaFile}`,
+          `\tsslCAPath = ${corpCaDir}`,
+          '[http "https://other.example/"]',
+          "\textraHeader = Authorization: Bearer OTHER-HOST",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const testEnv: NodeJS.ProcessEnv = { ...process.env, HOME: fakeHome, XDG_CONFIG_HOME: path.join(fakeHome, ".config") };
+      delete testEnv.GIT_CONFIG_GLOBAL;
+
+      // #10: URL 用户名匹配校验
+      const stagedForAlice = stageSanitizedGitConfig(testEnv, dataDir, {
+        allowedRemoteUrls: ["https://alice@forge.example/org/repo.git"],
+      });
+      assert.ok(stagedForAlice);
+      try {
+        const txt = fs.readFileSync(stagedForAlice!.file, "utf8");
+        assert.ok(txt.includes("ALICE-ONLY"), "alice 请求应保留 alice 的 extraHeader");
+        assert.ok(txt.includes("SHARED"), "alice 请求应保留无用户名通配段的 extraHeader");
+        assert.ok(!txt.includes("BOB-ONLY"), "alice 请求绝不得投影 bob 的 extraHeader");
+        assert.ok(!txt.includes("OTHER-HOST"), "绝不得投影其他主机的 extraHeader");
+        // #9: CA bundle 文件与目录必须加入 extraReadOnlyPaths
+        assert.ok(
+          stagedForAlice!.extraReadOnlyPaths.includes(fs.realpathSync(corpCaFile)),
+          "选中远端的 sslCAInfo 目标必须只读挂载",
+        );
+        assert.ok(
+          stagedForAlice!.extraReadOnlyPaths.includes(fs.realpathSync(corpCaDir)),
+          "选中远端的 sslCAPath 目录必须只读挂载",
+        );
+        // #3: core.excludesFile 目标必须只读挂载并保留配置项
+        assert.ok(
+          stagedForAlice!.extraReadOnlyPaths.includes(fs.realpathSync(customIgnore)),
+          "全局 core.excludesFile 目标必须只读挂载",
+        );
+        assert.ok(txt.toLowerCase().includes("excludesfile"), "脱敏 gitconfig 必须保留 core.excludesFile");
+      } finally {
+        stagedForAlice!.cleanup();
+      }
+
+      const stagedForAnon = stageSanitizedGitConfig(testEnv, dataDir, {
+        allowedRemoteUrls: ["https://forge.example/org/repo.git"],
+      });
+      assert.ok(stagedForAnon);
+      try {
+        const txt = fs.readFileSync(stagedForAnon!.file, "utf8");
+        assert.ok(txt.includes("SHARED"), "无用户名请求应保留无用户名通配段");
+        assert.ok(!txt.includes("ALICE-ONLY"), "无用户名请求绝不得投影 alice 的 extraHeader");
+        assert.ok(!txt.includes("BOB-ONLY"), "无用户名请求绝不得投影 bob 的 extraHeader");
+      } finally {
+        stagedForAnon!.cleanup();
+      }
+
+      // 危险路径（~/.ssh/id_rsa 或 $HOME 作为 sslCAPath）必须被拒绝挂载和剔除
+      const badCfgPath = path.join(fakeHome, ".gitconfig-bad");
+      fs.writeFileSync(
+        badCfgPath,
+        [
+          "[user]",
+          "\tname = Safe",
+          "[core]",
+          "\texcludesFile = ~/.ssh/id_rsa",
+          "[http]",
+          `\tsslCAPath = ${fakeHome}`,
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      const badStaged = stageSanitizedGitConfig(
+        { ...testEnv, GIT_CONFIG_GLOBAL: badCfgPath },
+        dataDir,
+        { allowedRemoteUrls: ["https://forge.example/org/repo.git"] },
+      );
+      assert.ok(badStaged);
+      try {
+        const txt = fs.readFileSync(badStaged!.file, "utf8");
+        assert.ok(!txt.includes("id_rsa"), "指向 ~/.ssh/id_rsa 的 core.excludesFile 必须被丢弃");
+        assert.ok(!txt.includes("sslcapath"), "指向 $HOME 的 http.sslCAPath 必须被丢弃");
+        assert.equal(badStaged!.extraReadOnlyPaths.length, 0, "非法路径不得被挂载");
+      } finally {
+        badStaged!.cleanup();
+      }
+
+      // #3 实测：隔离 commitAll（git add -A）必须遵守 ~/.gitignore_global，不提交本地敏感文件
+      const repoIgnore = path.join(dir, "r26-3-ignore-repo");
+      fs.mkdirSync(repoIgnore, { recursive: true });
+      await runHostGit(repoIgnore, ["init", "-q"], testEnv);
+      fs.writeFileSync(path.join(repoIgnore, "tracked.txt"), "v1\n");
+      await runHostGit(repoIgnore, ["add", "tracked.txt"], testEnv);
+      await runHostGit(repoIgnore, ["commit", "-q", "-m", "init"], testEnv);
+      fs.writeFileSync(path.join(repoIgnore, "tracked.txt"), "v2\n");
+      fs.writeFileSync(path.join(repoIgnore, "my.secret-local"), "DO-NOT-STAGE\n");
+      const appIgnore = makeR26App("r26-3-ignore-app");
+      try {
+        const committed = await commitAll(repoIgnore, "checkpoint", {
+          cfg: appIgnore.cfg,
+          trustedRepoRoot: repoIgnore,
+          extraEnv: { HOME: fakeHome, XDG_CONFIG_HOME: path.join(fakeHome, ".config") },
+        });
+        assert.equal(committed, true);
+        const committedFiles = (await runHostGit(repoIgnore, ["ls-tree", "-r", "--name-only", "HEAD"], testEnv))
+          .trim()
+          .split(/\r?\n/);
+        assert.ok(committedFiles.includes("tracked.txt"));
+        assert.ok(!committedFiles.includes("my.secret-local"), "隔离 commitAll 必须遵守 ~/.gitignore_global 忽略 *.secret-local");
+      } finally {
+        appIgnore.store.db.close();
+      }
+    }
+
+    // 7) [R26 #2 P1 + #20 P3] 非 SSH 强制签名路径必须透传 commit.gpgSign=true；且 commit.gpgSign=（空值=false）vs 无值（=true）遵循 Git 布尔语义
+    {
+      const appSign = makeR26App("r26-sign-app");
+      const cleanHome = path.join(dir, "r26-sign-home");
+      fs.mkdirSync(cleanHome, { recursive: true });
+      const signEnv: NodeJS.ProcessEnv = { ...process.env, HOME: cleanHome, XDG_CONFIG_HOME: path.join(cleanHome, ".config") };
+      delete signEnv.GIT_CONFIG_GLOBAL;
+      try {
+        // #2: 外部 [include] 启用 OpenPGP commit.gpgSign=true（沙箱内该外部 include 不可见），commitAll 绝不能静默提交未签名提交
+        const extIncludeDir = path.join(dir, "r26-2-ext-include");
+        fs.mkdirSync(extIncludeDir, { recursive: true });
+        const extCfg = path.join(extIncludeDir, "require-sign.gitconfig");
+        fs.writeFileSync(extCfg, "[commit]\n\tgpgSign = true\n[gpg]\n\tformat = openpgp\n[user]\n\tsigningkey = FAKEKEY123\n", "utf8");
+
+        const repoExtSign = path.join(dir, "r26-2-repo");
+        fs.mkdirSync(repoExtSign, { recursive: true });
+        await runHostGit(repoExtSign, ["init", "-q"], signEnv);
+        await runHostGit(repoExtSign, ["config", "user.name", "T"], signEnv);
+        await runHostGit(repoExtSign, ["config", "user.email", "t@t"], signEnv);
+        fs.writeFileSync(path.join(repoExtSign, "a.txt"), "1\n");
+        await runHostGit(repoExtSign, ["add", "a.txt"], signEnv);
+        await runHostGit(repoExtSign, ["commit", "-q", "-m", "init"], signEnv);
+        await runHostGit(repoExtSign, ["config", "include.path", extCfg], signEnv);
+        fs.writeFileSync(path.join(repoExtSign, "a.txt"), "2\n");
+        await assert.rejects(
+          () =>
+            commitAll(repoExtSign, "must not be unsigned", {
+              cfg: appSign.cfg,
+              trustedRepoRoot: repoExtSign,
+              extraEnv: { HOME: cleanHome, XDG_CONFIG_HOME: path.join(cleanHome, ".config") },
+            }),
+          /commit\.gpgSign=true/,
+          "外部 include 启用 OpenPGP 签名时，隔离 commitAll 必须拒绝静默生成未签名提交",
+        );
+
+        // #20a: 显式置空 `commit.gpgSign =` 遵循 Git 布尔语义为 false -> 允许无签名提交
+        const repoEmptyFalse = path.join(dir, "r26-20-empty-false");
+        fs.mkdirSync(repoEmptyFalse, { recursive: true });
+        await runHostGit(repoEmptyFalse, ["init", "-q"], signEnv);
+        await runHostGit(repoEmptyFalse, ["config", "user.name", "T"], signEnv);
+        await runHostGit(repoEmptyFalse, ["config", "user.email", "t@t"], signEnv);
+        fs.writeFileSync(path.join(repoEmptyFalse, "a.txt"), "1\n");
+        await runHostGit(repoEmptyFalse, ["add", "a.txt"], signEnv);
+        await runHostGit(repoEmptyFalse, ["commit", "-q", "-m", "init"], signEnv);
+        fs.appendFileSync(path.join(repoEmptyFalse, ".git", "config"), "\n[commit]\n\tgpgSign =\n");
+        fs.writeFileSync(path.join(repoEmptyFalse, "a.txt"), "2\n");
+        const okEmpty = await commitAll(repoEmptyFalse, "empty gpgSign is false", {
+          cfg: appSign.cfg,
+          trustedRepoRoot: repoEmptyFalse,
+          extraEnv: { HOME: cleanHome, XDG_CONFIG_HOME: path.join(cleanHome, ".config") },
+        });
+        assert.equal(okEmpty, true, "commit.gpgSign =（空值）按 Git 布尔语义应为 false，允许代理提交");
+
+        // #20b: 无值声明 `commit.gpgSign` 按 Git 布尔语义为 true -> 强制签名
+        const repoValuelessTrue = path.join(dir, "r26-20-valueless-true");
+        fs.mkdirSync(repoValuelessTrue, { recursive: true });
+        await runHostGit(repoValuelessTrue, ["init", "-q"], signEnv);
+        await runHostGit(repoValuelessTrue, ["config", "user.name", "T"], signEnv);
+        await runHostGit(repoValuelessTrue, ["config", "user.email", "t@t"], signEnv);
+        fs.writeFileSync(path.join(repoValuelessTrue, "a.txt"), "1\n");
+        await runHostGit(repoValuelessTrue, ["add", "a.txt"], signEnv);
+        await runHostGit(repoValuelessTrue, ["commit", "-q", "-m", "init"], signEnv);
+        fs.appendFileSync(path.join(repoValuelessTrue, ".git", "config"), "\n[commit]\n\tgpgSign\n[user]\n\tsigningkey = FAKEKEY456\n");
+        fs.writeFileSync(path.join(repoValuelessTrue, "a.txt"), "2\n");
+        await assert.rejects(
+          () =>
+            commitAll(repoValuelessTrue, "valueless gpgSign is true", {
+              cfg: appSign.cfg,
+              trustedRepoRoot: repoValuelessTrue,
+              extraEnv: { HOME: cleanHome, XDG_CONFIG_HOME: path.join(cleanHome, ".config") },
+            }),
+          /commit\.gpgSign=true/,
+          "无值 commit.gpgSign 按 Git 布尔语义应为 true 并强制签名",
+        );
+      } finally {
+        appSign.store.db.close();
+      }
+    }
+
+    // 8) [R26 #7 P2] OAuth 写回宿主机失败时保留受保护恢复副本与 pending_recovery，待宿主机恢复可写后同进程下次调用自动恢复（Codex / Claude / OpenCode）
+    {
+      const oauthRoot = path.join(dir, "r26-7-oauth");
+      const stateBase = path.join(oauthRoot, "data");
+      fs.mkdirSync(stateBase, { recursive: true });
+      const expiredIso = new Date(Date.now() - 2 * 3600_000).toISOString();
+      const freshIso = new Date(Date.now() + 3600_000).toISOString();
+
+      // 8a) Codex
+      const codexHost = path.join(oauthRoot, "codex-home");
+      fs.mkdirSync(codexHost, { recursive: true, mode: 0o700 });
+      const codexAuth = path.join(codexHost, "auth.json");
+      fs.writeFileSync(
+        codexAuth,
+        JSON.stringify({
+          auth_mode: "chatgpt",
+          last_refresh: expiredIso,
+          tokens: { access_token: "old-at", refresh_token: "old-rt", account_id: "acct-1" },
+        }),
+        { mode: 0o600 },
+      );
+      const lease1 = await coordinateCodexOAuthRefresh(codexHost);
+      const staged1 = stageIsolatedCodexHome(codexHost, { copyUserConfig: false, dataDir: stateBase });
+      lease1.attachScratch?.(staged1);
+      // 模拟沙箱子进程旋转单次 refresh_token
+      fs.writeFileSync(
+        path.join(staged1.scratchDir, "auth.json"),
+        JSON.stringify({
+          auth_mode: "chatgpt",
+          last_refresh: freshIso,
+          tokens: { access_token: "new-at", refresh_token: "new-rt", account_id: "acct-1" },
+        }),
+        { mode: 0o600 },
+      );
+      // 临时把宿主机目录置为 0500 模拟写回失败
+      fs.chmodSync(codexHost, 0o500);
+      try {
+        const ok = syncRefreshedCodexAuth(staged1);
+        assert.equal(ok, false, "只读宿主机目录写回必须返回 false");
+        assert.equal(staged1.retainScratchForRecovery, true, "已旋转令牌写回失败时必须标记保留恢复副本");
+        staged1.cleanup();
+        assert.ok(fs.existsSync(path.join(staged1.scratchDir, "auth.json")), "cleanup() 必须保留暂存目录中的新令牌");
+        lease1.release({ keepRecoveryRow: !!staged1.retainScratchForRecovery });
+      } finally {
+        fs.chmodSync(codexHost, 0o700);
+      }
+      // 宿主机目录恢复可写后，同一存活进程的下一次调用必须自动恢复旋转后的新令牌并清理暂存目录
+      const lease2 = await coordinateCodexOAuthRefresh(codexHost);
+      try {
+        const recovered = JSON.parse(fs.readFileSync(codexAuth, "utf8")) as { tokens: { refresh_token: string } };
+        assert.equal(recovered.tokens.refresh_token, "new-rt", "下一次调用必须从保留的恢复副本原子恢复新 refresh_token");
+        assert.equal(fs.existsSync(staged1.scratchDir), false, "恢复成功后应清理旧恢复暂存目录");
+      } finally {
+        lease2.release();
+      }
+
+      // 8b) Claude
+      const claudeHome = path.join(oauthRoot, "claude-home");
+      const claudeDir = path.join(claudeHome, ".claude");
+      fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 });
+      const claudeCred = path.join(claudeDir, ".credentials.json");
+      fs.writeFileSync(
+        claudeCred,
+        JSON.stringify({
+          claudeAiOauth: {
+            accessToken: "c-old-at",
+            refreshToken: "c-old-rt",
+            expiresAt: Date.now() - 60_000,
+            organizationUuid: "org-1",
+          },
+        }),
+        { mode: 0o600 },
+      );
+      const claudeLease1 = await coordinateClaudeOAuthRefresh(claudeDir);
+      const claudeStaged1 = stageIsolatedClaudeState(claudeHome, { HOME: claudeHome }, stateBase);
+      assert.ok(claudeStaged1);
+      claudeLease1.attachScratch?.(claudeStaged1!);
+      fs.writeFileSync(
+        path.join(claudeStaged1!.dir, ".credentials.json"),
+        JSON.stringify({
+          claudeAiOauth: {
+            accessToken: "c-new-at",
+            refreshToken: "c-new-rt",
+            expiresAt: Date.now() + 3600_000,
+            organizationUuid: "org-1",
+          },
+        }),
+        { mode: 0o600 },
+      );
+      fs.chmodSync(claudeDir, 0o500);
+      try {
+        assert.equal(syncRefreshedClaudeAuth(claudeStaged1!), false);
+        assert.equal(claudeStaged1!.retainScratchForRecovery, true);
+        claudeStaged1!.cleanup();
+        assert.ok(fs.existsSync(path.join(claudeStaged1!.dir, ".credentials.json")));
+        claudeLease1.release({ keepRecoveryRow: !!claudeStaged1!.retainScratchForRecovery });
+      } finally {
+        fs.chmodSync(claudeDir, 0o700);
+      }
+      const claudeLease2 = await coordinateClaudeOAuthRefresh(claudeDir);
+      try {
+        const recClaude = JSON.parse(fs.readFileSync(claudeCred, "utf8")) as { claudeAiOauth: { refreshToken: string } };
+        assert.equal(recClaude.claudeAiOauth.refreshToken, "c-new-rt", "Claude 下一次调用必须恢复保留的新 refreshToken");
+      } finally {
+        claudeLease2.release();
+      }
+
+      // 8c) OpenCode
+      const ocHome = path.join(oauthRoot, "oc-home");
+      const ocDataDir = path.join(ocHome, ".local", "share", "opencode");
+      fs.mkdirSync(ocDataDir, { recursive: true, mode: 0o700 });
+      const ocAuth = path.join(ocDataDir, "auth.json");
+      fs.writeFileSync(
+        ocAuth,
+        JSON.stringify({
+          anthropic: { type: "oauth", access: "o-old-at", refresh: "o-old-rt", expires: Date.now() - 60_000 },
+        }),
+        { mode: 0o600 },
+      );
+      const ocLease1 = await coordinateOpenCodeOAuthRefresh(ocDataDir);
+      const ocStaged1 = stageIsolatedOpenCodeState(ocHome, { HOME: ocHome }, stateBase);
+      assert.ok(ocStaged1);
+      ocLease1.attachScratch?.(ocStaged1!);
+      fs.writeFileSync(
+        path.join(ocStaged1!.stageDataDir, "auth.json"),
+        JSON.stringify({
+          anthropic: { type: "oauth", access: "o-new-at", refresh: "o-new-rt", expires: Date.now() + 3600_000 },
+        }),
+        { mode: 0o600 },
+      );
+      fs.chmodSync(ocDataDir, 0o500);
+      try {
+        assert.equal(syncRefreshedOpenCodeAuth(ocStaged1!), false);
+        assert.equal(ocStaged1!.retainScratchForRecovery, true);
+        ocStaged1!.cleanup();
+        assert.ok(fs.existsSync(path.join(ocStaged1!.stageDataDir, "auth.json")));
+        ocLease1.release({ keepRecoveryRow: !!ocStaged1!.retainScratchForRecovery });
+      } finally {
+        fs.chmodSync(ocDataDir, 0o700);
+      }
+      const ocLease2 = await coordinateOpenCodeOAuthRefresh(ocDataDir);
+      try {
+        const recOc = JSON.parse(fs.readFileSync(ocAuth, "utf8")) as { anthropic: { refresh: string } };
+        assert.equal(recOc.anthropic.refresh, "o-new-rt", "OpenCode 下一次调用必须恢复保留的新 refresh 令牌");
+      } finally {
+        ocLease2.release();
+      }
+    }
+
+    // 9) [R26 #11 P2 + #12 P2] Git credential helper 跨 helper 保留部分结果且完备即停；store 仅暂存首条匹配条目（绝不泄漏同主机其他账号）
+    {
+      const receivedAuths: string[] = [];
+      const credSrv = http.createServer((req, res) => {
+        req.resume();
+        receivedAuths.push(String(req.headers.authorization ?? ""));
+        res.writeHead(404, { Connection: "close" });
+        res.end("not found");
+      });
+      await new Promise<void>((resolve) => credSrv.listen(0, "127.0.0.1", resolve));
+      serversToClose.push(credSrv);
+      const port = (credSrv.address() as net.AddressInfo).port;
+      const remoteUrl = `http://127.0.0.1:${port}/org/repo.git`;
+
+      const appCred = makeR26App("r26-cred-app");
+      try {
+        // #11: Helper 1 返回 username=alice -> Helper 2 收到 username=alice 返回 password=pw-alice -> Helper 3 不得被调用
+        const credHome11 = path.join(dir, "r26-11-home");
+        fs.mkdirSync(credHome11, { recursive: true });
+        const h1 = path.join(credHome11, "h1.sh");
+        const h2 = path.join(credHome11, "h2.sh");
+        const h3 = path.join(credHome11, "h3.sh");
+        const h3Marker = path.join(credHome11, "h3-called");
+        fs.writeFileSync(h1, "#!/bin/sh\nif [ \"$1\" = \"get\" ]; then echo 'username=alice'; fi\n", { mode: 0o755 });
+        fs.writeFileSync(
+          h2,
+          "#!/bin/sh\nif [ \"$1\" = \"get\" ]; then\n  if grep -q '^username=alice$'; then echo 'password=pw-alice'; fi\nfi\n",
+          { mode: 0o755 },
+        );
+        fs.writeFileSync(
+          h3,
+          `#!/bin/sh\necho called >> "${h3Marker}"\nif [ "$1" = "get" ]; then echo 'password=wrong-fallback'; fi\n`,
+          { mode: 0o755 },
+        );
+        fs.writeFileSync(
+          path.join(credHome11, ".gitconfig"),
+          `[credential]\n\thelper =\n\thelper = !${h1}\n\thelper = !${h2}\n\thelper = !${h3}\n`,
+          "utf8",
+        );
+        const repo11 = path.join(dir, "r26-11-repo");
+        fs.mkdirSync(repo11, { recursive: true });
+        await runHostGit(repo11, ["init", "-q"]);
+        receivedAuths.length = 0;
+        await tryGit(repo11, ["ls-remote", remoteUrl], {
+          cfg: appCred.cfg,
+          trustedRepoRoot: repo11,
+          extraEnv: { HOME: credHome11, XDG_CONFIG_HOME: path.join(credHome11, ".config") },
+        });
+        const expectedBasic = `Basic ${Buffer.from("alice:pw-alice").toString("base64")}`;
+        // 注：http 首次请求通常无 Authorization，收到 401 才发 Authorization；我们改用返回 401 一次以验证实际发送的凭据
+        const authSrv = http.createServer((req, res) => {
+          req.resume();
+          const auth = String(req.headers.authorization ?? "");
+          if (!auth) {
+            res.writeHead(401, { "WWW-Authenticate": 'Basic realm="test"', Connection: "close" });
+            res.end();
+            return;
+          }
+          receivedAuths.push(auth);
+          res.writeHead(404, { Connection: "close" });
+          res.end();
+        });
+        await new Promise<void>((resolve) => authSrv.listen(0, "127.0.0.1", resolve));
+        serversToClose.push(authSrv);
+        const authPort = (authSrv.address() as net.AddressInfo).port;
+        const authUrl = `http://127.0.0.1:${authPort}/org/repo.git`;
+
+        receivedAuths.length = 0;
+        fs.rmSync(h3Marker, { force: true });
+        await tryGit(repo11, ["ls-remote", authUrl], {
+          cfg: appCred.cfg,
+          trustedRepoRoot: repo11,
+          extraEnv: { HOME: credHome11, XDG_CONFIG_HOME: path.join(credHome11, ".config") },
+        });
+        assert.ok(receivedAuths.includes(expectedBasic), `跨 helper 串联必须发送 alice:pw-alice，实际收到: ${receivedAuths.join(",")}`);
+        assert.equal(fs.existsSync(h3Marker), false, "前两个 helper 凑齐完整凭据后不得再调用第三个 helper");
+
+        // #12: store 文件含同主机多账号（alice 在前、bob 在后），无用户名远端只能暂存首条 alice，绝不暴露 bob
+        const credHome12 = path.join(dir, "r26-12-home");
+        fs.mkdirSync(credHome12, { recursive: true });
+        const storeFile12 = path.join(credHome12, ".git-credentials");
+        fs.writeFileSync(
+          storeFile12,
+          `http://alice:first-secret@127.0.0.1:${authPort}\nhttp://bob:second-secret@127.0.0.1:${authPort}\n`,
+          { mode: 0o600 },
+        );
+        fs.writeFileSync(
+          path.join(credHome12, ".gitconfig"),
+          `[credential]\n\thelper =\n\thelper = store --file=${storeFile12}\n`,
+          "utf8",
+        );
+        // 在无用户名请求中用沙箱侧查看临时 cred 文件内容：用 -c credential.helper 读取或借助另一个验证——
+        // 这里直接跑 tryGit 并通过本地 helper 读取传入的 -c credential.helper 路径验证仅含 alice 不含 bob
+        const repo12 = path.join(dir, "r26-12-repo");
+        fs.mkdirSync(repo12, { recursive: true });
+        await runHostGit(repo12, ["init", "-q"]);
+        const leakedProbe = path.join(repo12, "staged-creds-dump.txt");
+        // 仓库 local helper（在沙箱中按原顺序运行于 store 之后）检查同目录里被暂存的 store 文件是否含 second-secret
+        const localInspector = path.join(repo12, "inspect.sh");
+        fs.writeFileSync(
+          localInspector,
+          `#!/bin/sh\nfor f in $(git config --get-all credential.helper | sed -n 's/.*--file=//p'); do\n  cat "$f" >> "${leakedProbe}" 2>/dev/null\ndone\n`,
+          { mode: 0o755 },
+        );
+        await runHostGit(repo12, ["config", "--local", "credential.helper", `!${localInspector}`]);
+        receivedAuths.length = 0;
+        await tryGit(repo12, ["ls-remote", authUrl], {
+          cfg: appCred.cfg,
+          trustedRepoRoot: repo12,
+          extraEnv: { HOME: credHome12, XDG_CONFIG_HOME: path.join(credHome12, ".config") },
+        });
+        assert.ok(
+          receivedAuths.includes(`Basic ${Buffer.from("alice:first-secret").toString("base64")}`),
+          "store 必须使用首条匹配凭据 alice:first-secret",
+        );
+        // 触发一次不匹配请求以确认即使沙箱内可见该临时 store 文件，也不含 bob 的 second-secret
+        // （用另一个不同端口不命中 store 的方式或直接以 bob 失败认证检查；这里直接把 store 放在 localInspector 之后再测一次）
+        await runHostGit(repo12, ["config", "--local", "--unset-all", "credential.helper"]);
+        fs.writeFileSync(
+          path.join(credHome12, ".gitconfig"),
+          `[credential]\n\thelper =\n\thelper = store --file=${storeFile12}\n`,
+          "utf8",
+        );
+        // 用 local helper 排在 store 之前（故意返回空）以便在沙箱内 inspect 后续槽位的 store 文件内容
+        const repo12b = path.join(dir, "r26-12b-repo");
+        fs.mkdirSync(repo12b, { recursive: true });
+        await runHostGit(repo12b, ["init", "-q"]);
+        const dump12b = path.join(repo12b, "dump.txt");
+        const preInspect = path.join(repo12b, "pre-inspect.sh");
+        fs.writeFileSync(
+          preInspect,
+          `#!/bin/sh\nfor f in $(git config --get-all credential.helper | sed -n 's/.*--file=//p'); do\n  cat "$f" >> "${dump12b}" 2>/dev/null\ndone\n`,
+          { mode: 0o755 },
+        );
+        await runHostGit(repo12b, ["config", "--local", "credential.helper", ""]);
+        await runHostGit(repo12b, ["config", "--local", "--add", "credential.helper", `!${preInspect}`]);
+        await runHostGit(repo12b, ["config", "--local", "--add", "credential.helper", `store --file=${storeFile12}`]);
+        await tryGit(repo12b, ["ls-remote", authUrl], {
+          cfg: appCred.cfg,
+          trustedRepoRoot: repo12b,
+          extraEnv: { HOME: credHome12, XDG_CONFIG_HOME: path.join(credHome12, ".config") },
+        });
+        const dumped = fs.existsSync(dump12b) ? fs.readFileSync(dump12b, "utf8") : "";
+        assert.ok(dumped.includes("first-secret"), "暂存的 store 文件必须包含首条命中凭据");
+        assert.ok(!dumped.includes("second-secret"), "暂存的 store 文件绝不得泄露同主机第二条账号凭据");
+      } finally {
+        appCred.store.db.close();
+      }
+    }
+
+    // 10) [R26 #1 P1 + #4 P1 + #8 P2 + #18 P2 + #19 P2] LFS 安全与正确性全链路（实测 git-lfs）
+    if (resolveTrustedSystemBin("git-lfs")) {
+      const appLfs = makeR26App("r26-lfs-app");
+      const lfsHome = path.join(dir, "r26-lfs-home");
+      fs.mkdirSync(lfsHome, { recursive: true });
+      const lfsEnv: NodeJS.ProcessEnv = { ...process.env, HOME: lfsHome, XDG_CONFIG_HOME: path.join(lfsHome, ".config") };
+      delete lfsEnv.GIT_CONFIG_GLOBAL;
+      await runProcess("git", ["lfs", "install", "--skip-repo"], { env: lfsEnv, timeoutMs: 15_000 });
+      try {
+        // #1: 受版本控制的 .lfsconfig 企图指定宿主机目录为 lfs.storage -> 必须完全忽略，绝不将其作为外部可写存储返回
+        const repoLfsCfg = path.join(dir, "r26-1-lfsconfig");
+        const maliciousHostDir = path.join(dir, "r26-1-host-target");
+        fs.mkdirSync(repoLfsCfg, { recursive: true });
+        fs.mkdirSync(maliciousHostDir, { recursive: true });
+        await runHostGit(repoLfsCfg, ["init", "-q"], lfsEnv);
+        await runHostGit(repoLfsCfg, ["config", "user.name", "T"], lfsEnv);
+        await runHostGit(repoLfsCfg, ["config", "user.email", "t@t"], lfsEnv);
+        fs.writeFileSync(path.join(repoLfsCfg, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+        fs.writeFileSync(path.join(repoLfsCfg, ".lfsconfig"), `[lfs]\n\tstorage = ${maliciousHostDir}\n`);
+        fs.writeFileSync(path.join(repoLfsCfg, "asset.bin"), "lfs-content-r26-1");
+        await runHostGit(repoLfsCfg, ["add", "."], lfsEnv);
+        await runHostGit(repoLfsCfg, ["commit", "-q", "-m", "init"], lfsEnv);
+        const lfsPre1 = await ensureGitLfsObjectsForCheckout(repoLfsCfg, "HEAD", {
+          cfg: appLfs.cfg,
+          trustedRepoRoot: repoLfsCfg,
+          extraEnv: { HOME: lfsHome, XDG_CONFIG_HOME: path.join(lfsHome, ".config") },
+        });
+        assert.equal(lfsPre1.lfsStorageExternal, false, "tracked .lfsconfig 中的 lfs.storage 绝不得触发外部存储目录挂载");
+        assert.notEqual(lfsPre1.lfsStorageDir, fs.realpathSync(maliciousHostDir));
+
+        // #8: 受信任本地 Git 配置指定外部 lfs.storage -> 隔离 commitAll 修改 LFS 文件必须写入外部缓存并提交成功
+        const trustedLfsStorage = path.join(dir, "r26-8-trusted-lfs-storage");
+        fs.mkdirSync(trustedLfsStorage, { recursive: true });
+        const repoLfsCommit = path.join(dir, "r26-8-lfs-commit");
+        fs.mkdirSync(repoLfsCommit, { recursive: true });
+        await runHostGit(repoLfsCommit, ["init", "-q"], lfsEnv);
+        await runHostGit(repoLfsCommit, ["config", "user.name", "T"], lfsEnv);
+        await runHostGit(repoLfsCommit, ["config", "user.email", "t@t"], lfsEnv);
+        await runHostGit(repoLfsCommit, ["config", "lfs.storage", trustedLfsStorage], lfsEnv);
+        fs.writeFileSync(path.join(repoLfsCommit, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+        fs.writeFileSync(path.join(repoLfsCommit, "data.bin"), "v1-payload");
+        await runHostGit(repoLfsCommit, ["add", "."], lfsEnv);
+        await runHostGit(repoLfsCommit, ["commit", "-q", "-m", "init"], lfsEnv);
+        const newPayload = "v2-updated-lfs-binary-payload-r26-8";
+        const newOid = crypto.createHash("sha256").update(newPayload).digest("hex");
+        fs.writeFileSync(path.join(repoLfsCommit, "data.bin"), newPayload);
+        const committed8 = await commitAll(repoLfsCommit, "update lfs file", {
+          cfg: appLfs.cfg,
+          trustedRepoRoot: repoLfsCommit,
+          extraEnv: { HOME: lfsHome, XDG_CONFIG_HOME: path.join(lfsHome, ".config") },
+        });
+        assert.equal(committed8, true, "配置了外部 lfs.storage 时，隔离 commitAll 必须挂载缓存并成功暂存提交 LFS 改动");
+        const storedObj = path.join(trustedLfsStorage, "objects", newOid.slice(0, 2), newOid.slice(2, 4), newOid);
+        assert.ok(fs.existsSync(storedObj), "新 LFS 对象必须落盘到配置的外部 lfs.storage 目录");
+
+        // #18: 树中存在真实 LFS 资源（已缓存）+ 未受 filter=lfs 管理的普通文本指针样本（OID 未缓存且远端不可达）-> 不触发远程拉取
+        const repo18 = path.join(dir, "r26-18-pointer-fixture");
+        fs.mkdirSync(repo18, { recursive: true });
+        await runHostGit(repo18, ["init", "-q"], lfsEnv);
+        await runHostGit(repo18, ["config", "user.name", "T"], lfsEnv);
+        await runHostGit(repo18, ["config", "user.email", "t@t"], lfsEnv);
+        await runHostGit(repo18, ["remote", "add", "origin", "http://127.0.0.1:1/unreachable.git"], lfsEnv);
+        fs.writeFileSync(path.join(repo18, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+        fs.writeFileSync(path.join(repo18, "real.bin"), "cached-lfs-asset");
+        const missingFakeOid = "a".repeat(64);
+        fs.writeFileSync(
+          path.join(repo18, "pointer-fixture.txt"),
+          `version https://git-lfs.github.com/spec/v1\noid sha256:${missingFakeOid}\nsize 1234\n`,
+        );
+        await runHostGit(repo18, ["add", "."], lfsEnv);
+        await runHostGit(repo18, ["commit", "-q", "-m", "init"], lfsEnv);
+        const pre18 = await ensureGitLfsObjectsForCheckout(repo18, "HEAD", {
+          cfg: appLfs.cfg,
+          trustedRepoRoot: repo18,
+          extraEnv: { HOME: lfsHome, XDG_CONFIG_HOME: path.join(lfsHome, ".config") },
+        });
+        assert.equal(pre18.fetched, false, "非 filter=lfs 路径上的普通文本指针样本绝不得触发远程拉取");
+        assert.equal(pre18.missingCount, 0);
+
+        // #4: 独立下载镜像（lfs.url）与上传镜像（lfs.pushurl）配置下，推送仅授权上传主机，绝不暴露下载主机凭据
+        const dlReceivedAuths: string[] = [];
+        const ulReceivedAuths: string[] = [];
+        const dlSrv = http.createServer((req, res) => {
+          req.resume();
+          dlReceivedAuths.push(String(req.headers.authorization ?? ""));
+          res.writeHead(500, { Connection: "close" });
+          res.end("download host must not be contacted during push");
+        });
+        const ulSrv = http.createServer((req, res) => {
+          const chunks: Buffer[] = [];
+          req.on("data", (c: Buffer) => chunks.push(c));
+          req.on("end", () => {
+            const auth = String(req.headers.authorization ?? "");
+            if (!auth) {
+              res.writeHead(401, { "WWW-Authenticate": 'Basic realm="upload"', Connection: "close" });
+              res.end();
+              return;
+            }
+            ulReceivedAuths.push(auth);
+            let objs: { oid: string; size: number }[] = [];
+            try {
+              const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { objects?: { oid: string; size: number }[] };
+              objs = (body.objects ?? []).map((o) => ({ oid: o.oid, size: o.size }));
+            } catch {
+              // ignore
+            }
+            res.writeHead(200, { "Content-Type": "application/vnd.git-lfs+json", Connection: "close" });
+            res.end(JSON.stringify({ transfer: "basic", objects: objs }));
+          });
+        });
+        await new Promise<void>((resolve) => dlSrv.listen(0, "127.0.0.1", resolve));
+        await new Promise<void>((resolve) => ulSrv.listen(0, "127.0.0.1", resolve));
+        serversToClose.push(dlSrv, ulSrv);
+        const dlPort = (dlSrv.address() as net.AddressInfo).port;
+        const ulPort = (ulSrv.address() as net.AddressInfo).port;
+        const dlUrl = `http://127.0.0.1:${dlPort}/dl-lfs`;
+        const ulUrl = `http://127.0.0.1:${ulPort}/ul-lfs`;
+
+        const lfs4Home = path.join(dir, "r26-4-home");
+        fs.mkdirSync(lfs4Home, { recursive: true });
+        const cred4 = path.join(lfs4Home, ".git-credentials");
+        fs.writeFileSync(
+          cred4,
+          `http://dluser:DL-SECRET@127.0.0.1:${dlPort}\nhttp://uluser:UL-SECRET@127.0.0.1:${ulPort}\n`,
+          { mode: 0o600 },
+        );
+        const repo4 = path.join(dir, "r26-4-repo");
+        fs.mkdirSync(repo4, { recursive: true });
+        const dump4 = path.join(repo4, "staged-dump.txt");
+        const inspector4 = path.join(repo4, "inspect4.sh");
+        fs.writeFileSync(
+          inspector4,
+          `#!/bin/sh\nfor f in $(git config --get-all credential.helper | sed -n 's/.*--file=//p'); do\n  cat "$f" >> "${dump4}" 2>/dev/null\ndone\n`,
+          { mode: 0o755 },
+        );
+        const lfs4Env: NodeJS.ProcessEnv = { ...process.env, HOME: lfs4Home, XDG_CONFIG_HOME: path.join(lfs4Home, ".config") };
+        delete lfs4Env.GIT_CONFIG_GLOBAL;
+        await runProcess("git", ["lfs", "install", "--skip-repo"], { env: lfs4Env, timeoutMs: 15_000 });
+        await runHostGit(repo4, ["init", "-q"], lfs4Env);
+        await runHostGit(repo4, ["config", "user.name", "T"], lfs4Env);
+        await runHostGit(repo4, ["config", "user.email", "t@t"], lfs4Env);
+        await runHostGit(repo4, ["remote", "add", "origin", "http://127.0.0.1:1/git-only.git"], lfs4Env);
+        await runHostGit(repo4, ["config", "lfs.url", dlUrl], lfs4Env);
+        await runHostGit(repo4, ["config", "lfs.pushurl", ulUrl], lfs4Env);
+        await runHostGit(repo4, ["config", `lfs.${ulUrl}.locksverify`, "false"], lfs4Env);
+        await runHostGit(repo4, ["config", "--local", "credential.helper", ""], lfs4Env);
+        await runHostGit(repo4, ["config", "--local", "--add", "credential.helper", `!${inspector4}`], lfs4Env);
+        await runHostGit(repo4, ["config", "--local", "--add", "credential.helper", `store --file=${cred4}`], lfs4Env);
+        fs.writeFileSync(path.join(repo4, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+        const r26Payload4 = "r26-4-upload-payload";
+        const r26Oid4 = crypto.createHash("sha256").update(r26Payload4).digest("hex");
+        fs.writeFileSync(path.join(repo4, "f.bin"), r26Payload4);
+        await runHostGit(repo4, ["add", "."], lfs4Env);
+        await runHostGit(repo4, ["commit", "-q", "-m", "init"], lfs4Env);
+        await tryGit(repo4, ["lfs", "push", "--object-id", "origin", r26Oid4], {
+          cfg: appLfs.cfg,
+          trustedRepoRoot: repo4,
+          extraEnv: { HOME: lfs4Home, XDG_CONFIG_HOME: path.join(lfs4Home, ".config") },
+        });
+        assert.equal(dlReceivedAuths.length, 0, "push 过程绝不得访问下载镜像");
+        assert.ok(
+          ulReceivedAuths.includes(`Basic ${Buffer.from("uluser:UL-SECRET").toString("base64")}`),
+          "push 必须使用上传镜像凭据认证",
+        );
+        const dump4Text = fs.existsSync(dump4) ? fs.readFileSync(dump4, "utf8") : "";
+        assert.ok(dump4Text.includes("UL-SECRET"), "暂存凭据必须包含选中的上传主机令牌");
+        assert.ok(!dump4Text.includes("DL-SECRET"), "push 沙箱绝不得暴露未被选中的下载镜像令牌");
+
+        // #19: 已有分支工作树检出：按固定 branch tip 预检 LFS 对象，确保分支可正确检出且支持 branchHint upstream
+        const bare19 = path.join(dir, "r26-19-bare.git");
+        fs.mkdirSync(bare19, { recursive: true });
+        await runHostGit(bare19, ["init", "--bare", "-q"], lfsEnv);
+        const repo19 = path.join(dir, "r26-19-repo");
+        fs.mkdirSync(repo19, { recursive: true });
+        await runHostGit(repo19, ["init", "-q", "-b", "main"], lfsEnv);
+        await runHostGit(repo19, ["config", "user.name", "T"], lfsEnv);
+        await runHostGit(repo19, ["config", "user.email", "t@t"], lfsEnv);
+        await runHostGit(repo19, ["config", "filter.lfs.clean", "git-lfs clean -- %f"], lfsEnv);
+        await runHostGit(repo19, ["config", "filter.lfs.smudge", "git-lfs smudge -- %f"], lfsEnv);
+        await runHostGit(repo19, ["config", "filter.lfs.process", "git-lfs filter-process"], lfsEnv);
+        await runHostGit(repo19, ["config", "filter.lfs.required", "true"], lfsEnv);
+        await runHostGit(repo19, ["remote", "add", "origin", bare19], lfsEnv);
+        fs.writeFileSync(path.join(repo19, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+        fs.writeFileSync(path.join(repo19, "big.bin"), "r26-19-main-asset");
+        await runHostGit(repo19, ["add", "."], lfsEnv);
+        await runHostGit(repo19, ["commit", "-q", "-m", "main init"], lfsEnv);
+        await runHostGit(repo19, ["checkout", "-q", "-b", "pa/r2619001"], lfsEnv);
+        fs.writeFileSync(path.join(repo19, "big.bin"), "r26-19-branch-asset");
+        await runHostGit(repo19, ["add", "big.bin"], lfsEnv);
+        await runHostGit(repo19, ["commit", "-q", "-m", "branch lfs"], lfsEnv);
+        await runHostGit(repo19, ["push", "-q", "origin", "pa/r2619001"], lfsEnv);
+        await runHostGit(repo19, ["checkout", "-q", "main"], lfsEnv);
+        // 清空本地 LFS 缓存以强迫 prepareWorkspace 对已有分支 pa/r2619001 做预拉取
+        fs.rmSync(path.join(repo19, ".git", "lfs", "objects"), { recursive: true, force: true });
+
+        const app19 = makeR26App("r26-19-app", { repos: { r19: { path: repo19, default_branch: "main" } } });
+        try {
+          const disp = new Dispatcher(app19.cfg, app19.ledger, app19.store, app19.board);
+          const ws = await disp.prepareWorkspace({
+            guid: "r2619001",
+            summary: "existing branch lfs preflight",
+            description: "repo: r19",
+            dueMs: 0,
+            url: "",
+          });
+          assert.equal(ws.branch, "pa/r2619001");
+          assert.equal(
+            fs.readFileSync(path.join(ws.cwd, "big.bin"), "utf8"),
+            "r26-19-branch-asset",
+            "已有分支 LFS 预检后检出的 worktree 必须包含完整 smudge 后的内容",
+          );
+        } finally {
+          app19.store.db.close();
+        }
+      } finally {
+        appLfs.store.db.close();
+      }
+    }
+
+    // 11) [R26 #17 P2] doctor 在全新 Linux 工作区（无个人 Web 密钥、无观测、无仓库）也必须真正探测 worker-write 隔离沙箱
+    {
+      delete process.env.PA_FEISHU_WEB_KEY;
+      const freshApp = makeR26App("r26-17-fresh-doctor", { pwEnabled: false, repos: {} });
+      try {
+        const rep = await runDoctor(freshApp);
+        const isoChk = rep.checks.find((c) => c.id === "worker_isolation");
+        assert.ok(isoChk, "doctor 必须包含 worker_isolation 探测项");
+        if (process.platform === "linux") {
+          assert.ok(
+            !isoChk!.detail.includes("非强制内核隔离模式"),
+            `全新 Linux 工作区不得跳过沙箱探测（实际 detail=${isoChk!.detail}）`,
+          );
+          if (hasCredentialMountIsolation()) {
+            assert.equal(isoChk!.status, "ok", `可用内核隔离环境下应通过真实 worker-write 探测：${isoChk!.detail}`);
+          }
+        }
+      } finally {
+        freshApp.store.db.close();
+      }
+    }
+  } finally {
+    if (prevPwKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevPwKey;
+    for (const s of serversToClose) {
+      if ("closeAllConnections" in s && typeof s.closeAllConnections === "function") {
+        s.closeAllConnections();
+      }
       await new Promise<void>((resolve) => s.close(() => resolve()));
     }
     fs.rmSync(dir, { recursive: true, force: true });

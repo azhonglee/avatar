@@ -1,5 +1,5 @@
 import zlib from "node:zlib";
-import { MAX_WIRE_BYTES, parseProto, ProtoFields, ProtoWriter } from "./proto.ts";
+import { MAX_WIRE_BYTES, parseProto, ProtoFields, ProtoWriter, WIRE_BYTES, WIRE_VARINT } from "./proto.ts";
 
 /**
  * Feishu personal Web gateway / Frontier wire codec.
@@ -64,6 +64,7 @@ const TAG_CODE_BLOCK = 31;
 
 const MAX_RICH_ELEMENTS = 4096;
 const MAX_RICH_DEPTH = 16;
+const MAX_RICH_OUTPUT_CHARS = 64 * 1024;
 const MAX_FORWARD_MESSAGES = 200;
 const MAX_FORWARD_DEPTH = 8;
 const NATIVE_RICH_VERSION = 2;
@@ -205,22 +206,76 @@ export function encodeAckFrame(sid: string, nowMs = Date.now()): Buffer {
   return encodeFrame(ack, nowMs);
 }
 
-/** Unwrap a gateway HTTP response packet and verify status === 0. */
+/** Unwrap a gateway HTTP response packet and verify envelope shape, field wire types, and status === 0. */
 export function unwrapGatewayPayload(
   data: Uint8Array,
-  opts: { allowEmptyPayload?: boolean } = {},
+  opts: { allowEmptyPayload?: boolean; expectedCommand?: number; expectedCid?: string } = {},
 ): Buffer {
   if (data.length === 0) {
     throw new GatewayError("个人 Web 网关返回空响应", { emptyPayload: true });
   }
   const packet = parseProto(data, MAX_WIRE_BYTES);
-  const status = packet.uint(4);
+  const assertWireType = (field: number, expected: number, label: string): void => {
+    for (const v of packet.allFields(field)) {
+      if (v.type !== expected) {
+        throw new GatewayError(`个人 Web 网关响应 ${label} 字段线型非法`);
+      }
+    }
+  };
+  assertWireType(1, WIRE_BYTES, "sid");
+  assertWireType(2, WIRE_VARINT, "payloadType");
+  assertWireType(3, WIRE_VARINT, "cmd");
+  assertWireType(4, WIRE_VARINT, "status");
+  assertWireType(5, WIRE_BYTES, "payload");
+  assertWireType(6, WIRE_BYTES, "cid");
+
+  const statusField = packet.lastField(4);
+  const status = statusField ? Number(statusField.uint ?? 0n) : 0;
   if (status !== 0) {
     throw new GatewayError(`个人 Web 网关拒绝请求 (status=${status})`, { status });
   }
-  const payload = packet.bytes(5);
-  if (payload.length === 0 && !opts.allowEmptyPayload) {
-    throw new GatewayError("个人 Web 网关返回空载荷", { emptyPayload: true });
+
+  const payloadTypeField = packet.lastField(2);
+  if (payloadTypeField !== undefined && Number(payloadTypeField.uint ?? 0n) !== 1) {
+    throw new GatewayError(`个人 Web 网关响应 payloadType 非法 (${Number(payloadTypeField.uint ?? 0n)})`);
+  }
+
+  const cmdField = packet.lastField(3);
+  if (opts.expectedCommand !== undefined && cmdField !== undefined && Number(cmdField.uint ?? 0n) !== opts.expectedCommand) {
+    throw new GatewayError(
+      `个人 Web 网关响应命令号不匹配 (got=${Number(cmdField.uint ?? 0n)}, want=${opts.expectedCommand})`,
+    );
+  }
+
+  const cidField = packet.lastField(6);
+  if (opts.expectedCid && cidField !== undefined) {
+    const gotCid = cidField.bytes?.toString("utf8") ?? "";
+    if (gotCid && gotCid !== opts.expectedCid) {
+      throw new GatewayError("个人 Web 网关响应 cid 不匹配");
+    }
+  }
+
+  const payloadField = packet.lastField(5);
+  const payload = payloadField?.bytes ?? Buffer.alloc(0);
+  if (payload.length === 0) {
+    if (!opts.allowEmptyPayload) {
+      throw new GatewayError("个人 Web 网关返回空载荷", { emptyPayload: true });
+    }
+    // 仅当响应明确包含合法的 Packet 响应信封头（payloadType=1 / 匹配的 cmd / 匹配的 cid），
+    // 才把 0 字节载荷视作权威空结果；防止无关 protobuf 或畸形 HTTP 200 响应被误判为「消息已不存在」
+    const hasValidPayloadType = payloadTypeField !== undefined && Number(payloadTypeField.uint ?? 0n) === 1;
+    const hasValidCmd =
+      cmdField !== undefined &&
+      (opts.expectedCommand === undefined
+        ? Number(cmdField.uint ?? 0n) > 0
+        : Number(cmdField.uint ?? 0n) === opts.expectedCommand);
+    const hasMatchingCid =
+      !!opts.expectedCid &&
+      cidField !== undefined &&
+      (cidField.bytes?.toString("utf8") ?? "") === opts.expectedCid;
+    if (!hasValidPayloadType && !hasValidCmd && !hasMatchingCid) {
+      throw new GatewayError("个人 Web 网关响应缺少有效信封头，拒绝视为空结果", { emptyPayload: true });
+    }
   }
   return payload;
 }
@@ -358,13 +413,69 @@ export function decodeRichText(data: Uint8Array): DecodedRich {
   const mentions: WebMention[] = [];
   const resources: WebResource[] = [];
   let partial = false;
+  let budgetExhausted = false;
   let visited = 0;
   const active = new Set<string>();
 
+  const safeSlice = (s: string, max: number): string => {
+    if (max <= 0) return "";
+    if (s.length <= max) return s;
+    let end = max;
+    const last = s.charCodeAt(end - 1);
+    if (last >= 0xd800 && last <= 0xdbff) end--;
+    return s.slice(0, end);
+  };
+
+  const readBoundedStr = (f: ProtoFields, field: number, maxChars: number): { value: string; clipped: boolean } => {
+    const raw = f.bytes(field);
+    if (!raw.length) return { value: "", clipped: false };
+    if (maxChars <= 0) return { value: "", clipped: true };
+    const byteCap = Math.min(raw.length, maxChars * 4);
+    const slice = byteCap < raw.length ? raw.subarray(0, byteCap) : raw;
+    const decoded = slice.toString("utf8");
+    if (decoded.length > maxChars) {
+      return { value: safeSlice(decoded, maxChars), clipped: true };
+    }
+    return { value: decoded, clipped: byteCap < raw.length };
+  };
+
+  const appendText = (chunk: string, alreadyClipped = false): number => {
+    if (alreadyClipped) partial = true;
+    if (!chunk) {
+      if (alreadyClipped) budgetExhausted = true;
+      return 0;
+    }
+    const remaining = MAX_RICH_OUTPUT_CHARS - text.length;
+    if (remaining <= 0) {
+      partial = true;
+      budgetExhausted = true;
+      return 0;
+    }
+    if (chunk.length > remaining) {
+      const piece = safeSlice(chunk, remaining);
+      text += piece;
+      partial = true;
+      budgetExhausted = true;
+      return piece.length;
+    }
+    text += chunk;
+    if (alreadyClipped) budgetExhausted = true;
+    return chunk.length;
+  };
+
   const walk = (id: string, depth: number): void => {
+    if (budgetExhausted) {
+      partial = true;
+      return;
+    }
     visited++;
     if (depth > MAX_RICH_DEPTH || visited > MAX_RICH_ELEMENTS || active.has(id)) {
       throw new Error("富文本结构深度或循环超过上限");
+    }
+    if (text.length >= MAX_RICH_OUTPUT_CHARS) {
+      partial = true;
+      budgetExhausted = true;
+      return;
     }
     const elem = elements.get(id);
     if (!elem) {
@@ -375,34 +486,44 @@ export function decodeRichText(data: Uint8Array): DecodedRich {
     try {
       const tag = elem.uint(1);
       const prop = parseProto(elem.bytes(3), MAX_WIRE_BYTES);
+      const rem = MAX_RICH_OUTPUT_CHARS - text.length;
       switch (tag) {
-        case TAG_TEXT:
-          text += prop.str(1);
+        case TAG_TEXT: {
+          const piece = readBoundedStr(prop, 1, rem);
+          appendText(piece.value, piece.clipped);
           break;
+        }
         case TAG_MENTION: {
-          const uid = prop.str(1);
-          const display = prop.str(2) || (uid ? `@${uid}` : "");
+          const uid = readBoundedStr(prop, 1, 256).value;
+          const displayField = readBoundedStr(prop, 2, rem);
+          const display = displayField.value || (uid ? `@${uid}` : "");
           const start = text.length;
-          text += display;
-          mentions.push({
-            id: uid,
-            name: display.replace(/^@/, ""),
-            start,
-            end: text.length,
-          });
+          const appended = appendText(display, displayField.clipped);
+          if (appended > 0) {
+            mentions.push({
+              id: uid,
+              name: display.slice(0, appended).replace(/^@/, ""),
+              start,
+              end: start + appended,
+            });
+          }
           break;
         }
         case TAG_LINK: {
-          const url = prop.str(1);
-          const label = prop.str(2);
-          text += label || url;
+          const labelField = readBoundedStr(prop, 2, rem);
+          if (labelField.value || labelField.clipped) {
+            appendText(labelField.value, labelField.clipped);
+          } else {
+            const urlField = readBoundedStr(prop, 1, rem);
+            appendText(urlField.value, urlField.clipped);
+          }
           break;
         }
         case TAG_IMAGE: {
           const key = prop.str(4) || prop.str(2);
           const name = prop.str(10);
           if (key) resources.push({ kind: "image", key, name, mime: "", size: 0 });
-          text += "[图片]";
+          appendText("[图片]");
           break;
         }
         case TAG_CODE:
@@ -411,12 +532,12 @@ export function decodeRichText(data: Uint8Array): DecodedRich {
           if (children.length > 0) {
             walkChildren(elem, tag, depth);
           } else {
-            const codeText = prop.str(1);
-            if (!codeText) {
+            const codeField = readBoundedStr(prop, 1, rem);
+            if (!codeField.value && !codeField.clipped) {
               if (elem.bytes(3).length > 0) partial = true;
             } else {
-              text += codeText;
-              if (tag === TAG_CODE_BLOCK) text += "\n";
+              appendText(codeField.value, codeField.clipped);
+              if (tag === TAG_CODE_BLOCK && !budgetExhausted) appendText("\n");
             }
           }
           break;
@@ -451,7 +572,14 @@ export function decodeRichText(data: Uint8Array): DecodedRich {
       partial = true;
       return;
     }
-    for (const child of children) walk(child.toString("utf8"), depth + 1);
+    for (const child of children) {
+      if (budgetExhausted) {
+        partial = true;
+        break;
+      }
+      walk(child.toString("utf8"), depth + 1);
+    }
+    if (budgetExhausted) return;
     const allNestedParagraphs =
       children.length > 0 &&
       children.every((c) => {
@@ -459,15 +587,22 @@ export function decodeRichText(data: Uint8Array): DecodedRich {
         return nested !== undefined && nested.uint(1) === TAG_PARAGRAPH;
       });
     if (isTextBlockTag(tag) && !allNestedParagraphs) {
-      text += "\n";
+      appendText("\n");
     }
   };
 
   for (const rootId of rich.allBytes(1)) {
+    if (budgetExhausted) {
+      partial = true;
+      break;
+    }
     walk(rootId.toString("utf8"), 0);
   }
-  if (!text && rich.str(2)) {
-    text = rich.str(2);
+  if (!text) {
+    const fallback = readBoundedStr(rich, 2, MAX_RICH_OUTPUT_CHARS);
+    if (fallback.value || fallback.clipped) {
+      appendText(fallback.value, fallback.clipped);
+    }
   }
   return { text: text.replace(/\n+$/, ""), mentions, resources, partial };
 }
@@ -523,16 +658,28 @@ function decodeForwardText(content: ProtoFields, depth: number, counter: { n: nu
     return { text: "[转发内容已截断]", partial: true };
   }
   const lines: string[] = [];
+  let totalChars = 0;
   let partial = false;
   for (const raw of content.allBytes(1)) {
     counter.n++;
-    if (counter.n > MAX_FORWARD_MESSAGES) {
+    if (counter.n > MAX_FORWARD_MESSAGES || totalChars >= MAX_RICH_OUTPUT_CHARS) {
       partial = true;
       break;
     }
     try {
       const child = decodeMessageInner(parseProto(raw, MAX_WIRE_BYTES), "", depth + 1, counter);
-      if (child.text.trim()) lines.push(child.text.trim());
+      const trimmed = child.text.trim();
+      if (trimmed) {
+        const rem = MAX_RICH_OUTPUT_CHARS - totalChars;
+        if (trimmed.length > rem) {
+          lines.push(trimmed.slice(0, rem));
+          totalChars = MAX_RICH_OUTPUT_CHARS;
+          partial = true;
+          break;
+        }
+        lines.push(trimmed);
+        totalChars += trimmed.length + 1;
+      }
       if (child.partial) partial = true;
     } catch {
       partial = true;

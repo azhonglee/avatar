@@ -245,6 +245,34 @@ export class Ledger {
     return added;
   }
 
+  /** 将已因前置条件跳过（state='skipped' 且 terminal=1）的幂等工作原子重新武装为 pending，供新触发证据重试 */
+  rearmSkipped(id: string, payload: unknown): boolean {
+    const now = Date.now();
+    const rearmed = this.tx(() => {
+      const r = this.db
+        .prepare(
+          `UPDATE work
+             SET state = 'pending',
+                 terminal = 0,
+                 outcome = '',
+                 reason = '',
+                 attempts = 0,
+                 next_at = 0,
+                 lease_owner = '',
+                 lease_until = 0,
+                 cancel = 0,
+                 error = '',
+                 payload = ?,
+                 updated = ?
+           WHERE id = ? AND state = 'skipped' AND terminal = 1`,
+        )
+        .run(JSON.stringify(payload ?? {}), now, id);
+      return r.changes > 0;
+    });
+    if (rearmed) this.changed(id);
+    return rearmed;
+  }
+
   get<P = Record<string, unknown>>(id: string): WorkItem<P> | undefined {
     const r = this.db.prepare("SELECT * FROM work WHERE id = ?").get(id) as Row | undefined;
     return r ? toItem<P>(r) : undefined;
