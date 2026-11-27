@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Config } from "../config.ts";
@@ -42,6 +43,7 @@ export interface GitRunOpts {
   disableGitWorktreeMounts?: boolean;
   extraWritablePaths?: string[];
   extraReadOnlyPaths?: string[];
+  extraEnv?: Record<string, string>;
 }
 
 /** 仅对授权的远程 Git 传输子命令解析并校验单个 SSH 代理 Unix 套接字路径（绝不开放给普通 worker 或本地 git 命令） */
@@ -111,6 +113,7 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
     const safeSubArgs = args[0] === "diff" ? ["diff", "--no-ext-diff", ...args.slice(1)] : args;
     const childEnv: NodeJS.ProcessEnv = {
       ...baseEnv.env,
+      ...(opts?.extraEnv ?? {}),
       GIT_TERMINAL_PROMPT: "0",
       ...(sshSock ? { SSH_AUTH_SOCK: sshSock } : {}),
     };
@@ -343,11 +346,12 @@ export function extractGitLfsPointerOid(content: string | Buffer): string | unde
       if (!oidMatch) return undefined;
       oid = oidMatch[1];
     } else if (key.startsWith("ext-")) {
-      const extMatch = key.match(/^ext-(\d+)-(.+)$/);
+      // 对齐官方 git-lfs pointer 语法：扩展优先级严格为单个 ASCII 数字 0-9（ext-[0-9]-<name>）
+      const extMatch = key.match(/^ext-([0-9])-(.+)$/);
       if (!extMatch) return undefined;
       const idx = Number(extMatch[1]);
       const name = extMatch[2];
-      if (!Number.isSafeInteger(idx) || idx < 0 || !name) return undefined;
+      if (!name) return undefined;
       if (!/^sha256:[0-9a-f]{64}$/.test(val)) return undefined;
       const prevName = extByIdx.get(idx);
       if (prevName !== undefined && prevName !== name) return undefined;
@@ -420,6 +424,171 @@ export function resolveLocalGitRemoteDir(cwd: string, rawUrl: string): string | 
   return undefined;
 }
 
+/**
+ * 流式检测目标不可变提交 `targetRev` 的任意树内路径是否命中 `filter=lfs`：
+ *   - 优先使用 Git >= 2.40 的 `git check-attr --source=<targetRev>`；
+ *   - 旧版 Git（如 2.39）不支持 `--source` 时，改用临时独立 `GIT_INDEX_FILE` 执行 `git read-tree <targetRev>` 后跑 `git check-attr --cached`，
+ *     严格读取目标提交的 `.gitattributes`，绝不静默回退读取可能变动的工作区 `.gitattributes`；
+ *   - 以背压管道流式连接 `git ls-tree -r --name-only -z` 与 `git check-attr --stdin -z filter`，保持 O(1) 内存并在命中首个 `filter=lfs` 时立即早停。
+ */
+async function targetRevHasLfsAttr(cwd: string, targetRev: string, roOpts: GitRunOpts): Promise<boolean> {
+  let checkAttrArgs: string[] = ["check-attr", `--source=${targetRev}`, "--stdin", "-z", "filter"];
+  let attrTmpDir: string | undefined;
+  let attrExtraEnv: Record<string, string> | undefined;
+  let attrExtraRo: string[] = [];
+
+  try {
+    const probe = await tryGit(cwd, checkAttrArgs, { ...roOpts, input: "" });
+    if (probe.code !== 0) {
+      if (/unknown option.*source/i.test(`${probe.stderr}\n${probe.stdout}`)) {
+        attrTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-git-attr-"));
+        const pinnedIndex = path.join(attrTmpDir, "index");
+        const rt = await tryGit(cwd, ["read-tree", targetRev], {
+          ...roOpts,
+          extraWritablePaths: [...(roOpts.extraWritablePaths ?? []), attrTmpDir],
+          extraEnv: { ...(roOpts.extraEnv ?? {}), GIT_INDEX_FILE: pinnedIndex },
+        });
+        if (rt.code !== 0) {
+          throw new Error(`git read-tree 加载目标提交 ${targetRev} 临时索引失败：${(rt.stderr || rt.stdout).trim()}`);
+        }
+        checkAttrArgs = ["check-attr", "--cached", "--stdin", "-z", "filter"];
+        attrExtraEnv = { GIT_INDEX_FILE: pinnedIndex };
+        attrExtraRo = [attrTmpDir];
+      } else {
+        throw new Error(`git check-attr 检查提交 ${targetRev} 失败：${(probe.stderr || probe.stdout).trim()}`);
+      }
+    }
+
+    const streamEnv = prepareHarnessEnv();
+    try {
+      const lsEnv: NodeJS.ProcessEnv = { ...streamEnv.env, ...(roOpts.extraEnv ?? {}), GIT_TERMINAL_PROMPT: "0" };
+      delete lsEnv.GIT_EXTERNAL_DIFF;
+      const caEnv: NodeJS.ProcessEnv = { ...lsEnv, ...(attrExtraEnv ?? {}) };
+      const lsWrapped = wrapCredentialIsolatedCommand(
+        "git",
+        ["-C", cwd, ...GIT_SAFE_ARGS, "ls-tree", "-r", "--name-only", "-z", targetRev],
+        process.env,
+        buildGitIsolation(cwd, roOpts, streamEnv.env.CREDENTIALS_DIRECTORY),
+      );
+      const caOpts: GitRunOpts = {
+        ...roOpts,
+        extraReadOnlyPaths: [...(roOpts.extraReadOnlyPaths ?? []), ...attrExtraRo],
+      };
+      const caWrapped = wrapCredentialIsolatedCommand(
+        "git",
+        ["-C", cwd, ...GIT_SAFE_ARGS, ...checkAttrArgs],
+        process.env,
+        buildGitIsolation(cwd, caOpts, streamEnv.env.CREDENTIALS_DIRECTORY),
+      );
+
+      const lsChild = spawn(lsWrapped.cmd, lsWrapped.args, { env: lsEnv, stdio: ["ignore", "pipe", "pipe"] });
+      const caChild = spawn(caWrapped.cmd, caWrapped.args, { env: caEnv, stdio: ["pipe", "pipe", "pipe"] });
+
+      let lsErr = "";
+      let caErr = "";
+      let timedOut = false;
+      let stoppedEarly = false;
+      let hasLfsAttr = false;
+      const timeoutMs = roOpts.timeoutMs ?? 300_000;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        lsChild.kill("SIGKILL");
+        caChild.kill("SIGKILL");
+      }, timeoutMs);
+      timer.unref?.();
+
+      caChild.stdin.on("error", () => undefined);
+      lsChild.stderr.on("data", (d: Buffer) => {
+        if (lsErr.length < 16_384) lsErr += d.toString("utf8");
+      });
+      caChild.stderr.on("data", (d: Buffer) => {
+        if (caErr.length < 16_384) caErr += d.toString("utf8");
+      });
+
+      const lsExitP = new Promise<{ code: number; spawnErr?: Error }>((resolve) => {
+        lsChild.on("error", (err) => resolve({ code: 127, spawnErr: err }));
+        lsChild.on("close", (code) => resolve({ code: timedOut ? 124 : (code ?? 1) }));
+      });
+      const caExitP = new Promise<{ code: number; spawnErr?: Error }>((resolve) => {
+        caChild.on("error", (err) => resolve({ code: 127, spawnErr: err }));
+        caChild.on("close", (code) => resolve({ code: timedOut ? 124 : (code ?? 1) }));
+      });
+
+      const pumpP = (async () => {
+        try {
+          for await (const chunk of lsChild.stdout as AsyncIterable<Buffer>) {
+            if (stoppedEarly || caChild.stdin.destroyed) break;
+            if (!caChild.stdin.write(chunk)) {
+              await new Promise<void>((resolve) => {
+                caChild.stdin.once("drain", resolve);
+                caChild.stdin.once("close", resolve);
+                caChild.stdin.once("error", resolve);
+              });
+            }
+          }
+        } catch {
+          // 早停或子进程退出引起的管道中断由退出码阶段统一裁决
+        } finally {
+          if (!caChild.stdin.destroyed) caChild.stdin.end();
+        }
+      })();
+
+      let carry = "";
+      let fieldMod = 0; // 0 = path, 1 = attr, 2 = val
+      let curAttr = "";
+      try {
+        for await (const raw of caChild.stdout as AsyncIterable<Buffer>) {
+          carry += raw.toString("utf8");
+          let nul = carry.indexOf("\0");
+          while (nul !== -1) {
+            const field = carry.slice(0, nul);
+            carry = carry.slice(nul + 1);
+            if (fieldMod === 1) {
+              curAttr = field;
+            } else if (fieldMod === 2) {
+              if (curAttr === "filter" && field === "lfs") {
+                hasLfsAttr = true;
+                stoppedEarly = true;
+                lsChild.kill("SIGKILL");
+                caChild.kill("SIGKILL");
+                break;
+              }
+            }
+            fieldMod = (fieldMod + 1) % 3;
+            nul = carry.indexOf("\0");
+          }
+          if (stoppedEarly) break;
+        }
+      } catch (err) {
+        lsChild.kill("SIGKILL");
+        caChild.kill("SIGKILL");
+        await Promise.all([pumpP, lsExitP, caExitP]);
+        throw err;
+      } finally {
+        clearTimeout(timer);
+      }
+
+      await pumpP;
+      const [lsExit, caExit] = await Promise.all([lsExitP, caExitP]);
+      if (!stoppedEarly) {
+        if (lsExit.spawnErr) throw new Error(`git ls-tree 启动失败：${lsExit.spawnErr.message}`);
+        if (caExit.spawnErr) throw new Error(`git check-attr 启动失败：${caExit.spawnErr.message}`);
+        if (lsExit.code !== 0) {
+          throw new Error(`git ls-tree 检查提交 ${targetRev} 失败：${(timedOut ? `${lsErr}\n(timeout)` : lsErr).trim()}`);
+        }
+        if (caExit.code !== 0) {
+          throw new Error(`git check-attr 检查提交 ${targetRev} 失败：${(timedOut ? `${caErr}\n(timeout)` : caErr).trim()}`);
+        }
+      }
+      return hasLfsAttr;
+    } finally {
+      streamEnv.cleanup();
+    }
+  } finally {
+    if (attrTmpDir) fs.rmSync(attrTmpDir, { recursive: true, force: true });
+  }
+}
+
 async function scanOutgoingGitLfs(
   cwd: string,
   branchOrCommit: string,
@@ -427,41 +596,16 @@ async function scanOutgoingGitLfs(
   knownRemoteShas: string[] | undefined,
   opts: GitRunOpts | undefined,
   stopOnFirst: boolean,
+  precomputedHasLfsAttr?: boolean,
 ): Promise<{ hasLfsAttr: boolean; oids: string[] }> {
   const roOpts: GitRunOpts = { ...opts, readOnly: true };
   const targetRev = /^[0-9a-f]{40,64}$/i.test(branchOrCommit) || branchOrCommit.startsWith("refs/")
     ? branchOrCommit
     : `refs/heads/${branchOrCommit}`;
-  let hasLfsAttr = false;
-  const tree = await tryGit(cwd, ["ls-tree", "-r", "--name-only", "-z", targetRev], roOpts);
-  if (tree.code !== 0) {
-    throw new Error(`git ls-tree 检查提交 ${branchOrCommit} 失败：${(tree.stderr || tree.stdout).trim()}`);
-  }
-  if (tree.stdout) {
-    // Git >= 2.40 支持 --source=<rev> 精确读取目标提交的 .gitattributes；旧版 Git 自动回退标准 check-attr
-    let attrs = await tryGit(cwd, ["check-attr", `--source=${targetRev}`, "--stdin", "-z", "filter"], {
-      ...roOpts,
-      input: tree.stdout,
-    });
-    if (attrs.code !== 0 && /unknown option.*source/i.test(`${attrs.stderr}\n${attrs.stdout}`)) {
-      attrs = await tryGit(cwd, ["check-attr", "--stdin", "-z", "filter"], {
-        ...roOpts,
-        input: tree.stdout,
-      });
-    }
-    if (attrs.code !== 0) {
-      throw new Error(`git check-attr 检查提交 ${branchOrCommit} 失败：${(attrs.stderr || attrs.stdout).trim()}`);
-    }
-    if (attrs.stdout) {
-      const fields = attrs.stdout.split("\0");
-      for (let i = 0; i + 2 < fields.length; i += 3) {
-        if (fields[i + 1] === "filter" && fields[i + 2] === "lfs") {
-          hasLfsAttr = true;
-          if (stopOnFirst) return { hasLfsAttr: true, oids: [] };
-          break;
-        }
-      }
-    }
+  const hasLfsAttr =
+    precomputedHasLfsAttr !== undefined ? precomputedHasLfsAttr : await targetRevHasLfsAttr(cwd, targetRev, roOpts);
+  if (hasLfsAttr && stopOnFirst) {
+    return { hasLfsAttr: true, oids: [] };
   }
 
   // 仅排除远端已拥有且本地可解析为 commit 的基线提交，避免扫描整仓无关历史
@@ -662,6 +806,18 @@ export async function pushBranch(
   }
   const localRemoteDirs = [...new Set(localDirByUrl.values())];
 
+  // 对目标不可变提交 localSha 仅流式执行一次 .gitattributes 属性检查，避免多 pushurl 时重复分配与扫描
+  let precomputedHasLfsAttr: boolean;
+  try {
+    precomputedHasLfsAttr = await targetRevHasLfsAttr(cwd, localSha, { ...opts, readOnly: true });
+  } catch (err) {
+    return {
+      ok: false,
+      rejected: false,
+      message: `检测分支 ${branch}（提交 ${localSha.slice(0, 12)}）的 Git LFS 属性失败，已中止推送：${errMsg(err)}`,
+    };
+  }
+
   for (const pushUrl of effectivePushUrls) {
     const localDir = localDirByUrl.get(pushUrl);
     // 尽量用 ls-remote 缩小扫描范围；若远端是仅允许 receive-pack（禁止 upload-pack）的 push-only 端点，
@@ -686,7 +842,7 @@ export async function pushBranch(
 
     let scan: { hasLfsAttr: boolean; oids: string[] };
     try {
-      scan = await scanOutgoingGitLfs(cwd, localSha, remoteSha, knownRemoteShas, opts, false);
+      scan = await scanOutgoingGitLfs(cwd, localSha, remoteSha, knownRemoteShas, opts, false, precomputedHasLfsAttr);
     } catch (err) {
       return {
         ok: false,

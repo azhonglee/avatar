@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { App } from "../app.ts";
-import { extractOwnerOpenId } from "../lark.ts";
+import { verifyActiveLarkUser } from "../lark.ts";
 import { deepFind, errMsg, runProcess } from "../util.ts";
 import { hashId, norm, type ContextStore, type Obs } from "./store.ts";
 
@@ -263,34 +263,24 @@ export class Connectors {
   }
 
   /** 核验当前 lark-cli 登录用户 open_id 与工作区主人一致，防止切换 CLI 账号后跨账号拉取私聊/任务/妙记/日历 */
-  async verifyActiveLarkOwner(): Promise<
+  async verifyActiveLarkOwner(actionLabel = "用户态来源采集"): Promise<
     { ok: true; status: Record<string, unknown> } | { ok: false; error: string }
   > {
-    const expectedOwner = this.cfg.owner.open_id.trim();
-    if (!expectedOwner) {
-      return { ok: false, error: "未配置 owner.open_id，无法确认 lark-cli 采集账号归属，已中止用户态来源采集" };
-    }
-    let status: Record<string, unknown>;
     try {
-      status = await this.app.lark.authStatus();
+      const { status } = await verifyActiveLarkUser(this.app.lark, this.cfg.owner.open_id, actionLabel);
+      return { ok: true, status };
     } catch (err) {
-      return { ok: false, error: `无法核验当前 lark-cli 登录用户身份，已阻断用户态来源采集：${errMsg(err)}` };
+      return { ok: false, error: errMsg(err) };
     }
-    const authedOpenId = extractOwnerOpenId(status).trim();
-    if (!authedOpenId || !authedOpenId.startsWith("ou_")) {
-      return { ok: false, error: "无法从 lark-cli auth status 解析当前登录用户的 open_id，已阻断用户态来源采集" };
-    }
-    if (authedOpenId !== expectedOwner) {
-      return {
-        ok: false,
-        error: `当前 lark-cli 登录用户 (${authedOpenId}) 与工作区主人 (${expectedOwner}) 不一致，已阻断用户态来源采集以防跨账号混入数据`,
-      };
-    }
-    return { ok: true, status };
   }
 
-  /** 跑一轮所有启用的来源 */
-  async pullAll(opts?: { larkOwnerVerified?: boolean }): Promise<SourceReport[]> {
+  private async assertActiveLarkOwner(actionLabel: string): Promise<Record<string, unknown>> {
+    const { status } = await verifyActiveLarkUser(this.app.lark, this.cfg.owner.open_id, actionLabel);
+    return status;
+  }
+
+  /** 跑一轮所有启用的来源（各来源相互隔离；所有用户态 lark-cli 来源均在拉取前与提交前双次核验当前活跃 CLI 账号） */
+  async pullAll(): Promise<SourceReport[]> {
     const s = this.cfg.context.sources;
     const out: SourceReport[] = [];
     const step = async (name: string, enabled: boolean, fn: () => Promise<Omit<SourceReport, "source" | "error">>) => {
@@ -303,26 +293,11 @@ export class Connectors {
       }
       this.setKv(`source.${name}`, JSON.stringify({ at: Date.now(), ...out.at(-1) }));
     };
-    const needsLarkCli = s.tasks || s.im || s.minutes || s.calendar;
-    let larkOwnerErr = "";
-    if (needsLarkCli && !opts?.larkOwnerVerified) {
-      const check = await this.verifyActiveLarkOwner();
-      if (!check.ok) larkOwnerErr = check.error;
-    }
-    const larkStep = async (name: string, enabled: boolean, fn: () => Promise<Omit<SourceReport, "source" | "error">>) => {
-      if (!enabled) return;
-      if (larkOwnerErr) {
-        out.push({ source: name, count: 0, error: larkOwnerErr.slice(0, 300) });
-        this.setKv(`source.${name}`, JSON.stringify({ at: Date.now(), ...out.at(-1) }));
-        return;
-      }
-      await step(name, true, fn);
-    };
     await step("meego", s.meego, () => this.pullMeego());
-    await larkStep("tasks", s.tasks, () => this.pullTasks());
-    await larkStep("im", s.im, () => this.pullIm());
-    await larkStep("minutes", s.minutes, () => this.pullMinutes());
-    await larkStep("calendar", s.calendar, () => this.pullCalendar());
+    await step("tasks", s.tasks, () => this.pullTasks());
+    await step("im", s.im, () => this.pullIm());
+    await step("minutes", s.minutes, () => this.pullMinutes());
+    await step("calendar", s.calendar, () => this.pullCalendar());
     await step("docs", s.docs, async () => this.pullComments());
     return out;
   }
@@ -422,7 +397,10 @@ export class Connectors {
   // ───────── 飞书任务 → 事项 ─────────
 
   async pullTasks(): Promise<{ count: number }> {
+    await this.assertActiveLarkOwner("拉取飞书任务");
     const data = await this.lark(["task", "+get-my-tasks", "--complete=false", "--page-all"]);
+    // 提交前再次核验活跃 lark-cli 用户，防止拉取期间账号被切换导致他人任务落入本工作区
+    await this.assertActiveLarkOwner("提交飞书任务");
     const tasks = arr(data, "items");
     const now = Date.now();
     const legacyCut = now - this.cfg.context.legacy_days * DAY;
@@ -634,6 +612,7 @@ export class Connectors {
     restartAttempt: number,
     lease: { token: string; procOwner: string },
   ): Promise<{ count: number; dropped: number }> {
+    await this.assertActiveLarkOwner("拉取飞书消息");
     const me = this.cfg.owner.open_id;
     const now = Date.now();
     const lookback = this.cfg.context.lookback_days * DAY;
@@ -1070,6 +1049,7 @@ export class Connectors {
           .map(([id]) => id)
           .join(",");
         if (learnedRankedKey !== initialRankedKey) {
+          await this.assertActiveLarkOwner("保存学到的群名");
           mergeKnownOpenGroupNames(this.app.store, learnedNames);
           if (restartAttempt < 1) {
             return this.pullImInner(restartAttempt + 1, lease);
@@ -1087,6 +1067,9 @@ export class Connectors {
           o.conv_name = cleanPeer ? `私聊：${cleanPeer}` : "私聊";
         }
       }
+
+      // 落库提交前再次核验活跃 lark-cli 用户，防止拉取分页期间切换账号导致他人消息写入本工作区或推进游标
+      await this.assertActiveLarkOwner("提交飞书消息");
 
       // 原子事务提交前最后一次核对轮询租约、策略签名与群选择集合：
       // 若租约丢失则立刻中止（防过期慢轮询覆写新编辑）；若策略变更则重试/重启，绝不提交过期观测或游标
@@ -1143,6 +1126,7 @@ export class Connectors {
   // ───────── 妙记 → 观测 ─────────
 
   async pullMinutes(): Promise<{ count: number }> {
+    await this.assertActiveLarkOwner("拉取飞书妙记");
     const now = Date.now();
     const since = Number(this.kv("cursor.minutes") ?? 0) || now - this.cfg.context.lookback_days * DAY;
     const list: Raw[] = [];
@@ -1182,6 +1166,7 @@ export class Connectors {
         });
       }
     }
+    await this.assertActiveLarkOwner("提交飞书妙记");
     const n = this.store.addObs(obs);
     this.setKv("cursor.minutes", String(now));
     return { count: n };
@@ -1217,9 +1202,11 @@ export class Connectors {
   // ───────── 日历：今天和接下来两天的会议（只用于展示） ─────────
 
   async pullCalendar(): Promise<{ count: number }> {
+    await this.assertActiveLarkOwner("拉取飞书日历");
     const now = Date.now();
     const startOfDay = parseTime(new Intl.DateTimeFormat("en-CA", { timeZone: this.cfg.owner.timezone }).format(new Date(now)), this.cfg.owner.timezone);
     const data = await this.lark(["calendar", "+agenda", "--start", isoLocal(startOfDay), "--end", isoLocal(startOfDay + 3 * DAY)]);
+    await this.assertActiveLarkOwner("提交飞书日历");
     const events = arr(data, "items").length ? arr(data, "items") : arr(data, "events");
     const t = (x: Raw) => parseTime(x?.datetime ?? x?.timestamp ?? x?.date ?? x, this.cfg.owner.timezone);
     const meetings = events

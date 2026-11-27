@@ -2090,9 +2090,13 @@ export class PersonalWebBridge {
   /**
    * 原子抢占发送状态（SQLite BEGIN IMMEDIATE CAS）：
    *   - 仅当当前无记录或处于明确未创建状态（rejected）时才写入 `sending`；
+   *   - 在同一 SQLite 写锁内执行 `beforeClaim` 终检（发信开关、原消息未撤回、会话未登出/取代），防止与跨进程 web-logout 或撤回竞态；
    *   - 若另一进程已在异步校验期间抢先写入了 `sending` / `created` / `verified`，绝不覆盖，原样返回已有记录交调用方安全分流。
    */
-  private claimDeliveryForSend(rec: DeliveryRecord): { ok: true } | { ok: false; existing: DeliveryRecord } {
+  private claimDeliveryForSend(
+    rec: DeliveryRecord,
+    beforeClaim?: () => void,
+  ): { ok: true } | { ok: false; existing: DeliveryRecord } {
     this.app.store.db.exec("BEGIN IMMEDIATE");
     try {
       const cur = this.loadDelivery(rec.cid);
@@ -2111,6 +2115,7 @@ export class PersonalWebBridge {
           return { ok: false, existing: cur };
         }
       }
+      beforeClaim?.();
       this.saveDelivery(rec);
       this.app.store.db.exec("COMMIT");
       return { ok: true };
@@ -2274,24 +2279,30 @@ export class PersonalWebBridge {
         },
         {
           onBeforeSend: ({ rootId, parentId, threaded }) => {
-            this.assertSendEnabled();
-            assertTargetNotWithdrawn();
-            this.assertSessionOwner(args.owner_id, initialSessionId);
-            if (client.owner().id !== args.owner_id) {
-              throw new Error("发送前检测到客户端账号不匹配，已中止发送");
-            }
-            const claimed = this.claimDeliveryForSend({
-              cid: args.cid,
-              owner_id: args.owner_id,
-              chat_id: args.chat_id,
-              message_id: args.message_id,
-              root_id: rootId,
-              parent_id: parentId,
-              text_hash: textHash,
-              threaded,
-              state: "sending",
-              updated_at: Date.now(),
-            });
+            const claimed = this.claimDeliveryForSend(
+              {
+                cid: args.cid,
+                owner_id: args.owner_id,
+                chat_id: args.chat_id,
+                message_id: args.message_id,
+                root_id: rootId,
+                parent_id: parentId,
+                text_hash: textHash,
+                threaded,
+                state: "sending",
+                updated_at: Date.now(),
+              },
+              () => {
+                // 在写入 sending 状态的同一 SQLite BEGIN IMMEDIATE 写事务锁内重检授权、吊销与撤回，
+                // 彻底消除跨进程 web-logout 或消息撤回在读后锁前提交导致的误发竞态
+                this.assertSendEnabled();
+                assertTargetNotWithdrawn();
+                this.assertSessionOwner(args.owner_id, initialSessionId);
+                if (client.owner().id !== args.owner_id) {
+                  throw new Error("发送前检测到客户端账号不匹配，已中止发送");
+                }
+              },
+            );
             if (!claimed.ok) {
               throw new DeliveryAlreadyClaimedError(claimed.existing);
             }

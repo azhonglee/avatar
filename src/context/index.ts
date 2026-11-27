@@ -7,6 +7,7 @@ import { consoleBaseUrl, serverToken, signLoginTicket } from "../server/index.ts
 import { CommandError } from "../commands.ts";
 import { card as cardEffect, notify } from "../effects.ts";
 import type { Handler } from "../engine.ts";
+import { detectIsolatedCodexKeyringConflict } from "../harness.ts";
 import type { Effect, NotifyKind } from "../ledger.ts";
 import { deepFind, errMsg, log, truncate } from "../util.ts";
 import { draftCard, eveningCard, itemCard, KIND_LABEL, morningCard, type CtxRenderCtx } from "./cards.ts";
@@ -158,22 +159,28 @@ export class ContextService {
     this.running = true;
     const kv = this.app.store;
     try {
-      const s = this.cfg.context.sources;
-      const needsLarkCli = s.tasks || s.im || s.minutes || s.calendar;
-      let verifiedLarkStatus: Record<string, unknown> | undefined;
-      if (needsLarkCli) {
-        const larkCheck = await this.connectors.verifyActiveLarkOwner();
-        if (!larkCheck.ok) {
-          return { ...rep, skipped: true, errors: [larkCheck.error] };
-        }
-        verifiedLarkStatus = larkCheck.status;
-      }
       this.store.wakeSnoozed();
-      rep.sources = await this.connectors.pullAll({ larkOwnerVerified: needsLarkCli });
+      // 各来源按采集契约相互隔离：即使 lark-cli 认证失败或账号不匹配，独立来源（Meego / 文档评论）仍正常执行并上报各自状态；
+      // 每个用户态 lark-cli 来源均在拉取前与提交前双次校验活跃账号，确保他人数据绝不落库。
+      rep.sources = await this.connectors.pullAll();
       for (const s of rep.sources) if (s.error) rep.errors.push(`${s.source}: ${s.error}`);
-      await this.ensureOwnerName(verifiedLarkStatus);
+      const larkAuthBlocked = rep.sources.some(
+        (s) =>
+          (s.source === "tasks" || s.source === "im" || s.source === "minutes" || s.source === "calendar") &&
+          !!s.error &&
+          /lark-cli 登录用户|lark-cli auth status|lark-cli 账号归属/.test(s.error),
+      );
+      if (!larkAuthBlocked) {
+        await this.ensureOwnerName();
+      }
       const created: ItemRow[] = [];
-      if (this.cfg.context.understand) {
+      const ctxHarnessName = this.cfg.context.harness || this.cfg.roles.brain;
+      const keyringConflict = this.cfg.context.understand
+        ? detectIsolatedCodexKeyringConflict(this.cfg, process.env, ctxHarnessName)
+        : undefined;
+      if (keyringConflict?.severity === "error") {
+        rep.errors.push(keyringConflict.message);
+      } else if (this.cfg.context.understand) {
         // 每轮最多理解 max_convs_per_cycle 个会话批次；并行跑 understand_parallel 批（通过绑定进程与唯一令牌的 SQLite 租约+心跳跨进程互斥）
         let budget = this.cfg.context.max_convs_per_cycle;
         const par = this.cfg.context.understand_parallel;
@@ -181,10 +188,11 @@ export class ContextService {
         let policyRestarts = 0;
         while (budget > 0 && !signal?.aborted) {
           if (this.isWorkspaceOwnerMismatched() || !this.cfg.context.understand) break;
-          // 每轮动态重算启用的来源，防止运行中途关闭文档/妙记开关后后续批次仍选中已停用来源
+          // 每轮动态重算启用的来源，防止运行中途关闭文档/妙记开关后后续批次仍选中已停用来源；
+          // 若本轮 lark-cli 用户身份未通过核验，跳过依赖 lark-cli 的 IM/妙记理解，保留本地文档评论处理
           const activeSources = [
-            ...(this.cfg.context.sources.im ? ["im"] : []),
-            ...(this.cfg.context.sources.minutes ? ["minutes"] : []),
+            ...(this.cfg.context.sources.im && !larkAuthBlocked ? ["im"] : []),
+            ...(this.cfg.context.sources.minutes && !larkAuthBlocked ? ["minutes"] : []),
             ...(this.cfg.context.sources.docs ? ["doc"] : []),
           ];
           if (!activeSources.length) break;
@@ -430,7 +438,7 @@ export class ContextService {
     workId: string,
     p: { conv: string; conv_name: string; trigger_obs_id: string; anchor?: FastAnchor; anchors?: FastAnchor[] },
     signal?: AbortSignal,
-  ): Promise<{ busy?: boolean; fresh: number; created: number; nudged: number; pre_drafted: number }> {
+  ): Promise<{ busy?: boolean; deferMs?: number; fresh: number; created: number; nudged: number; pre_drafted: number }> {
     if (signal?.aborted) throw new Error("aborted");
     if (
       this.isWorkspaceOwnerMismatched() ||
@@ -441,9 +449,24 @@ export class ContextService {
     ) {
       return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
     }
+    const activeNativeOwner = this.personalWeb.activeBoundNativeOwner();
+    const rawAnchors = p.anchors?.length ? p.anchors : p.anchor ? [p.anchor] : [];
+    const preSelected = this.selectEligibleFastTriggers(p.conv, rawAnchors, p.trigger_obs_id, activeNativeOwner);
+    // 触发观测均已处理或已撤回时安全结束，避免在无待处理消息时反复延迟重试
+    if (!preSelected) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
     const eligBefore = await this.personalWeb.checkConvAllowedForUnderstand(p.conv, p.conv_name);
     if (signal?.aborted) throw new Error("aborted");
-    if (eligBefore !== "allowed") return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+    if (eligBefore === "excluded") return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+    // 仅明确 excluded 时永久结束；因网络抖动或独立 CLI 缺少在线 Web 客户端导致 uncertain 时延迟重排，保留快通道自动预起草能力
+    if (eligBefore === "uncertain") return { busy: true, deferMs: 5_000, fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+    const keyringConflict = detectIsolatedCodexKeyringConflict(
+      this.cfg,
+      process.env,
+      this.cfg.context.harness || this.cfg.roles.brain,
+    );
+    if (keyringConflict?.severity === "error") {
+      throw new Error(keyringConflict.message);
+    }
     const procOwner = this.app.ledger.owner;
     const claimToken = `${workId}:${procOwner}:${randomUUID().slice(0, 8)}`;
     if (!this.store.claimConv(p.conv, claimToken, procOwner)) {
@@ -462,7 +485,6 @@ export class ContextService {
       }
     }, 30_000);
     claimHeartbeat.unref?.();
-    const activeNativeOwner = this.personalWeb.activeBoundNativeOwner();
     const isFastSwitchEnabled = () =>
       !this.isWorkspaceOwnerMismatched() &&
       this.cfg.context.understand &&
@@ -473,7 +495,6 @@ export class ContextService {
       await this.ensureOwnerName();
       if (signal?.aborted) throw new Error("aborted");
       if (!isFastSwitchEnabled()) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
-      const rawAnchors = p.anchors?.length ? p.anchors : p.anchor ? [p.anchor] : [];
       const selectedBefore = this.selectEligibleFastTriggers(p.conv, rawAnchors, p.trigger_obs_id, activeNativeOwner);
       if (!selectedBefore) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
       if (selectedBefore.eligibleAnchors.length) {
@@ -487,9 +508,11 @@ export class ContextService {
       if (signal?.aborted) throw new Error("aborted");
       const eligAfter = await this.personalWeb.checkConvAllowedForUnderstand(p.conv, p.conv_name, fastNativeExcl);
       if (signal?.aborted) throw new Error("aborted");
-      if (eligAfter !== "allowed") return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
-      if (!isFastSwitchEnabled() || this.personalWeb.policySignature() !== fastPolicySig) {
-        return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+      if (eligAfter === "excluded") return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+      if (eligAfter === "uncertain") return { busy: true, deferMs: 5_000, fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+      if (!isFastSwitchEnabled()) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+      if (this.personalWeb.policySignature() !== fastPolicySig) {
+        return { busy: true, deferMs: 2_000, fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
       }
       const selectedAfter = this.selectEligibleFastTriggers(p.conv, rawAnchors, p.trigger_obs_id, activeNativeOwner);
       if (!selectedAfter) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
@@ -779,7 +802,7 @@ export class ContextService {
         if (p.task === "fast") {
           const r = await this.fastCycle(item.id, p, ctx.signal);
           if (r.busy) {
-            this.app.ledger.release(item.id, { nextAt: Date.now() + 2_000, refund: true });
+            this.app.ledger.release(item.id, { nextAt: Date.now() + (r.deferMs ?? 2_000), refund: true });
             return;
           }
           this.app.ledger.transition(item, { state: "done", terminal: true, payload: { ...p, result: r } as never });

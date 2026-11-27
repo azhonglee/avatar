@@ -754,6 +754,22 @@ export function wrapCredentialIsolatedCommand(
     for (const f of [extCredFile, `${extCredFile}.staged`, `${extCredFile}.lock.db`]) {
       if (fs.existsSync(f)) rawMasks.push(path.resolve(f), safeRealpath(f));
     }
+    // 同时遮罩按工作区隔离的外部暂存文件（<extCredFile>.<wsTag>.staged）与在途临时文件
+    const extDir = path.dirname(extCredFile);
+    const extBase = path.basename(extCredFile);
+    try {
+      for (const entry of fs.readdirSync(extDir)) {
+        if (
+          (entry.startsWith(`${extBase}.`) && entry.endsWith(".staged")) ||
+          (entry.startsWith(`.${extBase}.`) && entry.endsWith(".tmp"))
+        ) {
+          const full = path.join(extDir, entry);
+          rawMasks.push(path.resolve(full), safeRealpath(full));
+        }
+      }
+    } catch {
+      // 外部凭据父目录不可列举时跳过通配补扫
+    }
   }
   // 遮罩宿主机全局服务控制套接字（保留 /run/systemd/resolve 以免破坏 DNS 解析）
   for (const hostSock of [
@@ -1164,6 +1180,94 @@ export interface SafeCodexProviderConfig {
   extraEnv: Record<string, string>;
   /** 经过白名单校验与凭据环境变量化后的 `extraArgs` */
   sanitizedExtraArgs: string[];
+  /** 生效的 cli_auth_credentials_store（优先取 extraArgs 覆盖值，其次取 config.toml） */
+  credentialStore?: string;
+}
+
+/** 轻量读取某组 env + extraArgs 下 Codex 生效的 cli_auth_credentials_store（供隔离沙箱预检与 doctor 共用） */
+export function resolveEffectiveCodexCredentialStore(
+  env: NodeJS.ProcessEnv,
+  extraArgs: string[],
+): { store?: string; codexHome: string; hasConfig: boolean } {
+  const effectiveHome = env.HOME?.trim() || os.homedir();
+  const codexHome = env.CODEX_HOME?.trim() || path.join(effectiveHome, ".codex");
+  const configPath = path.join(codexHome, "config.toml");
+
+  let extraStore: string | undefined;
+  const scanExpr = (expr: string) => {
+    const parsed = parseCliConfigAssignment(expr);
+    if (!parsed || parsed.key !== "cli_auth_credentials_store") return;
+    try {
+      const val = parseCliTomlOrLiteral(parsed.key, parsed.value);
+      if (typeof val === "string") extraStore = val.trim();
+    } catch {
+      // 由严格提取阶段统一报错
+    }
+  };
+  for (let i = 0; i < extraArgs.length; i++) {
+    const a = extraArgs[i];
+    if ((a === "-c" || a === "--config") && extraArgs[i + 1]) {
+      scanExpr(extraArgs[++i]);
+    } else if (a.startsWith("--config=")) {
+      scanExpr(a.slice("--config=".length));
+    }
+  }
+
+  const hasConfig = fs.existsSync(configPath);
+  if (extraStore) return { store: extraStore, codexHome, hasConfig };
+  if (!hasConfig) return { store: undefined, codexHome, hasConfig: false };
+  try {
+    const doc = parseToml(fs.readFileSync(configPath, "utf8"));
+    const v = doc.cli_auth_credentials_store;
+    return { store: typeof v === "string" ? v.trim() : undefined, codexHome, hasConfig: true };
+  } catch {
+    return { store: undefined, codexHome, hasConfig: true };
+  }
+}
+
+export interface CodexKeyringConflict {
+  severity: "error" | "warn";
+  message: string;
+  fix: string;
+}
+
+/**
+ * 检测 Linux 隔离沙箱与 Codex `cli_auth_credentials_store = "keyring"`（或缺少文件凭据的 `"auto"`）的冲突：
+ * 隔离沙箱会屏蔽宿主机 D-Bus 会话总线与 XDG_RUNTIME_DIR，导致容器内无法访问 Secret Service keyring。
+ */
+export function detectIsolatedCodexKeyringConflict(
+  cfg: Pick<Config, "dataDir" | "context" | "harnesses">,
+  rawEnv: NodeJS.ProcessEnv = process.env,
+  harnessName?: string,
+  opts?: { home?: string; includeContextObs?: boolean },
+): CodexKeyringConflict | undefined {
+  if (process.platform !== "linux") return undefined;
+  if (!harnessName) return undefined;
+  const h = cfg.harnesses[harnessName];
+  if (!h || h.type !== "codex-exec") return undefined;
+  const isoActive = workspaceRequiresIsolation(cfg, rawEnv, { includeContextObs: opts?.includeContextObs ?? false });
+  if (!isoActive) return undefined;
+
+  const baseEnv: NodeJS.ProcessEnv = opts?.home ? { ...rawEnv, HOME: opts.home } : { ...rawEnv };
+  const merged = mergeHarnessEnv(baseEnv, h.env);
+  const { store, codexHome } = resolveEffectiveCodexCredentialStore(merged, h.extraArgs);
+  const fix =
+    '在 ~/.codex/config.toml 中设置 `cli_auth_credentials_store = "file"` 并重新运行 `codex login`，或在常驻进程环境中通过 `OPENAI_API_KEY` / 自定义供应商 `env_key` 提供 API 密钥';
+  if (store === "keyring") {
+    return {
+      severity: "error",
+      message: `执行者 ${harnessName} 配置了 cli_auth_credentials_store="keyring"，但当前 Linux 隔离沙箱已屏蔽宿主机 D-Bus 会话总线与 XDG_RUNTIME_DIR，无法访问 Secret Service；请改用文件凭据或 API 密钥`,
+      fix,
+    };
+  }
+  if (store === "auto" && !fs.existsSync(path.join(codexHome, "auth.json")) && !merged.OPENAI_API_KEY?.trim()) {
+    return {
+      severity: "warn",
+      message: `执行者 ${harnessName} 使用 cli_auth_credentials_store="auto" 且 ${codexHome}/auth.json 与 OPENAI_API_KEY 均不存在；Linux 隔离沙箱内无法访问宿主机 keyring，若 Codex 登录态仅存于 keyring 将导致鉴权失败`,
+      fix,
+    };
+  }
+  return undefined;
 }
 
 /**
@@ -1307,6 +1411,8 @@ export function extractSafeCodexProviderConfig(
   // 1) 严格校验并净化 extraArgs：tools="none" 仅允许模型/供应商/特性禁用参数
   let extraHasModelProvider = false;
   let extraProvider: string | undefined;
+  let extraCredentialStore: string | undefined;
+  let configCredentialStore: string | undefined;
   const extraProviderTables = new Map<string, TomlTable>();
   let extraHasModel = hasExplicitModel;
   const sanitizedExtraArgs: string[] = [];
@@ -1344,6 +1450,8 @@ export function extractSafeCodexProviderConfig(
         }
         extraHasModelProvider = true;
         extraProvider = checkedVal;
+      } else if (segs[0] === "cli_auth_credentials_store" && typeof checkedVal === "string") {
+        extraCredentialStore = checkedVal;
       }
       sanitizedExtraArgs.push("-c", `${formatTomlKeySegment(segs[0])}=${serializeTomlInlineValue(checkedVal)}`);
       return;
@@ -1542,6 +1650,9 @@ export function extractSafeCodexProviderConfig(
       const v = effectiveVal(scalarKey);
       if (v !== undefined) {
         const checked = validateSafeScalarValue(scalarKey, v);
+        if (scalarKey === "cli_auth_credentials_store" && typeof checked === "string") {
+          configCredentialStore = checked;
+        }
         out.push("-c", `${scalarKey}=${serializeTomlInlineValue(checked)}`);
       }
     }
@@ -1589,7 +1700,8 @@ export function extractSafeCodexProviderConfig(
     out.push("-c", `model_providers=${serializeTomlInlineValue(mergedProviders)}`);
   }
 
-  return { args: out, extraEnv, sanitizedExtraArgs };
+  const credentialStore = extraCredentialStore ?? configCredentialStore;
+  return { args: out, extraEnv, sanitizedExtraArgs, ...(credentialStore ? { credentialStore } : {}) };
 }
 
 /** 兼容辅助：仅返回提取后的 `-c` 参数（用于既有单元测试） */
@@ -1785,10 +1897,12 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
     let finalEnv = mergeHarnessEnv(baseEnv.env, h.env);
     args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--ephemeral", "--color", "never", "-o", outArg];
     let extraToPass = h.extraArgs;
+    let effectiveCredStore: string | undefined;
     if (run.tools === "none") {
       // 彻底隔离用户配置（包括 ~/.codex/config.toml 中配置的任意 MCP Server / 插件 / 钩子）与执行规则，
       // 仅保留认证与提取后的安全供应商/模型参数；静态 http_headers 改走环境变量引用，并严格过滤 extraArgs。
       const safeCfg = extractSafeCodexProviderConfig(finalEnv, h.extraArgs, !!h.model);
+      effectiveCredStore = safeCfg.credentialStore;
       finalEnv = { ...finalEnv, ...safeCfg.extraEnv };
       extraToPass = safeCfg.sanitizedExtraArgs;
       args.push(
@@ -1839,6 +1953,12 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       }),
     );
     if (wrapped.isolated) {
+      const credStore = effectiveCredStore ?? resolveEffectiveCodexCredentialStore(finalEnv, extraToPass).store;
+      if (process.platform === "linux" && credStore === "keyring") {
+        throw new Error(
+          `执行者 ${run.harness} 配置了 cli_auth_credentials_store="keyring"，但当前 Linux 隔离沙箱已屏蔽宿主机 D-Bus 会话总线与 XDG_RUNTIME_DIR，无法访问 Secret Service；请在 ~/.codex/config.toml 中改用 cli_auth_credentials_store="file" 并重新运行 codex login，或通过 OPENAI_API_KEY / 供应商 env_key 提供 API 密钥`,
+        );
+      }
       finalEnv = {
         ...finalEnv,
         TMPDIR: "/tmp",

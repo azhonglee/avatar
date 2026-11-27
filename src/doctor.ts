@@ -6,7 +6,13 @@ import type { App } from "./app.ts";
 import type { DoctorCheck, DoctorReport } from "./api/types.ts";
 import { repoSpec } from "./config.ts";
 import { WebLoginStore } from "./context/feishu-web/index.ts";
-import { buildWorkspaceIsolation, prepareHarnessEnv, resolveBin, wrapCredentialIsolatedCommand } from "./harness.ts";
+import {
+  buildWorkspaceIsolation,
+  detectIsolatedCodexKeyringConflict,
+  prepareHarnessEnv,
+  resolveBin,
+  wrapCredentialIsolatedCommand,
+} from "./harness.ts";
 import { consoleBaseUrl, isLoopbackHost } from "./server/index.ts";
 import { validateConfig } from "./settings.ts";
 import { deepFind, errMsg, runProcess, truncate } from "./util.ts";
@@ -255,6 +261,19 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
         }
         const how = h.type === "doubao-cli" ? `${cmdPath} -p（豆包 CLI）` : `${cmdPath} exec（只读）`;
         const detail = `${how}${h.model ? `，模型 ${h.model}` : ""}${roles.length ? `，角色：${roles.join("、")}` : ""}（未实际调用模型）`;
+        if (h.type === "codex-exec") {
+          const keyringConflict = detectIsolatedCodexKeyringConflict(cfg, env, name, {
+            home,
+            includeContextObs: cfg.roles.reviewer === name,
+          });
+          if (keyringConflict?.severity === "error") {
+            return fail(`${detail}；${keyringConflict.message}`, keyringConflict.fix);
+          }
+          if (keyringConflict?.severity === "warn") {
+            problems.push(keyringConflict.message);
+            fixes.push(keyringConflict.fix);
+          }
+        }
         return problems.length ? warn(`${detail}；${problems.join("；")}`, fixes.join("\n\n")) : ok(detail);
       }
       if (!h.agent === !h.agentCommand) return fail("必须且只能设置 agent 或 agentCommand 之一", `在设置页或配置文件的 ${code(`harnesses.${name}`)} 里修正`);

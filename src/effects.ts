@@ -6,7 +6,7 @@ import type { Store } from "./store.ts";
 import type { Config } from "./config.ts";
 import type { Handler } from "./engine.ts";
 import type { Effect, Ledger, NotifyKind } from "./ledger.ts";
-import type { Lark } from "./lark.ts";
+import { verifyActiveLarkUser, type Lark } from "./lark.ts";
 
 /**
  * 发布器：投递 outbox 里的飞书写操作。
@@ -78,6 +78,16 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
       // 归属旧主人的上下文委派派单卡片（card:dispatch:<guid>）、失败告警卡片（failure:<workId>）及任务操作，同样严格按主人隔离
       if (isWorkBlockedByOwner({ cfg, store, ledger }, item)) {
         throw new Error("该派单卡片、失败告警或外部动作源自旧工作区主人的工作上下文，已按主人隔离阻断投递");
+      }
+      // 任何以用户态 lark-cli 发布工作上下文派生数据或对外回复的写操作，执行前实时核验活跃 CLI 登录用户与工作区主人一致
+      const needsActiveLarkUserCheck =
+        e.op === "doc.create" ||
+        e.op === "task.create_own" ||
+        e.op === "im.reply" ||
+        e.op === "im.send" ||
+        (isContextEffect && (e.op === "task.move" || e.op === "task.comment" || e.op === "task.complete"));
+      if (needsActiveLarkUserCheck) {
+        await verifyActiveLarkUser(lark, cfg.owner.open_id, `执行用户态外部动作 (${e.op})`);
       }
       if (e.op === "notify" || e.op === "card.upsert") {
         const g = hooks.gate?.(e.args.kind, e);

@@ -1,5 +1,5 @@
 import type { Config } from "./config.ts";
-import type { Lark } from "./lark.ts";
+import { verifyActiveLarkUser, type Lark } from "./lark.ts";
 import type { Store } from "./store.ts";
 import { deepFind, errMsg, findItems, log } from "./util.ts";
 
@@ -41,6 +41,9 @@ export class Board {
     let tasklist = this.store.get("board.tasklist");
     const cfgOwner = this.cfg.owner.open_id.trim();
     if (!tasklist) {
+      // 全新初始化前必须先实时核验当前 lark-cli 登录用户与配置 owner.open_id 一致，
+      // 防止将其他账号的同名清单或新清单错误绑定并标成当前配置的 owner.open_id
+      const { openId: authedOwner } = await verifyActiveLarkUser(this.lark, cfgOwner, "初始化任务看板");
       const found = await this.lark.run(["task", "+tasklist-search", "--query", this.cfg.board.name], { as: "user" });
       tasklist = findItems(found, "guid").find((t) => t.name === this.cfg.board.name)?.guid as string | undefined;
       if (!tasklist) {
@@ -50,7 +53,7 @@ export class Board {
         log("info", "已创建任务清单", { name: this.cfg.board.name, guid: tasklist });
       }
       this.store.set("board.tasklist", tasklist);
-      if (cfgOwner) this.store.set("board.owner_open_id", cfgOwner);
+      this.store.set("board.owner_open_id", authedOwner);
     } else {
       const existingBoardOwner = (this.store.get("board.owner_open_id") ?? "").trim();
       if (existingBoardOwner) {
@@ -59,6 +62,7 @@ export class Board {
             `本地持久化看板归属账号 (${existingBoardOwner}) 与当前配置 owner.open_id (${cfgOwner || "未配置"}) 不一致，拒绝复用或改标；请切回原主人或使用全新的 data_dir 重新运行 pa init`,
           );
         }
+        await verifyActiveLarkUser(this.lark, existingBoardOwner, "同步任务看板分组");
       } else {
         const priorOwner = (opts?.prevOwner !== undefined ? opts.prevOwner : (this.store.get("owner.open_id") ?? "")).trim();
         if (!priorOwner) {
@@ -71,7 +75,8 @@ export class Board {
             `本地遗留看板归属原主人 (${priorOwner})，与当前配置 owner.open_id (${cfgOwner || "未配置"}) 不一致，拒绝改标为新主人；请切回原主人或使用全新的 data_dir 重新运行 pa init`,
           );
         }
-        this.store.set("board.owner_open_id", priorOwner);
+        const { openId: authedOwner } = await verifyActiveLarkUser(this.lark, priorOwner, "迁移遗留任务看板");
+        this.store.set("board.owner_open_id", authedOwner);
       }
     }
     const listed = await this.lark.run(

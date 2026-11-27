@@ -304,6 +304,7 @@ export class ContextStore {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
     );
     const upd = this.db.prepare("UPDATE ctx_obs SET kind = ?, conv_name = ?, actor_name = ?, text = ?, url = ?, meta = ?, processed = 0 WHERE id = ?");
+    const updMetaOnly = this.db.prepare("UPDATE ctx_obs SET meta = ? WHERE id = ?");
     let n = 0;
     this.tx(() => {
       if (beforeCommit && !beforeCommit()) return;
@@ -319,23 +320,25 @@ export class ContextStore {
           const wasWithdrawn = curMeta.withdrawn === true;
           const curVer = typeof curMeta.edit_version === "number" && Number.isFinite(curMeta.edit_version) ? curMeta.edit_version : undefined;
           const nextVer = typeof o.meta?.edit_version === "number" && Number.isFinite(o.meta.edit_version) ? o.meta.edit_version : undefined;
+          const curPollAt =
+            typeof curMeta.poll_observed_at === "number" && Number.isFinite(curMeta.poll_observed_at)
+              ? curMeta.poll_observed_at
+              : undefined;
+          const nextPollAt =
+            typeof o.meta?.poll_observed_at === "number" && Number.isFinite(o.meta.poll_observed_at)
+              ? o.meta.poll_observed_at
+              : undefined;
           if (curVer !== undefined && nextVer !== undefined && nextVer < curVer) continue;
           const hasNewerEditVer = curVer !== undefined && nextVer !== undefined && nextVer > curVer;
-          if (!hasNewerEditVer) {
-            const curPollAt =
-              typeof curMeta.poll_observed_at === "number" && Number.isFinite(curMeta.poll_observed_at)
-                ? curMeta.poll_observed_at
-                : undefined;
-            const nextPollAt =
-              typeof o.meta?.poll_observed_at === "number" && Number.isFinite(o.meta.poll_observed_at)
-                ? o.meta.poll_observed_at
-                : undefined;
-            if (curPollAt !== undefined && nextPollAt !== undefined && nextPollAt < curPollAt) continue;
+          if (!hasNewerEditVer && curPollAt !== undefined && nextPollAt !== undefined && nextPollAt < curPollAt) {
+            continue;
           }
           const curEffectiveMeta =
             curMeta.at_me === undefined && String(cur.kind ?? "") === "at_me" ? { ...curMeta, at_me: true } : curMeta;
           const incomingMeta = o.meta ?? {};
           const nextMeta: Record<string, unknown> = { ...curEffectiveMeta, ...incomingMeta };
+          if (curVer !== undefined && nextVer !== undefined) nextMeta.edit_version = Math.max(curVer, nextVer);
+          if (curPollAt !== undefined && nextPollAt !== undefined) nextMeta.poll_observed_at = Math.max(curPollAt, nextPollAt);
           delete nextMeta.background_only;
           delete nextMeta.withdrawn;
           // 按即将落库的合并后元数据比对修订：未确认的省略（undefined）保留原值且不误触发重开，确认移除（at_me: false）则清除旧标记且后续重复投递幂等
@@ -355,6 +358,19 @@ export class ContextStore {
               o.id,
             );
             n++;
+          } else {
+            // 内容与 @mention 均未变化但收到更高的排序水位（edit_version / poll_observed_at）：
+            // 仅推进水位元数据，不重置 processed 也不递增 edit_gen，防止后续乱序到达的中间旧版本覆写当前状态
+            const advancedVer = nextVer !== undefined && (curVer === undefined || nextVer > curVer);
+            const advancedPollAt = nextPollAt !== undefined && (curPollAt === undefined || nextPollAt > curPollAt);
+            if (advancedVer || advancedPollAt) {
+              const watermarkMeta: Record<string, unknown> = {
+                ...curMeta,
+                ...(advancedVer ? { edit_version: nextVer } : {}),
+                ...(advancedPollAt ? { poll_observed_at: nextPollAt } : {}),
+              };
+              updMetaOnly.run(JSON.stringify(watermarkMeta), o.id);
+            }
           }
         }
       }

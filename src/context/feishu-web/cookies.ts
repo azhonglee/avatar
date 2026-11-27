@@ -540,7 +540,10 @@ export class WebLoginStore {
     const external = process.env.PA_FEISHU_WEB_CRED_FILE?.trim();
     this.file = external ? path.resolve(external) : path.join(dataDir, filename);
     this.lockFile = `${this.file}.lock.db`;
-    this.stagedFile = `${this.file}.staged`;
+    // 多个 data_dir 指向同一个外部 PA_FEISHU_WEB_CRED_FILE 时，按工作区 dataDir 隔离各自暂存文件，
+    // 避免工作区 B 启动/查状态时误删工作区 A 崩溃尚未 rename 的已提交暂存凭据
+    const wsTag = crypto.createHash("sha256").update(path.resolve(dataDir)).digest("hex").slice(0, 12);
+    this.stagedFile = external ? `${this.file}.${wsTag}.staged` : `${this.file}.staged`;
     this.lockTimeoutMs = Math.max(100, Math.trunc(lockTimeoutMs));
   }
 
@@ -764,7 +767,13 @@ export class WebLoginStore {
     if (initialPending?.file && path.resolve(initialPending.file) !== path.resolve(this.file)) {
       return;
     }
-    const hasStaged = fs.existsSync(this.stagedFile);
+    const legacyStagedFile = `${this.file}.staged`;
+    const initialStagedPath = initialPending?.staged_file
+      ? path.resolve(initialPending.staged_file)
+      : fs.existsSync(this.stagedFile)
+        ? this.stagedFile
+        : legacyStagedFile;
+    const hasStaged = fs.existsSync(this.stagedFile) || (!!initialPending && fs.existsSync(initialStagedPath));
     if (!initialPending && !hasStaged) return;
     try {
       this.withLock(() => {
@@ -773,11 +782,17 @@ export class WebLoginStore {
         if (pendingNow?.file && path.resolve(pendingNow.file) !== path.resolve(this.file)) {
           return;
         }
-        const stagedPath = pendingNow?.staged_file ? path.resolve(pendingNow.staged_file) : this.stagedFile;
+        const resolvedSelfStaged = path.resolve(this.stagedFile);
+        const resolvedLegacyStaged = path.resolve(legacyStagedFile);
+        const stagedPath = pendingNow?.staged_file
+          ? path.resolve(pendingNow.staged_file)
+          : fs.existsSync(this.stagedFile)
+            ? resolvedSelfStaged
+            : resolvedLegacyStaged;
         const stagedNow = fs.existsSync(stagedPath);
         if (pendingNow) {
           let installed = false;
-          if (stagedNow && path.resolve(stagedPath) === path.resolve(this.stagedFile)) {
+          if (stagedNow && (stagedPath === resolvedSelfStaged || stagedPath === resolvedLegacyStaged)) {
             fs.renameSync(stagedPath, this.file);
             fsyncDir(path.dirname(this.file));
             installed = true;
@@ -799,6 +814,7 @@ export class WebLoginStore {
             });
           }
         } else if (fs.existsSync(this.stagedFile)) {
+          // 仅清理严格归属本工作区路径的孤儿暂存文件，绝不触碰共享外部路径下其他工作区的暂存登录
           fs.rmSync(this.stagedFile, { force: true });
         }
       });
