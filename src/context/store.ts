@@ -460,18 +460,19 @@ export class ContextStore {
     });
   }
 
-  /** 待理解的会话（按最早未处理观测排序），支持分页跳过排除列表并按当前绑定 Web 账号隔离 */
+  /** 待理解的会话（按最早未处理观测排序），支持分页跳过排除列表、按当前绑定 Web 账号隔离，以及在 CLI 认证受阻时仅放行已验权的原生 pw:* IM 观测 */
   pendingConvs(
     limit: number,
     sources: string[] = ["im", "minutes", "doc"],
-    opts: { excludeConvs?: Iterable<string>; activeNativeOwner?: string | null } = {},
+    opts: { excludeConvs?: Iterable<string>; activeNativeOwner?: string | null; excludeCliIm?: boolean } = {},
   ): { conv: string; conv_name: string; n: number }[] {
     if (!sources.length) return [];
     const excluded = opts.excludeConvs ? [...opts.excludeConvs] : [];
     const owner = this.ownerClause(opts.activeNativeOwner);
     const exclSql = excluded.length ? ` AND conv NOT IN (${excluded.map(() => "?").join(",")})` : "";
+    const cliImSql = opts.excludeCliIm ? " AND NOT (source = 'im' AND id NOT LIKE 'pw:%')" : "";
     const q = `SELECT conv, MAX(conv_name) AS conv_name, COUNT(*) AS n, MIN(time) AS t FROM ctx_obs
-               WHERE processed = 0 AND source IN (${sources.map(() => "?").join(",")}) AND conv NOT IN (SELECT conv FROM ctx_mute_conv)${ContextStore.NOT_WITHDRAWN}${exclSql}${owner.sql}
+               WHERE processed = 0 AND source IN (${sources.map(() => "?").join(",")}) AND conv NOT IN (SELECT conv FROM ctx_mute_conv)${ContextStore.NOT_WITHDRAWN}${exclSql}${cliImSql}${owner.sql}
                GROUP BY conv ORDER BY t LIMIT ?`;
     return this.db.prepare(q).all(...sources, ...excluded, ...owner.args, limit) as { conv: string; conv_name: string; n: number }[];
   }
@@ -490,15 +491,16 @@ export class ContextStore {
     maxFresh = 60,
     context = 12,
     activeNativeOwner?: string | null,
-    opts?: { onlyMentions?: boolean },
+    opts?: { onlyMentions?: boolean; excludeCliIm?: boolean },
   ): Obs[] {
     const owner = this.ownerClause(activeNativeOwner);
     const nw = ContextStore.NOT_WITHDRAWN;
     const mentionSql = opts?.onlyMentions
       ? " AND (kind = 'at_me' OR json_extract(meta, '$.at_me') = 1) AND COALESCE(json_extract(meta, '$.at_me'), 1) != 0 AND COALESCE(json_extract(meta, '$.is_mention_me'), 1) != 0"
       : "";
+    const cliImSql = opts?.excludeCliIm ? " AND NOT (source = 'im' AND id NOT LIKE 'pw:%')" : "";
     const fresh = this.db
-      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0${nw}${mentionSql}${owner.sql} ORDER BY time ASC, id ASC LIMIT ?`)
+      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0${nw}${mentionSql}${cliImSql}${owner.sql} ORDER BY time ASC, id ASC LIMIT ?`)
       .all(conv, ...owner.args, maxFresh) as Row[];
     if (!fresh.length) return [];
     if (opts?.onlyMentions) {
@@ -506,7 +508,7 @@ export class ContextStore {
     }
     const t0 = Number(fresh[0].time);
     const before = this.db
-      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 1 AND time <= ?${nw}${owner.sql} ORDER BY time DESC, id DESC LIMIT ?`)
+      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 1 AND time <= ?${nw}${cliImSql}${owner.sql} ORDER BY time DESC, id DESC LIMIT ?`)
       .all(conv, t0, ...owner.args, context) as Row[];
     return [...before.reverse(), ...fresh].map((r) => this.toObs(r));
   }

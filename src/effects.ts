@@ -1,4 +1,4 @@
-import { isWorkBlockedByOwner } from "./api/queries.ts";
+import { isContextDerivedWorkOrTask, isWorkBlockedByOwner } from "./api/queries.ts";
 import type { Board, SectionKey } from "./board.ts";
 import { computePwReplyCid, hasWorkspaceOwnerMismatch, isLiveDaemonHeartbeat } from "./context/personal-web.ts";
 import { deepFind, runProcess } from "./util.ts";
@@ -79,13 +79,19 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
       if (isWorkBlockedByOwner({ cfg, store, ledger }, item)) {
         throw new Error("该派单卡片、失败告警或外部动作源自旧工作区主人的工作上下文，已按主人隔离阻断投递");
       }
-      // 任何以用户态 lark-cli 发布工作上下文派生数据或对外回复的写操作，执行前实时核验活跃 CLI 登录用户与工作区主人一致
+      // 任何以用户态 lark-cli 发布工作上下文派生数据（含上下文委派派单/交付产生的评论、移列、完成）或对外回复的写操作，
+      // 执行前实时核验活跃 CLI 登录用户与工作区主人一致
+      const isContextTaskEffect =
+        (e.op === "task.move" || e.op === "task.comment" || e.op === "task.complete") &&
+        (isContextEffect ||
+          isContextDerivedWorkOrTask({ cfg, store, ledger }, e.args.guid) ||
+          isContextDerivedWorkOrTask({ cfg, store, ledger }, item.ref));
       const needsActiveLarkUserCheck =
         e.op === "doc.create" ||
         e.op === "task.create_own" ||
         e.op === "im.reply" ||
         e.op === "im.send" ||
-        (isContextEffect && (e.op === "task.move" || e.op === "task.comment" || e.op === "task.complete"));
+        isContextTaskEffect;
       if (needsActiveLarkUserCheck) {
         await verifyActiveLarkUser(lark, cfg.owner.open_id, `执行用户态外部动作 (${e.op})`);
       }

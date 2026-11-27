@@ -138,10 +138,12 @@ function loadRevokedSessionIds(store: Store): Set<string> {
 export function revokeWorkspacePersonalWebSession(app: App): { fileRemoved: boolean; credFile: string; fileError?: string } {
   const loginStore = new WebLoginStore(app.cfg.dataDir);
   let existingOnDisk: WebLogin | undefined;
-  try {
-    existingOnDisk = loginStore.load();
-  } catch {
-    existingOnDisk = undefined;
+  if (!loginStore.isExternal) {
+    try {
+      existingOnDisk = loginStore.load();
+    } catch {
+      existingOnDisk = undefined;
+    }
   }
 
   let revokedSet = new Set<string>();
@@ -154,7 +156,11 @@ export function revokeWorkspacePersonalWebSession(app: App): { fileRemoved: bool
       const clean = (sid ?? "").trim();
       if (clean) revokedIds.add(clean);
     };
-    addId(existingOnDisk?.session_id);
+    // 仅对当前工作区私有凭据文件将磁盘现有 session_id 纳入黑名单；
+    // 外部共享 PA_FEISHU_WEB_CRED_FILE 可能归属其他工作区，严禁未经归属核实就将其 session_id 加入本工作区吊销集
+    if (!loginStore.isExternal) {
+      addId(existingOnDisk?.session_id);
+    }
     addId(app.store.get(ACTIVE_SESSION_KV_KEY));
     try {
       const saved = JSON.parse(app.store.get(STATE_KV_KEY) ?? "null") as { session_id?: string } | null;
@@ -214,20 +220,33 @@ export function revokeWorkspacePersonalWebSession(app: App): { fileRemoved: bool
     const res = loginStore.clearIf((curRes, stagedRes) => {
       const workspaceStillRevoked = () =>
         !!(app.store.get(REVOKED_AT_KV_KEY) ?? "").trim() && !(app.store.get(ACTIVE_SESSION_KV_KEY) ?? "").trim();
-      const shouldRemoveEntry = (entry: typeof curRes): boolean => {
+      const shouldRemoveWorkspaceOwnedEntry = (entry: typeof curRes): boolean => {
         if (entry.status === "missing") return false;
         if (entry.status === "ok" && entry.login.session_id) {
-          if (revokedSet.has(entry.login.session_id)) return true;
           const activeNow = (app.store.get(ACTIVE_SESSION_KV_KEY) ?? "").trim();
           // 并发 web-login 刚刚在吊销后提交了新会话：绝不删除该新会话文件
           if (activeNow && activeNow === entry.login.session_id) return false;
+          if (revokedSet.has(entry.login.session_id)) return true;
           return workspaceStillRevoked();
         }
         return workspaceStillRevoked();
       };
+      const shouldRemoveMainFile = (entry: typeof curRes): boolean => {
+        if (entry.status === "missing") return false;
+        if (!loginStore.isExternal) {
+          return shouldRemoveWorkspaceOwnedEntry(entry);
+        }
+        // 共享外部 PA_FEISHU_WEB_CRED_FILE：仅在能够解密且确认其 session_id 明确属于当前工作区（已记录在本工作区吊销集且未被并发重登取代）时才删除；
+        // 其他工作区的活跃凭据或当前进程无法解密验证归属的共享文件一律保留，仅做本工作区 SQLite 局部吊销。
+        if (entry.status !== "ok" || !entry.login.session_id) return false;
+        const activeNow = (app.store.get(ACTIVE_SESSION_KV_KEY) ?? "").trim();
+        if (activeNow && activeNow === entry.login.session_id) return false;
+        return revokedSet.has(entry.login.session_id);
+      };
       return {
-        removeFile: shouldRemoveEntry(curRes),
-        removeStaged: shouldRemoveEntry(stagedRes),
+        removeFile: shouldRemoveMainFile(curRes),
+        // stagedFile 已按工作区 dataDir 哈希隔离（<file>.<wsTag>.staged），仅归属当前工作区
+        removeStaged: shouldRemoveWorkspaceOwnedEntry(stagedRes),
       };
     });
     fileRemoved = res.fileRemoved;

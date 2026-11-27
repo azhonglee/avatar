@@ -185,7 +185,8 @@ export async function fetchWithJar(jar: RecordingCookieJar, opts: HttpRequestOpt
     let viewJar: RecordingCookieJar = jar;
     if (stagedCookies.length > 0) {
       viewJar = jar.clone();
-      for (const s of stagedCookies) viewJar.setFromHeaders(s.url, s.headers, s.nowMs);
+      // 复用快照冲突校验叠算各重定向跳 Set-Cookie，确保在途期间 syncFromRecords() 写入的更新轮换值不被陈旧重定向覆写
+      viewJar.applyStaged(stagedCookies);
     }
     const cookie = viewJar.cookieHeader(currentUrl);
     if (cookie) reqHeaders["Cookie"] = cookie;
@@ -199,7 +200,8 @@ export async function fetchWithJar(jar: RecordingCookieJar, opts: HttpRequestOpt
       if (destCsrf) reqHeaders["x-csrf-token"] = destCsrf;
     }
 
-    const reqSnap = jar.snapshot();
+    // 记录本跳实际发出的 Cookie 视图基准（含同步代际），避免重定向跳以未发送的新轮换值作为基线而误覆盖并发刷新
+    const reqSnap = viewJar.snapshot();
     const res = await singleRequest(currentUrl, method, reqHeaders, body, timeoutMs, maxBytes, opts.signal);
     const rawSetCookie = res.headers["set-cookie"];
     if (rawSetCookie) {

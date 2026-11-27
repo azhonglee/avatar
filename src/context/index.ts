@@ -189,14 +189,16 @@ export class ContextService {
         while (budget > 0 && !signal?.aborted) {
           if (this.isWorkspaceOwnerMismatched() || !this.cfg.context.understand) break;
           // 每轮动态重算启用的来源，防止运行中途关闭文档/妙记开关后后续批次仍选中已停用来源；
-          // 若本轮 lark-cli 用户身份未通过核验，跳过依赖 lark-cli 的 IM/妙记理解，保留本地文档评论处理
+          // 若本轮 lark-cli 用户身份未通过核验，跳过依赖 lark-cli 的妙记与 CLI 轮询 IM 观测，
+          // 但仍保留本地文档评论与已通过独立个人 Web 认证且绑定当前主人的 `pw:*` IM 观测
+          const activeNativeOwner = this.personalWeb.activeBoundNativeOwner();
+          const allowImInCycle = this.cfg.context.sources.im && (!larkAuthBlocked || !!activeNativeOwner);
           const activeSources = [
-            ...(this.cfg.context.sources.im && !larkAuthBlocked ? ["im"] : []),
+            ...(allowImInCycle ? ["im"] : []),
             ...(this.cfg.context.sources.minutes && !larkAuthBlocked ? ["minutes"] : []),
             ...(this.cfg.context.sources.docs ? ["doc"] : []),
           ];
           if (!activeSources.length) break;
-          const activeNativeOwner = this.personalWeb.activeBoundNativeOwner();
           // 在解析原生排除快照与筛选候选之前捕获策略签名，确保筛选过程一旦发生静音/白名单/开关变化就重启筛选而非带着旧快照送模型
           const selectionPolicySig = this.personalWeb.policySignature();
           const nativeExclSnapshot = await this.personalWeb.resolveNativeExclusionsForPolling();
@@ -231,6 +233,7 @@ export class ContextService {
               const page = this.store.pendingConvs(Math.max(targetCount * 2, 16), activeSources, {
                 excludeConvs: scanned,
                 activeNativeOwner,
+                excludeCliIm: larkAuthBlocked,
               });
               if (!page.length) break;
               for (const c of page) {
@@ -245,7 +248,7 @@ export class ContextService {
                 const onlyMentions = this.personalWeb.isConvMentionsOnly(c.conv, nativeExclSnapshot);
                 const scopedPreview = this.personalWeb.filterWindowByCurrentScope(
                   c.conv,
-                  this.store.convWindow(c.conv, 60, 12, activeNativeOwner, { onlyMentions }),
+                  this.store.convWindow(c.conv, 60, 12, activeNativeOwner, { onlyMentions, excludeCliIm: larkAuthBlocked }),
                   nativeExclSnapshot,
                 );
                 if (!scopedPreview.some((o) => this.store.obsPending(o.id))) {
@@ -313,8 +316,14 @@ export class ContextService {
                     return disallowed;
                   };
                   return this.understander.runBatch(workId, g, batchAbort.signal, activeNativeOwner, validateBeforeApply, {
-                    filterObs: (conv, win) => this.personalWeb.filterWindowByCurrentScope(conv, win, nativeExclSnapshot),
+                    filterObs: (conv, win) => {
+                      const noCliIm = larkAuthBlocked
+                        ? win.filter((o) => !(o.source === "im" && !o.id.startsWith("pw:")))
+                        : win;
+                      return this.personalWeb.filterWindowByCurrentScope(conv, noCliIm, nativeExclSnapshot);
+                    },
                     isMentionsOnly: (conv) => this.personalWeb.isConvMentionsOnly(conv, nativeExclSnapshot),
+                    excludeCliIm: larkAuthBlocked,
                     claimCheck: { convs: g.map((x) => x.conv), holder: claimToken, procOwner },
                     commitGuard: () =>
                       !this.isWorkspaceOwnerMismatched() &&
@@ -578,6 +587,30 @@ export class ContextService {
         },
       );
       if (signal?.aborted) throw new Error("aborted");
+      // 若本批推理结果因背景消息被编辑、策略瞬时漂移或丢租约被整体丢弃，且触发消息本身仍待处理并符合快通道资格，
+      // 则延迟重排该快通道作业而非直接标为 done，避免触发 @我 错失自动预起草而退化到定时轮询
+      if (r.discarded || (r.fresh === 0 && this.store.obsPending(selectedAfter.targetObsId))) {
+        if (!isFastSwitchEnabled()) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+        const postNativeOwner = this.personalWeb.activeBoundNativeOwner();
+        const stillEligible = this.selectEligibleFastTriggers(p.conv, rawAnchors, p.trigger_obs_id, postNativeOwner);
+        if (!stillEligible) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+        const postExcl = await this.personalWeb.resolveNativeExclusionsForPolling();
+        if (signal?.aborted) throw new Error("aborted");
+        const eligPost = await this.personalWeb.checkConvAllowedForUnderstand(p.conv, p.conv_name, postExcl);
+        if (signal?.aborted) throw new Error("aborted");
+        if (eligPost === "excluded") return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+        if (eligPost === "uncertain") return { busy: true, deferMs: 5_000, fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+        const postOnlyMentions = this.personalWeb.isConvMentionsOnly(p.conv, postExcl);
+        const postWindow = this.personalWeb.filterWindowByCurrentScope(
+          p.conv,
+          this.store.convWindowAround(p.conv, stillEligible.targetObsId, 60, 12, postNativeOwner, { onlyMentions: postOnlyMentions }),
+          postExcl,
+        );
+        if (postWindow.some((o) => this.store.obsPending(o.id))) {
+          return { busy: true, deferMs: 2_000, fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+        }
+        return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+      }
       relinkMeegoItems(this.store);
       this.store.mergeConflicts();
       this.markNotImportant();

@@ -7,7 +7,14 @@ import { repoSpec, type Config } from "../config.ts";
 import { tryGit } from "../delivery/git.ts";
 import { comment, move } from "../effects.ts";
 import { checkpoint, type Ctx, type Handler } from "../engine.ts";
-import { buildWorkspaceIsolation, loadPrompt, prepareHarnessEnv, runHarness, wrapCredentialIsolatedCommand } from "../harness.ts";
+import {
+  buildWorkspaceIsolation,
+  isolatedSandboxTempEnv,
+  loadPrompt,
+  prepareHarnessEnv,
+  runHarness,
+  wrapCredentialIsolatedCommand,
+} from "../harness.ts";
 import type { Effect, Ledger, WorkItem } from "../ledger.ts";
 import type { Store } from "../store.ts";
 import { errMsg, log, render, runProcess, truncate } from "../util.ts";
@@ -520,7 +527,7 @@ export class Dispatcher {
         }),
       );
       const verifyEnv: NodeJS.ProcessEnv = wrapped.isolated
-        ? { ...baseEnv.env, XDG_RUNTIME_DIR: "/tmp/.pa-run" }
+        ? { ...baseEnv.env, ...isolatedSandboxTempEnv() }
         : baseEnv.env;
       const r = await runProcess(wrapped.cmd, wrapped.args, {
         cwd: p.cwd,

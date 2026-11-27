@@ -438,9 +438,14 @@ async function targetRevHasLfsAttr(cwd: string, targetRev: string, roOpts: GitRu
   let attrExtraRo: string[] = [];
 
   try {
-    const probe = await tryGit(cwd, checkAttrArgs, { ...roOpts, input: "" });
+    // 强制在 C locale 下探测 --source 支持情况，避免在 zh_CN 等本地化环境下被翻译为“未知选项”而误判失败
+    const probe = await tryGit(cwd, checkAttrArgs, {
+      ...roOpts,
+      input: "",
+      extraEnv: { ...(roOpts.extraEnv ?? {}), LC_ALL: "C", LC_MESSAGES: "C", LANG: "C", LANGUAGE: "C" },
+    });
     if (probe.code !== 0) {
-      if (/unknown option.*source/i.test(`${probe.stderr}\n${probe.stdout}`)) {
+      if (probe.code === 129 && /unknown option.*source/i.test(`${probe.stderr}\n${probe.stdout}`)) {
         attrTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-git-attr-"));
         const pinnedIndex = path.join(attrTmpDir, "index");
         const rt = await tryGit(cwd, ["read-tree", targetRev], {
@@ -520,9 +525,15 @@ async function targetRevHasLfsAttr(cwd: string, targetRev: string, roOpts: GitRu
             if (stoppedEarly || caChild.stdin.destroyed) break;
             if (!caChild.stdin.write(chunk)) {
               await new Promise<void>((resolve) => {
-                caChild.stdin.once("drain", resolve);
-                caChild.stdin.once("close", resolve);
-                caChild.stdin.once("error", resolve);
+                const onDone = () => {
+                  caChild.stdin.off("drain", onDone);
+                  caChild.stdin.off("close", onDone);
+                  caChild.stdin.off("error", onDone);
+                  resolve();
+                };
+                caChild.stdin.once("drain", onDone);
+                caChild.stdin.once("close", onDone);
+                caChild.stdin.once("error", onDone);
               });
             }
           }

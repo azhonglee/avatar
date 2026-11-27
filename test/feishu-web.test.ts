@@ -103,7 +103,7 @@ import {
   tryGit,
 } from "../src/delivery/git.ts";
 import { runDoctor } from "../src/doctor.ts";
-import { card as cardEffect, effectHandler } from "../src/effects.ts";
+import { card as cardEffect, comment as commentEffect, effectHandler, move as moveEffect } from "../src/effects.ts";
 import {
   buildWorkspaceIsolation,
   detectGitWorktreeDirs,
@@ -111,9 +111,12 @@ import {
   extractSafeCodexProviderArgs,
   extractSafeCodexProviderConfig,
   hasCredentialMountIsolation,
+  isolatedSandboxTempEnv,
   mergeHarnessEnv,
   prepareHarnessEnv,
   runHarness,
+  stageIsolatedCodexHome,
+  syncRefreshedCodexAuth,
   workspaceRequiresIsolation,
   wrapCredentialIsolatedCommand,
   type HarnessRun,
@@ -7555,6 +7558,8 @@ test("Codex 第十轮回归：服务文件凭据隔离、失败卡片/委派落�
       next_step: "内部机密改造",
       source: "im",
     });
+    app.store.set("board.owner_open_id", "ou_owner_a");
+    fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner_a" }));
     app.board.createTask = async () => "guid_r10_reconcile_fail";
     app.board.listSection = async () => {
       throw new Error("simulated board read failure during reconcile");
@@ -8356,8 +8361,10 @@ test("Codex 第十一轮回归：PID+挂载隔离、草稿终检防重插、晨�
 
     // 6) [R11 P1] Board.createTask 必须在 move() 之前通过 onCreated 持久化 GUID 归属
     app.store.set("board.tasklist", "tl_r11");
+    app.store.set("board.owner_open_id", "ou_owner_a");
     app.store.set("board.section.dispatch", "sec_dispatch_r11");
     app.store.set("board.section.running", "sec_running_r11");
+    fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner_a" }));
     const origLarkRun = app.lark.run.bind(app.lark);
     app.lark.run = async (argv, opts) => {
       if (argv[0] === "task" && argv[1] === "+create") return { task: { guid: "guid_r11_move_timeout" } };
@@ -9499,23 +9506,36 @@ test("Codex 第十三轮回归：dataDir 祖先重遮蔽、worktree .git 防篡�
         `! touch ${JSON.stringify(path.join(spaceRoDir, "tamper.txt"))} 2>/dev/null`,
       ].join(" && ");
 
-      const bwrapCmd = wrapCredentialIsolatedCommand("sh", ["-c", checkScript], {}, {
-        requireIsolation: true,
-        dataDir,
-        cwd: wtDir,
-        writablePaths: [parentDir, wtDir, spaceRwDir],
-        readOnlyPaths: [spaceRoDir],
-        forceBackend: { kind: "bwrap", bin: "bwrap" },
-      });
-      const rBwrap = await runProcess(bwrapCmd.cmd, bwrapCmd.args, { timeoutMs: 15_000 });
-      assert.equal(rBwrap.code, 0, `bwrap 在祖先目录可写挂载下仍必须遮蔽 dataDir 且放行 worktree：${rBwrap.stderr}`);
-      assert.equal(fs.readFileSync(path.join(wtDir, "child.txt"), "utf8").trim(), "child-wt");
-      assert.equal(fs.readFileSync(path.join(spaceRwDir, "space-out.txt"), "utf8").trim(), "child-space");
-      assert.equal(fs.existsSync(path.join(spaceRoDir, "tamper.txt")), false);
+      const probeBwrap = await runProcess(
+        "bwrap",
+        ["--ro-bind", "/", "/", "--dev", "/dev", "--unshare-pid", "--proc", "/proc", "--", "true"],
+        { timeoutMs: 5_000 },
+      );
+      if (probeBwrap.code === 0) {
+        const bwrapCmd = wrapCredentialIsolatedCommand("sh", ["-c", checkScript], {}, {
+          requireIsolation: true,
+          dataDir,
+          cwd: wtDir,
+          writablePaths: [parentDir, wtDir, spaceRwDir],
+          readOnlyPaths: [spaceRoDir],
+          forceBackend: { kind: "bwrap", bin: "bwrap" },
+        });
+        const rBwrap = await runProcess(bwrapCmd.cmd, bwrapCmd.args, { timeoutMs: 15_000 });
+        assert.equal(rBwrap.code, 0, `bwrap 在祖先目录可写挂载下仍必须遮蔽 dataDir 且放行 worktree：${rBwrap.stderr}`);
+        assert.equal(fs.readFileSync(path.join(wtDir, "child.txt"), "utf8").trim(), "child-wt");
+        assert.equal(fs.readFileSync(path.join(spaceRwDir, "space-out.txt"), "utf8").trim(), "child-space");
+        assert.equal(fs.existsSync(path.join(spaceRoDir, "tamper.txt")), false);
+      }
 
-      const probeSetpriv = await runProcess("which", ["setpriv"], { timeoutMs: 5_000 });
       const pivotBin = ["/sbin/pivot_root", "/usr/sbin/pivot_root"].find((p) => fs.existsSync(p));
-      if (probeSetpriv.code === 0 && pivotBin) {
+      const probeUnshare = pivotBin
+        ? await runProcess(
+            "unshare",
+            ["--user", "--map-root-user", "--mount", "--pid", "--fork", "--mount-proc", "setpriv", "--bounding-set", "-all", "--inh-caps", "-all", "--ambient-caps", "-all", "--no-new-privs", "true"],
+            { timeoutMs: 5_000 },
+          )
+        : { code: 1, stdout: "", stderr: "", timedOut: false };
+      if (probeUnshare.code === 0 && pivotBin) {
         const unshareCmd = wrapCredentialIsolatedCommand("sh", ["-c", checkScript], {}, {
           requireIsolation: true,
           dataDir,
@@ -9526,6 +9546,9 @@ test("Codex 第十三轮回归：dataDir 祖先重遮蔽、worktree .git 防篡�
         });
         const rUnshare = await runProcess(unshareCmd.cmd, unshareCmd.args, { timeoutMs: 15_000 });
         assert.equal(rUnshare.code, 0, `unshare 在祖先挂载与含空格路径下必须遮蔽 dataDir 并强制只读复查：${rUnshare.stderr}`);
+        assert.equal(fs.readFileSync(path.join(wtDir, "child.txt"), "utf8").trim(), "child-wt");
+        assert.equal(fs.readFileSync(path.join(spaceRwDir, "space-out.txt"), "utf8").trim(), "child-space");
+        assert.equal(fs.existsSync(path.join(spaceRoDir, "tamper.txt")), false);
       }
 
       // [R13 #4 P1] 模拟宿主机 ~/.codex / ~/.claude / ~/.acpx / ~/.doubao：buildWorkspaceIsolation 绝不将其加入 writablePaths
@@ -12045,23 +12068,25 @@ data_dir: ${dataDir}
         });
         assert.equal(fs.existsSync(storeA.stagedFile), true);
 
-        // 验证沙箱隔离命令会遮罩工作区 A 的工作区级外部暂存文件（显式挂载父目录模拟位于 /tmp 之外的共享目录）
+        // 验证沙箱隔离命令会遮罩工作区 A 的工作区级外部暂存文件（纯参数规划测试，显式指定 forceBackend 脱离宿主机命名空间可用性）
         const isoWrap = wrapCredentialIsolatedCommand(
           "true",
           [],
           { ...process.env, PA_FEISHU_WEB_CRED_FILE: sharedCredFile },
-          buildWorkspaceIsolation({ dataDir: wsDirB, context: { personal_web: { enabled: true } } } as never, {
-            mode: "worker-ro",
-            cwd: wsDirB,
-            extraReadOnlyPaths: [dir],
-          }),
+          {
+            ...buildWorkspaceIsolation({ dataDir: wsDirB, context: { personal_web: { enabled: true } } } as never, {
+              mode: "worker-ro",
+              cwd: wsDirB,
+              extraReadOnlyPaths: [dir],
+            }),
+            forceBackend: { kind: "bwrap", bin: "bwrap" },
+          },
         );
-        if (isoWrap.isolated) {
-          assert.ok(
-            isoWrap.args.includes(fs.realpathSync(storeA.stagedFile)),
-            "沙箱必须同样遮罩共享外部凭据路径下按工作区命名的 *.staged 文件",
-          );
-        }
+        assert.equal(isoWrap.isolated, true);
+        assert.ok(
+          isoWrap.args.includes(fs.realpathSync(storeA.stagedFile)),
+          "沙箱必须同样遮罩共享外部凭据路径下按工作区命名的 *.staged 文件",
+        );
 
         // 工作区 B 无 pending marker 启动协调：绝不能删除工作区 A 的暂存文件
         storeB.reconcilePendingCommit(mkKv(kvB), PENDING_CRED_COMMIT_KV_KEY);
@@ -12207,6 +12232,875 @@ data_dir: ${dataDir}
     else process.env.CODEX_HOME = prevCodexHome;
     app?.store.db.close();
     await mock.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex 第十六轮回归：委派创建与派单副作用实时验号、Git属性探测跨locale、隔离npm缓存与verify临时目录、共享外部凭据登出归属边界、CLI失效保留pw消息、API Key免keyring与file态OAuth刷新安全回写、重定向并发Cookie冲突校验、快通道丢弃后重排与管道监听清理", async () => {
+  const dir = makeTmp("pa-feishu-r16-");
+  const ctxDir = path.join(dir, "ctx");
+  fs.mkdirSync(ctxDir, { recursive: true });
+  const prevKey = process.env.PA_FEISHU_WEB_KEY;
+  const prevCredFile = process.env.PA_FEISHU_WEB_CRED_FILE;
+  const prevCredDir = process.env.CREDENTIALS_DIRECTORY;
+  const prevCtxDir = process.env.CTX_DIR;
+  const prevCodexHome = process.env.CODEX_HOME;
+  const prevLcAll = process.env.LC_ALL;
+  const prevLang = process.env.LANG;
+  const prevLanguage = process.env.LANGUAGE;
+  process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
+  delete process.env.PA_FEISHU_WEB_CRED_FILE;
+  delete process.env.CREDENTIALS_DIRECTORY;
+  process.env.CTX_DIR = ctxDir;
+
+  let app: ReturnType<typeof createApp> | undefined;
+  let extraAppA: ReturnType<typeof createApp> | undefined;
+  let extraAppB: ReturnType<typeof createApp> | undefined;
+  let redirectSrv: http.Server | undefined;
+
+  try {
+    const cfgFile = path.join(dir, "config.yaml");
+    fs.writeFileSync(
+      cfgFile,
+      JSON.stringify({
+        data_dir: path.join(dir, "data"),
+        bins: { lark: path.join(STUBS, "ctx-lark"), acpx: path.join(STUBS, "acpx"), bytedcli: path.join(STUBS, "ctx-bytedcli") },
+        harnesses: {
+          claude: { agent: "claude" },
+          codex: { type: "codex-exec", cmd: path.join(STUBS, "ctx-codex") },
+        },
+        roles: { brain: "codex" },
+        owner: { open_id: "ou_owner_a" },
+        cards: { enabled: false },
+        engine: { retry_base_ms: 20, retry_max_ms: 50, tick_ms: 50, effect_attempts: 1 },
+        context: {
+          enabled: true,
+          harness: "codex",
+          groups: "allowlist",
+          groups_allow: ["pw_chat:9001"],
+          groups_deny: [],
+          sources: { im: true, minutes: false, docs: false, tasks: false, calendar: false, meego: false },
+          personal_web: { enabled: true, fast_lane: true, debounce_ms: 0, pre_draft: true, send_replies: true },
+        },
+      }),
+    );
+    app = createApp(loadConfig(cfgFile));
+    const svc = new ContextService(app);
+    installCtxDirStubLlm(svc, ctxDir);
+    const baseCookies = [{ name: "session", value: "r16_sess", domain: "internal-api-lark-api.feishu.cn", path: "/" }];
+    commitWorkspaceLogin(
+      app,
+      { owner_id: "7001", owner_name: "主人A", session_id: "sess_r16_a", cookies: baseCookies },
+      { allowUnverifiedOwner: true },
+    );
+
+    // 1) [R16 #1 P1] context.item_delegate -> dispatch.create 在远端 board.createTask 前校验看板归属与实时活跃 lark-cli 登录用户
+    {
+      app.store.set("board.tasklist", "tl_r16");
+      app.store.set("board.section.dispatch", "sec_dispatch_r16");
+      app.store.set("board.section.running", "sec_running_r16");
+      const { item: delItem } = svc.store.upsertItem({
+        title: "绝密架构方案委派",
+        kind: "todo",
+        project_id: "",
+        status: "open",
+        priority: "high",
+        next_step: "内部机密改造",
+        source: "im",
+      });
+      let remoteCreateCalls = 0;
+      const origCreateTask = app.board.createTask.bind(app.board);
+      const origReconcile = app.dispatcher.reconcile.bind(app.dispatcher);
+      app.board.createTask = async (t) => {
+        remoteCreateCalls++;
+        t.onCreated?.("guid_r16_ok");
+        return "guid_r16_ok";
+      };
+      app.dispatcher.reconcile = async () => ({ enqueued: 0, cancelled: 0, deferred: 0 });
+      try {
+        // 1a) 看板归属为主人 B：远端 createTask 绝不可被调用
+        app.store.set("board.owner_open_id", "ou_owner_b");
+        fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner_a" }));
+        await assert.rejects(
+          () => app!.commands.exec("context.item_delegate", { id: delItem.id }, { source: "web", actor: "owner" }),
+          /看板归属账号.*不一致/,
+        );
+        assert.equal(remoteCreateCalls, 0, "看板归属不一致时绝不能调用远端 board.createTask");
+
+        // 1b) 看板归属为主人 A，但活跃 lark-cli 已切换为主人 B：远端 createTask 绝不可被调用
+        app.store.set("board.owner_open_id", "ou_owner_a");
+        fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner_b" }));
+        await assert.rejects(
+          () => app!.commands.exec("context.item_delegate", { id: delItem.id }, { source: "web", actor: "owner" }),
+          /lark-cli 登录用户.*不一致/,
+        );
+        assert.equal(remoteCreateCalls, 0, "lark-cli 已切换为主人 B 时绝不能调用远端 board.createTask");
+
+        // 1c) 看板归属与活跃 lark-cli 均为 A：顺利创建
+        fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner_a" }));
+        const okDel = await app.commands.exec("context.item_delegate", { id: delItem.id }, { source: "web", actor: "owner" });
+        assert.equal(okDel.ok, true);
+        assert.equal(remoteCreateCalls, 1);
+      } finally {
+        app.board.createTask = origCreateTask;
+        app.dispatcher.reconcile = origReconcile;
+      }
+    }
+
+    // 2) [R16 #2 P1] 上下文委派派单 / 交付工作产生的 task.comment / task.move 副作用，执行前必须核验活跃 lark-cli 登录用户
+    {
+      const delegatedGuid = "guid_r16_delegated_fx";
+      const dispatchWorkId = `dispatch:${delegatedGuid}:1`;
+      app.store.set(`ctx.dispatch_ref_owner.${delegatedGuid}`, "ou_owner_a");
+      app.store.set(`ctx.dispatch_owner.${dispatchWorkId}`, "ou_owner_a");
+
+      let commentCalls = 0;
+      let moveCalls = 0;
+      const origComment = app.board.comment.bind(app.board);
+      const origMove = app.board.move.bind(app.board);
+      app.board.comment = async () => {
+        commentCalls++;
+      };
+      app.board.move = async () => {
+        moveCalls++;
+      };
+      const fxHandler = effectHandler(app.cfg, app.ledger, app.board, app.lark, app.store);
+      try {
+        // lark-cli 切换为主人 B：无论是 dispatch:* 还是 delivery:dispatch:* 父级，task.comment 与 task.move 均被阻断
+        fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner_b" }));
+        app.ledger.emit(dispatchWorkId, [commentEffect(delegatedGuid, "worker 报告")], "r16-fx-c1");
+        app.ledger.emit(`delivery:${dispatchWorkId}:create_pr`, [moveEffect(delegatedGuid, "review")], "r16-fx-m1");
+        const claimed = [
+          app.ledger.claim<import("../src/ledger.ts").Effect>("effect", 60_000),
+          app.ledger.claim<import("../src/ledger.ts").Effect>("effect", 60_000),
+        ].filter((x): x is NonNullable<typeof x> => !!x);
+        const fxComment = claimed.find((x) => x.ref === dispatchWorkId)!;
+        const fxMove = claimed.find((x) => x.ref === `delivery:${dispatchWorkId}:create_pr`)!;
+        assert.ok(fxComment && fxMove);
+        await assert.rejects(
+          () => fxHandler.run(fxComment, { attempt: 1, signal: new AbortController().signal }),
+          /lark-cli 登录用户.*不一致/,
+        );
+        await assert.rejects(
+          () => fxHandler.run(fxMove, { attempt: 1, signal: new AbortController().signal }),
+          /lark-cli 登录用户.*不一致/,
+        );
+        assert.equal(commentCalls, 0, "CLI 切号后绝不能对委派任务发表评论");
+        assert.equal(moveCalls, 0, "CLI 切号后绝不能移动委派任务");
+
+        // 切回主人 A 后同一副作用正常投递
+        fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner_a" }));
+        await fxHandler.run(fxComment, { attempt: 1, signal: new AbortController().signal });
+        await fxHandler.run(fxMove, { attempt: 1, signal: new AbortController().signal });
+        assert.equal(commentCalls, 1);
+        assert.equal(moveCalls, 1);
+      } finally {
+        app.board.comment = origComment;
+        app.board.move = origMove;
+      }
+    }
+
+    // 3) [R16 #3 P1 + #13 P3] Git 属性探测跨 locale（LC_ALL=zh_CN.UTF-8）正常工作；大树管道背压不累积监听（无 MaxListenersExceededWarning）
+    {
+      const repoPlain = path.join(dir, "repo-locale-plain");
+      const barePlain = path.join(dir, "bare-locale-plain.git");
+      fs.mkdirSync(repoPlain, { recursive: true });
+      fs.mkdirSync(barePlain, { recursive: true });
+      await tryGit(barePlain, ["init", "--bare", "-q"]);
+      await tryGit(repoPlain, ["init", "-q"]);
+      await tryGit(repoPlain, ["config", "user.name", "Test"]);
+      await tryGit(repoPlain, ["config", "user.email", "test@example.com"]);
+      await tryGit(repoPlain, ["remote", "add", "origin", barePlain]);
+      fs.writeFileSync(path.join(repoPlain, "hello.txt"), "hello\n");
+      // 制造 1400 个较长路径文件以在 ls-tree -> check-attr 管道中触发多次背压 drain，验证无 MaxListenersExceededWarning
+      const deepBase = path.join(repoPlain, "assets", "deeply_nested_directory_for_backpressure_test_0123456789");
+      fs.mkdirSync(deepBase, { recursive: true });
+      for (let i = 0; i < 1400; i++) {
+        fs.writeFileSync(
+          path.join(deepBase, `file_entry_${String(i).padStart(4, "0")}_padding_name_to_exceed_pipe_buffer.txt`),
+          "x",
+        );
+      }
+      await tryGit(repoPlain, ["add", "."]);
+      await tryGit(repoPlain, ["commit", "-qm", "init many files"]);
+      const curBr = (await tryGit(repoPlain, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
+
+      const warnings: Error[] = [];
+      const onWarn = (w: Error) => warnings.push(w);
+      process.on("warning", onWarn);
+      process.env.LC_ALL = "zh_CN.UTF-8";
+      process.env.LANG = "zh_CN.UTF-8";
+      process.env.LANGUAGE = "zh_CN:zh";
+      try {
+        const usesLfs = await branchUsesGitLfs(repoPlain, curBr);
+        assert.equal(usesLfs, false, "在 LC_ALL=zh_CN.UTF-8 下非 LFS 仓库必须正常完成属性探测并返回 false");
+        const pushed = await pushBranch(repoPlain, "origin", curBr);
+        assert.equal(pushed.ok, true, `LC_ALL=zh_CN.UTF-8 下 pushBranch 必须成功：${pushed.ok ? "" : pushed.message}`);
+      } finally {
+        process.off("warning", onWarn);
+        if (prevLcAll === undefined) delete process.env.LC_ALL;
+        else process.env.LC_ALL = prevLcAll;
+        if (prevLang === undefined) delete process.env.LANG;
+        else process.env.LANG = prevLang;
+        if (prevLanguage === undefined) delete process.env.LANGUAGE;
+        else process.env.LANGUAGE = prevLanguage;
+      }
+      assert.equal(
+        warnings.some((w) => w.name === "MaxListenersExceededWarning"),
+        false,
+        "大树管道背压后必须移除未触发监听器，绝不产生 MaxListenersExceededWarning",
+      );
+    }
+
+    // 4) [R16 #4 P1 + #11 P2] 隔离 acpx 提供可写 npm 缓存，隔离 runVerifyCommand 提供私有可写 /tmp 与缓存环境变量
+    {
+      const tmpEnv = isolatedSandboxTempEnv();
+      assert.equal(tmpEnv.TMPDIR, "/tmp");
+      assert.equal(tmpEnv.XDG_CACHE_HOME, "/tmp/.pa-cache");
+      assert.equal(tmpEnv.XDG_STATE_HOME, "/tmp/.pa-state");
+      assert.equal(tmpEnv.XDG_RUNTIME_DIR, "/tmp/.pa-run");
+      assert.equal(tmpEnv.npm_config_cache, "/tmp/.pa-npm-cache");
+      assert.equal(tmpEnv.NPM_CONFIG_CACHE, "/tmp/.pa-npm-cache");
+
+      if (hasCredentialMountIsolation()) {
+        const fakeAcpx = path.join(dir, "stub-acpx-env.sh");
+        fs.writeFileSync(
+          fakeAcpx,
+          [
+            "#!/bin/sh",
+            "set -e",
+            'test "$npm_config_cache" = "/tmp/.pa-npm-cache"',
+            'test "$NPM_CONFIG_CACHE" = "/tmp/.pa-npm-cache"',
+            'test "$TMPDIR" = "/tmp"',
+            'mkdir -p "$npm_config_cache/_npx" && touch "$npm_config_cache/_npx/probe.ok"',
+            'echo "ACPX_NPM_CACHE_OK"',
+          ].join("\n"),
+          { mode: 0o755 },
+        );
+        const origAcpxBin = app.cfg.bins.acpx;
+        app.cfg.bins.acpx = fakeAcpx;
+        try {
+          const acpxRes = await runHarness(app.cfg, {
+            harness: "claude",
+            prompt: "hi",
+            cwd: path.join(dir, "acpx-cwd"),
+            tools: "read",
+            lark: "none",
+            timeoutSec: 15,
+            logFile: path.join(dir, "acpx-r16.log"),
+          });
+          assert.equal(acpxRes.ok, true, `隔离 acpx 必须可写入私有的 npm_config_cache：${acpxRes.text}`);
+          assert.equal(acpxRes.text, "ACPX_NPM_CACHE_OK");
+        } finally {
+          app.cfg.bins.acpx = origAcpxBin;
+        }
+
+        // [R16 #11 P2] 即使宿主机 TMPDIR 指向只读目录，隔离 runVerifyCommand 也必须切到私有 /tmp 使 mktemp 成功
+        const roTmpHost = path.join(dir, "ro-host-tmp");
+        fs.mkdirSync(roTmpHost, { recursive: true });
+        const prevTmpdir = process.env.TMPDIR;
+        process.env.TMPDIR = roTmpHost;
+        const wtDir = path.join(app.cfg.dataDir, "worktrees", "r16-verify-wt");
+        fs.mkdirSync(wtDir, { recursive: true });
+        fs.mkdirSync(path.join(app.cfg.dataDir, "runs", "r16_veri"), { recursive: true });
+        try {
+          const verifyWork = {
+            id: "dispatch:r16_verify:1",
+            kind: "dispatch",
+            ref: "r16_verify",
+            state: "running",
+            terminal: false,
+            attempts: 1,
+            created: Date.now(),
+            updated: Date.now(),
+            lease_until: Date.now() + 60_000,
+            cancel: false,
+            reason: "",
+            error: "",
+            payload: {
+              guid: "r16_verify",
+              summary: "verify tmpdir",
+              description: "",
+              harness: "claude",
+              reviewer: "",
+              cwd: wtDir,
+              base: "",
+              branch: "",
+              verify:
+                'test "$TMPDIR" = "/tmp" && test "$XDG_CACHE_HOME" = "/tmp/.pa-cache" && test "$XDG_STATE_HOME" = "/tmp/.pa-state" && test "$XDG_RUNTIME_DIR" = "/tmp/.pa-run" && test "$npm_config_cache" = "/tmp/.pa-npm-cache" && f=$(mktemp) && echo ok > "$f" && rm -f "$f"',
+              round: 1,
+              maxRounds: 1,
+              report: "",
+              history: [],
+            },
+          };
+          const disp = app.dispatcher;
+          const vRes = await (
+            disp as unknown as {
+              runVerifyCommand(it: typeof verifyWork, ctx: { attempt: number; signal: AbortSignal }): Promise<{ status: string; detail: string }>;
+            }
+          ).runVerifyCommand(verifyWork, { attempt: 1, signal: new AbortController().signal });
+          assert.equal(vRes.status, "pass", `隔离 verify 必须使用可写私有 /tmp 与缓存目录：${vRes.detail}`);
+        } finally {
+          if (prevTmpdir === undefined) delete process.env.TMPDIR;
+          else process.env.TMPDIR = prevTmpdir;
+        }
+      }
+    }
+
+    // 5) [R16 #5 P2] 共享外部 PA_FEISHU_WEB_CRED_FILE：A 从未登录（或无法解密）时登出 A 绝不能删除 B 的活跃凭据，仅 B 登出才删自己的共享凭据
+    {
+      const sharedCred = path.join(dir, "shared-logout-cred.json");
+      const cfgA = path.join(dir, "cfg-a.json");
+      const cfgB = path.join(dir, "cfg-b.json");
+      fs.writeFileSync(
+        cfgA,
+        JSON.stringify({
+          data_dir: path.join(dir, "ws-logout-a"),
+          harnesses: { codex: { type: "codex-exec", cmd: path.join(STUBS, "ctx-codex") } },
+          roles: { brain: "codex" },
+          owner: { open_id: "ou_owner_a" },
+          context: { enabled: true, personal_web: { enabled: true } },
+        }),
+      );
+      fs.writeFileSync(
+        cfgB,
+        JSON.stringify({
+          data_dir: path.join(dir, "ws-logout-b"),
+          harnesses: { codex: { type: "codex-exec", cmd: path.join(STUBS, "ctx-codex") } },
+          roles: { brain: "codex" },
+          owner: { open_id: "ou_owner_b" },
+          context: { enabled: true, personal_web: { enabled: true } },
+        }),
+      );
+      process.env.PA_FEISHU_WEB_CRED_FILE = sharedCred;
+      try {
+        extraAppA = createApp(loadConfig(cfgA));
+        extraAppB = createApp(loadConfig(cfgB));
+        commitWorkspaceLogin(
+          extraAppB,
+          { owner_id: "8002", owner_name: "工作区B", session_id: "sess_shared_b", cookies: baseCookies },
+          { allowUnverifiedOwner: true },
+        );
+        assert.equal(fs.existsSync(sharedCred), true);
+
+        // 工作区 A 从未登录，执行登出：仅在 A 自身 SQLite 标记吊销，不得将 sess_shared_b 收入黑名单，更不得删 B 的共享文件
+        const resA = revokeWorkspacePersonalWebSession(extraAppA);
+        assert.equal(resA.fileRemoved, false, "A 从未持有该共享文件会话，登出 A 绝不能删除 B 的凭据文件");
+        assert.equal(fs.existsSync(sharedCred), true);
+        assert.equal(
+          JSON.parse(extraAppA.store.get(REVOKED_SESSIONS_KV_KEY) ?? "[]").includes("sess_shared_b"),
+          false,
+          "A 绝不能未经归属校验就把 B 的 session_id 写入 A 的吊销集",
+        );
+        assert.equal(new WebLoginStore(extraAppB.cfg.dataDir).load()?.session_id, "sess_shared_b");
+
+        // 即使 A 在无密钥（无法解密共享文件）状态下再次登出，同样不得删除 B 的共享文件
+        delete process.env.PA_FEISHU_WEB_KEY;
+        try {
+          const resANoKey = revokeWorkspacePersonalWebSession(extraAppA);
+          assert.equal(resANoKey.fileRemoved, false, "无法解密外部共享凭据时绝不能误删他人文件");
+          assert.equal(fs.existsSync(sharedCred), true);
+        } finally {
+          process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
+        }
+
+        // B 自身登出（持有 sess_shared_b 归属）：正常删除属于 B 的共享凭据文件
+        const resB = revokeWorkspacePersonalWebSession(extraAppB);
+        assert.equal(resB.fileRemoved, true, "B 登出自己持有的共享凭据会话应正常删除文件");
+        assert.equal(fs.existsSync(sharedCred), false);
+      } finally {
+        delete process.env.PA_FEISHU_WEB_CRED_FILE;
+      }
+    }
+
+    // 6) [R16 #6 P2] lark-cli 认证失败/切号时，周期 cycle 过滤 CLI im:* 观测，但仍保留已绑定的独立个人 Web pw:* 观测
+    {
+      const now = Date.now();
+      svc.store.addObs([
+        {
+          id: "im:cli_blocked_msg_1",
+          source: "im",
+          kind: "msg",
+          conv: "oc_cli_blocked_chat",
+          conv_name: "CLI 轮询群",
+          actor_id: "ou_other",
+          actor_name: "同事甲",
+          is_me: false,
+          time: now - 30_000,
+          text: "请今天确认 CLI 群发布方案",
+          url: "",
+          meta: { chat_type: "group" },
+        },
+        {
+          id: "pw:native_allowed_msg_1",
+          source: "im",
+          kind: "msg",
+          conv: "pw_chat:9001",
+          conv_name: "原生白名单群",
+          actor_id: "9002",
+          actor_name: "同事乙",
+          is_me: false,
+          time: now - 20_000,
+          text: "请今天确认原生 Web 群接口文档",
+          url: "",
+          meta: { chat_type: "group", native_owner_id: "7001" },
+        },
+      ]);
+      // 模拟 lark-cli 登录用户切换为主人 B（导致 pullIm 报 lark-cli 账号不匹配 -> larkAuthBlocked = true）
+      fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner_b" }));
+      fs.writeFileSync(
+        path.join(ctxDir, "llm.json"),
+        JSON.stringify({
+          projects: [],
+          items: [
+            {
+              title: "确认原生 Web 群接口文档",
+              kind: "ask_me",
+              priority: "high",
+              evidence: [{ obs_id: "pw:native_allowed_msg_1", quote: "请今天确认原生 Web 群接口文档" }],
+            },
+          ],
+        }),
+      );
+      const seenPrompts: string[] = [];
+      const origRunner = svc.understander.runner;
+      svc.understander.runner = async (_cfg, run) => {
+        seenPrompts.push(run.prompt);
+        return {
+          ok: true,
+          exitCode: 0,
+          text: fs.readFileSync(path.join(ctxDir, "llm.json"), "utf8"),
+          timedOut: false,
+          aborted: false,
+        };
+      };
+      try {
+        const rep = await svc.cycle("ctx:r16-cli-blocked");
+        assert.ok(rep.errors.some((e) => /lark-cli 登录用户/.test(e)), "应上报 CLI 账号不匹配错误");
+        assert.equal(svc.store.obsPending("pw:native_allowed_msg_1"), false, "独立认证的 pw:* 观测在 CLI 登出时必须照常被理解消费");
+        assert.equal(svc.store.obsPending("im:cli_blocked_msg_1"), true, "CLI im:* 观测在 CLI 鉴权失败时必须保留待处理且不送模型");
+        assert.ok(seenPrompts.some((p) => p.includes("pw:native_allowed_msg_1")));
+        assert.ok(!seenPrompts.some((p) => p.includes("im:cli_blocked_msg_1")));
+      } finally {
+        svc.understander.runner = origRunner;
+        fs.writeFileSync(path.join(ctxDir, "lark.json"), JSON.stringify({ user_open_id: "ou_owner_a" }));
+      }
+    }
+
+    // 7) [R16 #7 P2] Linux 隔离沙箱允许走 API 密钥 / 自定义 env_key 的 Codex 供应商绕开 keyring 限制，而强制 chatgpt 或无 API 密钥仍报错
+    if (process.platform === "linux") {
+      const customKeyringHome = path.join(dir, "codex-custom-envkey");
+      fs.mkdirSync(customKeyringHome, { recursive: true });
+      fs.writeFileSync(
+        path.join(customKeyringHome, "config.toml"),
+        [
+          'cli_auth_credentials_store = "keyring"',
+          'model_provider = "deepseek"',
+          "[model_providers.deepseek]",
+          'name = "deepseek"',
+          'base_url = "https://api.deepseek.com/v1"',
+          'env_key = "DEEPSEEK_API_KEY"',
+        ].join("\n"),
+      );
+      assert.equal(
+        detectIsolatedCodexKeyringConflict(
+          app.cfg,
+          { ...process.env, CODEX_HOME: customKeyringHome, DEEPSEEK_API_KEY: "sk-ds-test" },
+          "codex",
+        ),
+        undefined,
+        "自定义供应商使用 env_key 时无需 keyring，不得误报冲突",
+      );
+
+      const oaiKeyringHome = path.join(dir, "codex-oai-keyring");
+      fs.mkdirSync(oaiKeyringHome, { recursive: true });
+      fs.writeFileSync(path.join(oaiKeyringHome, "config.toml"), 'cli_auth_credentials_store = "keyring"\n');
+      assert.equal(
+        detectIsolatedCodexKeyringConflict(
+          app.cfg,
+          { ...process.env, CODEX_HOME: oaiKeyringHome, OPENAI_API_KEY: "sk-oai-test" },
+          "codex",
+        ),
+        undefined,
+        "提供 OPENAI_API_KEY 且未强制 chatgpt 登录时无需 keyring",
+      );
+      assert.equal(
+        detectIsolatedCodexKeyringConflict(
+          app.cfg,
+          { ...process.env, CODEX_HOME: oaiKeyringHome, CODEX_API_KEY: "sk-cdx-test" },
+          "codex",
+        ),
+        undefined,
+        "提供 CODEX_API_KEY 且未强制 chatgpt 登录时无需 keyring",
+      );
+      // 强制 chatgpt 登录时即使提供 OPENAI_API_KEY 也依然需要 keyring -> 报错
+      fs.writeFileSync(
+        path.join(oaiKeyringHome, "config.toml"),
+        'cli_auth_credentials_store = "keyring"\nforced_login_method = "chatgpt"\n',
+      );
+      assert.equal(
+        detectIsolatedCodexKeyringConflict(
+          app.cfg,
+          { ...process.env, CODEX_HOME: oaiKeyringHome, OPENAI_API_KEY: "sk-oai-test" },
+          "codex",
+        )?.severity,
+        "error",
+        "forced_login_method=chatgpt 时仍必须拦截 keyring 冲突",
+      );
+
+      // 端到端验证自定义 env_key 在隔离 runHarness(codex-exec) 中不触发 keyring 拒发且子进程收到该密钥
+      if (hasCredentialMountIsolation()) {
+        const stubCustomCodex = path.join(dir, "stub-codex-custom.mjs");
+        fs.writeFileSync(
+          stubCustomCodex,
+          [
+            "#!/usr/bin/env node",
+            'import fs from "node:fs";',
+            'if (process.env.DEEPSEEK_API_KEY !== "sk-ds-test") process.exit(2);',
+            'const oIdx = process.argv.indexOf("-o");',
+            'if (oIdx >= 0 && process.argv[oIdx + 1]) fs.writeFileSync(process.argv[oIdx + 1], "CUSTOM_ENV_KEY_OK");',
+            'console.log("CUSTOM_ENV_KEY_OK");',
+          ].join("\n"),
+          { mode: 0o755 },
+        );
+        const origCodexCmd = app.cfg.harnesses.codex.cmd;
+        const prevDsKey = process.env.DEEPSEEK_API_KEY;
+        app.cfg.harnesses.codex.cmd = stubCustomCodex;
+        process.env.CODEX_HOME = customKeyringHome;
+        process.env.DEEPSEEK_API_KEY = "sk-ds-test";
+        try {
+          const okCustom = await runHarness(app.cfg, {
+            harness: "codex",
+            prompt: "ping",
+            cwd: dir,
+            tools: "none",
+            lark: "none",
+            timeoutSec: 15,
+            logFile: path.join(dir, "codex-custom-r16.log"),
+          });
+          assert.equal(okCustom.ok, true, "自定义 env_key 供应商在隔离 codex-exec 下应放行执行");
+          assert.equal(okCustom.text, "CUSTOM_ENV_KEY_OK");
+        } finally {
+          app.cfg.harnesses.codex.cmd = origCodexCmd;
+          if (prevDsKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+          else process.env.DEEPSEEK_API_KEY = prevDsKey;
+          if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+          else process.env.CODEX_HOME = prevCodexHome;
+        }
+      }
+    }
+
+    // 8) [R16 #8 P2] 文件态 Codex OAuth 刷新安全回写：宿主机 CODEX_HOME 保持只读，合法刷新原子回写 0600，拒绝符号链接/跨账号/已登出/陈旧覆盖
+    {
+      const hostCodexHome = path.join(dir, "host-codex-refresh");
+      fs.mkdirSync(hostCodexHome, { recursive: true });
+      fs.writeFileSync(path.join(hostCodexHome, "config.toml"), 'cli_auth_credentials_store = "file"\n');
+      const hostAuthPath = path.join(hostCodexHome, "auth.json");
+      const origAuthObj = {
+        auth_mode: "chatgpt",
+        OPENAI_API_KEY: null,
+        tokens: {
+          id_token: "id_old",
+          access_token: "acc_old",
+          refresh_token: "ref_old",
+          account_id: "acct_owner_1",
+        },
+        last_refresh: "2026-11-26T00:00:00.000Z",
+      };
+      fs.writeFileSync(hostAuthPath, JSON.stringify(origAuthObj, null, 2), { mode: 0o600 });
+
+      // 8a) 单元测试安全拒绝条件（符号链接、跨账号、删除登出、并发更新）
+      const stagedReject = stageIsolatedCodexHome(hostCodexHome, { copyUserConfig: false });
+      try {
+        // 恶意替换 scratch/auth.json 为符号链接 -> 拒绝回写
+        fs.rmSync(path.join(stagedReject.scratchDir, "auth.json"));
+        fs.symlinkSync("/etc/hosts", path.join(stagedReject.scratchDir, "auth.json"));
+        assert.equal(syncRefreshedCodexAuth(stagedReject), false, "符号链接 scratch auth.json 必须拒绝回写");
+
+        // 篡改 account_id -> 拒绝回写
+        fs.rmSync(path.join(stagedReject.scratchDir, "auth.json"));
+        fs.writeFileSync(
+          path.join(stagedReject.scratchDir, "auth.json"),
+          JSON.stringify({
+            ...origAuthObj,
+            tokens: { ...origAuthObj.tokens, access_token: "acc_hijack", refresh_token: "ref_hijack", account_id: "acct_other" },
+            last_refresh: "2026-11-27T01:00:00.000Z",
+          }),
+        );
+        assert.equal(syncRefreshedCodexAuth(stagedReject), false, "跨账号 account_id 篡改必须拒绝回写");
+      } finally {
+        stagedReject.cleanup();
+      }
+
+      // 8b) 宿主机在运行期间已被更新到更新的 last_refresh：不覆盖更新的令牌
+      const stagedCas = stageIsolatedCodexHome(hostCodexHome, { copyUserConfig: false });
+      try {
+        fs.writeFileSync(
+          hostAuthPath,
+          JSON.stringify({
+            ...origAuthObj,
+            tokens: { ...origAuthObj.tokens, access_token: "acc_newer_host", refresh_token: "ref_newer_host" },
+            last_refresh: "2026-11-27T05:00:00.000Z",
+          }),
+          { mode: 0o600 },
+        );
+        fs.writeFileSync(
+          path.join(stagedCas.scratchDir, "auth.json"),
+          JSON.stringify({
+            ...origAuthObj,
+            tokens: { ...origAuthObj.tokens, access_token: "acc_older_scratch", refresh_token: "ref_older_scratch" },
+            last_refresh: "2026-11-27T02:00:00.000Z",
+          }),
+        );
+        assert.equal(syncRefreshedCodexAuth(stagedCas), false, "并发已有更新刷新时绝不能用旧刷新覆盖");
+        assert.equal(JSON.parse(fs.readFileSync(hostAuthPath, "utf8")).tokens.access_token, "acc_newer_host");
+      } finally {
+        stagedCas.cleanup();
+      }
+
+      // 8c) 端到端隔离 runCodexExec：宿主机 config.toml 不可写，但刷新后的 auth.json 经校验净写回宿主机（过滤多余字段并保持 0600）
+      fs.writeFileSync(hostAuthPath, JSON.stringify(origAuthObj, null, 2), { mode: 0o600 });
+      if (hasCredentialMountIsolation()) {
+        const stubRefreshCodex = path.join(dir, "stub-codex-refresh.mjs");
+        fs.writeFileSync(
+          stubRefreshCodex,
+          [
+            "#!/usr/bin/env node",
+            'import fs from "node:fs";',
+            'import path from "node:path";',
+            'const codexHome = process.env.CODEX_HOME;',
+            `const hostHome = ${JSON.stringify(hostCodexHome)};`,
+            'if (!codexHome || codexHome === hostHome) { console.error("expected scratch CODEX_HOME"); process.exit(2); }',
+            // 宿主机 CODEX_HOME 绝不可写
+            'let tampered = false;',
+            'try { fs.writeFileSync(path.join(hostHome, "tamper.toml"), "evil"); tampered = true; } catch {}',
+            'if (tampered) { console.error("host CODEX_HOME unexpectedly writable"); process.exit(3); }',
+            // 在私有可写 scratch CODEX_HOME 中刷新 OAuth auth.json（附带非法字段验证父进程会剥离）
+            'const cur = JSON.parse(fs.readFileSync(path.join(codexHome, "auth.json"), "utf8"));',
+            'cur.tokens.access_token = "acc_refreshed_r16";',
+            'cur.tokens.refresh_token = "ref_refreshed_r16";',
+            'cur.last_refresh = "2026-11-27T02:00:00.000Z";',
+            'cur.injected_field = "must_not_persist";',
+            'fs.writeFileSync(path.join(codexHome, "auth.json"), JSON.stringify(cur, null, 2));',
+            'const oIdx = process.argv.indexOf("-o");',
+            'if (oIdx >= 0 && process.argv[oIdx + 1]) fs.writeFileSync(process.argv[oIdx + 1], "REFRESH_OK");',
+            'console.log("REFRESH_OK");',
+          ].join("\n"),
+          { mode: 0o755 },
+        );
+        const origCodexCmd = app.cfg.harnesses.codex.cmd;
+        app.cfg.harnesses.codex.cmd = stubRefreshCodex;
+        process.env.CODEX_HOME = hostCodexHome;
+        try {
+          const refRes = await runHarness(app.cfg, {
+            harness: "codex",
+            prompt: "refresh test",
+            cwd: dir,
+            tools: "none",
+            lark: "none",
+            timeoutSec: 15,
+            logFile: path.join(dir, "codex-refresh-r16.log"),
+          });
+          assert.equal(refRes.ok, true, `隔离 codex-exec 刷新令牌应成功：${refRes.text}`);
+          assert.equal(refRes.text, "REFRESH_OK");
+          const persisted = JSON.parse(fs.readFileSync(hostAuthPath, "utf8")) as Record<string, unknown>;
+          const persistedTokens = persisted.tokens as Record<string, unknown>;
+          assert.equal(persistedTokens.access_token, "acc_refreshed_r16");
+          assert.equal(persistedTokens.refresh_token, "ref_refreshed_r16");
+          assert.equal(persistedTokens.account_id, "acct_owner_1");
+          assert.equal("injected_field" in persisted, false, "非白名单注入字段不得被写回宿主机 auth.json");
+          assert.equal(fs.statSync(hostAuthPath).mode & 0o777, 0o600, "写回后的 auth.json 必须保持 0600 权限");
+          assert.equal(fs.existsSync(path.join(hostCodexHome, "tamper.toml")), false);
+        } finally {
+          app.cfg.harnesses.codex.cmd = origCodexCmd;
+          if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+          else process.env.CODEX_HOME = prevCodexHome;
+        }
+      }
+    }
+
+    // 9) [R16 #9 P2] 重定向期间并发 syncFromRecords 轮换 Cookie：后续跳发送最新轮换值并追踪真实发送基线，绝不用陈旧值覆盖并发刷新
+    {
+      const jar = RecordingCookieJar.fromRecords(
+        [{ name: "session", value: "v1_init", domain: "127.0.0.1", path: "/" }],
+        ["127.0.0.1"],
+      );
+      let hop1SeenCookie = "";
+      redirectSrv = http.createServer((req, res) => {
+        if (req.url === "/hop0") {
+          // 模拟 hop0 在途期间后台 watcher 将磁盘较新轮换同步进共享 jar
+          jar.syncFromRecords([{ name: "session", value: "v2_disk_rotated", domain: "127.0.0.1", path: "/" }]);
+          res.writeHead(302, {
+            Location: "/hop1",
+            "Set-Cookie": "session=v1_stale_redirect; Path=/",
+          });
+          res.end();
+          return;
+        }
+        if (req.url === "/hop1") {
+          hop1SeenCookie = String(req.headers.cookie ?? "");
+          // 模拟 hop1 在途期间磁盘再次同步更新到 v3
+          jar.syncFromRecords([{ name: "session", value: "v3_disk_newer", domain: "127.0.0.1", path: "/" }]);
+          res.writeHead(200, {
+            "Set-Cookie": "session=v2_hop1_stale_resp; Path=/",
+            "Content-Type": "text/plain",
+          });
+          res.end("ok");
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+      await new Promise<void>((resolve) => redirectSrv!.listen(0, "127.0.0.1", resolve));
+      const port = (redirectSrv.address() as { port: number }).port;
+      const r = await fetchWithJar(jar, {
+        method: "GET",
+        url: `http://127.0.0.1:${port}/hop0`,
+        allowInsecureHttp: true,
+        extraAllowedHosts: ["127.0.0.1"],
+      });
+      assert.equal(r.status, 200);
+      assert.ok(
+        hop1SeenCookie.includes("session=v2_disk_rotated"),
+        `hop1 必须发送在途轮换后的 v2_disk_rotated 而非陈旧重定向 Cookie，实际：${hop1SeenCookie}`,
+      );
+      assert.equal(
+        jar.cookieValue(new URL(`http://127.0.0.1:${port}/hop1`), "session"),
+        "v3_disk_newer",
+        "hop1 响应不得覆盖在其在途期间同步的更新轮换值 v3_disk_newer",
+      );
+    }
+
+    // 10) [R16 #10 P2] 快通道推理期间背景消息被编辑导致 Understander.apply 丢弃陈旧批次时，fastCycle 延迟重排而不标 done，重试后正常预起草
+    {
+      const now = Date.now();
+      const conv = "pw_chat:9001";
+      svc.store.addObs([
+        {
+          id: "pw:bg_edit_1",
+          source: "im",
+          kind: "msg",
+          conv,
+          conv_name: "原生白名单群",
+          actor_id: "9002",
+          actor_name: "同事乙",
+          is_me: false,
+          time: now - 10_000,
+          text: "背景原文本",
+          url: "",
+          meta: { chat_type: "group", native_owner_id: "7001" },
+        },
+        {
+          id: "pw:mention_retry_1",
+          source: "im",
+          kind: "at_me",
+          conv,
+          conv_name: "原生白名单群",
+          actor_id: "9002",
+          actor_name: "同事乙",
+          is_me: false,
+          time: now - 5_000,
+          text: "@主人A 请帮忙确认一下上线窗口",
+          url: "",
+          meta: { chat_type: "group", native_owner_id: "7001", at_me: true, is_mention_me: true, chat_id: "9001", message_id: "71001" },
+        },
+      ]);
+      // 先将背景标为已处理，保持 mention_retry_1 为待处理
+      svc.store.markProcessed(["pw:bg_edit_1"]);
+
+      let inferCalls = 0;
+      const origRunner = svc.understander.runner;
+      svc.understander.runner = async () => {
+        inferCalls++;
+        if (inferCalls === 1) {
+          // 第一次推理在途期间，背景消息被编辑，触发 Understander.apply 整批丢弃
+          svc.store.addObs([
+            {
+              id: "pw:bg_edit_1",
+              source: "im",
+              kind: "msg",
+              conv,
+              conv_name: "原生白名单群",
+              actor_id: "9002",
+              actor_name: "同事乙",
+              is_me: false,
+              time: now - 10_000,
+              text: "背景已编辑新文本",
+              url: "",
+              meta: { chat_type: "group", native_owner_id: "7001" },
+            },
+          ]);
+        }
+        return {
+          ok: true,
+          exitCode: 0,
+          text: JSON.stringify({
+            projects: [],
+            items: [
+              {
+                title: "确认上线窗口",
+                kind: "ask_me",
+                priority: "high",
+                counterpart: "同事乙",
+                next_step: "回复上线时间",
+                evidence: [{ obs_id: "pw:mention_retry_1", quote: "@主人A 请帮忙确认一下上线窗口" }],
+              },
+            ],
+          }),
+          timedOut: false,
+          aborted: false,
+        };
+      };
+      try {
+        const fastPayload = {
+          conv,
+          conv_name: "原生白名单群",
+          trigger_obs_id: "pw:mention_retry_1",
+          anchor: {
+            id: "71001",
+            conversationId: "9001",
+            rootId: "",
+            parentId: "",
+            threadId: "",
+            position: 10,
+            createdAtMs: now - 5_000,
+          },
+        };
+        const firstRun = await svc.fastCycle("context:fast-r16-1", fastPayload);
+        assert.equal(firstRun.busy, true, "推理批次因背景编辑被丢弃且触发消息仍待处理时，fastCycle 必须返回 busy 延迟重排而非标 done");
+        assert.equal(svc.store.obsPending("pw:mention_retry_1"), true);
+
+        const secondRun = await svc.fastCycle("context:fast-r16-1", fastPayload);
+        assert.equal(secondRun.busy, undefined);
+        assert.equal(secondRun.created, 1);
+        assert.equal(secondRun.pre_drafted, 1, "重试成功后必须正常触发高优 ask_me 的自动预起草");
+        assert.equal(svc.store.obsPending("pw:mention_retry_1"), false);
+      } finally {
+        svc.understander.runner = origRunner;
+      }
+    }
+  } finally {
+    if (redirectSrv) await new Promise<void>((resolve) => redirectSrv!.close(() => resolve()));
+    if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevKey;
+    if (prevCredFile === undefined) delete process.env.PA_FEISHU_WEB_CRED_FILE;
+    else process.env.PA_FEISHU_WEB_CRED_FILE = prevCredFile;
+    if (prevCredDir === undefined) delete process.env.CREDENTIALS_DIRECTORY;
+    else process.env.CREDENTIALS_DIRECTORY = prevCredDir;
+    if (prevCtxDir === undefined) delete process.env.CTX_DIR;
+    else process.env.CTX_DIR = prevCtxDir;
+    if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevCodexHome;
+    if (prevLcAll === undefined) delete process.env.LC_ALL;
+    else process.env.LC_ALL = prevLcAll;
+    if (prevLang === undefined) delete process.env.LANG;
+    else process.env.LANG = prevLang;
+    if (prevLanguage === undefined) delete process.env.LANGUAGE;
+    else process.env.LANGUAGE = prevLanguage;
+    extraAppA?.store.db.close();
+    extraAppB?.store.db.close();
+    app?.store.db.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

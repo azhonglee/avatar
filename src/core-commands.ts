@@ -7,9 +7,10 @@ import { CommandError, S, type Commands } from "./commands.ts";
 import type { Config } from "./config.ts";
 import type { Board } from "./board.ts";
 import { loadPrompt } from "./harness.ts";
+import { verifyActiveLarkUser } from "./lark.ts";
 import type { Ledger, WorkItem } from "./ledger.ts";
 import type { Store } from "./store.ts";
-import { expandHome } from "./util.ts";
+import { errMsg, expandHome } from "./util.ts";
 import { enqueueJob } from "./workflows/agent.ts";
 import type { Dispatcher, DispatchPayload } from "./workflows/dispatch.ts";
 
@@ -78,8 +79,24 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
     run: async (a, ctx) => {
       const summary = `${a.harness ? `[${a.harness}] ` : ""}${a.summary}`;
       const description = [a.description ?? "", a.repo ? `repo: ${a.repo}` : ""].filter(Boolean).join("\n");
-      // 在远端创建返回 GUID 的第一时间（先于独立的 move 与 reconcile）即持久化主人归属，防止 move/reconcile 超时导致无主委派任务
+      // 在远端创建返回 GUID 的第一时间（先于独立的 move 与 reconcile）即持久化主人归属，防止 move/reconcile 超时导致无主委派任务；
+      // 而在发起任何远端创建前，先核验本地看板归属与当前活跃 lark-cli 登录用户均与 contextOwner 一致，防止切换 CLI 账号后私密摘要被错发给他人看板
       const contextOwner = ctx.contextOwner?.trim();
+      if (contextOwner) {
+        const hasBoard = !!store.get("board.tasklist");
+        const boardOwner = (store.get("board.owner_open_id") || store.get("owner.open_id") || "").trim();
+        if ((boardOwner && boardOwner !== contextOwner) || (hasBoard && !boardOwner)) {
+          throw new CommandError(
+            "conflict",
+            `本地持久化看板归属账号 (${boardOwner || "未知"}) 与上下文主人 (${contextOwner}) 不一致，拒绝创建工作上下文委派派单以防跨账号泄漏`,
+          );
+        }
+        try {
+          await verifyActiveLarkUser(board.lark, contextOwner, "创建工作上下文委派派单");
+        } catch (err) {
+          throw new CommandError("conflict", errMsg(err));
+        }
+      }
       const guid = await board.createTask({
         summary,
         description,

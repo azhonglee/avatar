@@ -155,9 +155,10 @@ export class RecordingCookieJar {
     return { generation: this.syncGeneration, values: snap };
   }
 
-  /** 复制当前内存 Cookie 视图供单次请求的重定向跳暂存叠算使用，不修改共享活罐也不携带未提交增量 */
+  /** 复制当前内存 Cookie 视图供单次请求的重定向跳暂存叠算使用，保留 syncGeneration 以便校验并发轮换冲突，且不修改共享活罐 */
   clone(): RecordingCookieJar {
     const copy = new RecordingCookieJar(this.extraAllowed);
+    copy.syncGeneration = this.syncGeneration;
     for (const [k, v] of this.values) copy.values.set(k, { ...v });
     return copy;
   }
@@ -534,10 +535,13 @@ export class WebLoginStore {
   readonly file: string;
   readonly lockFile: string;
   readonly stagedFile: string;
+  /** 是否通过 PA_FEISHU_WEB_CRED_FILE 指向外部可能跨工作区共享的凭据文件 */
+  readonly isExternal: boolean;
   private readonly lockTimeoutMs: number;
 
   constructor(dataDir: string, filename = "feishu-web.json", lockTimeoutMs = 5_000) {
     const external = process.env.PA_FEISHU_WEB_CRED_FILE?.trim();
+    this.isExternal = !!external;
     this.file = external ? path.resolve(external) : path.join(dataDir, filename);
     this.lockFile = `${this.file}.lock.db`;
     // 多个 data_dir 指向同一个外部 PA_FEISHU_WEB_CRED_FILE 时，按工作区 dataDir 隔离各自暂存文件，

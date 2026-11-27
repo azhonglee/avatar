@@ -262,6 +262,85 @@ export function isContextOwnedTaskBlocked(app: Pick<App, "cfg" | "store" | "ledg
   return false;
 }
 
+/**
+ * 判断某条派单 / 交付工作 / 任务 GUID 是否源自工作上下文（无论当前工作区配置主人是否变更）。
+ * 用于在投递其后续评论/移列/完成副作用前强制核验活跃 lark-cli 登录用户，防止 CLI 切号后以他人身份发布委派报告。
+ */
+export function isContextDerivedWorkOrTask(
+  app: Pick<App, "cfg" | "store" | "ledger">,
+  idOrGuid: string,
+  visited: Set<string> = new Set(),
+): boolean {
+  if (!idOrGuid) return false;
+  const normalized = idOrGuid.startsWith("card:") ? idOrGuid.slice("card:".length) : idOrGuid;
+  if (!normalized || visited.has(normalized)) return false;
+  visited.add(normalized);
+
+  const w = app.ledger.get(normalized);
+  if (w?.kind === "delivery") {
+    const p = w.payload as { dispatch_id?: unknown; guid?: unknown };
+    const candidates = [
+      w.ref,
+      typeof p.dispatch_id === "string" ? p.dispatch_id : "",
+      typeof p.guid === "string" ? p.guid : "",
+    ].filter(Boolean);
+    if (candidates.some((c) => isContextDerivedWorkOrTask(app, c, visited))) return true;
+  } else if (!w && normalized.startsWith("delivery:")) {
+    const rest = normalized.slice("delivery:".length);
+    if (rest.startsWith("dispatch:")) {
+      const parts = rest.split(":");
+      const parsedDispatchId = parts.length >= 3 ? parts.slice(0, 3).join(":") : "";
+      const parsedDeliveryGuid = parts[1] ?? "";
+      if (parsedDispatchId && isContextDerivedWorkOrTask(app, parsedDispatchId, visited)) return true;
+      if (parsedDeliveryGuid && isContextDerivedWorkOrTask(app, parsedDeliveryGuid, visited)) return true;
+    }
+  }
+
+  const parsedGuid = normalized.startsWith("dispatch:") ? (normalized.split(":")[1] ?? "") : "";
+  const hasOrigin =
+    !!(app.store.get(`ctx.dispatch_owner.${normalized}`) ?? "").trim() ||
+    !!(w?.ref ? (app.store.get(`ctx.dispatch_ref_owner.${w.ref}`) ?? "").trim() : "") ||
+    !!(app.store.get(`ctx.dispatch_ref_owner.${normalized}`) ?? "").trim() ||
+    !!(parsedGuid ? (app.store.get(`ctx.dispatch_ref_owner.${parsedGuid}`) ?? "").trim() : "") ||
+    !!(app.store.get(`ctx.own_task_owner.${normalized}`) ?? "").trim() ||
+    !!(w?.ref ? (app.store.get(`ctx.own_task_owner.${w.ref}`) ?? "").trim() : "") ||
+    !!(parsedGuid ? (app.store.get(`ctx.own_task_owner.${parsedGuid}`) ?? "").trim() : "");
+  if (hasOrigin) return true;
+
+  try {
+    const candidateRef = w?.ref || parsedGuid || normalized;
+    const hasCtxTable = app.store.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ctx_item'").get();
+    if (hasCtxTable) {
+      if (app.store.db.prepare("SELECT 1 FROM ctx_item WHERE json_extract(meta, '$.delegated') = ? LIMIT 1").get(normalized)) {
+        return true;
+      }
+      if (candidateRef) {
+        if (app.store.db.prepare("SELECT 1 FROM ctx_item WHERE json_extract(meta, '$.delegated') = ? LIMIT 1").get(candidateRef)) {
+          return true;
+        }
+        const historyRow = app.store.db
+          .prepare(
+            `SELECT 1 FROM work w
+              WHERE w.kind = 'dispatch' AND w.ref = ?
+                AND EXISTS (SELECT 1 FROM ctx_item ci WHERE json_extract(ci.meta, '$.delegated') = w.id)
+              LIMIT 1`,
+          )
+          .get(candidateRef);
+        if (historyRow) return true;
+      }
+    }
+    if (candidateRef) {
+      const legacyOwn = app.store.db
+        .prepare("SELECT 1 FROM kv WHERE k LIKE 'op.task.create_own.%' AND v = ? LIMIT 1")
+        .get(candidateRef);
+      if (legacyOwn) return true;
+    }
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
 /** 生成紧凑的主人隔离标签（用于 brief 卡片与去重键，保证飞书 50 字符幂等键不截断冲突） */
 export function briefOwnerTag(ownerOpenId: string): string {
   const clean = ownerOpenId.trim();

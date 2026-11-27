@@ -120,6 +120,8 @@ export interface ApplyResult {
   rejected: number;
   /** 本次事务实际标记为已处理的新观测数量（整批被拒绝或丢租约时为 0） */
   processed: number;
+  /** 整批推理结果因租约失效、策略漂移或批次观测在推理期间被编辑/撤回而被整体丢弃 */
+  discarded?: boolean;
 }
 
 const fmt = (ms: number, tz: string) =>
@@ -146,6 +148,7 @@ export class Understander {
     activeNativeOwner?: string | null,
     filterObs?: (conv: string, obs: Obs[]) => Obs[],
     isMentionsOnly?: (conv: string) => boolean,
+    excludeCliIm?: boolean,
   ): { prompt: string; obs: Obs[]; fresh: string[]; convs: string[] } {
     const tz = this.cfg.owner.timezone;
     const sections: string[] = [];
@@ -157,7 +160,7 @@ export class Understander {
       const onlyMentions = isMentionsOnly ? isMentionsOnly(c.conv) : false;
       const rawList = c.target_obs_id
         ? this.store.convWindowAround(c.conv, c.target_obs_id, 60, 12, activeNativeOwner, { onlyMentions })
-        : this.store.convWindow(c.conv, 60, 12, activeNativeOwner, { onlyMentions });
+        : this.store.convWindow(c.conv, 60, 12, activeNativeOwner, { onlyMentions, excludeCliIm });
       const list = filterObs ? filterObs(c.conv, rawList) : rawList;
       if (!list.length) continue;
       if (!list.some((o) => !this.isProcessed(o.id))) continue;
@@ -249,6 +252,7 @@ export class Understander {
     opts?: {
       filterObs?: (conv: string, obs: Obs[]) => Obs[];
       isMentionsOnly?: (conv: string) => boolean;
+      excludeCliIm?: boolean;
       claimCheck?: { convs: string[]; holder: string; procOwner: string };
       /** 提交事务内执行的同步策略版本守卫：返回 false 时整体丢弃本批模型结果且不消费观测 */
       commitGuard?: () => boolean;
@@ -256,7 +260,7 @@ export class Understander {
   ): Promise<ApplyResult & { convs: string[]; fresh: number }> {
     if (signal?.aborted) throw new Error("aborted");
     this.processedCache.clear();
-    const batch = this.buildBatch(convs, 24_000, activeNativeOwner, opts?.filterObs, opts?.isMentionsOnly);
+    const batch = this.buildBatch(convs, 24_000, activeNativeOwner, opts?.filterObs, opts?.isMentionsOnly, opts?.excludeCliIm);
     if (!batch.fresh.length) {
       // 若因当前白名单/范围过滤导致该会话无合格待处理行，不调用 skipConv，留待后续范围恢复或 @我 触发
       if (!opts?.filterObs) {
@@ -348,6 +352,7 @@ export class Understander {
           this.store.isConvClaimedBy(c, claimCheck.holder, claimCheck.procOwner, nowCheck),
         );
         if (!stillOwned) {
+          res.discarded = true;
           res.rejected += out.items.length + out.knowledge.length + out.updates.length + out.projects.length + out.people.length;
           return;
         }
@@ -355,6 +360,7 @@ export class Understander {
 
       // 1b) 在写事务内强校验策略版本守卫：防止 validateBeforeApply 异步复核期间发生第二次策略变更而将过期批次写入图谱
       if (commitGuard && !commitGuard()) {
+        res.discarded = true;
         res.rejected += out.items.length + out.knowledge.length + out.updates.length + out.projects.length + out.people.length;
         return;
       }
@@ -391,6 +397,7 @@ export class Understander {
       if (batchPartiallyStale || (fresh.length > 0 && validFreshIds.length === 0)) {
         // 只要本批中任一会话/观测在推理期间被静音、撤回、编辑或策略失效，整体丢弃本批全部模型产出
         // （含无逐条 evidence 归属的 projects / people），同时不标记其余仍有效观测为已处理，供下轮干净批次重跑。
+        res.discarded = true;
         res.rejected += out.items.length + out.knowledge.length + out.updates.length + out.projects.length + out.people.length;
         return;
       }
