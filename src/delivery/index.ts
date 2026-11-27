@@ -25,6 +25,7 @@ import {
   remoteDefaultBranch,
   remoteUrl,
   removeStaleWorktreeAdminRecord,
+  resolveExternalLfsStorageGitOpts,
   revParse,
   tryGit,
 } from "./git.ts";
@@ -260,7 +261,8 @@ export function registerDelivery(app: App): void {
         if ((await currentBranch(repo, gitOpts)) === target) {
           // 目标分支正检出在主仓库：只有工作区干净时才合并，且只允许快进
           if (!(await isClean(repo, gitOpts))) throw new DeliveryError(`主仓库 ${repo} 当前检出了 ${target} 且有未提交的改动，为避免覆盖没有合并。请先提交或暂存后重试。`);
-          await git(repo, ["merge", "--ff-only", "-q", `refs/heads/${d.branch}`], gitOpts);
+          const mergeOpts = await resolveExternalLfsStorageGitOpts(repo, gitOpts);
+          await git(repo, ["merge", "--ff-only", "-q", `refs/heads/${d.branch}`], mergeOpts);
         } else {
           // 没检出：直接更新分支引用（不带 + 的 refspec 只允许快进；目标分支在别的 worktree 检出时 git 会拒绝）
           await git(repo, ["fetch", "-q", ".", `refs/heads/${d.branch}:refs/heads/${target}`], gitOpts);

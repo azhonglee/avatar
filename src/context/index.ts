@@ -54,7 +54,12 @@ export class ContextService {
   constructor(app: App) {
     this.app = app;
     this.store = new ContextStore(app.store.db);
-    this.connectors = new Connectors(app, this.store, () => this.personalWeb.resolveNativeExclusionsForPolling());
+    this.connectors = new Connectors(
+      app,
+      this.store,
+      () => this.personalWeb.resolveNativeExclusionsForPolling(),
+      () => this.personalWeb.syncDiskPrivacyConfig({ throwOnError: false }),
+    );
     this.understander = new Understander(app, this.store);
     this.views = new ContextViews(app, this.store);
     this.drafter = new Drafter(
@@ -165,6 +170,9 @@ export class ContextService {
   /** 一轮：唤醒稍后事项 → 采集 → 理解 → 挂接 → 提醒 / 自主动作 */
   async cycle(workId: string, signal?: AbortSignal): Promise<CtxCycleReport> {
     const rep: CtxCycleReport = { skipped: false, sources: [], convs: 0, created: 0, closed: 0, knowledge: 0, updates: 0, conflicts: 0, rejected: 0, nudged: 0, errors: [] };
+    if (this.personalWeb.hasDiskPolicyError()) {
+      return { ...rep, skipped: true, errors: ["磁盘隐私配置无法核验，已按安全策略暂缓上下文周期执行"] };
+    }
     if (this.isWorkspaceOwnerMismatched()) {
       return { ...rep, skipped: true, errors: ["工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已阻断上下文周期执行"] };
     }
@@ -297,7 +305,7 @@ export class ContextService {
                     batchObs: import("./store.ts").Obs[],
                   ): Promise<Set<string>> => {
                     const disallowed = new Set<string>();
-                    if (this.isWorkspaceOwnerMismatched() || !this.cfg.context.understand) {
+                    if (this.isWorkspaceOwnerMismatched() || !this.cfg.context.understand || this.personalWeb.hasDiskPolicyError()) {
                       verifiedPolicySig = "";
                       for (const c of usedConvs) disallowed.add(c.conv);
                       return disallowed;
@@ -342,6 +350,7 @@ export class ContextService {
                     claimCheck: { convs: g.map((x) => x.conv), holder: claimToken, procOwner },
                     commitGuard: () =>
                       !this.isWorkspaceOwnerMismatched() &&
+                      !this.personalWeb.hasDiskPolicyError() &&
                       this.cfg.context.understand &&
                       !!verifiedPolicySig &&
                       this.personalWeb.policySignature() === verifiedPolicySig,
@@ -474,6 +483,7 @@ export class ContextService {
     if (signal?.aborted) throw new Error("aborted");
     if (
       this.isWorkspaceOwnerMismatched() ||
+      this.personalWeb.hasDiskPolicyError() ||
       !this.cfg.context.understand ||
       !this.cfg.context.sources.im ||
       !this.cfg.context.personal_web.enabled ||
@@ -518,6 +528,7 @@ export class ContextService {
     }, 30_000);
     claimHeartbeat.unref?.();
     const isFastSwitchEnabled = () =>
+      !this.personalWeb.hasDiskPolicyError() &&
       !this.isWorkspaceOwnerMismatched() &&
       this.cfg.context.understand &&
       this.cfg.context.sources.im &&
@@ -605,6 +616,7 @@ export class ContextService {
           claimCheck: { convs: [p.conv], holder: claimToken, procOwner },
           commitGuard: () =>
             isFastSwitchEnabled() &&
+            !this.personalWeb.hasDiskPolicyError() &&
             !!verifiedFastPolicySig &&
             this.personalWeb.policySignature() === verifiedFastPolicySig,
         },
@@ -688,7 +700,10 @@ export class ContextService {
     };
     const obsKey = (oid: string): string => {
       const o = this.store.obs(oid);
-      return o ? `${oid}@${obsRevision(o)}` : oid;
+      if (!o) return oid;
+      const editGen = typeof o.meta.edit_gen === "number" && Number.isFinite(o.meta.edit_gen) ? o.meta.edit_gen : 0;
+      const digest = createHash("sha256").update(obsRevision(o)).digest("hex").slice(0, 12);
+      return `${oid}#g${editGen}:${digest}`;
     };
     let count = 0;
     for (const c of items) {
@@ -748,6 +763,7 @@ export class ContextService {
 
   /** 判断事项是否满足快通道自动预起草资格（入队与执行前复用同一判据，防止开关关闭或后续降级后仍送模型） */
   private canAutoPreDraft(it: ItemRow | undefined): it is ItemRow {
+    if (this.personalWeb.hasDiskPolicyError()) return false;
     const pw = this.cfg.context.personal_web;
     if (!this.cfg.context.understand || !this.cfg.context.sources.im || !pw.enabled || !pw.fast_lane || !pw.pre_draft) {
       return false;

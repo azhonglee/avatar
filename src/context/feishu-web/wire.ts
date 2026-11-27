@@ -229,12 +229,6 @@ export function unwrapGatewayPayload(
   assertWireType(5, WIRE_BYTES, "payload");
   assertWireType(6, WIRE_BYTES, "cid");
 
-  const statusField = packet.lastField(4);
-  const status = statusField ? Number(statusField.uint ?? 0n) : 0;
-  if (status !== 0) {
-    throw new GatewayError(`个人 Web 网关拒绝请求 (status=${status})`, { status });
-  }
-
   const payloadTypeField = packet.lastField(2);
   if (payloadTypeField !== undefined && Number(payloadTypeField.uint ?? 0n) !== 1) {
     throw new GatewayError(`个人 Web 网关响应 payloadType 非法 (${Number(payloadTypeField.uint ?? 0n)})`);
@@ -253,6 +247,12 @@ export function unwrapGatewayPayload(
     if (gotCid && gotCid !== opts.expectedCid) {
       throw new GatewayError("个人 Web 网关响应 cid 不匹配");
     }
+  }
+
+  const statusField = packet.lastField(4);
+  const status = statusField ? Number(statusField.uint ?? 0n) : 0;
+  if (status !== 0) {
+    throw new GatewayError(`个人 Web 网关拒绝请求 (status=${status})`, { status });
   }
 
   const payloadField = packet.lastField(5);

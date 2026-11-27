@@ -4,7 +4,13 @@ import { z } from "zod";
 import { isContextDerivedDispatchBlocked } from "../api/queries.ts";
 import type { Board, BoardTask } from "../board.ts";
 import { repoSpec, type Config } from "../config.ts";
-import { commitAll, ensureGitLfsObjectsForCheckout, removeStaleWorktreeAdminRecord, tryGit } from "../delivery/git.ts";
+import {
+  commitAll,
+  ensureGitLfsObjectsForCheckout,
+  removeStaleWorktreeAdminRecord,
+  resolveExternalLfsStorageGitOpts,
+  tryGit,
+} from "../delivery/git.ts";
 import { comment, move } from "../effects.ts";
 import { checkpoint, type Ctx, type Handler } from "../engine.ts";
 import {
@@ -439,8 +445,9 @@ export class Dispatcher {
       const cp = p.checkpoints[round];
       const gitOpts = { cfg: this.cfg, ...repoGuard };
       if (cp) {
-        // 重入（崩溃 / 失败重试）：丢弃上次没跑完的半成品，回到本轮起点
-        await git(p.cwd, ["reset", "--hard", cp], gitOpts);
+        // 重入（崩溃 / 失败重试）：丢弃上次没跑完的半成品，回到本轮起点（挂载受信任外部 lfs.storage 以便 smudge 还原 LFS 文件）
+        const resetOpts = await resolveExternalLfsStorageGitOpts(p.cwd, gitOpts);
+        await git(p.cwd, ["reset", "--hard", cp], resetOpts);
         await git(p.cwd, ["clean", "-fd"], gitOpts);
         log("info", "回到本轮检查点后重跑", { task: p.summary, round: p.round, checkpoint: cp.slice(0, 8) });
       } else {

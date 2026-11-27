@@ -441,12 +441,18 @@ function classifyRecordedChatType(obs: Obs | undefined): "group" | "dm" | "unkno
   return "unknown";
 }
 
-function statSignature(file: string): string {
+const MAX_DISK_CONFIG_BYTES = 2 * 1024 * 1024;
+
+function readDiskConfigRaw(file: string): { exists: boolean; raw?: string; error?: string } {
   try {
     const st = fs.statSync(file);
-    return `${st.ino}:${st.mtimeMs}:${st.size}`;
-  } catch {
-    return "";
+    if (!st.isFile()) return { exists: false, error: `配置文件 ${file} 不是普通文件` };
+    if (st.size > MAX_DISK_CONFIG_BYTES) return { exists: true, error: `配置文件 ${file} 体积超过安全上限` };
+    return { exists: true, raw: fs.readFileSync(file, "utf8") };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT") return { exists: false };
+    return { exists: true, error: `无法读取配置文件 ${file}：${errMsg(err)}` };
   }
 }
 
@@ -470,7 +476,9 @@ export class PersonalWebBridge {
   private readonly debounceFirstAt = new Map<string, number>();
   private readonly ocExclusionCache = new Map<string, OpenChatExclusionMeta>();
   private readonly pwGroupNameCache = new Map<string, string>();
-  private readonly initialCfgStat: string;
+  private readonly hadInitialCfgFile: boolean;
+  private lastSyncedCfgRaw: string | undefined;
+  private diskPolicyError = "";
   private state: PersistedState;
 
   constructor(app: App, store: ContextStore, hooks: PersonalWebBridgeHooks) {
@@ -479,7 +487,9 @@ export class PersonalWebBridge {
     this.hooks = hooks;
     this.loginStore = new WebLoginStore(app.cfg.dataDir);
     this.loginStore.reconcilePendingCommit(app.store, PENDING_CRED_COMMIT_KV_KEY);
-    this.initialCfgStat = app.cfg.file ? statSignature(app.cfg.file) : "";
+    const initDisk = app.cfg.file ? readDiskConfigRaw(app.cfg.file) : { exists: false };
+    this.hadInitialCfgFile = initDisk.exists;
+    this.lastSyncedCfgRaw = initDisk.raw;
     const saved = this.loadSavedState();
     const login = this.loginStore.load();
     this.state = saved ?? {
@@ -498,12 +508,143 @@ export class PersonalWebBridge {
   }
 
   /**
+   * 同步检测并重载被外部进程修改的磁盘 `config.yaml` 隐私与采集策略（直接比对原始文本，避免粗粒度文件系统 mtime 漏检同毫秒/等长修改；未变时零 YAML 解析）：
+   *   - 复用 `ContextScopeConfigSchema` 严格校验范围/排除列表与隐私开关；
+   *   - 若磁盘配置文件被删、不可读或格式损坏，记录 `diskPolicyError` 并按 fail-closed 阻断推送入库与推理提交。
+   */
+  syncDiskPrivacyConfig(opts?: { throwOnError?: boolean }): boolean {
+    const cfgFile = this.cfg.file;
+    if (!cfgFile) return true;
+    const disk = readDiskConfigRaw(cfgFile);
+    if (!disk.exists && !this.hadInitialCfgFile) {
+      return true;
+    }
+    if (disk.error || !disk.exists || disk.raw === undefined) {
+      this.diskPolicyError = disk.error || `配置文件 ${cfgFile} 不存在或无法读取，按安全原则暂缓采集与理解`;
+      this.lastSyncedCfgRaw = undefined;
+      if (opts?.throwOnError) throw new Error(this.diskPolicyError);
+      return false;
+    }
+    if (disk.raw === this.lastSyncedCfgRaw) {
+      if (this.diskPolicyError) {
+        if (opts?.throwOnError) throw new Error(this.diskPolicyError);
+        return false;
+      }
+      return true;
+    }
+    try {
+      const parsed = YAML.parse(disk.raw) as Record<string, unknown> | null;
+      if (parsed !== null && (typeof parsed !== "object" || Array.isArray(parsed))) {
+        throw new Error("配置文件根节点格式非法");
+      }
+      const root = (parsed ?? {}) as {
+        owner?: { open_id?: unknown };
+        context?: {
+          understand?: unknown;
+          sources?: { im?: unknown; minutes?: unknown; docs?: unknown };
+          groups?: unknown;
+          groups_allow?: unknown;
+          groups_deny?: unknown;
+          max_groups?: unknown;
+          lookback_days?: unknown;
+          bot_allow?: unknown;
+          personal_web?: {
+            enabled?: unknown;
+            fast_lane?: unknown;
+            pre_draft?: unknown;
+            send_replies?: unknown;
+          };
+        };
+      };
+      if (root.owner !== undefined && (typeof root.owner !== "object" || root.owner === null || Array.isArray(root.owner))) {
+        throw new Error("配置文件中的 owner 格式非法");
+      }
+      if (root.owner?.open_id !== undefined && typeof root.owner.open_id !== "string") {
+        throw new Error("配置文件中的 owner.open_id 格式非法");
+      }
+      const ctx = root.context;
+      if (ctx !== undefined && (typeof ctx !== "object" || ctx === null || Array.isArray(ctx))) {
+        throw new Error("配置文件中的 context 格式非法");
+      }
+      const scopeParsed = ContextScopeConfigSchema.safeParse({
+        lookback_days: ctx?.lookback_days,
+        groups: ctx?.groups,
+        groups_allow: ctx?.groups_allow,
+        groups_deny: ctx?.groups_deny,
+        max_groups: ctx?.max_groups,
+      });
+      if (!scopeParsed.success) {
+        const badField = String(scopeParsed.error.issues[0]?.path[0] ?? "groups");
+        throw new Error(`配置文件中的 context.${badField} 格式非法`);
+      }
+      const parseOptBool = (val: unknown, fallback: boolean, name: string): boolean => {
+        if (val === undefined) return fallback;
+        if (typeof val !== "boolean") throw new Error(`配置文件中的 ${name} 格式非法`);
+        return val;
+      };
+      if (ctx?.sources !== undefined && (typeof ctx.sources !== "object" || ctx.sources === null || Array.isArray(ctx.sources))) {
+        throw new Error("配置文件中的 context.sources 格式非法");
+      }
+      if (
+        ctx?.personal_web !== undefined &&
+        (typeof ctx.personal_web !== "object" || ctx.personal_web === null || Array.isArray(ctx.personal_web))
+      ) {
+        throw new Error("配置文件中的 context.personal_web 格式非法");
+      }
+      if (ctx?.bot_allow !== undefined && (!Array.isArray(ctx.bot_allow) || !ctx.bot_allow.every((x) => typeof x === "string"))) {
+        throw new Error("配置文件中的 context.bot_allow 格式非法");
+      }
+      const nextUnderstand = parseOptBool(ctx?.understand, true, "context.understand");
+      const nextIm = parseOptBool(ctx?.sources?.im, true, "context.sources.im");
+      const nextMinutes = parseOptBool(ctx?.sources?.minutes, true, "context.sources.minutes");
+      const nextDocs = parseOptBool(ctx?.sources?.docs, true, "context.sources.docs");
+      const nextPwEnabled = parseOptBool(ctx?.personal_web?.enabled, false, "context.personal_web.enabled");
+      const nextPwFast = parseOptBool(ctx?.personal_web?.fast_lane, true, "context.personal_web.fast_lane");
+      const nextPwPreDraft = parseOptBool(ctx?.personal_web?.pre_draft, false, "context.personal_web.pre_draft");
+      const nextPwSend = parseOptBool(ctx?.personal_web?.send_replies, false, "context.personal_web.send_replies");
+
+      if (typeof root.owner?.open_id === "string") {
+        this.cfg.owner.open_id = root.owner.open_id;
+      }
+      this.cfg.context.groups = scopeParsed.data.groups;
+      this.cfg.context.groups_allow = scopeParsed.data.groups_allow;
+      this.cfg.context.groups_deny = scopeParsed.data.groups_deny;
+      this.cfg.context.max_groups = scopeParsed.data.max_groups;
+      this.cfg.context.lookback_days = scopeParsed.data.lookback_days;
+      this.cfg.context.understand = nextUnderstand;
+      this.cfg.context.sources.im = nextIm;
+      this.cfg.context.sources.minutes = nextMinutes;
+      this.cfg.context.sources.docs = nextDocs;
+      if (ctx?.bot_allow !== undefined) {
+        this.cfg.context.bot_allow = ctx.bot_allow as string[];
+      }
+      this.cfg.context.personal_web.enabled = nextPwEnabled;
+      this.cfg.context.personal_web.fast_lane = nextPwFast;
+      this.cfg.context.personal_web.pre_draft = nextPwPreDraft;
+      this.cfg.context.personal_web.send_replies = nextPwSend;
+      this.diskPolicyError = "";
+      this.lastSyncedCfgRaw = disk.raw;
+      return true;
+    } catch (err) {
+      this.diskPolicyError = `无法核验磁盘隐私配置 (${cfgFile})：${errMsg(err)}`;
+      this.lastSyncedCfgRaw = disk.raw;
+      if (opts?.throwOnError) throw new Error(this.diskPolicyError);
+      return false;
+    }
+  }
+
+  hasDiskPolicyError(): boolean {
+    return !this.syncDiskPrivacyConfig({ throwOnError: false });
+  }
+
+  /**
    * 当前工作区是否存在有效且与 config.owner.open_id 一致的个人 Web 账号绑定：
    *   - 必须已由 web-login 显式写入 BOUND_OWNER_KV_KEY；
    *   - 且 BOUND_WORKSPACE_OWNER_KV_KEY 必须与当前 config.yaml 中的 owner.open_id 完全一致。
    * 绑定缺失或工作区主人变更时返回 null（调用方必须彻底拦截全部 pw:* 观测，绝不退化为无过滤）。
    */
   activeBoundNativeOwner(): string | null {
+    this.syncDiskPrivacyConfig({ throwOnError: false });
     const boundNative = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
     if (!boundNative) return null;
     const cfgWs = this.cfg.owner.open_id.trim();
@@ -512,23 +653,24 @@ export class PersonalWebBridge {
     return boundNative;
   }
 
-  /** 轻量同步策略签名（静音表 + groups_deny + 有序 allowlist + 发言群榜单 + sources.im + 工作区主人绑定），用于检测长耗时异步/推理期间策略是否变更 */
+  /** 轻量同步策略签名（结构化 JSON 编码，杜绝分隔符碰撞；含静音表 + groups_deny + 有序 allowlist + 发言群榜单 + sources.im + 磁盘配置健康态 + 工作区主人绑定） */
   policySignature(): string {
+    this.syncDiskPrivacyConfig({ throwOnError: false });
     const mutes = this.store
       .mutedConvs()
-      .map((m) => `${m.conv}=${m.name}`)
-      .sort()
-      .join("|");
-    const deny = [...this.cfg.context.groups_deny].map((s) => s.trim()).sort().join("|");
+      .map((m) => [m.conv, m.name] as const)
+      .sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]));
+    const deny = [...this.cfg.context.groups_deny].map((s) => s.trim()).sort();
     // 保留 groups_allow 顺序：在 max_groups 截断下，顺序变更会改变生效群集合
-    const allow = this.cfg.context.groups_allow.map((s) => s.trim()).join("|");
+    const allow = this.cfg.context.groups_allow.map((s) => s.trim());
     const bound = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
     const boundWs = (this.app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
     const openSpoken = this.app.store.get("ctx.spoken_groups") ?? "";
     const openNames = this.app.store.get("ctx.open_group_names") ?? "";
     const pwSpoken = bound ? (this.app.store.get(pwSpokenGroupsKey(bound)) ?? "") : "";
     const pw = this.cfg.context.personal_web;
-    return [
+    return JSON.stringify([
+      this.diskPolicyError ? `err:${this.diskPolicyError}` : "ok",
       this.cfg.context.sources.im ? 1 : 0,
       this.cfg.context.sources.minutes ? 1 : 0,
       this.cfg.context.sources.docs ? 1 : 0,
@@ -547,7 +689,7 @@ export class PersonalWebBridge {
       bound,
       boundWs,
       this.cfg.owner.open_id.trim(),
-    ].join(";");
+    ]);
   }
 
   private loadSavedState(): PersistedState | undefined {
@@ -683,14 +825,22 @@ export class PersonalWebBridge {
     };
   }
 
-  /** 启动个人 Web 长连接监听（异步后台运行，不阻塞常驻进程启动）。 */
+  /** 启动个人 Web 长连接监听（异步后台运行，不阻塞常驻进程启动；所有内部异常均在守护边界内消化退避，绝不产生未捕获拒绝拖垮主进程）。 */
   start(): { stop(): void } {
     if (!this.cfg.context.personal_web.enabled) return { stop: () => undefined };
-    this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
+    try {
+      this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
+    } catch (err) {
+      log("warn", "启动个人 Web 通道时恢复暂存凭据失败（将在守护循环中重试）", { err: errMsg(err) });
+    }
     this.stop();
     const ctrl = new AbortController();
     this.stopCtrl = ctrl;
-    void this.runSupervisor(ctrl.signal);
+    void this.runSupervisor(ctrl.signal).catch((err) => {
+      if (!ctrl.signal.aborted) {
+        log("error", "个人 Web 监听守护循环异常退出（已隔离，不影响常驻进程）", { err: errMsg(err) });
+      }
+    });
     return { stop: () => this.stop() };
   }
 
@@ -708,14 +858,23 @@ export class PersonalWebBridge {
     assertLoginAuthorizedForWorkspace(this.app, login);
   }
 
-  /** 失败休眠后的唤醒键：包含 cookie_version、updated_at、吊销状态与当前活跃会话代际（与活跃长连接的 sessionKeyOf 分离），确保同会话轮换或跨文件重登后立即唤醒 */
+  /** 失败休眠后的唤醒键：结构化 JSON 编码，包含 cookie_version、updated_at、吊销状态与当前活跃会话代际（与活跃长连接的 sessionKeyOf 分离） */
   private credentialWatchKey(login: WebLogin | undefined): string {
     const bound = this.app.store.get(BOUND_OWNER_KV_KEY) ?? "";
     const boundWs = this.app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "";
     const revoked = this.app.store.get(REVOKED_AT_KV_KEY) ?? "";
     const active = this.app.store.get(ACTIVE_SESSION_KV_KEY) ?? "";
-    if (!login) return `none|${bound}|${boundWs}|${revoked}|${active}`;
-    return `${login.owner_id}:${login.session_id ?? ""}:v${login.cookie_version ?? 1}:${login.updated_at ?? ""}|${bound}|${boundWs}|${revoked}|${active}`;
+    if (!login) return JSON.stringify(["none", bound, boundWs, revoked, active]);
+    return JSON.stringify([
+      login.owner_id,
+      login.session_id ?? "",
+      login.cookie_version ?? 1,
+      login.updated_at ?? "",
+      bound,
+      boundWs,
+      revoked,
+      active,
+    ]);
   }
 
   /** 活跃长连接的会话代际键（仅含账号与 session_id，不因同会话 Cookie 轮换主动断开健康长连接） */
@@ -727,20 +886,27 @@ export class PersonalWebBridge {
   /** 阻塞等待直到磁盘凭据（含同会话 Cookie 修订与未完成暂存提交恢复）或工作区账号绑定发生变化，或收到中止信号 */
   private async waitForCredentialChange(lastFailedStateKey: string, signal: AbortSignal): Promise<void> {
     const interval = this.hooks.credentialWatchIntervalMs ?? 5_000;
-    this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
-    const immediate = this.loginStore.load();
-    if (immediate && this.credentialWatchKey(immediate) !== lastFailedStateKey) return;
+    const checkChanged = (): boolean => {
+      try {
+        this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
+        const cur = this.loginStore.load();
+        return !!cur && this.credentialWatchKey(cur) !== lastFailedStateKey;
+      } catch (err) {
+        log("warn", "等待个人 Web 凭据变更时读取状态失败（将在下个轮询周期重试）", { err: errMsg(err) });
+        return false;
+      }
+    };
+    if (checkChanged()) return;
     while (!signal.aborted) {
       await waitAbortable(interval, signal);
       if (signal.aborted) return;
-      this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
-      const cur = this.loginStore.load();
-      if (cur && this.credentialWatchKey(cur) !== lastFailedStateKey) return;
+      if (checkChanged()) return;
     }
   }
 
   private async runSupervisor(signal: AbortSignal): Promise<void> {
     let connectDelayMs = 2_000;
+    let supervisorErrDelayMs = 2_000;
     let connectDenials = 0;
     let lastAttemptedKey = "";
     let wasDegraded = false;
@@ -748,186 +914,222 @@ export class PersonalWebBridge {
     const watchInterval = this.hooks.credentialWatchIntervalMs ?? 5_000;
 
     const handleState = (next: ListenerState, detail = "", notifyLogin = true, sessionIdOverride?: string) => {
-      if (next === "reconnecting" || next === "reverifying") wasDegraded = true;
-      if (next === "listening") {
-        if (wasDegraded && everConnected) {
-          wasDegraded = false;
-          this.hooks.onReconnect();
+      try {
+        if (next === "reconnecting" || next === "reverifying") wasDegraded = true;
+        if (next === "listening") {
+          if (wasDegraded && everConnected) {
+            wasDegraded = false;
+            try {
+              this.hooks.onReconnect();
+            } catch (err) {
+              log("warn", "个人 Web 重连补扫回调失败", { err: errMsg(err) });
+            }
+          }
+          everConnected = true;
         }
-        everConnected = true;
-      }
-      const disk = this.loginStore.load();
-      this.persistState({
-        state: next,
-        owner_id: this.client?.owner().id ?? disk?.owner_id ?? "",
-        owner_name: this.client?.owner().name ?? disk?.owner_name ?? "",
-        session_id: sessionIdOverride ?? this.client?.currentSessionId() ?? disk?.session_id ?? "",
-        cookie_version: this.client?.currentCookieVersion() ?? disk?.cookie_version ?? 0,
-        since: Date.now(),
-        last_error: next === "listening" || next === "stopped" ? "" : detail,
-      });
-      if (next === "needs_login" && notifyLogin) {
-        this.hooks.onNeedsLogin(detail || "个人 Web 会话已失效，请重新扫码登录");
+        const disk = this.loginStore.load();
+        this.persistState({
+          state: next,
+          owner_id: this.client?.owner().id ?? disk?.owner_id ?? "",
+          owner_name: this.client?.owner().name ?? disk?.owner_name ?? "",
+          session_id: sessionIdOverride ?? this.client?.currentSessionId() ?? disk?.session_id ?? "",
+          cookie_version: this.client?.currentCookieVersion() ?? disk?.cookie_version ?? 0,
+          since: Date.now(),
+          last_error: next === "listening" || next === "stopped" ? "" : detail,
+        });
+        if (next === "needs_login" && notifyLogin) {
+          this.hooks.onNeedsLogin(detail || "个人 Web 会话已失效，请重新扫码登录");
+        }
+      } catch (err) {
+        log("warn", "更新个人 Web 监听状态或发送登录提醒失败（守护循环将继续运行）", { next, err: errMsg(err) });
       }
     };
 
     while (!signal.aborted) {
-      this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
-      const inspected = this.loginStore.inspect();
-      const login = inspected.status === "ok" ? inspected.login : undefined;
-      if (!login) {
-        lastAttemptedKey = "";
-        connectDenials = 0;
-        connectDelayMs = 2_000;
-        const msg =
-          inspected.status === "missing_key"
-            ? "检测到已加密的个人 Web 凭据，但当前环境缺少解密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）"
-            : inspected.status === "plaintext_rejected"
-              ? "检测到未加密的明文个人 Web 凭据（已拒绝加载），请配置加密密钥后重新运行 `pa context web-login`"
-              : "尚未完成个人 Web 扫码登录，请运行 `pa context web-login`";
-        handleState("needs_login", msg, false, "");
-        log("warn", "个人 Web 通道等待有效凭据", { file: this.loginStore.file, status: inspected.status });
-        await this.waitForCredentialChange(this.credentialWatchKey(undefined), signal);
-        continue;
-      }
-
-      const activeSessionKey = this.sessionKeyOf(login);
-      let lastObservedWatchKey = this.credentialWatchKey(login);
-      if (lastObservedWatchKey !== lastAttemptedKey) {
-        connectDenials = 0;
-        connectDelayMs = 2_000;
-        lastAttemptedKey = lastObservedWatchKey;
-      }
       try {
-        this.validateBoundOwner(login);
-      } catch (err) {
-        const msg = errMsg(err);
-        handleState("needs_login", msg, true, login.session_id ?? "");
-        await this.waitForCredentialChange(lastObservedWatchKey, signal);
-        continue;
-      }
-
-      const sessionCtrl = new AbortController();
-      const onOuterAbort = () => sessionCtrl.abort();
-      signal.addEventListener("abort", onOuterAbort, { once: true });
-      let invalidatedByDisk = false;
-      const credWatcher = setInterval(() => {
         this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
-        const latest = this.loginStore.load();
-        if (!latest || this.sessionKeyOf(latest) !== activeSessionKey) {
-          invalidatedByDisk = true;
-          sessionCtrl.abort();
-          return;
+        const inspected = this.loginStore.inspect();
+        const login = inspected.status === "ok" ? inspected.login : undefined;
+        if (!login) {
+          lastAttemptedKey = "";
+          connectDenials = 0;
+          connectDelayMs = 2_000;
+          const msg =
+            inspected.status === "missing_key"
+              ? "检测到已加密的个人 Web 凭据，但当前环境缺少解密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）"
+              : inspected.status === "plaintext_rejected"
+                ? "检测到未加密的明文个人 Web 凭据（已拒绝加载），请配置加密密钥后重新运行 `pa context web-login`"
+                : "尚未完成个人 Web 扫码登录，请运行 `pa context web-login`";
+          handleState("needs_login", msg, false, "");
+          log("warn", "个人 Web 通道等待有效凭据", { file: this.loginStore.file, status: inspected.status });
+          await this.waitForCredentialChange(this.credentialWatchKey(undefined), signal);
+          supervisorErrDelayMs = 2_000;
+          continue;
         }
-        try {
-          this.validateBoundOwner(latest);
-        } catch {
-          invalidatedByDisk = true;
-          sessionCtrl.abort();
-          return;
-        }
-        if (this.client && (latest.cookie_version ?? 1) > this.client.currentCookieVersion()) {
-          this.client.syncFromDisk(latest);
-          lastObservedWatchKey = this.credentialWatchKey(latest);
+
+        const activeSessionKey = this.sessionKeyOf(login);
+        let lastObservedWatchKey = this.credentialWatchKey(login);
+        if (lastObservedWatchKey !== lastAttemptedKey) {
+          connectDenials = 0;
+          connectDelayMs = 2_000;
           lastAttemptedKey = lastObservedWatchKey;
         }
-      }, watchInterval);
-      credWatcher.unref?.();
-
-      try {
-        handleState("connecting", "", true, login.session_id ?? "");
-        const client = await FeishuWebClient.connect(
-          login,
-          {
-            ...this.hooks.clientOptions,
-            onSessionConfirmed: (updated, delta) => {
-              try {
-                this.validateBoundOwner(updated);
-              } catch {
-                invalidatedByDisk = true;
-                sessionCtrl.abort();
-                return null;
-              }
-              const saved = this.loginStore.saveIfSessionMatches(updated, delta);
-              if (!saved) {
-                invalidatedByDisk = true;
-                sessionCtrl.abort();
-                return null;
-              }
-              // 本进程自身落盘的 Cookie 轮换同步更新 lastAttemptedKey，避免下轮误判为外部新凭据而清零 connectDenials
-              lastObservedWatchKey = this.credentialWatchKey(saved);
-              lastAttemptedKey = lastObservedWatchKey;
-              if (saved.owner_name && !this.app.store.get("ctx.owner_name")) {
-                this.app.store.set("ctx.owner_name", saved.owner_name);
-              }
-              return saved;
-            },
-          },
-          sessionCtrl.signal,
-        );
-        if (invalidatedByDisk || sessionCtrl.signal.aborted) continue;
-
-        this.client = client;
-        // 严禁在常驻监听中静默创建或修改工作区账号绑定（仅允许经 pa context web-login 人工确认后绑定）
-        connectDelayMs = 2_000;
-        connectDenials = 0;
-        if (client.owner().name && !this.app.store.get("ctx.owner_name")) {
-          this.app.store.set("ctx.owner_name", client.owner().name);
-        }
-        log("info", "个人 Web 通道已连接", { owner_id: client.owner().id, owner_name: client.owner().name });
-
-        await client.listen({
-          signal: sessionCtrl.signal,
-          onMessage: (msg) => this.handleMessage(msg, client, sessionCtrl.signal),
-          shouldDeliverInvalid: (msg) => {
-            if (!msg.id) return false;
-            const existing = this.store.obs(`pw:${msg.id}`);
-            return !!existing && existing.meta.withdrawn !== true;
-          },
-          onState: (s, d) => handleState(s, d, true),
-          onWarn: (m) => log("warn", m),
-        });
-      } catch (err) {
-        if (signal.aborted) break;
-        this.client = undefined;
-        if (invalidatedByDisk) {
-          connectDenials = 0;
-          connectDelayMs = 2_000;
-          log("info", "检测到个人 Web 凭据已登出或更新，正在重新同步会话状态");
-          continue;
-        }
-        const msg = errMsg(err);
-        if (err instanceof SessionNeedsLoginError) {
-          handleState("needs_login", msg, false, login.session_id ?? "");
+        try {
+          this.validateBoundOwner(login);
+        } catch (err) {
+          const msg = errMsg(err);
+          handleState("needs_login", msg, true, login.session_id ?? "");
           await this.waitForCredentialChange(lastObservedWatchKey, signal);
-          connectDenials = 0;
-          connectDelayMs = 2_000;
+          supervisorErrDelayMs = 2_000;
           continue;
         }
-        if (err instanceof WebHttpError && err.code === "credential_denied") {
-          connectDenials++;
-          if (connectDenials >= 3) {
-            handleState("needs_login", msg, true, login.session_id ?? "");
+
+        const sessionCtrl = new AbortController();
+        const onOuterAbort = () => sessionCtrl.abort();
+        signal.addEventListener("abort", onOuterAbort, { once: true });
+        let invalidatedByDisk = false;
+        const credWatcher = setInterval(() => {
+          try {
+            this.loginStore.reconcilePendingCommit(this.app.store, PENDING_CRED_COMMIT_KV_KEY);
+            const latest = this.loginStore.load();
+            if (!latest || this.sessionKeyOf(latest) !== activeSessionKey) {
+              invalidatedByDisk = true;
+              sessionCtrl.abort();
+              return;
+            }
+            try {
+              this.validateBoundOwner(latest);
+            } catch {
+              invalidatedByDisk = true;
+              sessionCtrl.abort();
+              return;
+            }
+            if (this.client && (latest.cookie_version ?? 1) > this.client.currentCookieVersion()) {
+              this.client.syncFromDisk(latest);
+              lastObservedWatchKey = this.credentialWatchKey(latest);
+              lastAttemptedKey = lastObservedWatchKey;
+            }
+          } catch (err) {
+            log("warn", "个人 Web 凭据定时检查失败（下个周期重试）", { err: errMsg(err) });
+          }
+        }, watchInterval);
+        credWatcher.unref?.();
+
+        try {
+          handleState("connecting", "", true, login.session_id ?? "");
+          const client = await FeishuWebClient.connect(
+            login,
+            {
+              ...this.hooks.clientOptions,
+              onSessionConfirmed: (updated, delta) => {
+                try {
+                  this.validateBoundOwner(updated);
+                } catch {
+                  invalidatedByDisk = true;
+                  sessionCtrl.abort();
+                  return null;
+                }
+                const saved = this.loginStore.saveIfSessionMatches(updated, delta);
+                if (!saved) {
+                  invalidatedByDisk = true;
+                  sessionCtrl.abort();
+                  return null;
+                }
+                // 本进程自身落盘的 Cookie 轮换同步更新 lastAttemptedKey，避免下轮误判为外部新凭据而清零 connectDenials
+                lastObservedWatchKey = this.credentialWatchKey(saved);
+                lastAttemptedKey = lastObservedWatchKey;
+                try {
+                  if (saved.owner_name && !this.app.store.get("ctx.owner_name")) {
+                    this.app.store.set("ctx.owner_name", saved.owner_name);
+                  }
+                } catch {
+                  // best-effort owner name cache
+                }
+                return saved;
+              },
+            },
+            sessionCtrl.signal,
+          );
+          if (invalidatedByDisk || sessionCtrl.signal.aborted) continue;
+
+          this.client = client;
+          // 严禁在常驻监听中静默创建或修改工作区账号绑定（仅允许经 pa context web-login 人工确认后绑定）
+          connectDelayMs = 2_000;
+          supervisorErrDelayMs = 2_000;
+          connectDenials = 0;
+          try {
+            if (client.owner().name && !this.app.store.get("ctx.owner_name")) {
+              this.app.store.set("ctx.owner_name", client.owner().name);
+            }
+          } catch {
+            // best-effort owner name cache
+          }
+          log("info", "个人 Web 通道已连接", { owner_id: client.owner().id, owner_name: client.owner().name });
+
+          await client.listen({
+            signal: sessionCtrl.signal,
+            onMessage: (msg) => this.handleMessage(msg, client, sessionCtrl.signal),
+            shouldDeliverInvalid: (msg) => {
+              if (!msg.id) return false;
+              const existing = this.store.obs(`pw:${msg.id}`);
+              return !!existing && existing.meta.withdrawn !== true;
+            },
+            onState: (s, d) => handleState(s, d, true),
+            onWarn: (m) => log("warn", m),
+          });
+        } catch (err) {
+          if (signal.aborted) break;
+          this.client = undefined;
+          if (invalidatedByDisk) {
+            connectDenials = 0;
+            connectDelayMs = 2_000;
+            log("info", "检测到个人 Web 凭据已登出或更新，正在重新同步会话状态");
+            continue;
+          }
+          const msg = errMsg(err);
+          if (err instanceof SessionNeedsLoginError) {
+            handleState("needs_login", msg, false, login.session_id ?? "");
             await this.waitForCredentialChange(lastObservedWatchKey, signal);
             connectDenials = 0;
             connectDelayMs = 2_000;
             continue;
           }
-          handleState("reverifying", msg, true, login.session_id ?? "");
-          await waitAbortable(30_000, sessionCtrl.signal);
-        } else {
-          connectDenials = 0;
-          handleState("reconnecting", msg, true, login.session_id ?? "");
-          await waitAbortable(connectDelayMs, sessionCtrl.signal);
-          connectDelayMs = Math.min(connectDelayMs * 2, 30_000);
+          if (err instanceof WebHttpError && err.code === "credential_denied") {
+            connectDenials++;
+            if (connectDenials >= 3) {
+              handleState("needs_login", msg, true, login.session_id ?? "");
+              await this.waitForCredentialChange(lastObservedWatchKey, signal);
+              connectDenials = 0;
+              connectDelayMs = 2_000;
+              continue;
+            }
+            handleState("reverifying", msg, true, login.session_id ?? "");
+            await waitAbortable(30_000, sessionCtrl.signal);
+          } else {
+            connectDenials = 0;
+            handleState("reconnecting", msg, true, login.session_id ?? "");
+            await waitAbortable(connectDelayMs, sessionCtrl.signal);
+            connectDelayMs = Math.min(connectDelayMs * 2, 30_000);
+          }
+        } finally {
+          clearInterval(credWatcher);
+          signal.removeEventListener("abort", onOuterAbort);
+          this.client = undefined;
         }
-      } finally {
-        clearInterval(credWatcher);
-        signal.removeEventListener("abort", onOuterAbort);
+        supervisorErrDelayMs = 2_000;
+      } catch (outerErr) {
+        if (signal.aborted) break;
         this.client = undefined;
+        log("warn", "个人 Web 守护循环发生未预期异常，退避重试", { err: errMsg(outerErr), delayMs: supervisorErrDelayMs });
+        await waitAbortable(supervisorErrDelayMs, signal);
+        supervisorErrDelayMs = Math.min(supervisorErrDelayMs * 2, 30_000);
       }
     }
-    this.persistState({ state: "stopped", since: Date.now(), last_error: "" });
+    try {
+      this.persistState({ state: "stopped", since: Date.now(), last_error: "" });
+    } catch {
+      // ignore stop-time persistence failure
+    }
   }
 
   // ───────── 排除规则（双向一致、实时复核负向命中、绝不 fail-open、绝不破坏数字关键词） ─────────
@@ -983,22 +1185,21 @@ export class PersonalWebBridge {
   }
 
   private openChatExclusionsKey(): string {
-    return [...this.collectOpenChatExclusions().keys()].sort().join(",");
+    return JSON.stringify([...this.collectOpenChatExclusions().keys()].sort());
   }
 
-  /** 原生推送入库/发送期间需监测的完整排除策略快照（含 oc_* 排除规则、本地静音集合与全部 groups_deny 关键词/ID 规则） */
-  private nativeExclusionPolicyKey(groupsDeny: string[] = this.cfg.context.groups_deny): string {
-    const oc = [...this.collectOpenChatExclusions(groupsDeny).entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([id, name]) => `${id}=${name}`)
-      .join("|");
+  /** 原生推送入库/发送期间需监测的完整排除策略快照（结构化 JSON 编码，杜绝分隔符碰撞；含 oc_* 排除规则、本地静音集合、全部 groups_deny 规则与磁盘配置健康态） */
+  private nativeExclusionPolicyKey(groupsDeny?: string[]): string {
+    this.syncDiskPrivacyConfig({ throwOnError: false });
+    const effectiveDeny = groupsDeny ?? this.cfg.context.groups_deny;
+    const oc = [...this.collectOpenChatExclusions(effectiveDeny).entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]));
     const mutes = this.store
       .mutedConvs()
-      .map((m) => `${m.conv}=${m.name}`)
-      .sort()
-      .join("|");
-    const deny = [...groupsDeny].map((s) => s.trim()).sort().join("|");
-    return `${oc};${mutes};${deny}`;
+      .map((m) => [m.conv, m.name] as const)
+      .sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]));
+    const deny = [...effectiveDeny].map((s) => s.trim()).sort();
+    return JSON.stringify([this.diskPolicyError ? `err:${this.diskPolicyError}` : "ok", oc, mutes, deny]);
   }
 
   /** 仅收集显式 `pw_chat:<id>` 原生排除/静音规则（纯数字如 "2024" 保持既有群名关键词语义，避免误把老配置当原生 ID） */
@@ -1326,6 +1527,7 @@ export class PersonalWebBridge {
     convName: string,
     nativeExclSnapshot?: NativePollingExclusions,
   ): Promise<"allowed" | "excluded" | "uncertain"> {
+    if (!this.syncDiskPrivacyConfig({ throwOnError: false })) return "uncertain";
     if (conv.startsWith("minutes:")) return this.cfg.context.sources.minutes ? "allowed" : "excluded";
     if (conv.startsWith("doc:")) return this.cfg.context.sources.docs ? "allowed" : "excluded";
     if (!conv.startsWith("pw_chat:") && !conv.startsWith("oc_")) return "allowed";
@@ -1641,7 +1843,8 @@ export class PersonalWebBridge {
    */
   async handleMessage(msg: WebMessage, client?: FeishuWebClient, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) return;
-    if (!this.cfg.context.sources.im) return;
+    this.syncDiskPrivacyConfig({ throwOnError: true });
+    if (!this.cfg.context.sources.im || !this.cfg.context.personal_web.enabled) return;
     if (!msg.id) return;
 
     const activeClient = client ?? this.client;
@@ -1913,6 +2116,7 @@ export class PersonalWebBridge {
         }
         this.validateBoundOwner(diskNow);
       }
+      this.syncDiskPrivacyConfig({ throwOnError: true });
       if (!this.cfg.context.sources.im || !this.cfg.context.personal_web.enabled) return false;
       if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(effectiveMsg.conversationId)) return false;
       if (this.isDirectlyDenied(pwConv, chatName || convName, undefined, convKind)) return false;
@@ -2338,65 +2542,24 @@ export class PersonalWebBridge {
     if (!this.cfg.context.personal_web.send_replies) {
       throw new Error("未开启个人 Web 回复（需在配置中设置 context.personal_web.send_replies: true）");
     }
-    let groups: "spoken" | "allowlist" = this.cfg.context.groups;
-    let groupsAllow: string[] = this.cfg.context.groups_allow;
-    let groupsDeny: string[] = this.cfg.context.groups_deny;
-    let maxGroups: number = this.cfg.context.max_groups;
-    let lookbackDays: number = this.cfg.context.lookback_days;
     const cfgFile = this.cfg.file;
     if (cfgFile) {
-      const curSig = statSignature(cfgFile);
-      if (!curSig) {
+      const disk = readDiskConfigRaw(cfgFile);
+      if (!disk.exists || disk.error || disk.raw === undefined) {
         throw new Error(`配置文件 ${cfgFile} 不存在或无法读取，无法核验 context.personal_web.send_replies 开关，按安全原则中止发送`);
       }
-      if (curSig !== this.initialCfgStat) {
-        try {
-          const parsed = YAML.parse(fs.readFileSync(cfgFile, "utf8")) as {
-            context?: {
-              personal_web?: { send_replies?: boolean };
-              groups?: unknown;
-              groups_allow?: unknown;
-              groups_deny?: unknown;
-              max_groups?: unknown;
-              lookback_days?: unknown;
-            };
-          };
-          const ctx = parsed?.context;
-          if (!ctx || typeof ctx !== "object" || ctx.personal_web?.send_replies !== true) {
-            throw new Error("检测到配置文件已关闭 context.personal_web.send_replies，已中止发送");
-          }
-          // 复用 ConfigSchema 同一组范围与排除列表校验，严禁将 YAML mapping/非字符串隐式 String() 化为 "[object Object]"
-          const scopeParsed = ContextScopeConfigSchema.safeParse({
-            lookback_days: ctx.lookback_days,
-            groups: ctx.groups,
-            groups_allow: ctx.groups_allow,
-            groups_deny: ctx.groups_deny,
-            max_groups: ctx.max_groups,
-          });
-          if (!scopeParsed.success) {
-            const badField = String(scopeParsed.error.issues[0]?.path[0] ?? "groups");
-            throw new Error(`检测到配置文件中的 context.${badField} 格式非法，已中止发送`);
-          }
-          groups = scopeParsed.data.groups;
-          groupsAllow = scopeParsed.data.groups_allow;
-          groupsDeny = scopeParsed.data.groups_deny;
-          maxGroups = scopeParsed.data.max_groups;
-          lookbackDays = scopeParsed.data.lookback_days;
-        } catch (err) {
-          if (
-            err instanceof Error &&
-            (err.message.includes("send_replies") ||
-              err.message.includes("context.groups") ||
-              err.message.includes("context.max_groups") ||
-              err.message.includes("context.lookback_days"))
-          ) {
-            throw err;
-          }
-          throw new Error("无法核验配置文件中的 context.personal_web.send_replies 开关，按安全原则中止发送");
-        }
+      this.syncDiskPrivacyConfig({ throwOnError: true });
+      if (!this.cfg.context.personal_web.send_replies) {
+        throw new Error("检测到配置文件已关闭 context.personal_web.send_replies，已中止发送");
       }
     }
-    return { groups, groupsAllow, groupsDeny, maxGroups, lookbackDays };
+    return {
+      groups: this.cfg.context.groups,
+      groupsAllow: this.cfg.context.groups_allow,
+      groupsDeny: this.cfg.context.groups_deny,
+      maxGroups: this.cfg.context.max_groups,
+      lookbackDays: this.cfg.context.lookback_days,
+    };
   }
 
   private assertSessionOwner(expectedOwnerId: string, expectedSessionId = ""): WebLogin {

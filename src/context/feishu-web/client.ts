@@ -519,7 +519,13 @@ export class FeishuWebClient {
       }
       const pair = parseProto(v.bytes, MAX_WIRE_BYTES);
       if (pair.str(1) === id) {
-        return decodeMessage(pair.bytes(2), this.ownerId);
+        const decoded = decodeMessage(pair.bytes(2), this.ownerId);
+        if (!decoded.id || decoded.id !== id) {
+          throw new GatewayError(
+            `个人 Web 消息查询返回不匹配的消息 ID (got=${decoded.id || "empty"}, want=${id})`,
+          );
+        }
+        return decoded;
       }
     }
     throw new MessageNotFoundError(id);

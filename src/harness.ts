@@ -638,7 +638,7 @@ function isSafeGitLfsFilterEntry(rawKey: string, rawValue: string): boolean {
   return false;
 }
 
-function gitUrlPrefixMatchesTarget(sectionPattern: string, targetRaw: string): boolean {
+export function gitUrlPrefixMatchesTarget(sectionPattern: string, targetRaw: string): boolean {
   const pat = sectionPattern.trim();
   const tgt = targetRaw.trim();
   if (!pat || !tgt) return false;
@@ -648,10 +648,10 @@ function gitUrlPrefixMatchesTarget(sectionPattern: string, targetRaw: string): b
     patUrl = new URL(pat);
     tgtUrl = new URL(tgt);
   } catch {
-    return tgt.toLowerCase().startsWith(pat.toLowerCase());
+    return false;
   }
   if (patUrl.protocol !== tgtUrl.protocol) return false;
-  // 按 Git urlmatch 规则校验用户名：配置段含用户名时仅匹配同一用户名目标，绝不把 A 账号的 extraHeader 投影给 B 账号或无用户名请求
+  // 按 Git urlmatch 规则校验用户名：配置段含用户名时仅匹配同一用户名目标，绝不把 A 账号的凭据/extraHeader 投影给 B 账号或无用户名请求
   if (patUrl.username) {
     if (!tgtUrl.username) return false;
     let patUser = patUrl.username;
@@ -670,9 +670,13 @@ function gitUrlPrefixMatchesTarget(sectionPattern: string, targetRaw: string): b
   }
   const patHost = patUrl.hostname.toLowerCase();
   const tgtHost = tgtUrl.hostname.toLowerCase();
+  if (!patHost || !tgtHost) return false;
   if (patHost.startsWith("*.")) {
+    // 按 Git urlmatch 规范：`*.example.com` 仅匹配单个主机名标签（如 `a.example.com`），绝不匹配多级子域（`x.a.example.com`）或裸域（`example.com`）
     const suffix = patHost.slice(1);
     if (!tgtHost.endsWith(suffix) || tgtHost.length <= suffix.length) return false;
+    const wildcardLabel = tgtHost.slice(0, tgtHost.length - suffix.length);
+    if (!wildcardLabel || wildcardLabel.includes(".")) return false;
   } else if (patHost !== tgtHost) {
     return false;
   }

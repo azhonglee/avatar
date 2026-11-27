@@ -294,10 +294,17 @@ export class Connectors {
   app: App;
   store: ContextStore;
   nativeExclusions?: () => Promise<NativePollingExclusions>;
-  constructor(app: App, store: ContextStore, nativeExclusions?: () => Promise<NativePollingExclusions>) {
+  syncDiskPolicy?: () => boolean;
+  constructor(
+    app: App,
+    store: ContextStore,
+    nativeExclusions?: () => Promise<NativePollingExclusions>,
+    syncDiskPolicy?: () => boolean,
+  ) {
     this.app = app;
     this.store = store;
     this.nativeExclusions = nativeExclusions;
+    this.syncDiskPolicy = syncDiskPolicy;
   }
 
   private get cfg() {
@@ -520,16 +527,26 @@ export class Connectors {
   }
 
   private pollingPolicySignature(): string {
+    const diskOk = this.syncDiskPolicy ? this.syncDiskPolicy() : true;
     const mutes = this.store
       .mutedConvs()
-      .map((m) => `${m.conv}=${m.name}`)
-      .sort()
-      .join("|");
-    const deny = [...this.cfg.context.groups_deny].map((s) => s.trim()).sort().join("|");
-    // 保留 groups_allow 顺序：在 max_groups 截断下，白名单顺序变化同样改变选中群集合；包含 lookback_days 与 bot_allow 以感知热重载变更
-    const allow = this.cfg.context.groups_allow.map((s) => s.trim()).join("|");
-    const bots = [...this.cfg.context.bot_allow].map((s) => s.trim()).sort().join("|");
-    return `${this.cfg.context.sources.im ? 1 : 0};${this.cfg.context.groups};${this.cfg.context.max_groups};${this.cfg.context.lookback_days};${allow};${deny};${mutes};${bots}`;
+      .map((m) => [m.conv, m.name] as const)
+      .sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]));
+    const deny = [...this.cfg.context.groups_deny].map((s) => s.trim()).sort();
+    // 保留 groups_allow 顺序：在 max_groups 截断下，白名单顺序变化同样改变选中群集合；包含 lookback_days、bot_allow 与磁盘配置健康态以感知外部修改
+    const allow = this.cfg.context.groups_allow.map((s) => s.trim());
+    const bots = [...this.cfg.context.bot_allow].map((s) => s.trim()).sort();
+    return JSON.stringify([
+      diskOk ? 1 : 0,
+      this.cfg.context.sources.im ? 1 : 0,
+      this.cfg.context.groups,
+      this.cfg.context.max_groups,
+      this.cfg.context.lookback_days,
+      allow,
+      deny,
+      mutes,
+      bots,
+    ]);
   }
 
   private async resolveCurrentChatMeta(chatId: string): Promise<{ name: string; chatType: "p2p" | "group" | "" } | undefined> {
@@ -721,7 +738,7 @@ export class Connectors {
     const initialGroupsMode = this.cfg.context.groups;
     const initialMaxGroups = this.cfg.context.max_groups;
     const initialLookbackDays = this.cfg.context.lookback_days;
-    const initialAllowOrder = this.cfg.context.groups_allow.map((s) => s.trim()).join("|");
+    const initialAllowOrder = JSON.stringify(this.cfg.context.groups_allow.map((s) => s.trim()));
     const atMeWindowStartMs = Math.ceil((sinceAtMe - 5 * 60_000) / 1000) * 1000;
     let nativeExcl = this.nativeExclusions ? await this.nativeExclusions() : undefined;
 
@@ -866,7 +883,7 @@ export class Connectors {
           nativeExcl,
           now,
         });
-    const initialRankedKey = ranked.map(([id]) => id).join(",");
+    const initialRankedKey = JSON.stringify(ranked.map(([id]) => id));
     const rankedSet = new Set(ranked.map(([id]) => id));
 
     const chatPollState = new Map<string, { startCur: number; hadPriorCursor: boolean; fetchFailed: boolean; hadInconclusiveRow: boolean }>();
@@ -1179,23 +1196,23 @@ export class Connectors {
         this.cfg.context.groups !== initialGroupsMode ||
         this.cfg.context.max_groups !== initialMaxGroups ||
         this.cfg.context.lookback_days !== initialLookbackDays ||
-        this.cfg.context.groups_allow.map((s) => s.trim()).join("|") !== initialAllowOrder ||
+        JSON.stringify(this.cfg.context.groups_allow.map((s) => s.trim())) !== initialAllowOrder ||
         (!latestExcl?.groupsInconclusive) !== scannedGroups
       ) {
         return true;
       }
       const rechecked = !latestExcl?.groupsInconclusive
-        ? selectEffectiveOpenGroups({
-            cfg: this.cfg,
-            store: this.store,
-            spoken: initialSpokenSnapshot,
-            knownNames: initialKnownNamesSnapshot,
-            nativeExcl: latestExcl,
-            now,
-          })
-            .map(([id]) => id)
-            .join(",")
-        : "";
+        ? JSON.stringify(
+            selectEffectiveOpenGroups({
+              cfg: this.cfg,
+              store: this.store,
+              spoken: initialSpokenSnapshot,
+              knownNames: initialKnownNamesSnapshot,
+              nativeExcl: latestExcl,
+              now,
+            }).map(([id]) => id),
+          )
+        : "[]";
       return rechecked !== initialRankedKey;
     };
 
@@ -1207,7 +1224,7 @@ export class Connectors {
         policySig = latestSig;
         nativeExcl = this.nativeExclusions ? await this.nativeExclusions() : undefined;
       }
-      if (!this.cfg.context.sources.im) {
+      if (!this.cfg.context.sources.im || (this.syncDiskPolicy && !this.syncDiskPolicy())) {
         return { count: 0, dropped: 0 };
       }
       if (scopeSelectionChanged(nativeExcl)) {
@@ -1385,16 +1402,16 @@ export class Connectors {
       // 若拉取消息期间学到的新群名导致生效群选排变化（例如群 A 改名命中排除规则，空出名额给群 B），
       // 先持久化新学到的群名，再不推进游标重启一轮拉取以补采接替群 B，避免推进 cursor.im.groups 遗漏 B 的消息
       if (learnedNames.size > 0 && !nativeExcl?.groupsInconclusive) {
-        const learnedRankedKey = selectEffectiveOpenGroups({
-          cfg: this.cfg,
-          store: this.store,
-          spoken,
-          knownNames,
-          nativeExcl,
-          now,
-        })
-          .map(([id]) => id)
-          .join(",");
+        const learnedRankedKey = JSON.stringify(
+          selectEffectiveOpenGroups({
+            cfg: this.cfg,
+            store: this.store,
+            spoken,
+            knownNames,
+            nativeExcl,
+            now,
+          }).map(([id]) => id),
+        );
         if (learnedRankedKey !== initialRankedKey) {
           await this.assertActiveLarkOwner("保存学到的群名");
           mergeKnownOpenGroupNames(this.app.store, learnedNames);
@@ -1427,7 +1444,7 @@ export class Connectors {
         if (this.pollingPolicySignature() !== policySig || scopeSelectionChanged(nativeExcl)) {
           return { committed: false as const, lostLease: false as const, count: 0 };
         }
-        if (!this.cfg.context.sources.im) {
+        if (!this.cfg.context.sources.im || (this.syncDiskPolicy && !this.syncDiskPolicy())) {
           return { committed: true as const, lostLease: false as const, count: 0 };
         }
         const n = this.store.addObs(obs);

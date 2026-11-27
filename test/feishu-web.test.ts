@@ -104,17 +104,21 @@ import {
   collectScopedSshMounts,
   commitAll,
   ensureGitLfsObjectsForCheckout,
+  git,
   gitCredentialLineMatchesTarget,
+  gitCredentialSectionMatchesUrl,
   isGitLfsPointerBlob,
   parseRemote,
   parseScpGitUrl,
   pushBranch,
   remoteDefaultBranch,
   resolveAuthorizedSshAuthSock,
+  resolveExternalLfsStorageGitOpts,
   resolveLocalGitRemoteDir,
   resolveLocalGitRemoteMount,
   rewriteGitCredentialHelperChain,
   tryGit,
+  writeScopedStaticCredentialHelper,
 } from "../src/delivery/git.ts";
 import { registerDelivery } from "../src/delivery/index.ts";
 import { runDoctor } from "../src/doctor.ts";
@@ -133,6 +137,7 @@ import {
   detectIsolatedCodexKeyringConflict,
   extractSafeCodexProviderArgs,
   extractSafeCodexProviderConfig,
+  gitUrlPrefixMatchesTarget,
   hasCredentialMountIsolation,
   isAuthMethodAllowedForAcpxAgent,
   isCodexOAuthRefreshNeeded,
@@ -15853,7 +15858,19 @@ test("Codex 第十九轮回归：仓库工人默认隔离、可信沙箱引导�
 
       // 12) 受信任远程 Git 操作仅投影目标域的 credential.helper=store 凭据，且绝不暴露其他域凭据
       assert.equal(
+        gitCredentialLineMatchesTarget("https://u:p@git.a.example:8443/org/repo.git", new URL("https://git.a.example:8443/org/repo.git"), true),
+        true,
+      );
+      assert.equal(
         gitCredentialLineMatchesTarget("https://u:p@git.a.example:8443/org", new URL("https://git.a.example:8443/org/repo.git"), true),
+        false,
+      );
+      assert.equal(
+        gitCredentialLineMatchesTarget("https://u:p@git.a.example:8443", new URL("https://git.a.example:8443/org/repo.git"), true),
+        false,
+      );
+      assert.equal(
+        gitCredentialLineMatchesTarget("https://u:p@git.a.example:8443/org", new URL("https://git.a.example:8443/org/repo.git"), false),
         true,
       );
       assert.equal(
@@ -21947,7 +21964,7 @@ test("Codex 第二十六轮回归：拒绝 .lfsconfig lfs.storage、非 SSH 强�
         const preInspect = path.join(repo12b, "pre-inspect.sh");
         fs.writeFileSync(
           preInspect,
-          `#!/bin/sh\nfor f in $(git config --get-all credential.helper | sed -n 's/.*--file=//p'); do\n  cat "$f" >> "${dump12b}" 2>/dev/null\ndone\n`,
+          `#!/bin/sh\nfor f in $(git config --get-regexp '^credential(\\..+)?\\.helper$' | sed -n 's/.*--file=//p'); do\n  cat "$f" >> "${dump12b}" 2>/dev/null\ndone\n`,
           { mode: 0o755 },
         );
         await runHostGit(repo12b, ["config", "--local", "credential.helper", ""]);
@@ -22098,7 +22115,7 @@ test("Codex 第二十六轮回归：拒绝 .lfsconfig lfs.storage、非 SSH 强�
         const inspector4 = path.join(repo4, "inspect4.sh");
         fs.writeFileSync(
           inspector4,
-          `#!/bin/sh\nfor f in $(git config --get-all credential.helper | sed -n 's/.*--file=//p'); do\n  cat "$f" >> "${dump4}" 2>/dev/null\ndone\n`,
+          `#!/bin/sh\nfor f in $(git config --get-regexp '^credential(\\..+)?\\.helper$' | sed -n 's/.*--file=//p'); do\n  cat "$f" >> "${dump4}" 2>/dev/null\ndone\n`,
           { mode: 0o755 },
         );
         const lfs4Env: NodeJS.ProcessEnv = { ...process.env, HOME: lfs4Home, XDG_CONFIG_HOME: path.join(lfs4Home, ".config") };
@@ -22204,6 +22221,784 @@ test("Codex 第二十六轮回归：拒绝 .lfsconfig lfs.storage、非 SSH 强�
         }
       } finally {
         freshApp.store.db.close();
+      }
+    }
+  } finally {
+    if (prevPwKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevPwKey;
+    for (const s of serversToClose) {
+      if ("closeAllConnections" in s && typeof s.closeAllConnections === "function") {
+        s.closeAllConnections();
+      }
+      await new Promise<void>((resolve) => s.close(() => resolve()));
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex 第二十七轮回归：磁盘隐私热重检、Git URL 通配与用户名匹配、credential helper 跨节重置/exact store/quit/Bearer/解码路径/相对文件、readMessage ID 核验、网关错误先验关联、LFS 临时索引与全局 attributesFile、merge/reset 挂载外部 lfs.storage、无碰撞策略签名、不透明 trigger_keys 与后台守护异常隔离", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-r27-"));
+  const serversToClose: (http.Server | net.Server)[] = [];
+  const prevPwKey = process.env.PA_FEISHU_WEB_KEY;
+  process.env.PA_FEISHU_WEB_KEY = "r27-test-key";
+
+  const makeR27App = (name: string, opts?: { pwEnabled?: boolean; groupsDeny?: string[]; imEnabled?: boolean }) => {
+    const dataDir = path.join(dir, name);
+    fs.mkdirSync(dataDir, { recursive: true });
+    const cfgFile = path.join(dataDir, "config.yaml");
+    const rawCfg = {
+      data_dir: dataDir,
+      owner: { open_id: "ou_r27_owner" },
+      harnesses: { cx: { type: "codex-exec", cmd: "/bin/true" } },
+      roles: { brain: "cx" },
+      context: {
+        groups: "spoken",
+        groups_deny: opts?.groupsDeny ?? [],
+        sources: { im: opts?.imEnabled ?? true, minutes: false, docs: false, meego: false, tasks: false, calendar: false },
+        personal_web: {
+          enabled: opts?.pwEnabled ?? true,
+          fast_lane: true,
+          pre_draft: true,
+          send_replies: false,
+        },
+      },
+    };
+    fs.writeFileSync(cfgFile, JSON.stringify(rawCfg, null, 2), "utf8");
+    const app = createApp(loadConfig(cfgFile));
+    return { app, cfgFile, rawCfg, dataDir };
+  };
+
+  const runHostGit = async (cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env) => {
+    const r = await runProcess("git", ["-C", cwd, ...args], { env, timeoutMs: 20_000 });
+    assert.equal(r.code, 0, `git ${args.join(" ")} 失败: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+
+  try {
+    // 1) [R27 #1 P1 + #15 P2 + #16 P2 + #17 P2] 磁盘隐私热重检、结构化无碰撞签名、不透明 edit_gen+digest trigger_keys 与守护异常隔离
+    {
+      const { app, cfgFile, rawCfg } = makeR27App("r27-privacy");
+      try {
+        const ctxSvc = new ContextService(app);
+        saveWorkspaceBinding(app.store, "777001", "ou_r27_owner");
+        ctxSvc.personalWeb.loginStore.save({
+          owner_id: "777001",
+          owner_name: "我",
+          session_id: "sess_r27",
+          updated_at: new Date().toISOString(),
+          cookies: [{ name: "session", value: "s", domain: ".larkoffice.com", path: "/" }],
+        });
+
+        // #15: ["Finance|Legal"] 与 ["Finance", "Legal"] 绝不能产生相同的 policySignature
+        app.cfg.context.groups_deny = ["Finance|Legal"];
+        const sigJoined = ctxSvc.personalWeb.policySignature();
+        app.cfg.context.groups_deny = ["Finance", "Legal"];
+        const sigSplit = ctxSvc.personalWeb.policySignature();
+        assert.notEqual(sigJoined, sigSplit, "groups_deny 中包含管道符时策略签名绝不得与拆分数组碰撞");
+        app.cfg.context.groups_deny = [];
+
+        // #1: 外部进程修改磁盘 config.yaml（把群加入 groups_deny 或关闭 sources.im），运行中监听器必须立即感知并拒收推送
+        const updatedDeny = {
+          ...rawCfg,
+          context: { ...rawCfg.context, groups_deny: ["pw_chat:99001"] },
+        };
+        fs.writeFileSync(cfgFile, JSON.stringify(updatedDeny, null, 2), "utf8");
+        await ctxSvc.personalWeb.handleMessage({
+          id: "m_r27_denied_disk",
+          ownerId: "777001",
+          actorId: "888001",
+          conversationId: "99001",
+          conversationKind: "group",
+          rootId: "",
+          parentId: "",
+          threadId: "",
+          cid: "c_r27_1",
+          kind: MSG_TEXT,
+          senderType: USER_SENDER_TYPE,
+          messageType: "text",
+          createdAtMs: Date.now(),
+          position: 1,
+          threadPosition: 0,
+          sendToChat: false,
+          text: "@我 请看这个机密信息",
+          mentions: [{ id: "777001", name: "我", start: 0, end: 2 }],
+          resources: [],
+          unsupported: false,
+          partial: false,
+        });
+        assert.equal(ctxSvc.store.obs("pw:m_r27_denied_disk"), undefined, "磁盘新增 groups_deny 后推送必须立即被拦截不落库");
+
+        // 外部进程关闭 context.sources.im -> 即使未改内存对象，新私聊也必须被拦截
+        const updatedImOff = {
+          ...rawCfg,
+          context: { ...rawCfg.context, sources: { ...rawCfg.context.sources, im: false } },
+        };
+        fs.writeFileSync(cfgFile, JSON.stringify(updatedImOff, null, 2), "utf8");
+        await ctxSvc.personalWeb.handleMessage({
+          id: "m_r27_im_off",
+          ownerId: "777001",
+          actorId: "888002",
+          conversationId: "99002",
+          conversationKind: "dm",
+          rootId: "",
+          parentId: "",
+          threadId: "",
+          cid: "c_r27_2",
+          kind: MSG_TEXT,
+          senderType: USER_SENDER_TYPE,
+          messageType: "text",
+          createdAtMs: Date.now(),
+          position: 1,
+          threadPosition: 0,
+          sendToChat: false,
+          text: "关闭 IM 后发来的私聊",
+          mentions: [],
+          resources: [],
+          unsupported: false,
+          partial: false,
+        });
+        assert.equal(ctxSvc.store.obs("pw:m_r27_im_off"), undefined, "磁盘关闭 sources.im 后推送必须立即拒收");
+
+        // 外部进程破坏 config.yaml -> hasDiskPolicyError() 必须 fail-closed 阻断周期与快通道
+        fs.writeFileSync(cfgFile, "context: { groups_deny: [ { bad: 1 } ] }\n", "utf8");
+        assert.equal(ctxSvc.personalWeb.hasDiskPolicyError(), true, "损坏磁盘隐私配置必须触发 fail-closed");
+        const cycRep = await ctxSvc.cycle("w_r27_bad_cfg");
+        assert.equal(cycRep.skipped, true, "磁盘配置损坏时 cycle 必须中止执行");
+
+        // 恢复合法配置后，验证 #16：不透明 trigger_keys 不含私聊正文，且 A -> B -> A 经由递增 edit_gen 重新武装已跳过草稿
+        fs.writeFileSync(cfgFile, JSON.stringify(rawCfg, null, 2), "utf8");
+        assert.equal(ctxSvc.personalWeb.hasDiskPolicyError(), false);
+        const secretBody = "PRIVATE_SALARY_TEXT_R27_999";
+        const nowTs = Date.now();
+        ctxSvc.store.addObs([
+          {
+            id: "pw:m_r27_aba",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:77001",
+            conv_name: "私聊：Alice",
+            actor_id: "888001",
+            actor_name: "Alice",
+            is_me: false,
+            time: nowTs,
+            text: secretBody,
+            url: "",
+            meta: { chat_type: "p2p", message_id: "m_r27_aba", native_owner_id: "777001", edit_gen: 0 },
+          },
+        ]);
+        const proj = ctxSvc.store.upsertProject({ id: "p_r27", name: "R27 项目" }, nowTs);
+        const { item } = ctxSvc.store.upsertItem(
+          {
+            strong_key: "r27:aba",
+            title: "回复 Alice",
+            kind: "ask_me",
+            source: "im",
+            project_id: proj.id,
+            priority: "high",
+            confidence: 0.95,
+            status: "open",
+            meta: {},
+          },
+          nowTs,
+        );
+        ctxSvc.store.addEvidence("item", item.id, "pw:m_r27_aba", "quote", nowTs);
+        const enq = (ctxSvc as unknown as {
+          enqueueAutoPreDrafts: (
+            items: typeof item[],
+            reqNative: boolean,
+            fresh: Record<string, string[]>,
+          ) => number;
+        }).enqueueAutoPreDrafts.bind(ctxSvc);
+        assert.equal(enq([item], true, { [item.id]: ["pw:m_r27_aba"] }), 1);
+        const draftWorkId = `context:draft:${item.id}:reply:fast`;
+        const w0 = app.ledger.get<{ trigger_keys?: string[] }>(draftWorkId);
+        assert.ok(w0, "预起草作业应入队");
+        assert.ok(
+          !JSON.stringify(w0!.payload).includes(secretBody),
+          "work 账本 trigger_keys 绝不得明文保留私聊正文",
+        );
+        assert.ok(
+          (w0!.payload.trigger_keys ?? []).some((k) => k.startsWith("pw:m_r27_aba#g0:")),
+          "trigger_keys 必须使用 obsId#g<edit_gen>:<digest> 格式",
+        );
+        // 标记为 skipped，真实执行 A -> B（edit_gen=1）再改回 A（edit_gen=2）
+        const claimed = app.ledger.claim("context", 60_000);
+        assert.equal(claimed?.id, draftWorkId, "应成功领取预起草作业");
+        app.ledger.transition(claimed!, { state: "skipped", terminal: true, outcome: "skipped" });
+        ctxSvc.store.addObs([
+          {
+            id: "pw:m_r27_aba",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:77001",
+            conv_name: "私聊：Alice",
+            actor_id: "888001",
+            actor_name: "Alice",
+            is_me: false,
+            time: nowTs + 500,
+            text: "INTERMEDIATE_EDIT_B",
+            url: "",
+            meta: { chat_type: "p2p", message_id: "m_r27_aba", native_owner_id: "777001" },
+          },
+        ]);
+        ctxSvc.store.addObs([
+          {
+            id: "pw:m_r27_aba",
+            source: "im",
+            kind: "p2p",
+            conv: "pw_chat:77001",
+            conv_name: "私聊：Alice",
+            actor_id: "888001",
+            actor_name: "Alice",
+            is_me: false,
+            time: nowTs + 1000,
+            text: secretBody,
+            url: "",
+            meta: { chat_type: "p2p", message_id: "m_r27_aba", native_owner_id: "777001" },
+          },
+        ]);
+        assert.equal(ctxSvc.store.obs("pw:m_r27_aba")?.meta.edit_gen, 2);
+        assert.equal(enq([item], true, { [item.id]: ["pw:m_r27_aba"] }), 1, "A->B->A 修订递增 edit_gen 后必须重新武装已跳过预起草");
+        const w2 = app.ledger.get<{ trigger_keys?: string[] }>(draftWorkId);
+        assert.equal(w2?.state, "pending");
+        assert.ok((w2?.payload.trigger_keys ?? []).some((k) => k.startsWith("pw:m_r27_aba#g2:")));
+
+        // #17: 后台 supervisor / onNeedsLogin 抛出瞬态 SQLite 错误时绝不得产生未捕获 Promise 拒绝
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => unhandled.push(reason);
+        process.on("unhandledRejection", onUnhandled);
+        try {
+          const crashBridge = new PersonalWebBridge(app, ctxSvc.store, {
+            onFastTrigger: () => undefined,
+            onReconnect: () => undefined,
+            onNeedsLogin: () => {
+              throw new Error("SQLITE_BUSY: database is locked");
+            },
+          });
+          // 清空登录态使 supervisor 立即进入 onNeedsLogin 分支并触发异常
+          crashBridge.loginStore.clear();
+          const handle = crashBridge.start();
+          await new Promise((r) => setTimeout(r, 80));
+          handle.stop();
+          await new Promise((r) => setTimeout(r, 40));
+          assert.equal(unhandled.length, 0, `后台守护循环异常必须被隔离，不得泄漏 unhandledRejection: ${String(unhandled[0])}`);
+        } finally {
+          process.off("unhandledRejection", onUnhandled);
+        }
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 2) [R27 #6 P2 + #7 P2] readMessage 解码 ID 校验 + unwrapGatewayPayload 关联字段先于 status 校验
+    {
+      // #7: nonzero status 但 command 或 cid 不匹配时，抛出的 GatewayError 不得带 status（避免 isDefinitiveNonCreationError 误判为可安全重试）
+      const mismatchCmdPkt = new ProtoWriter()
+        .uint(2, 1)
+        .uint(3, 999)
+        .uint(4, 500)
+        .bytes(5, new Uint8Array([1, 2]))
+        .str(6, "cid-ok")
+        .finish();
+      let errCmd: unknown;
+      try {
+        unwrapGatewayPayload(mismatchCmdPkt, { expectedCommand: CMD_SEND_MESSAGE, expectedCid: "cid-ok" });
+      } catch (e) {
+        errCmd = e;
+      }
+      assert.ok(errCmd instanceof GatewayError);
+      assert.equal(errCmd.status, undefined, "command 不匹配时不得把异包 status 当作确定性拒单状态");
+
+      const mismatchCidPkt = new ProtoWriter()
+        .uint(2, 1)
+        .uint(3, CMD_SEND_MESSAGE)
+        .uint(4, 400)
+        .bytes(5, new Uint8Array([1, 2]))
+        .str(6, "cid-other-req")
+        .finish();
+      let errCid: unknown;
+      try {
+        unwrapGatewayPayload(mismatchCidPkt, { expectedCommand: CMD_SEND_MESSAGE, expectedCid: "cid-expected" });
+      } catch (e) {
+        errCid = e;
+      }
+      assert.ok(errCid instanceof GatewayError);
+      assert.equal(errCid.status, undefined, "cid 不匹配时不得把异包 status 当作确定性拒单状态");
+
+      // #6: CMD 8 map key 为 "7001"，但内嵌解码出的 Message ID 为 "7002" 或空 -> readMessage 必须拒绝
+      const mock = await startMockFeishuWebServer();
+      try {
+        const client = await FeishuWebClient.connect(
+          {
+            owner_id: "7001",
+            owner_name: "张三",
+            cookies: [
+              { name: "session", value: "sess_live_1", domain: "127.0.0.1", path: "/" },
+              { name: "passport_web_did", value: "did_test_123", domain: "127.0.0.1", path: "/" },
+            ],
+          },
+          { endpoints: mock.endpoints },
+        );
+        for (const badInnerId of ["7002", ""]) {
+          const msgW = new ProtoWriter();
+          if (badInnerId) msgW.str(1, badInnerId);
+          msgW.uint(2, MSG_TEXT);
+          msgW.str(3, "8001");
+          msgW.bytes(4, new ProtoWriter().bytes(3, encodeRichText([{ text: "sibling text" }])).finish());
+          msgW.str(8, "9001");
+          msgW.uint(12, USER_SENDER_TYPE);
+          mock.addMessage("7001", msgW.finish());
+          await assert.rejects(
+            () => client.readMessage("7001"),
+            (err: unknown) => err instanceof GatewayError,
+            `readMessage 收到解码 ID=${JSON.stringify(badInnerId)} 与请求 7001 不符时必须拒绝`,
+          );
+        }
+      } finally {
+        await mock.close();
+      }
+    }
+
+    // 3) [R27 #5 P1 + #4 P1 + #3 P1] Git URL 单段通配、用户名匹配与 exact useHttpPath 单元测试
+    {
+      // #5: HTTP extraHeader / urlmatch 单段主机通配符
+      assert.equal(gitUrlPrefixMatchesTarget("https://*.example.com", "https://a.example.com/r"), true);
+      assert.equal(gitUrlPrefixMatchesTarget("https://*.example.com", "https://x.a.example.com/r"), false);
+      assert.equal(gitUrlPrefixMatchesTarget("https://*.example.com", "https://example.com/r"), false);
+      assert.equal(gitUrlPrefixMatchesTarget("https://", "https://a.example.com/r"), false);
+
+      const wildHome = path.join(dir, "r27-wild-home");
+      fs.mkdirSync(wildHome, { recursive: true });
+      fs.writeFileSync(
+        path.join(wildHome, ".gitconfig"),
+        `[http "https://*.example.com"]\n\textraHeader = Authorization: Bearer WILD_R27_TOK\n`,
+        "utf8",
+      );
+      const stSingle = stageSanitizedGitConfig(
+        { ...process.env, HOME: wildHome, XDG_CONFIG_HOME: path.join(wildHome, ".config") },
+        undefined,
+        { allowedRemoteUrls: ["https://a.example.com/org/repo.git"] },
+      );
+      const stMulti = stageSanitizedGitConfig(
+        { ...process.env, HOME: wildHome, XDG_CONFIG_HOME: path.join(wildHome, ".config") },
+        undefined,
+        { allowedRemoteUrls: ["https://x.a.example.com/org/repo.git"] },
+      );
+      try {
+        assert.ok(stSingle && fs.readFileSync(stSingle.file, "utf8").includes("WILD_R27_TOK"), "单级子域应继承 *.example.com extraHeader");
+        assert.ok(!stMulti || !fs.readFileSync(stMulti.file, "utf8").includes("WILD_R27_TOK"), "多级子域绝不得继承 *.example.com extraHeader");
+      } finally {
+        stSingle?.cleanup();
+        stMulti?.cleanup();
+      }
+
+      // #4: credential.<url>.helper 用户名与通配符匹配
+      assert.equal(gitCredentialSectionMatchesUrl("https://alice@example.com", new URL("https://example.com/r")), false);
+      assert.equal(gitCredentialSectionMatchesUrl("https://alice@example.com", new URL("https://alice@example.com/r")), true);
+      assert.equal(gitCredentialSectionMatchesUrl("https://alice@example.com", new URL("https://bob@example.com/r")), false);
+      assert.equal(gitCredentialSectionMatchesUrl("https://*.example.com", new URL("https://git.example.com/r")), true);
+      assert.equal(gitCredentialSectionMatchesUrl("https://*.example.com", new URL("https://a.b.example.com/r")), false);
+      assert.equal(gitCredentialSectionMatchesUrl("https://*.example.com", new URL("https://example.com/r")), false);
+      assert.equal(gitCredentialSectionMatchesUrl("example.com", new URL("https://example.com/r")), true);
+      assert.equal(gitCredentialSectionMatchesUrl("*.example.com", new URL("https://git.example.com/r")), false);
+
+      // #3: credential.useHttpPath=true 精确路径匹配（含 %20 解码）
+      const tgtPathUrl = new URL("https://git.example/my%20project/repo.git");
+      assert.equal(gitCredentialLineMatchesTarget("https://u:p@git.example", tgtPathUrl, true), false);
+      assert.equal(gitCredentialLineMatchesTarget("https://u:p@git.example/my%20project", tgtPathUrl, true), false);
+      assert.equal(gitCredentialLineMatchesTarget("https://u:p@git.example/my%20project/repo.git", tgtPathUrl, true), true);
+      assert.equal(gitCredentialLineMatchesTarget("https://u:p@git.example/other/repo.git", tgtPathUrl, false), true);
+    }
+
+    // 4) [R27 #2 P1 + #3 P1 + #4 P1 + #11 P2 + #12 P2 + #13 P2 + #14 P2] 隔离沙箱下端到端真实 HTTP credential helper 链路
+    {
+      const { app: appCred } = makeR27App("r27-cred-e2e");
+      try {
+        const receivedAuths: string[] = [];
+        const authSrv = http.createServer((req, res) => {
+          req.resume();
+          const auth = req.headers.authorization ?? "";
+          if (auth) receivedAuths.push(auth);
+          res.statusCode = 401;
+          res.setHeader("WWW-Authenticate", 'Basic realm="r27"');
+          res.setHeader("Connection", "close");
+          res.end("auth required");
+        });
+        await new Promise<void>((resolve) => authSrv.listen(0, "127.0.0.1", resolve));
+        serversToClose.push(authSrv);
+        const port = (authSrv.address() as net.AddressInfo).port;
+        const baseHost = `http://127.0.0.1:${port}`;
+
+        const mkRepo = async (sub: string) => {
+          const r = path.join(dir, sub);
+          fs.mkdirSync(r, { recursive: true });
+          await runHostGit(r, ["init", "-q"]);
+          return r;
+        };
+
+        // #2: 跨节 credential.<url>.helper= 重置必须清空较早的通用 credential.helper，使默认 helper 绝不被调用
+        {
+          const hDir = path.join(dir, "r27-h2-home");
+          fs.mkdirSync(hDir, { recursive: true });
+          const defaultCalled = path.join(dir, "r27-h2-default-called");
+          const hDef = path.join(hDir, "def.sh");
+          const hRep = path.join(hDir, "rep.sh");
+          fs.writeFileSync(hDef, `#!/bin/sh\ntouch "${defaultCalled}"\nprintf "username=wrong\\npassword=wrong\\n"\n`, { mode: 0o755 });
+          fs.writeFileSync(hRep, `#!/bin/sh\ncat >/dev/null\nprintf "username=right\\npassword=rightpass\\n"\n`, { mode: 0o755 });
+          fs.writeFileSync(
+            path.join(hDir, ".gitconfig"),
+            `[credential]\n\thelper = !${hDef}\n[credential "${baseHost}"]\n\thelper =\n\thelper = !${hRep}\n`,
+            "utf8",
+          );
+          const repo = await mkRepo("r27-h2-repo");
+          receivedAuths.length = 0;
+          await tryGit(repo, ["ls-remote", `${baseHost}/r.git`], {
+            cfg: appCred.cfg,
+            trustedRepoRoot: repo,
+            extraEnv: { HOME: hDir, XDG_CONFIG_HOME: path.join(hDir, ".config") },
+          });
+          assert.equal(fs.existsSync(defaultCalled), false, "跨节空值重置后，先前的通用 credential.helper 绝不得被调用");
+          assert.ok(
+            receivedAuths.includes(`Basic ${Buffer.from("right:rightpass").toString("base64")}`),
+            "重置后的 URL 特化 helper 必须生效",
+          );
+        }
+
+        // #3: useHttpPath=true 时 store 中排在前面的无路径条目与前缀条目必须被跳过，命中后续精确路径条目
+        {
+          const hDir = path.join(dir, "r27-h3-home");
+          fs.mkdirSync(hDir, { recursive: true });
+          const sf = path.join(hDir, ".git-credentials");
+          fs.writeFileSync(
+            sf,
+            [
+              `http://hostonly:bad1@127.0.0.1:${port}`,
+              `http://prefixonly:bad2@127.0.0.1:${port}/org`,
+              `http://exactu:exactp@127.0.0.1:${port}/org/repo.git`,
+            ].join("\n") + "\n",
+            { mode: 0o600 },
+          );
+          fs.writeFileSync(
+            path.join(hDir, ".gitconfig"),
+            `[credential]\n\tuseHttpPath = true\n\thelper = store --file=${sf}\n`,
+            "utf8",
+          );
+          const repo = await mkRepo("r27-h3-repo");
+          receivedAuths.length = 0;
+          await tryGit(repo, ["ls-remote", `${baseHost}/org/repo.git`], {
+            cfg: appCred.cfg,
+            trustedRepoRoot: repo,
+            extraEnv: { HOME: hDir, XDG_CONFIG_HOME: path.join(hDir, ".config") },
+          });
+          assert.ok(
+            receivedAuths.includes(`Basic ${Buffer.from("exactu:exactp").toString("base64")}`),
+            "useHttpPath=true 必须跳过无路径与前缀条目并选取精确路径凭据",
+          );
+        }
+
+        // #4: 含用户名的 credential.http://alice@host.helper 绝不得用于无用户名远端
+        {
+          const hDir = path.join(dir, "r27-h4-home");
+          fs.mkdirSync(hDir, { recursive: true });
+          const aliceCalled = path.join(dir, "r27-h4-alice-called");
+          const hAlice = path.join(hDir, "alice.sh");
+          fs.writeFileSync(hAlice, `#!/bin/sh\ntouch "${aliceCalled}"\nprintf "username=alice\\npassword=alicepass\\n"\n`, { mode: 0o755 });
+          fs.writeFileSync(
+            path.join(hDir, ".gitconfig"),
+            `[credential "http://alice@127.0.0.1:${port}"]\n\thelper = !${hAlice}\n`,
+            "utf8",
+          );
+          const repo = await mkRepo("r27-h4-repo");
+          receivedAuths.length = 0;
+          await tryGit(repo, ["ls-remote", `${baseHost}/r.git`], {
+            cfg: appCred.cfg,
+            trustedRepoRoot: repo,
+            extraEnv: { HOME: hDir, XDG_CONFIG_HOME: path.join(hDir, ".config") },
+          });
+          assert.equal(fs.existsSync(aliceCalled), false, "带用户名的 credential.<url>.helper 绝不得对无用户名远端触发");
+          assert.equal(receivedAuths.length, 0);
+        }
+
+        // #11: 宿主机 helper 返回 quit=1 排在仓库 local helper 之前 -> 必须原位保留 quit 并阻止 local helper 执行
+        {
+          const hDir = path.join(dir, "r27-h11-home");
+          fs.mkdirSync(hDir, { recursive: true });
+          const hQuit = path.join(hDir, "quit.sh");
+          fs.writeFileSync(hQuit, `#!/bin/sh\ncat >/dev/null\nprintf "quit=1\\n"\n`, { mode: 0o755 });
+          fs.writeFileSync(path.join(hDir, ".gitconfig"), `[credential]\n\thelper = !${hQuit}\n`, "utf8");
+          const repo = await mkRepo("r27-h11-repo");
+          const localRan = path.join(repo, "local-ran");
+          const hLocal = path.join(repo, "local.sh");
+          fs.writeFileSync(hLocal, `#!/bin/sh\ntouch "${localRan}"\nprintf "username=loc\\npassword=locp\\n"\n`, { mode: 0o755 });
+          await runHostGit(repo, ["config", "--local", "credential.helper", `!${hLocal}`]);
+          receivedAuths.length = 0;
+          await tryGit(repo, ["ls-remote", `${baseHost}/r.git`], {
+            cfg: appCred.cfg,
+            trustedRepoRoot: repo,
+            extraEnv: { HOME: hDir, XDG_CONFIG_HOME: path.join(hDir, ".config") },
+          });
+          assert.equal(fs.existsSync(localRan), false, "宿主机 helper 返回 quit=1 后绝不得再执行后续仓库 local helper");
+          assert.equal(receivedAuths.length, 0);
+        }
+
+        // #12: 宿主机 helper 协商 capability[]=authtype 并返回 Bearer 令牌 -> 沙箱内必须原位暂存受限响应脚本且含精确令牌
+        {
+          const hDir = path.join(dir, "r27-h12-home");
+          fs.mkdirSync(hDir, { recursive: true });
+          const seenCaps = path.join(dir, "r27-h12-caps.txt");
+          const hBearer = path.join(hDir, "bearer.sh");
+          fs.writeFileSync(
+            hBearer,
+            `#!/bin/sh\ncat > "${seenCaps}"\nprintf 'capability[]=authtype\\nauthtype=Bearer\\ncredential=tok_r27_$100%%_bearer\\n'\n`,
+            { mode: 0o755 },
+          );
+          fs.writeFileSync(path.join(hDir, ".gitconfig"), `[credential]\n\thelper = !${hBearer}\n`, "utf8");
+          const repo = await mkRepo("r27-h12-repo");
+          const traceRes = await tryGit(repo, ["ls-remote", `${baseHost}/r.git`], {
+            cfg: appCred.cfg,
+            trustedRepoRoot: repo,
+            extraEnv: {
+              HOME: hDir,
+              XDG_CONFIG_HOME: path.join(hDir, ".config"),
+              GIT_TRACE: "1",
+            },
+          });
+          assert.ok(fs.existsSync(seenCaps), "宿主机 Bearer helper 必须被调用");
+          assert.ok(
+            fs.readFileSync(seenCaps, "utf8").includes("capability[]=authtype"),
+            "调用宿主机 helper 时必须协商 capability[]=authtype",
+          );
+          assert.ok(
+            /helper-resp-\d+\.sh/.test(traceRes.stderr),
+            `沙箱内 Git 必须执行暂存的 Bearer 响应脚本（实际 stderr=${traceRes.stderr.slice(0, 400)}）`,
+          );
+
+          // 直接校验受限静态响应脚本的作用域隔离与特殊字符（$ / %）保真输出
+          const staticDir = path.join(dir, "r27-h12-static");
+          fs.mkdirSync(staticDir, { recursive: true, mode: 0o700 });
+          const helperCmd = writeScopedStaticCredentialHelper(
+            staticDir,
+            0,
+            {
+              protocol: "https",
+              hostname: "git.example.com",
+              port: "",
+              useHttpPath: true,
+              decodedPath: "my project/repo.git",
+              rejectNonEmptyUser: true,
+            },
+            ["capability[]=authtype", "authtype=Bearer", "credential=tok_r27_$100%_bearer"],
+          );
+          const matchOut = await runProcess("/bin/sh", ["-c", `${helperCmd.slice(1)} get`], {
+            input: "capability[]=authtype\nprotocol=https\nhost=GIT.EXAMPLE.COM:443\npath=my project/repo.git\n\n",
+          });
+          assert.equal(matchOut.code, 0);
+          assert.equal(
+            matchOut.stdout,
+            "capability[]=authtype\nauthtype=Bearer\ncredential=tok_r27_$100%_bearer\n",
+            "命中目标时必须原样返回 authtype 与含特殊字符的 Bearer 凭据",
+          );
+          const wrongHostOut = await runProcess("/bin/sh", ["-c", `${helperCmd.slice(1)} get`], {
+            input: "capability[]=authtype\nprotocol=https\nhost=evil.example.com\npath=my project/repo.git\n\n",
+          });
+          assert.equal(wrongHostOut.stdout, "", "不同主机绝不得获取暂存的 Bearer 凭据");
+          const wrongPathOut = await runProcess("/bin/sh", ["-c", `${helperCmd.slice(1)} get`], {
+            input: "capability[]=authtype\nprotocol=https\nhost=git.example.com\npath=other/repo.git\n\n",
+          });
+          assert.equal(wrongPathOut.stdout, "", "useHttpPath=true 下不同路径绝不得获取暂存的 Bearer 凭据");
+          const storeActionOut = await runProcess("/bin/sh", ["-c", `${helperCmd.slice(1)} store`], {
+            input: "protocol=https\nhost=git.example.com\npath=my project/repo.git\n\n",
+          });
+          assert.equal(storeActionOut.stdout, "", "非 get 动作必须静默忽略");
+        }
+
+        // #13: useHttpPath=true 且远端路径含 %20 时，发送给宿主机 helper 的 path 必须已解码，且暂存凭据可成功认证
+        {
+          const hDir = path.join(dir, "r27-h13-home");
+          fs.mkdirSync(hDir, { recursive: true });
+          const seenInput = path.join(dir, "r27-h13-stdin.txt");
+          const hSpace = path.join(hDir, "space.sh");
+          fs.writeFileSync(
+            hSpace,
+            `#!/bin/sh\ncat > "${seenInput}"\nprintf "username=spaceu\\npassword=spacep\\n"\n`,
+            { mode: 0o755 },
+          );
+          fs.writeFileSync(
+            path.join(hDir, ".gitconfig"),
+            `[credential]\n\tuseHttpPath = true\n\thelper = !${hSpace}\n`,
+            "utf8",
+          );
+          const repo = await mkRepo("r27-h13-repo");
+          receivedAuths.length = 0;
+          await tryGit(repo, ["ls-remote", `${baseHost}/my%20project/repo.git`], {
+            cfg: appCred.cfg,
+            trustedRepoRoot: repo,
+            extraEnv: { HOME: hDir, XDG_CONFIG_HOME: path.join(hDir, ".config") },
+          });
+          const stdinText = fs.readFileSync(seenInput, "utf8");
+          assert.ok(stdinText.includes("path=my project/repo.git"), `宿主机 helper 必须收到解码后的 path（实际=${stdinText}）`);
+          assert.ok(!stdinText.includes("my%20project"), "发给宿主机 helper 的 path 不得保留百分号转义");
+          assert.ok(
+            receivedAuths.includes(`Basic ${Buffer.from("spaceu:spacep").toString("base64")}`),
+            "含空格路径的凭据写回 store 后必须可成功认证",
+          );
+        }
+
+        // #14: credential.helper = store --file=.git/my-creds 相对路径必须相对 Git 工作目录 cwd 解析而非 daemon process.cwd()
+        {
+          const hDir = path.join(dir, "r27-h14-home");
+          fs.mkdirSync(hDir, { recursive: true });
+          const repo = await mkRepo("r27-h14-repo");
+          fs.writeFileSync(
+            path.join(repo, ".git", "my-creds"),
+            `http://relu:relp@127.0.0.1:${port}\n`,
+            { mode: 0o600 },
+          );
+          await runHostGit(repo, ["config", "--local", "credential.helper", "store --file=.git/my-creds"]);
+          receivedAuths.length = 0;
+          await tryGit(repo, ["ls-remote", `${baseHost}/r.git`], {
+            cfg: appCred.cfg,
+            trustedRepoRoot: repo,
+            extraEnv: { HOME: hDir, XDG_CONFIG_HOME: path.join(hDir, ".config") },
+          });
+          assert.ok(
+            receivedAuths.includes(`Basic ${Buffer.from("relu:relp").toString("base64")}`),
+            "相对路径 --file=.git/my-creds 必须相对仓库 cwd 解析并成功认证",
+          );
+        }
+      } finally {
+        appCred.store.db.close();
+      }
+    }
+
+    // 5) [R27 #8 P2 + #9 P2 + #10 P2] LFS 临时索引 GIT_INDEX_FILE 透传、全局 core.attributesFile 预检与 merge/reset 外部 lfs.storage 挂载
+    if (resolveTrustedSystemBin("git-lfs")) {
+      const { app: appLfs } = makeR27App("r27-lfs");
+      const lfsHome = path.join(dir, "r27-lfs-home");
+      fs.mkdirSync(lfsHome, { recursive: true });
+      const lfsEnv: NodeJS.ProcessEnv = { ...process.env, HOME: lfsHome, XDG_CONFIG_HOME: path.join(lfsHome, ".config") };
+      delete lfsEnv.GIT_CONFIG_GLOBAL;
+      await runProcess("git", ["lfs", "install", "--skip-repo"], { env: lfsEnv, timeoutMs: 15_000 });
+      try {
+        // #8: 目标分支新增 .gitattributes 标为 filter=lfs（而当前 HEAD 无 .gitattributes）-> ensureGitLfsObjectsForCheckout 必须把 GIT_INDEX_FILE 传给 tryGitBuffer 并检出缺失对象
+        {
+          const bare8 = path.join(dir, "r27-8-bare.git");
+          const repo8 = path.join(dir, "r27-8-repo");
+          fs.mkdirSync(bare8, { recursive: true });
+          fs.mkdirSync(repo8, { recursive: true });
+          await runHostGit(bare8, ["init", "--bare", "-q"], lfsEnv);
+          await runHostGit(repo8, ["init", "-q", "-b", "main"], lfsEnv);
+          await runHostGit(repo8, ["config", "user.name", "T"], lfsEnv);
+          await runHostGit(repo8, ["config", "user.email", "t@t"], lfsEnv);
+          await runHostGit(repo8, ["remote", "add", "origin", bare8], lfsEnv);
+          fs.writeFileSync(path.join(repo8, "readme.txt"), "base\n");
+          await runHostGit(repo8, ["add", "."], lfsEnv);
+          await runHostGit(repo8, ["commit", "-q", "-m", "base"], lfsEnv);
+          await runHostGit(repo8, ["push", "-q", "-u", "origin", "main"], lfsEnv);
+
+          await runHostGit(repo8, ["checkout", "-q", "-b", "lfs-feat"], lfsEnv);
+          fs.writeFileSync(path.join(repo8, ".gitattributes"), "*.dat filter=lfs diff=lfs merge=lfs -text\n");
+          const payload8 = "r27-8-pinned-index-lfs-body";
+          fs.writeFileSync(path.join(repo8, "asset.dat"), payload8);
+          await runHostGit(repo8, ["add", "."], lfsEnv);
+          await runHostGit(repo8, ["commit", "-q", "-m", "add lfs on branch"], lfsEnv);
+          await runHostGit(repo8, ["push", "-q", "origin", "lfs-feat"], lfsEnv);
+          // 切回 main（此时当前工作区与索引不含 .gitattributes），并清空本地 .git/lfs/objects
+          await runHostGit(repo8, ["checkout", "-q", "main"], lfsEnv);
+          fs.rmSync(path.join(repo8, ".git", "lfs", "objects"), { recursive: true, force: true });
+
+          const res8 = await ensureGitLfsObjectsForCheckout(repo8, "lfs-feat", {
+            cfg: appLfs.cfg,
+            trustedRepoRoot: repo8,
+            extraEnv: { HOME: lfsHome, XDG_CONFIG_HOME: path.join(lfsHome, ".config") },
+          });
+          assert.equal(res8.missingCount, 1, "当目标分支新增 .gitattributes 时，缓冲 check-attr 必须通过 GIT_INDEX_FILE 识别缺失 LFS 对象");
+          assert.equal(res8.fetched, true, "缺失 LFS 对象必须由预检提前拉取回本地缓存");
+        }
+
+        // #9: 仓库无 .gitattributes，仅由全局 core.attributesFile 标为 filter=lfs -> 预检必须采用同一脱敏全局配置识别并预拉取
+        {
+          const gHome = path.join(dir, "r27-9-home");
+          fs.mkdirSync(gHome, { recursive: true });
+          const gEnv: NodeJS.ProcessEnv = { ...process.env, HOME: gHome, XDG_CONFIG_HOME: path.join(gHome, ".config") };
+          delete gEnv.GIT_CONFIG_GLOBAL;
+          await runProcess("git", ["lfs", "install", "--skip-repo"], { env: gEnv, timeoutMs: 15_000 });
+          const gAttr = path.join(gHome, "global.gitattributes");
+          fs.writeFileSync(gAttr, "*.gbin filter=lfs diff=lfs merge=lfs -text\n");
+          await runProcess("git", ["config", "--global", "core.attributesFile", gAttr], { env: gEnv, timeoutMs: 15_000 });
+
+          const bare9 = path.join(dir, "r27-9-bare.git");
+          const repo9 = path.join(dir, "r27-9-repo");
+          fs.mkdirSync(bare9, { recursive: true });
+          fs.mkdirSync(repo9, { recursive: true });
+          await runHostGit(bare9, ["init", "--bare", "-q"], gEnv);
+          await runHostGit(repo9, ["init", "-q", "-b", "main"], gEnv);
+          await runHostGit(repo9, ["config", "user.name", "T"], gEnv);
+          await runHostGit(repo9, ["config", "user.email", "t@t"], gEnv);
+          await runHostGit(repo9, ["remote", "add", "origin", bare9], gEnv);
+          fs.writeFileSync(path.join(repo9, "data.gbin"), "r27-9-global-attr-lfs-payload");
+          await runHostGit(repo9, ["add", "."], gEnv);
+          await runHostGit(repo9, ["commit", "-q", "-m", "global attr lfs"], gEnv);
+          await runHostGit(repo9, ["push", "-q", "-u", "origin", "main"], gEnv);
+          fs.rmSync(path.join(repo9, ".git", "lfs", "objects"), { recursive: true, force: true });
+
+          const res9 = await ensureGitLfsObjectsForCheckout(repo9, "HEAD", {
+            cfg: appLfs.cfg,
+            trustedRepoRoot: repo9,
+            extraEnv: { HOME: gHome, XDG_CONFIG_HOME: path.join(gHome, ".config") },
+          });
+          assert.equal(res9.missingCount, 1, "仅由全局 core.attributesFile 标记为 LFS 的文件必须被预检识别");
+          assert.equal(res9.fetched, true, "预检必须拉取缺失的全局属性 LFS 对象");
+        }
+
+        // #10: 外部 lfs.storage 下，commitAll + 快进 merge 与 checkpoint reset --hard 必须挂载同一外部缓存并正确 smudge
+        {
+          const extStore = path.join(dir, "r27-10-ext-lfs");
+          fs.mkdirSync(extStore, { recursive: true });
+          const repo10 = path.join(dir, "r27-10-repo");
+          const wt10 = path.join(dir, "r27-10-wt");
+          fs.mkdirSync(repo10, { recursive: true });
+          await runHostGit(repo10, ["init", "-q", "-b", "main"], lfsEnv);
+          await runHostGit(repo10, ["config", "user.name", "T"], lfsEnv);
+          await runHostGit(repo10, ["config", "user.email", "t@t"], lfsEnv);
+          await runHostGit(repo10, ["config", "lfs.storage", extStore], lfsEnv);
+          fs.writeFileSync(path.join(repo10, ".gitattributes"), "*.extbin filter=lfs diff=lfs merge=lfs -text\n");
+          fs.writeFileSync(path.join(repo10, "base.txt"), "base\n");
+          await runHostGit(repo10, ["add", "."], lfsEnv);
+          await runHostGit(repo10, ["commit", "-q", "-m", "init"], lfsEnv);
+          await runHostGit(repo10, ["worktree", "add", "-q", "-b", "pa/ext", wt10, "main"], lfsEnv);
+
+          const gitOpts10 = {
+            cfg: appLfs.cfg,
+            trustedRepoRoot: repo10,
+            extraEnv: { HOME: lfsHome, XDG_CONFIG_HOME: path.join(lfsHome, ".config") },
+          };
+          const extPayload = "r27-10-external-storage-real-content";
+          fs.writeFileSync(path.join(wt10, "blob.extbin"), extPayload);
+          assert.equal(await commitAll(wt10, "commit external lfs", gitOpts10), true);
+          const cpSha = (await runHostGit(wt10, ["rev-parse", "HEAD"], lfsEnv)).trim();
+
+          // 模拟 checkpoint reset --hard 恢复（篡改文件后调用与 Dispatcher.execute 相同的 resolveExternalLfsStorageGitOpts）
+          fs.writeFileSync(path.join(wt10, "blob.extbin"), "corrupted-partial-write");
+          const resetOpts = await resolveExternalLfsStorageGitOpts(wt10, gitOpts10);
+          await git(wt10, ["reset", "--hard", cpSha], resetOpts);
+          assert.equal(
+            fs.readFileSync(path.join(wt10, "blob.extbin"), "utf8"),
+            extPayload,
+            "checkpoint reset --hard 必须挂载外部 lfs.storage 并完整 smudge 还原内容",
+          );
+
+          // 模拟 mergeLocal 快进合并到检出着 main 的主仓库（调用与 mergeLocal 相同的 resolveExternalLfsStorageGitOpts）
+          const mergeOpts = await resolveExternalLfsStorageGitOpts(repo10, gitOpts10);
+          await git(repo10, ["merge", "--ff-only", "-q", "refs/heads/pa/ext"], mergeOpts);
+          assert.equal(
+            fs.readFileSync(path.join(repo10, "blob.extbin"), "utf8"),
+            extPayload,
+            "隔离快进合并必须挂载外部 lfs.storage 并完整 smudge 还原 LFS 文件内容",
+          );
+        }
+      } finally {
+        appLfs.store.db.close();
       }
     }
   } finally {
