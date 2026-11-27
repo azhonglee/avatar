@@ -26019,6 +26019,87 @@ test("子 Agent 联合审查 15 项缺陷回归：pw.reply遵守sources.im、CLI
           /移出当前允许的群范围/,
           "仅含 chat_id 的群草稿若群不在白名单内必须拒绝",
         );
+
+        // 2c) 远端 mget 返回缺少 chat_id 且无本地 targetConv 时必须 fail-closed 拒绝
+        fakeLark.run = async (argv: string[]) => {
+          if (argv[0] === "im" && argv[1] === "+messages-mget") {
+            return { messages: [{ message_id: "om_sr_a2_nochat", content: "缺少 chat_id" }] };
+          }
+          return {};
+        };
+        await assert.rejects(
+          () => ctxSvc.verifyCliDraftTargetForDelivery("", "", "om_sr_a2_nochat"),
+          /无法确定目标会话 ID/,
+          "mget 省略 chat_id 且无本地会话 ID 时必须 fail-closed 拒绝",
+        );
+
+        // 2d) mget 异步等待期间磁盘新增 groups_deny 排除目标私聊 -> 异步复检 policySignature 变化必须立刻中止发送
+        const { app: app2d, cfgFile: cfg2d, dataDir: data2d } = makeApp("sr-a2-toctou", {
+          groups: "allowlist",
+          groupsAllow: ["白名单群"],
+        });
+        try {
+          const ctxSvc2d = registerContext(app2d)!;
+          ctxSvc2d.store.addObs([
+            {
+              id: "im:om_sr_a2_dm",
+              source: "im",
+              kind: "p2p",
+              conv: "oc_sr_a2_dm",
+              conv_name: "私聊：甲",
+              actor_id: "ou_other",
+              actor_name: "甲",
+              is_me: false,
+              time: Date.now(),
+              text: "私聊咨询",
+              url: "",
+              meta: { message_id: "om_sr_a2_dm", chat_type: "p2p" },
+            },
+          ]);
+          const { item: dmIt } = ctxSvc2d.store.upsertItem({ title: "回复私聊", kind: "ask_me", source: "im" });
+          const dmDraft = ctxSvc2d.store.addDraft({
+            item_id: dmIt.id,
+            project_id: "",
+            kind: "reply",
+            target_label: "私聊：甲",
+            target: { chat_id: "oc_sr_a2_dm", message_id: "om_sr_a2_dm", obs_id: "im:om_sr_a2_dm" },
+            content: "好的",
+          });
+          const fakeLark2d = app2d.lark as unknown as {
+            authStatus: () => Promise<unknown>;
+            run: (argv: string[]) => Promise<unknown>;
+          };
+          fakeLark2d.authStatus = async () => ({ identity: "user", user: { open_id: "ou_sr_owner_A" } });
+          fakeLark2d.run = async (argv: string[]) => {
+            if (argv[0] === "im" && argv[1] === "+messages-mget") {
+              // 模拟 mget 网络等待期间用户修改磁盘 groups_deny 排除该私聊
+              fs.writeFileSync(
+                cfg2d,
+                JSON.stringify(makeCfg(data2d, { groups: "allowlist", groupsAllow: ["白名单群"], groupsDeny: ["oc_sr_a2_dm"] }), null, 2),
+                "utf8",
+              );
+              return {
+                messages: [
+                  {
+                    message_id: "om_sr_a2_dm",
+                    chat_id: "oc_sr_a2_dm",
+                    chat_name: "私聊：甲",
+                    chat_type: "p2p",
+                    content: "私聊咨询",
+                  },
+                ],
+              };
+            }
+            return {};
+          };
+          await assert.rejects(
+            () => ctxSvc2d.verifyCliDraftTargetForDelivery(dmDraft.id, "oc_sr_a2_dm", "om_sr_a2_dm"),
+            /隐私或范围策略发生变更/,
+            "mget 异步等待期间磁盘新增 groups_deny 时必须中止发送",
+          );
+        } finally {
+          app2d.store.db.close();
+        }
       } finally {
         app2.store.db.close();
       }

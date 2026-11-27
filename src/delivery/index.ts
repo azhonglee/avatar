@@ -8,7 +8,7 @@ import { CommandError } from "../commands.ts";
 import { repoSpec, type Config, type RepoSpec } from "../config.ts";
 import { comment } from "../effects.ts";
 import type { Handler } from "../engine.ts";
-import type { Effect, Ledger, WorkItem } from "../ledger.ts";
+import { LeaseLost, type Effect, type Ledger, type WorkItem } from "../ledger.ts";
 import { errMsg, log, truncate } from "../util.ts";
 import { parseRepo, type DispatchPayload } from "../workflows/dispatch.ts";
 import { denyReason, prBody, prTitle, retentionText, type DeliveryAction, type DeliveryPayload } from "./body.ts";
@@ -401,6 +401,7 @@ export function registerDelivery(app: App): void {
             throw new DeliveryError(`未知的交付动作：${String((p as { action?: unknown }).action)}`);
         }
       } catch (e) {
+        if (e instanceof LeaseLost) throw e;
         const msg = maskUrl(errMsg(e));
         if (!isPermanent(e)) throw new Error(msg); // 网络等暂时性错误：先脱敏再交给引擎退避重试，防止 work.error / 日志泄露凭据 URL
         ledger.transition(item, { state: "errored", terminal: true, outcome: "errored", error: msg, payload: { ...p, message: msg } }, say(p.guid, `❌ ${ACTION_TEXT[p.action] ?? "交付"}失败：${msg}`));

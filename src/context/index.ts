@@ -147,6 +147,7 @@ export class ContextService {
     if (!this.cfg.context.enabled || !this.cfg.context.sources.im) {
       throw new Error("工作上下文或 IM 采集已关闭，拒绝投递基于会话消息起草的草稿");
     }
+    const policyBefore = this.personalWeb.policySignature();
     const d = draftId ? this.store.draft(draftId) : undefined;
     if (draftId && !d) {
       throw new Error("草稿记录不存在，拒绝发送");
@@ -160,6 +161,7 @@ export class ContextService {
       throw new Error("该回复目标对应的原消息已被撤回，拒绝发送");
     }
     const targetConv = obs?.conv || d?.target.chat_id || fallbackChatId || "";
+    let effectiveChatId = targetConv;
     if (targetConv) {
       const convDecision = await this.personalWeb.checkConvAllowedForUnderstand(targetConv, obs?.conv_name ?? "");
       if (convDecision !== "allowed") {
@@ -200,8 +202,12 @@ export class ContextService {
         throw new Error("发送前实时核验发现原消息已被撤回、删除或不可读，已中止发送");
       }
       const liveChatId = String(fresh.chat_id ?? "") || targetConv;
+      if (!liveChatId) {
+        throw new Error("发送前实时核验无法确定目标会话 ID，按安全原则中止发送");
+      }
+      effectiveChatId = liveChatId;
       const liveChatType = String(fresh.chat_type ?? obs?.meta.chat_type ?? "").trim().toLowerCase();
-      if (liveChatId && liveChatId !== targetConv) {
+      if (liveChatId !== targetConv) {
         const liveConvDecision = await this.personalWeb.checkConvAllowedForUnderstand(
           liveChatId,
           String(fresh.chat_name ?? obs?.conv_name ?? ""),
@@ -211,7 +217,7 @@ export class ContextService {
         }
       }
       const isDm =
-        liveChatType === "p2p" || obs?.kind === "p2p" || (!!liveChatId && this.store.isDmConv(liveChatId));
+        liveChatType === "p2p" || obs?.kind === "p2p" || this.store.isDmConv(liveChatId);
       if (!isDm && liveChatId.startsWith("oc_")) {
         const inScope = this.personalWeb.isGroupConvInCurrentScope(liveChatId, nativeExcl);
         if (!inScope) {
@@ -232,11 +238,14 @@ export class ContextService {
       }
     }
 
-    // 所有异步回读完成后再次同步核验磁盘策略、主人一致、IM 开关、源观测未撤回与会话未静音
+    // 所有异步回读完成后再次同步核验磁盘策略指纹（拦截异步等待期间 groups_deny / groups_allow / 静音 / 开关 / 主人漂移）、源观测未撤回与最终会话未静音
     this.personalWeb.syncDiskPrivacyConfig({ throwOnError: true });
     this.assertWorkspaceOwnerMatches();
     if (!this.cfg.context.enabled || !this.cfg.context.sources.im) {
       throw new Error("工作上下文或 IM 采集在核验期间已关闭，拒绝发送");
+    }
+    if (this.personalWeb.policySignature() !== policyBefore) {
+      throw new Error("核验期间隐私或范围策略发生变更，已按安全原则中止发送");
     }
     if (obsId) {
       const latestObs = this.store.obs(obsId);
@@ -253,7 +262,7 @@ export class ContextService {
         }
       }
     }
-    if (targetConv && this.store.isConvMutedById(targetConv)) {
+    if (effectiveChatId && this.store.isConvMutedById(effectiveChatId)) {
       throw new Error("核验期间检测到目标会话已被静音，拒绝发送");
     }
   }
