@@ -81,7 +81,34 @@ export function resolveAuthorizedSshAuthSock(
   }
 }
 
-/** 分类 Git 远端地址的实际传输协议（绝不把 HTTPS 或本地 `git fetch .` 误判为 SSH） */
+/**
+ * 统一解析 scp 风格的 SSH Git 远端地址，同时支持相对路径（`git@host:org/repo.git`）与绝对路径（`git@host:/srv/project.git`）
+ * 以及方括号 IPv6 主机（`git@[::1]:/srv/repo.git`）；若传了 `cwd` 且本地恰好存在同名含冒号路径则视为本地目录返回 undefined。
+ */
+export function parseScpGitUrl(
+  rawUrl: string,
+  cwd?: string,
+): { user?: string; host: string; path: string } | undefined {
+  const u = rawUrl.trim();
+  if (!u || u === "." || u === "..") return undefined;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) return undefined;
+  if (u.startsWith("/") || u.startsWith("./") || u.startsWith("../") || /^[a-z]:\\/i.test(u)) return undefined;
+  const m = u.match(/^(?:([^@/:]+)@)?(\[[^\]]+\]|[^/:]+):(.+)$/);
+  if (!m) return undefined;
+  if (cwd) {
+    try {
+      if (fs.existsSync(path.resolve(cwd, u))) return undefined;
+    } catch {
+      // ignore
+    }
+  }
+  const rawHost = m[2];
+  const host = (rawHost.startsWith("[") && rawHost.endsWith("]") ? rawHost.slice(1, -1) : rawHost).toLowerCase();
+  if (!host) return undefined;
+  return { user: m[1] || undefined, host, path: m[3] };
+}
+
+/** 分类 Git 远端地址的实际传输协议（绝不把 HTTPS 或本地 `git fetch .` 误判为 SSH，也绝不把 `git@host:/srv/repo.git` 误判为本地） */
 export function classifyGitRemoteTransport(cwd: string, rawUrl: string): "ssh" | "http" | "local" | "other" {
   const u = rawUrl.trim();
   if (!u || u === "." || u === "..") return "local";
@@ -90,19 +117,11 @@ export function classifyGitRemoteTransport(cwd: string, rawUrl: string): "ssh" |
   if (/^file:\/\//i.test(u)) return "local";
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) return "other";
   if (u.startsWith("/") || u.startsWith("./") || u.startsWith("../") || /^[a-z]:\\/i.test(u)) return "local";
-  if (/^(?:[^@/]+@)?[^/:]+:(?!\/)/.test(u)) {
-    // 兼容本地目录恰好含冒号的情形：存在本地路径则视为本地传输
-    try {
-      if (fs.existsSync(path.resolve(cwd, u))) return "local";
-    } catch {
-      // ignore
-    }
-    return "ssh";
-  }
+  if (parseScpGitUrl(u, cwd)) return "ssh";
   return "local";
 }
 
-function extractSshHostname(rawUrl: string): string | undefined {
+function extractSshHostname(rawUrl: string, cwd?: string): string | undefined {
   const u = rawUrl.trim();
   if (/^(?:ssh|git\+ssh|ssh\+git):\/\//i.test(u)) {
     try {
@@ -113,8 +132,7 @@ function extractSshHostname(rawUrl: string): string | undefined {
       return undefined;
     }
   }
-  const scp = u.match(/^(?:[^@/]+@)?([^/:]+):(?!\/)/);
-  return scp?.[1]?.toLowerCase() || undefined;
+  return parseScpGitUrl(u, cwd)?.host;
 }
 
 function sshPatternMatch(pattern: string, host: string): boolean {
@@ -146,10 +164,103 @@ function expandSshPath(raw: string, hostHome: string): string | undefined {
   return path.isAbsolute(s) ? s : hostHome ? path.join(hostHome, ".ssh", s) : undefined;
 }
 
+function sshGlobSegmentMatches(pattern: string, name: string): boolean {
+  if (name.startsWith(".") && !pattern.startsWith(".")) return false;
+  let re = "^";
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "*") {
+      re += ".*";
+    } else if (ch === "?") {
+      re += ".";
+    } else if (ch === "[") {
+      const close = pattern.indexOf("]", i + 1);
+      if (close > i + 1) {
+        let cls = pattern.slice(i + 1, close);
+        if (cls.startsWith("!")) cls = `^${cls.slice(1)}`;
+        re += `[${cls.replace(/\\/g, "\\\\")}]`;
+        i = close;
+      } else {
+        re += "\\[";
+      }
+    } else if (/[.+^${}()|\\]/.test(ch)) {
+      re += `\\${ch}`;
+    } else {
+      re += ch;
+    }
+  }
+  re += "$";
+  try {
+    return new RegExp(re).test(name);
+  } catch {
+    return false;
+  }
+}
+
+/** 按 OpenSSH Include 语义安全展开通配路径（相对路径基于 `~/.ssh`，按字典序返回，跳过 dataDir 内文件并限制展开上限） */
+function expandSshIncludePattern(
+  rawPattern: string,
+  hostHome: string,
+  isOutsideData: (p: string) => boolean,
+): string[] {
+  const expanded = expandSshPath(rawPattern, hostHome);
+  if (!expanded) return [];
+  if (!/[*?[\]]/.test(expanded)) {
+    return fs.existsSync(expanded) && isOutsideData(expanded) ? [expanded] : [];
+  }
+  const norm = path.resolve(expanded);
+  const parts = norm.split(path.sep).filter(Boolean);
+  const results: string[] = [];
+  const MAX_MATCHES = 256;
+
+  const walk = (baseDir: string, segIdx: number) => {
+    if (results.length >= MAX_MATCHES) return;
+    if (segIdx >= parts.length) {
+      try {
+        if (fs.statSync(baseDir).isFile() && isOutsideData(baseDir)) {
+          results.push(baseDir);
+        }
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    const seg = parts[segIdx];
+    if (!/[*?[\]]/.test(seg)) {
+      const next = path.join(baseDir, seg);
+      if (!fs.existsSync(next)) return;
+      walk(next, segIdx + 1);
+      return;
+    }
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(baseDir).sort((a, b) => a.localeCompare(b));
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      if (results.length >= MAX_MATCHES) break;
+      if (!sshGlobSegmentMatches(seg, name)) continue;
+      const next = path.join(baseDir, name);
+      if (segIdx + 1 < parts.length) {
+        try {
+          if (!fs.statSync(next).isDirectory()) continue;
+        } catch {
+          continue;
+        }
+      }
+      walk(next, segIdx + 1);
+    }
+  };
+
+  walk(path.sep, 0);
+  return results;
+}
+
 /**
  * 仅为实际使用 SSH 传输的受信任远程 Git 操作收集最小化的只读 SSH 挂载（绝不整目录挂载 ~/.ssh）：
- *   - 始终仅挂载 ~/.ssh/config、~/.ssh/known_hosts*；
- *   - 按目标 SSH 主机解析 ~/.ssh/config 中匹配的 Host 块，仅挂载该主机引用的 IdentityFile / UserKnownHostsFile（及 .pub）；
+ *   - 仅挂载 `~/.ssh/config`、`~/.ssh/known_hosts*` 以及 `Include`（含 `config.d/*.conf` 等通配模式）中实际命中目标主机的配置片段；
+ *   - 按目标 SSH 主机解析 `~/.ssh/config` 及匹配片段中生效的 Host 块，仅挂载该主机引用的 IdentityFile / CertificateFile / UserKnownHostsFile（及 .pub）；
  *   - 未命中显式 IdentityFile 时：有 SSH_AUTH_SOCK 代理仅挂载默认 .pub，无代理仅挂载标准默认密钥对（id_ed25519 / id_rsa / id_ecdsa / id_dsa），绝不暴露无关命名私钥。
  */
 export function collectScopedSshMounts(
@@ -215,23 +326,33 @@ export function collectScopedSshMounts(
   addSingleFile(path.join(sshDir, "known_hosts"));
   addSingleFile(path.join(sshDir, "known_hosts2"));
 
+  const tokenizeSshValues = (val: string): string[] => {
+    const out: string[] = [];
+    for (const m of val.matchAll(/"([^"]+)"|'([^']+)'|(\S+)/g)) {
+      const tok = m[1] ?? m[2] ?? m[3];
+      if (tok) out.push(tok);
+    }
+    return out;
+  };
+
   const matchedIdentityFiles: string[] = [];
   const visitedConfigs = new Set<string>();
-  const parseSshConfigFile = (cfgFile: string, depth: number) => {
-    if (depth > 3 || !fs.existsSync(cfgFile)) return;
+  const parseSshConfigFile = (cfgFile: string, depth: number, isRoot: boolean): boolean => {
+    if (depth > 4 || !fs.existsSync(cfgFile)) return false;
     let realCfg: string;
     try {
       const st = fs.statSync(cfgFile);
-      if (!st.isFile() || st.size > 256 * 1024) return;
+      if (!st.isFile() || st.size > 256 * 1024) return false;
       realCfg = fs.realpathSync(cfgFile);
     } catch {
-      return;
+      return false;
     }
-    if (visitedConfigs.has(realCfg) || !isOutsideData(realCfg)) return;
+    if (visitedConfigs.has(realCfg) || !isOutsideData(realCfg)) return false;
     visitedConfigs.add(realCfg);
-    addSingleFile(cfgFile);
+    if (isRoot) addSingleFile(cfgFile);
 
     let active = true;
+    let matchedAny = false;
     const text = fs.readFileSync(realCfg, "utf8");
     for (const rawLine of text.split(/\r?\n/)) {
       const trimmed = rawLine.trim();
@@ -241,29 +362,42 @@ export function collectScopedSshMounts(
       const key = m[1].toLowerCase();
       const val = m[2].trim();
       if (key === "host") {
-        const patterns = val.split(/\s+/).filter(Boolean);
+        const patterns = tokenizeSshValues(val);
         active = sshHosts.length > 0 && sshHosts.some((h) => sshHostClauseMatches(patterns, h));
+        if (active) matchedAny = true;
       } else if (key === "match") {
         active = false;
       } else if (key === "include" && active) {
-        for (const rawInc of val.split(/\s+/).filter(Boolean)) {
-          if (/[*?[\]]/.test(rawInc)) continue;
-          const incPath = expandSshPath(rawInc, hostHome);
-          if (incPath) parseSshConfigFile(incPath, depth + 1);
+        for (const rawInc of tokenizeSshValues(val)) {
+          for (const incPath of expandSshIncludePattern(rawInc, hostHome, isOutsideData)) {
+            if (parseSshConfigFile(incPath, depth + 1, false)) {
+              matchedAny = true;
+            }
+          }
         }
-      } else if (key === "identityfile" && active) {
-        const idPath = expandSshPath(val, hostHome);
-        if (idPath) matchedIdentityFiles.push(idPath);
-      } else if (key === "userknownhostsfile" && active) {
-        for (const tok of val.split(/\s+/).filter(Boolean)) {
-          const kh = expandSshPath(tok, hostHome);
-          if (kh) addSingleFile(kh);
+      } else if (active) {
+        matchedAny = true;
+        if (key === "identityfile") {
+          const idPath = expandSshPath(val, hostHome);
+          if (idPath) matchedIdentityFiles.push(idPath);
+        } else if (key === "certificatefile") {
+          const certPath = expandSshPath(val, hostHome);
+          if (certPath) addSingleFile(certPath);
+        } else if (key === "userknownhostsfile") {
+          for (const tok of tokenizeSshValues(val)) {
+            const kh = expandSshPath(tok, hostHome);
+            if (kh) addSingleFile(kh);
+          }
         }
       }
     }
+    if (!isRoot && matchedAny) {
+      addSingleFile(cfgFile);
+    }
+    return matchedAny;
   };
 
-  parseSshConfigFile(path.join(sshDir, "config"), 0);
+  parseSshConfigFile(path.join(sshDir, "config"), 0, true);
 
   if (matchedIdentityFiles.length > 0) {
     for (const idFile of matchedIdentityFiles) {
@@ -323,7 +457,7 @@ function buildGitIsolation(
       ? {}
       : detectGitWorktreeDirs(cwd, { trustedRepoRoot: opts?.trustedRepoRoot });
   const wtTargets = [wt.commonDir, wt.gitDir].filter((p): p is string => !!p);
-  const gitCfg = isoActive ? collectSafeGitConfigMounts(rawEnv) : { readOnlyPaths: [], symlinks: [] };
+  const gitCfg = isoActive ? collectSafeGitConfigMounts(rawEnv, undefined, { cwd }) : { readOnlyPaths: [], symlinks: [] };
   const combinedRo = [...gitCfg.readOnlyPaths, ...extraRo];
   const combinedSymlinks = [...gitCfg.symlinks, ...sshSymlinks];
   return {
@@ -473,24 +607,41 @@ function gitCredentialSectionMatchesUrl(sectionUrl: string, target: URL): boolea
 }
 
 /**
- * 原位替换 Git credential helper 链中的 `store` 条目，完整保留其他 helper（如 credential manager / cache）的原始优先级顺序。
+ * 原位替换 Git credential helper 链中的条目，按槽位独立映射每个 `store`（绝不合并多个 store 破坏中间 helper 的优先级）
+ * 或宿主机预解析的非 store helper（如 `gh auth setup-git` / `git credential-cache`）。
+ *
+ * `credFileOrResolver` 既支持单个路径字符串（兼容旧调用），也支持按 `(key, helperValue, index)` 返回：
+ *   - 非空字符串：替换为该 helper（例如 `store --file=/tmp/...`）；
+ *   - `null`：该槽位对目标 URL 无命中，原位省略以便 Git 立即顺序进入下一个 helper；
+ *   - `undefined`：原样保留原始 `helperValue`。
  */
 export function rewriteGitCredentialHelperChain(
   activeByKey: Map<string, string[]>,
   rewrittenKeys: Set<string>,
-  credFile: string,
+  credFileOrResolver: string | ((key: string, helperValue: string, index: number) => string | null | undefined),
   hostHome: string,
 ): string[] {
   const gitConfigArgs: string[] = [];
   for (const [key, helpers] of activeByKey) {
     if (!rewrittenKeys.has(key)) continue;
     gitConfigArgs.push("-c", `${key}=`);
-    for (const hv of helpers) {
-      const parsed = parseStoreHelperFile(hv, hostHome);
-      if (parsed.isStore) {
-        gitConfigArgs.push("-c", `${key}=store --file=${credFile}`);
+    for (let i = 0; i < helpers.length; i++) {
+      const hv = helpers[i];
+      if (typeof credFileOrResolver === "function") {
+        const mapped = credFileOrResolver(key, hv, i);
+        if (mapped === null) continue;
+        if (typeof mapped === "string") {
+          gitConfigArgs.push("-c", `${key}=${mapped}`);
+        } else {
+          gitConfigArgs.push("-c", `${key}=${hv}`);
+        }
       } else {
-        gitConfigArgs.push("-c", `${key}=${hv}`);
+        const parsed = parseStoreHelperFile(hv, hostHome);
+        if (parsed.isStore) {
+          gitConfigArgs.push("-c", `${key}=store --file=${credFileOrResolver}`);
+        } else {
+          gitConfigArgs.push("-c", `${key}=${hv}`);
+        }
       }
     }
   }
@@ -511,7 +662,7 @@ async function resolveEffectiveRemoteUrls(
       spec.target.startsWith("/") ||
       spec.target.startsWith("./") ||
       spec.target.startsWith("../") ||
-      /^(?:[^@/]+@)?[^/:]+:(?!\/)/.test(spec.target);
+      !!parseScpGitUrl(spec.target, cwd);
     if (looksLikeUrlOrPath) {
       rawUrls.add(spec.target);
     } else {
@@ -532,8 +683,85 @@ async function resolveEffectiveRemoteUrls(
 }
 
 /**
- * 仅为处于沙箱隔离下的受信任远程 Git HTTP(S) 操作投影目标域作用域内的 `store` 凭据，
- * 且仅在原始位置替换 `store` helper，完整保留原有 credential.helper 优先级链（非隔离运行不改动宿主机配置）。
+ * 在受信任宿主机上下文中调用单个 global/system 配置的非 store helper（例如 `gh auth setup-git`、`git credential-cache`），
+ * 严格隔离仓库级 `.git/config` 与个人 Web 凭据，仅解析目标 URL 的单次用户名与密码。
+ */
+async function resolveHostCredentialViaHelper(
+  helperValue: string,
+  target: URL,
+  useHttpPath: boolean,
+  rawEnv: NodeJS.ProcessEnv,
+): Promise<string | undefined> {
+  const hostPrep = prepareHarnessEnv(rawEnv, { preserveDbusSession: true });
+  try {
+    const hostEnv: NodeJS.ProcessEnv = {
+      ...hostPrep.env,
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+    };
+    const proto = target.protocol.slice(0, -1); // "http" | "https"
+    const cleanPath = target.pathname.replace(/^\/+/, "");
+    const lines = [`protocol=${proto}`, `host=${target.host}`];
+    if (useHttpPath && cleanPath) lines.push(`path=${cleanPath}`);
+    if (target.username) {
+      try {
+        lines.push(`username=${decodeURIComponent(target.username)}`);
+      } catch {
+        lines.push(`username=${target.username}`);
+      }
+    }
+    const input = `${lines.join("\n")}\n\n`;
+    const r = await runProcess(
+      "git",
+      [
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "credential.helper=",
+        "-c",
+        `credential.helper=${helperValue}`,
+        "-c",
+        `credential.useHttpPath=${useHttpPath ? "true" : "false"}`,
+        "credential",
+        "fill",
+      ],
+      {
+        cwd: os.tmpdir(),
+        env: hostEnv,
+        input,
+        timeoutMs: 10_000,
+        group: true,
+      },
+    );
+    if (r.code !== 0 || r.timedOut) return undefined;
+    const kv = new Map<string, string>();
+    for (const rawLine of r.stdout.split(/\r?\n/)) {
+      if (!rawLine) break;
+      const eq = rawLine.indexOf("=");
+      if (eq <= 0) continue;
+      kv.set(rawLine.slice(0, eq).trim(), rawLine.slice(eq + 1));
+    }
+    const username = kv.get("username");
+    const password = kv.get("password");
+    if (username === undefined || password === undefined || (!username && !password)) return undefined;
+    const outProto = (kv.get("protocol") || proto).trim();
+    const outHost = (kv.get("host") || target.host).trim();
+    const outPath = useHttpPath ? (kv.get("path") ?? cleanPath).replace(/^\/+/, "") : "";
+    const pathSuffix = outPath ? `/${outPath}` : "";
+    return `${outProto}://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${outHost}${pathSuffix}`;
+  } finally {
+    hostPrep.cleanup();
+  }
+}
+
+/**
+ * 仅为处于沙箱隔离下的受信任远程 Git HTTP(S) 操作投影目标域作用域内的凭据：
+ *   - 每个 `store` 槽位独立过滤并写入各自 `0600` 临时文件（绝不将多个 store 合并到首个槽位，严格保持 `store A -> 中间 helper -> store B` 优先级）；
+ *   - 对宿主机 global/system 作用域配置的非 store helper（如 `gh auth setup-git`、`git credential-cache`），在宿主机按槽位预解析目标 URL 凭据并原位替换为单目标临时 store 文件，
+ *     绝不把 `~/.config/gh` 或宿主机 cache 套接字暴露进沙箱，也不在宿主机执行仓库级 local helper。
  */
 async function prepareScopedGitHttpCredentials(
   cwd: string,
@@ -555,71 +783,61 @@ async function prepareScopedGitHttpCredentials(
     ...(xdgConfigHome ? [path.join(xdgConfigHome, "git", "credentials")] : []),
   ];
 
-  // 读取宿主机/仓库生效的 credential.helper 与按 URL 限定的 credential.<url>.helper
-  const helperCfg = await tryGit(cwd, ["config", "--get-regexp", "^credential(\\..+)?\\.helper$"], {
-    ...opts,
-    readOnly: true,
-  });
-  const storeFiles = new Set<string>();
-  const activeByKey = new Map<string, string[]>();
-  const rewrittenKeys = new Set<string>();
-  let hasActiveStoreHelper = false;
+  // 读取宿主机/仓库生效的 credential.helper 与按 URL 限定的 credential.<url>.helper（含 --includes 与作用域）
+  const helperCfg = await tryGit(
+    cwd,
+    ["config", "--includes", "--show-scope", "--null", "--get-regexp", "^credential(\\..+)?\\.helper$"],
+    { ...opts, readOnly: true },
+  );
+  if (helperCfg.code !== 0 || !helperCfg.stdout) return undefined;
 
-  if (helperCfg.code === 0) {
-    // 顺序解析以便尊重 `credential.helper = ""` 清空前序 helper 的 Git 语义，同时保留 subsection URL 路径大小写
-    for (const rawLine of helperCfg.stdout.split("\n")) {
-      const line = rawLine.trimEnd();
-      if (!line) continue;
-      const sp = line.indexOf(" ");
-      const rawKey = sp === -1 ? line : line.slice(0, sp);
-      const val = sp === -1 ? "" : line.slice(sp + 1).trim();
-      let normKey: string;
-      if (/^credential\.helper$/i.test(rawKey)) {
-        normKey = "credential.helper";
-      } else {
-        const subMatch = rawKey.match(/^credential\.(.+)\.helper$/i);
-        if (!subMatch) continue;
-        normKey = `credential.${subMatch[1]}.helper`;
-      }
-      if (!val) {
-        activeByKey.set(normKey, []);
-      } else {
-        const list = activeByKey.get(normKey) ?? [];
-        list.push(val);
-        activeByKey.set(normKey, list);
-      }
+  interface ScopedHelperEntry {
+    value: string;
+    scope: string;
+  }
+  const activeScopedByKey = new Map<string, ScopedHelperEntry[]>();
+  const tokens = helperCfg.stdout.split("\0");
+  for (let i = 0; i + 1 < tokens.length; i += 2) {
+    const scope = tokens[i].trim();
+    const rec = tokens[i + 1];
+    if (!rec) continue;
+    const nl = rec.indexOf("\n");
+    const rawKey = nl === -1 ? rec : rec.slice(0, nl);
+    const val = nl === -1 ? "" : rec.slice(nl + 1).trim();
+    let normKey: string;
+    if (/^credential\.helper$/i.test(rawKey)) {
+      normKey = "credential.helper";
+    } else {
+      const subMatch = rawKey.match(/^credential\.(.+)\.helper$/i);
+      if (!subMatch) continue;
+      normKey = `credential.${subMatch[1]}.helper`;
     }
-    for (const [key, helpers] of activeByKey) {
-      if (key === "credential.helper") {
-        for (const hv of helpers) {
-          const parsed = parseStoreHelperFile(hv, hostHome);
-          if (!parsed.isStore) continue;
-          hasActiveStoreHelper = true;
-          rewrittenKeys.add(key);
-          if (parsed.explicitFile) storeFiles.add(parsed.explicitFile);
-          else for (const df of defaultStoreFiles) storeFiles.add(df);
-        }
-      } else if (key.startsWith("credential.") && key.endsWith(".helper")) {
-        const pattern = key.slice("credential.".length, -".helper".length);
-        if (!targetUrls.some((t) => gitCredentialSectionMatchesUrl(pattern, t))) continue;
-        for (const hv of helpers) {
-          const parsed = parseStoreHelperFile(hv, hostHome);
-          if (!parsed.isStore) continue;
-          hasActiveStoreHelper = true;
-          rewrittenKeys.add(key);
-          if (parsed.explicitFile) storeFiles.add(parsed.explicitFile);
-          else for (const df of defaultStoreFiles) storeFiles.add(df);
-        }
-      }
+    if (!val) {
+      activeScopedByKey.set(normKey, []);
+    } else {
+      const list = activeScopedByKey.get(normKey) ?? [];
+      list.push({ value: val, scope });
+      activeScopedByKey.set(normKey, list);
     }
   }
 
-  if (!hasActiveStoreHelper || storeFiles.size === 0 || rewrittenKeys.size === 0) return undefined;
+  const matchingKeys = new Map<string, URL[]>();
+  for (const [key, helpers] of activeScopedByKey) {
+    if (helpers.length === 0) continue;
+    if (key === "credential.helper") {
+      matchingKeys.set(key, targetUrls);
+    } else if (key.startsWith("credential.") && key.endsWith(".helper")) {
+      const pattern = key.slice("credential.".length, -".helper".length);
+      const matchedTargets = targetUrls.filter((t) => gitCredentialSectionMatchesUrl(pattern, t));
+      if (matchedTargets.length > 0) matchingKeys.set(key, matchedTargets);
+    }
+  }
+  if (matchingKeys.size === 0) return undefined;
 
   // 检查目标 URL 是否启用 credential.useHttpPath
   const useHttpPathByTarget = new Map<URL, boolean>();
   for (const t of targetUrls) {
-    const uhp = await tryGit(cwd, ["config", "--bool", "--get-urlmatch", "credential.useHttpPath", t.href], {
+    const uhp = await tryGit(cwd, ["config", "--includes", "--bool", "--get-urlmatch", "credential.useHttpPath", t.href], {
       ...opts,
       readOnly: true,
     });
@@ -639,40 +857,108 @@ async function prepareScopedGitHttpCredentials(
     }
   };
 
-  const matchedLines = new Set<string>();
-  for (const file of storeFiles) {
-    if (!file || !fs.existsSync(file) || !isOutsideDataDir(file)) continue;
-    try {
-      const st = fs.statSync(file);
-      if (!st.isFile() || st.size > 4 * 1024 * 1024) continue;
-      const text = fs.readFileSync(file, "utf8");
-      for (const rawLine of text.split(/\r?\n/)) {
-        const line = rawLine.trim();
-        if (!line || line.startsWith("#")) continue;
-        const matches = targetUrls.some((t) =>
-          gitCredentialLineMatchesTarget(line, t, useHttpPathByTarget.get(t) === true),
-        );
-        if (matches) matchedLines.add(line);
-      }
-    } catch {
-      // ignore unreadable credential file
-    }
-  }
+  let scoped: { dir: string; cleanup: () => void } | undefined;
+  let fileSeq = 0;
+  let wroteAnyCreds = false;
+  const rewrittenKeys = new Set<string>();
+  const slotMappings = new Map<string, (string | null | undefined)[]>();
 
-  if (matchedLines.size === 0) return undefined;
-
-  const scoped = createScopedSecretDir("pa-git-http-cred-", rawEnv);
-  const credFile = path.join(scoped.dir, "credentials");
   try {
-    fs.writeFileSync(credFile, `${[...matchedLines].join("\n")}\n`, { mode: 0o600 });
-    const gitConfigArgs = rewriteGitCredentialHelperChain(activeByKey, rewrittenKeys, credFile, hostHome);
+    for (const [key, keyTargets] of matchingKeys) {
+      const helpers = activeScopedByKey.get(key) ?? [];
+      const mappedSlots: (string | null | undefined)[] = [];
+      let keyRewritten = false;
+
+      for (const entry of helpers) {
+        const parsed = parseStoreHelperFile(entry.value, hostHome);
+        if (parsed.isStore) {
+          keyRewritten = true;
+          const filesForSlot = parsed.explicitFile ? [parsed.explicitFile] : defaultStoreFiles;
+          const slotLines = new Set<string>();
+          for (const file of filesForSlot) {
+            if (!file || !fs.existsSync(file) || !isOutsideDataDir(file)) continue;
+            try {
+              const st = fs.statSync(file);
+              if (!st.isFile() || st.size > 4 * 1024 * 1024) continue;
+              const text = fs.readFileSync(file, "utf8");
+              for (const rawLine of text.split(/\r?\n/)) {
+                const line = rawLine.trim();
+                if (!line || line.startsWith("#")) continue;
+                const matches = keyTargets.some((t) =>
+                  gitCredentialLineMatchesTarget(line, t, useHttpPathByTarget.get(t) === true),
+                );
+                if (matches) slotLines.add(line);
+              }
+            } catch {
+              // ignore unreadable credential file
+            }
+          }
+          if (slotLines.size > 0) {
+            scoped ??= createScopedSecretDir("pa-git-http-cred-", rawEnv);
+            const slotFile = path.join(scoped.dir, `store-${fileSeq++}.creds`);
+            fs.writeFileSync(slotFile, `${[...slotLines].join("\n")}\n`, { mode: 0o600 });
+            mappedSlots.push(`store --file=${slotFile}`);
+            wroteAnyCreds = true;
+          } else {
+            // 该 store 槽位对目标 URL 无命中：原位省略以便 Git 顺序进入下一个 helper（绝不把后续 store 凭据提前到本槽位）
+            mappedSlots.push(null);
+          }
+        } else if (entry.scope === "global" || entry.scope === "system") {
+          // 仅对宿主机 global/system 作用域的非 store helper（如 gh / credential-cache）在受信任宿主机预解析目标凭据
+          keyRewritten = true;
+          const slotLines = new Set<string>();
+          for (const t of keyTargets) {
+            const line = await resolveHostCredentialViaHelper(
+              entry.value,
+              t,
+              useHttpPathByTarget.get(t) === true,
+              rawEnv,
+            );
+            if (line) slotLines.add(line);
+          }
+          if (slotLines.size > 0) {
+            scoped ??= createScopedSecretDir("pa-git-http-cred-", rawEnv);
+            const slotFile = path.join(scoped.dir, `helper-${fileSeq++}.creds`);
+            fs.writeFileSync(slotFile, `${[...slotLines].join("\n")}\n`, { mode: 0o600 });
+            mappedSlots.push(`store --file=${slotFile}`);
+            wroteAnyCreds = true;
+          } else {
+            mappedSlots.push(null);
+          }
+        } else {
+          // 仓库 local 作用域的自定义 helper 不在宿主机执行，原位保留在沙箱内按原顺序执行
+          mappedSlots.push(undefined);
+        }
+      }
+
+      if (keyRewritten) {
+        rewrittenKeys.add(key);
+        slotMappings.set(key, mappedSlots);
+      }
+    }
+
+    if (!scoped || !wroteAnyCreds || rewrittenKeys.size === 0) {
+      scoped?.cleanup();
+      return undefined;
+    }
+
+    const activeValuesByKey = new Map<string, string[]>();
+    for (const [k, list] of activeScopedByKey) {
+      activeValuesByKey.set(k, list.map((x) => x.value));
+    }
+    const gitConfigArgs = rewriteGitCredentialHelperChain(
+      activeValuesByKey,
+      rewrittenKeys,
+      (key, _hv, idx) => slotMappings.get(key)?.[idx],
+      hostHome,
+    );
     return {
       credDir: scoped.dir,
       gitConfigArgs,
       cleanup: scoped.cleanup,
     };
   } catch (err) {
-    scoped.cleanup();
+    scoped?.cleanup();
     throw err;
   }
 }
@@ -690,7 +976,7 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
   const baseEnv = prepareHarnessEnv(process.env, { preserveSshAgent: !!sshSock });
   let scopedHttpCreds: ScopedGitHttpCreds | undefined;
   try {
-    const sshHosts = [...new Set(sshUrls.map(extractSshHostname).filter((h): h is string => !!h))];
+    const sshHosts = [...new Set(sshUrls.map((u) => extractSshHostname(u, cwd)).filter((h): h is string => !!h))];
     const sshMounts = usesSsh
       ? collectScopedSshMounts(sshHosts, effectiveRawEnv, opts?.cfg?.dataDir, !!sshSock)
       : undefined;
@@ -823,10 +1109,10 @@ export function parseRemote(url: string): RemoteRef | undefined {
     const path = clean(m[2]);
     return path.includes("/") ? { host: m[1].toLowerCase(), path } : undefined;
   }
-  const scp = u.match(/^(?:[^@/]+@)?([^/:]+):(?!\/)(.+)$/);
-  if (scp && !/^[a-z]:\\/i.test(u)) {
-    const path = clean(scp[2]);
-    return path.includes("/") ? { host: scp[1].toLowerCase(), path } : undefined;
+  const scp = parseScpGitUrl(u);
+  if (scp) {
+    const path = clean(scp.path);
+    return path.includes("/") ? { host: scp.host, path } : undefined;
   }
   return undefined;
 }
@@ -1021,10 +1307,8 @@ export function resolveLocalGitRemoteDir(cwd: string, rawUrl: string): string | 
     }
   } else if (/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) {
     return undefined;
-  } else if (/^(?:[^@/]+@)?[^/:]+:(?!\/)/.test(u) && !/^[a-z]:\\/i.test(u)) {
-    const resolved = path.resolve(cwd, u);
-    if (!fs.existsSync(resolved)) return undefined;
-    candidate = resolved;
+  } else if (parseScpGitUrl(u, cwd)) {
+    return undefined;
   } else {
     candidate = path.resolve(cwd, u);
   }

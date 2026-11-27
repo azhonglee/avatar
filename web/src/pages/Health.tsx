@@ -5,12 +5,19 @@ import { useCommand } from "../lib/command.ts";
 import { absTime, useNow } from "../lib/format.ts";
 import { useQuery } from "../lib/query.ts";
 
-const KIND_LABEL: Record<HealthItem["kind"], string> = { event: "飞书事件", effect: "飞书写入", job: "作业", delivery: "交付" };
+const KIND_LABEL: Record<HealthItem["kind"], string> = {
+  event: "飞书事件",
+  effect: "飞书写入",
+  job: "作业",
+  delivery: "交付",
+  context: "工作上下文",
+};
 const KIND_HINT: Record<HealthItem["kind"], string> = {
   event: "收到的飞书事件处理失败，相关的消息/评论可能没有被识别。",
   effect: "要写回飞书的评论、移动卡片或私信没有成功。",
   job: "定时作业没有跑完。",
   delivery: "推送分支 / 创建 PR / 合并没有成功。",
+  context: "工作上下文采集、快通道理解或起草失败。",
 };
 
 function refLink(it: HealthItem) {

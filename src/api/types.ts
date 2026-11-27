@@ -170,7 +170,7 @@ export interface JobView {
 
 export interface HealthItem {
   id: string;
-  kind: "event" | "effect" | "job" | "delivery";
+  kind: "event" | "effect" | "job" | "delivery" | "context";
   ref: string;
   state: string;
   terminal: boolean;

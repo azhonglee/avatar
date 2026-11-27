@@ -40,6 +40,8 @@ export interface IsolationOptions {
   extraCmdPaths?: string[];
   /** 需要保留逻辑路径的只读文件符号链接（如 dotfiles 仓库中的 ~/.gitconfig -> ~/dotfiles/gitconfig，绝不暴露 dotfiles 其余文件） */
   extraSymlinks?: { dest: string; target: string }[];
+  /** 将宿主机独立投影源路径按只读或可写方式绑定挂载到沙箱内指定目标路径（例如脱敏 ~/.npmrc、私有 ~/.acpx 或独立暂存的 Doubao 数据目录） */
+  extraBindMounts?: { src: string; dest: string; mode: "ro" | "rw" }[];
 }
 
 const BROAD_UNSAFE_AUTO_MOUNT_ROOTS = new Set([
@@ -245,10 +247,24 @@ export function collectLarkGuardReadOnlyFiles(): string[] {
   return candidates.filter((p) => fs.existsSync(p)).map((p) => safeRealpath(p));
 }
 
+function resolveMountDestRealpath(destPath: string): string {
+  const abs = path.resolve(destPath);
+  const tail: string[] = [];
+  let cur = abs;
+  while (cur && cur !== path.dirname(cur)) {
+    if (fs.existsSync(cur)) {
+      return tail.length ? path.join(safeRealpath(cur), ...tail) : safeRealpath(cur);
+    }
+    tail.unshift(path.basename(cur));
+    cur = path.dirname(cur);
+  }
+  return abs;
+}
+
 /**
- * 解析豆包 CLI 在隔离沙箱中运行所需的只读配置与运行时目录：
+ * 解析豆包 CLI 在隔离沙箱中运行所需的只读配置、二进制与登录态目录：
  *   - `~/.doubao` 与 `${XDG_CONFIG_HOME:-~/.config}/doubao`
- *   - Linux 上 npm 启动器 `@bytedance/doubao-cli` 校验并拉起的二进制目录 `${XDG_DATA_HOME:-~/.local/share}/doubao_cli/app/current`
+ *   - Linux 上 `@bytedance/doubao-cli` 运行目录 `app/current` 以及登录态 `doubao-cli-pc-login`、`keys`（绝不暴露 logs/agent_mode/sandbox_envs_dir）
  */
 export function selectDoubaoRuntimePaths(hostEnv: NodeJS.ProcessEnv = process.env): string[] {
   const hostHome = hostEnv.HOME?.trim() || os.homedir();
@@ -257,21 +273,339 @@ export function selectDoubaoRuntimePaths(hostEnv: NodeJS.ProcessEnv = process.en
   const out: string[] = [];
   if (hostHome) out.push(path.join(hostHome, ".doubao"));
   if (xdgConfig) out.push(path.join(xdgConfig, "doubao"));
-  if (xdgData) out.push(path.join(xdgData, "doubao_cli", "app", "current"));
+  if (xdgData) {
+    out.push(path.join(xdgData, "doubao_cli", "app", "current"));
+    out.push(path.join(xdgData, "doubao_cli", "doubao-cli-pc-login"));
+    out.push(path.join(xdgData, "doubao_cli", "keys"));
+  }
   return [...new Set(out)];
 }
 
 /**
- * 仅收集安全的 Git 只读配置文件（绝不挂载整个 ~/.config/git 目录或 ~/.config/git/credentials / ~/.git-credentials），
- * 并为符号链接 dotfiles（如 ~/.gitconfig -> ~/dotfiles/gitconfig）保留逻辑路径符号链接，避免 Git 丢失配置且不暴露 dotfiles 其余文件。
+ * 解析受守卫保护的 `lark-cli` 所需的配置与 Linux 文件存储登录态目录：
+ *   - `~/.lark-cli`、`${XDG_CONFIG_HOME:-~/.config}/lark-cli`
+ *   - Linux 文件存储加密凭据与主密钥目录 `${XDG_DATA_HOME:-~/.local/share}/lark-cli`
+ */
+export function selectLarkCliAuthPaths(hostEnv: NodeJS.ProcessEnv = process.env): string[] {
+  const hostHome = hostEnv.HOME?.trim() || os.homedir();
+  const xdgConfig = hostEnv.XDG_CONFIG_HOME?.trim() || (hostHome ? path.join(hostHome, ".config") : "");
+  const xdgData = hostEnv.XDG_DATA_HOME?.trim() || (hostHome ? path.join(hostHome, ".local", "share") : "");
+  const out: string[] = [];
+  if (hostHome) out.push(path.join(hostHome, ".lark-cli"));
+  if (xdgConfig) out.push(path.join(xdgConfig, "lark-cli"));
+  if (xdgData) out.push(path.join(xdgData, "lark-cli"));
+  return [...new Set(out)];
+}
+
+function copyTreeBounded(
+  srcDir: string,
+  destDir: string,
+  allowedRoot: string,
+  resolvedDataDir: string,
+  opts?: { skipNames?: Set<string>; depth?: number; budget?: { files: number; bytes: number } },
+): void {
+  const depth = opts?.depth ?? 0;
+  const budget = opts?.budget ?? { files: 0, bytes: 0 };
+  if (depth > 8 || budget.files > 512 || budget.bytes > 16 * 1024 * 1024) return;
+  let realSrc: string;
+  try {
+    const st = fs.statSync(srcDir);
+    if (!st.isDirectory()) return;
+    realSrc = fs.realpathSync(srcDir);
+  } catch {
+    return;
+  }
+  if (!isPathInsideOrEqual(realSrc, allowedRoot)) return;
+  if (resolvedDataDir && (isPathInsideOrEqual(realSrc, resolvedDataDir) || isPathInsideOrEqual(resolvedDataDir, realSrc))) return;
+  fs.mkdirSync(destDir, { recursive: true, mode: 0o700 });
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(realSrc, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const ent of entries) {
+    if (opts?.skipNames?.has(ent.name)) continue;
+    const srcPath = path.join(realSrc, ent.name);
+    const dstPath = path.join(destDir, ent.name);
+    try {
+      const lst = fs.lstatSync(srcPath);
+      if (lst.isSymbolicLink()) continue;
+      if (lst.isDirectory()) {
+        copyTreeBounded(srcPath, dstPath, allowedRoot, resolvedDataDir, {
+          skipNames: opts?.skipNames,
+          depth: depth + 1,
+          budget,
+        });
+      } else if (lst.isFile()) {
+        if (lst.size > 4 * 1024 * 1024) continue;
+        budget.files++;
+        budget.bytes += lst.size;
+        if (budget.files > 512 || budget.bytes > 16 * 1024 * 1024) return;
+        const buf = fs.readFileSync(srcPath);
+        fs.writeFileSync(dstPath, buf, { mode: (lst.mode & 0o111) ? 0o700 : 0o600 });
+      }
+    } catch {
+      // ignore unreadable entry
+    }
+  }
+}
+
+export interface StagedDoubaoDataDir {
+  hostDataDir: string;
+  bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[];
+  cleanup: () => void;
+}
+
+/**
+ * 为 Linux `@bytedance/doubao-cli` 构建隔离且独立的私有可写 `doubao_cli` 运行目录：
+ *   - 仅复制 `doubao-cli-pc-login` 与 `keys`（跳过实例锁），在私有 `0700` 临时目录中为本次调用提供独立的 `doubao-cli-instance.lock` 与日志空间；
+ *   - 将宿主机 `app/current` 二进制目录以只读方式叠加挂载到 `<doubao_cli>/app/current`，既无需复制大体积二进制又防止子进程篡改；
+ *   - 绝不暴露宿主机 `logs`、`agent_mode`、`crash-monitor`、`sandbox_envs_dir` 等历史数据。
+ */
+export function stageIsolatedDoubaoDataDir(
+  hostEnv: NodeJS.ProcessEnv = process.env,
+  dataDir?: string,
+): StagedDoubaoDataDir | undefined {
+  const hostHome = hostEnv.HOME?.trim() || os.homedir();
+  const xdgData = hostEnv.XDG_DATA_HOME?.trim() || (hostHome ? path.join(hostHome, ".local", "share") : "");
+  if (!xdgData) return undefined;
+  const hostDoubaoDir = path.join(xdgData, "doubao_cli");
+  if (!fs.existsSync(hostDoubaoDir)) return undefined;
+  const realHostDoubao = safeRealpath(hostDoubaoDir);
+  const resolvedDataDir = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
+  if (
+    resolvedDataDir &&
+    (isPathInsideOrEqual(realHostDoubao, resolvedDataDir) || isPathInsideOrEqual(resolvedDataDir, realHostDoubao))
+  ) {
+    return undefined;
+  }
+  const appCurrentSrc = path.join(realHostDoubao, "app", "current");
+  const loginSrc = path.join(realHostDoubao, "doubao-cli-pc-login");
+  const keysSrc = path.join(realHostDoubao, "keys");
+  const hasAppCurrent = fs.existsSync(appCurrentSrc);
+  const hasLogin = fs.existsSync(loginSrc);
+  const hasKeys = fs.existsSync(keysSrc);
+  if (!hasAppCurrent && !hasLogin && !hasKeys) return undefined;
+
+  const scoped = createScopedSecretDir("pa-doubao-data-", hostEnv);
+  try {
+    const stageDir = path.join(scoped.dir, "doubao_cli");
+    fs.mkdirSync(stageDir, { recursive: true, mode: 0o700 });
+    if (hasLogin) {
+      copyTreeBounded(loginSrc, path.join(stageDir, "doubao-cli-pc-login"), realHostDoubao, resolvedDataDir, {
+        skipNames: new Set(["lock"]),
+      });
+    }
+    if (hasKeys) {
+      copyTreeBounded(keysSrc, path.join(stageDir, "keys"), realHostDoubao, resolvedDataDir, {
+        skipNames: new Set(["lock"]),
+      });
+    }
+    const bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[] = [
+      { src: stageDir, dest: realHostDoubao, mode: "rw" },
+    ];
+    if (hasAppCurrent) {
+      const realAppCurrent = safeRealpath(appCurrentSrc);
+      fs.mkdirSync(path.join(stageDir, "app", "current"), { recursive: true, mode: 0o700 });
+      bindMounts.push({ src: realAppCurrent, dest: path.join(realHostDoubao, "app", "current"), mode: "ro" });
+    }
+    return { hostDataDir: realHostDoubao, bindMounts, cleanup: scoped.cleanup };
+  } catch (err) {
+    scoped.cleanup();
+    throw err;
+  }
+}
+
+const SAFE_NPMRC_SCALAR_KEYS = new Set([
+  "registry",
+  "proxy",
+  "https-proxy",
+  "http-proxy",
+  "noproxy",
+  "no-proxy",
+  "strict-ssl",
+  "fetch-retries",
+  "fetch-retry-mintimeout",
+  "fetch-retry-maxtimeout",
+  "fetch-timeout",
+  "fetch-retry-factor",
+  "maxsockets",
+  "prefer-offline",
+  "prefer-online",
+  "offline",
+  "loglevel",
+  "progress",
+  "fund",
+  "audit",
+  "save-exact",
+  "engine-strict",
+  "legacy-peer-deps",
+  "disturl",
+  "sass_binary_site",
+  "electron_mirror",
+  "puppeteer_download_host",
+  "sharp_binary_host",
+  "sharp_libvips_binary_host",
+]);
+
+/** 仅保留 `.npmrc` 中非敏感的镜像/代理/网络行为配置，彻底剥离注册表令牌、密码、Basic Auth、URL 内嵌凭据与环境变量展开。 */
+export function sanitizeNpmrcContent(raw: string): string {
+  const out: string[] = [];
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(";")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const val = trimmed.slice(eq + 1).trim();
+    if (!key || !val) continue;
+    if (key.startsWith("//")) continue;
+    const lowerKey = key.toLowerCase();
+    const isScopedRegistry = /^@[a-z0-9_.-]+:registry$/i.test(key);
+    if (!isScopedRegistry && !SAFE_NPMRC_SCALAR_KEYS.has(lowerKey)) continue;
+    if (val.includes("${") || /[\r\n\0]/.test(val)) continue;
+    const unquoted =
+      (val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))
+        ? val.slice(1, -1).trim()
+        : val;
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(unquoted)) {
+      try {
+        const parsed = new URL(unquoted);
+        if (parsed.username || parsed.password) continue;
+      } catch {
+        continue;
+      }
+    } else if (/:\/\/[^/\s@]+@/.test(unquoted)) {
+      continue;
+    }
+    out.push(`${key}=${val}`);
+  }
+  return out.length ? `${out.join("\n")}\n` : "";
+}
+
+export interface StagedSanitizedNpmrc {
+  dir: string;
+  file: string;
+  homeMountDest: string;
+  cleanup: () => void;
+}
+
+/** 读取宿主机用户 `.npmrc`（或 `NPM_CONFIG_USERCONFIG`），仅将非敏感配置写入独立 `0600` 临时文件供隔离任务只读使用。 */
+export function stageSanitizedNpmrc(
+  rawEnv: NodeJS.ProcessEnv = process.env,
+  dataDir?: string,
+): StagedSanitizedNpmrc | undefined {
+  const rawHome = rawEnv.HOME?.trim() || os.homedir();
+  if (!rawHome) return undefined;
+  const resolvedHome = safeRealpath(rawHome);
+  const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
+  const explicit = rawEnv.NPM_CONFIG_USERCONFIG?.trim() || rawEnv.npm_config_userconfig?.trim();
+  const sourcePath = explicit ? path.resolve(explicit) : path.join(resolvedHome, ".npmrc");
+  try {
+    const st = fs.statSync(sourcePath);
+    if (!st.isFile() || st.size > 256 * 1024) return undefined;
+    const realSource = fs.realpathSync(sourcePath);
+    if (resolvedData && (isPathInsideOrEqual(realSource, resolvedData) || isPathInsideOrEqual(resolvedData, realSource))) {
+      return undefined;
+    }
+    const sanitized = sanitizeNpmrcContent(fs.readFileSync(realSource, "utf8"));
+    if (!sanitized) return undefined;
+    const scoped = createScopedSecretDir("pa-npmrc-", rawEnv);
+    try {
+      const file = path.join(scoped.dir, "npmrc");
+      fs.writeFileSync(file, sanitized, { mode: 0o600 });
+      return {
+        dir: scoped.dir,
+        file,
+        homeMountDest: path.join(resolvedHome, ".npmrc"),
+        cleanup: scoped.cleanup,
+      };
+    } catch (err) {
+      scoped.cleanup();
+      throw err;
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+export function applySanitizedNpmrcEnv(
+  env: NodeJS.ProcessEnv,
+  staged: StagedSanitizedNpmrc | undefined,
+  isolated: boolean,
+): void {
+  if (!isolated) return;
+  delete env.npm_config_userconfig;
+  if (staged) {
+    env.NPM_CONFIG_USERCONFIG = staged.file;
+  } else {
+    delete env.NPM_CONFIG_USERCONFIG;
+  }
+}
+
+function isSafeGitConfigIncludeTarget(realPath: string, resolvedData: string): boolean {
+  if (!realPath) return false;
+  if (resolvedData && (isPathInsideOrEqual(realPath, resolvedData) || isPathInsideOrEqual(resolvedData, realPath))) {
+    return false;
+  }
+  const base = path.basename(realPath).toLowerCase();
+  if (base === ".git-credentials") return false;
+  if (realPath.toLowerCase().endsWith(`${path.sep}git${path.sep}credentials`)) return false;
+  return true;
+}
+
+function expandGitIncludePath(rawPath: string, baseDir: string, resolvedHome: string): string | undefined {
+  let s = rawPath.trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim();
+  }
+  if (!s) return undefined;
+  if (s === "~") return resolvedHome || undefined;
+  if (s.startsWith("~/")) return resolvedHome ? path.join(resolvedHome, s.slice(2)) : undefined;
+  return path.isAbsolute(s) ? s : path.resolve(baseDir, s);
+}
+
+function matchesGitDirIncludeIf(condition: string, cwd: string | undefined, resolvedHome: string): boolean {
+  if (!cwd) return false;
+  const ci = condition.toLowerCase().startsWith("gitdir/i:");
+  const prefixLen = ci ? "gitdir/i:".length : condition.toLowerCase().startsWith("gitdir:") ? "gitdir:".length : 0;
+  if (!prefixLen) return false;
+  let pat = condition.slice(prefixLen).trim();
+  if (!pat) return false;
+  if (pat.startsWith("~/")) pat = path.join(resolvedHome, pat.slice(2));
+  else if (pat.startsWith("./")) pat = path.resolve(resolvedHome, pat);
+  const normCwd = safeRealpath(cwd).replace(/\/?$/, "/");
+  const normPat = pat.startsWith("/") ? path.resolve(pat) + (pat.endsWith("/") ? "/" : "") : pat;
+  const target = ci ? normCwd.toLowerCase() : normCwd;
+  const cmpPat = ci ? normPat.toLowerCase() : normPat;
+  if (!/[*?[\]]/.test(cmpPat)) {
+    return cmpPat.startsWith("/") ? target.startsWith(cmpPat) : target.includes(`/${cmpPat}`);
+  }
+  const esc = cmpPat
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*\*/g, "__GLOBSTAR__")
+    .replace(/\*/g, "[^/]*")
+    .replace(/\?/g, "[^/]")
+    .replace(/__GLOBSTAR__/g, ".*");
+  const re = new RegExp(cmpPat.startsWith("/") ? `^${esc}` : `(?:^|/)${esc}`);
+  return re.test(target);
+}
+
+/**
+ * 仅收集安全的 Git 只读配置文件（含适用当前工作目录的全局 `[include]` / `[includeIf]` 文件，绝不挂载整个 `~/.config/git` 目录、
+ * `~/.config/git/credentials`、`~/.git-credentials` 或原始 `~/.npmrc`），
+ * 并为符号链接 dotfiles（如 `~/.gitconfig -> ~/dotfiles/gitconfig`）保留逻辑路径符号链接，避免 Git 丢失配置且不暴露 dotfiles 其余文件。
  */
 export function collectSafeGitConfigMounts(
   rawEnv: NodeJS.ProcessEnv = process.env,
   dataDir?: string,
-  opts?: { includeNpmrc?: boolean },
+  opts?: { cwd?: string },
 ): { readOnlyPaths: string[]; symlinks: { dest: string; target: string }[] } {
   const readOnlyPaths: string[] = [];
   const symlinks: { dest: string; target: string }[] = [];
+  const addedFiles = new Set<string>();
+  const addedSymlinks = new Set<string>();
   const rawHome = rawEnv.HOME?.trim() || os.homedir();
   if (!rawHome) return { readOnlyPaths, symlinks };
   const resolvedHome = safeRealpath(rawHome);
@@ -279,73 +613,328 @@ export function collectSafeGitConfigMounts(
   const rawXdgConfig = rawEnv.XDG_CONFIG_HOME?.trim();
   const xdgConfigBase = rawXdgConfig ? safeRealpath(rawXdgConfig) : path.join(resolvedHome, ".config");
 
-  const addLogicalFile = (logicalPath: string) => {
+  const addLogicalFile = (logicalPath: string): string | undefined => {
     try {
       const lst = fs.lstatSync(logicalPath);
       const st = fs.statSync(logicalPath);
-      if (!st.isFile()) return;
+      if (!st.isFile() || st.size > 512 * 1024) return undefined;
       const real = fs.realpathSync(logicalPath);
-      if (resolvedData && (isPathInsideOrEqual(real, resolvedData) || isPathInsideOrEqual(resolvedData, real))) return;
-      readOnlyPaths.push(real);
+      if (!isSafeGitConfigIncludeTarget(real, resolvedData)) return undefined;
+      if (!addedFiles.has(real)) {
+        addedFiles.add(real);
+        readOnlyPaths.push(real);
+      }
       if (lst.isSymbolicLink()) {
         const logicalDest = path.join(safeRealpath(path.dirname(logicalPath)), path.basename(logicalPath));
-        if (logicalDest !== real) {
+        if (logicalDest !== real && !addedSymlinks.has(logicalDest)) {
+          addedSymlinks.add(logicalDest);
           symlinks.push({ dest: logicalDest, target: real });
         }
       }
+      return real;
     } catch {
-      // 文件不存在或符号链接损坏时忽略
+      return undefined;
     }
   };
 
-  addLogicalFile(path.join(resolvedHome, ".gitconfig"));
-  addLogicalFile(path.join(xdgConfigBase, "git", "config"));
+  const visitedStatic = new Set<string>();
+  const parseStaticIncludes = (logicalCfgPath: string, depth: number) => {
+    if (depth > 4) return;
+    const real = addLogicalFile(logicalCfgPath);
+    if (!real || visitedStatic.has(real)) return;
+    visitedStatic.add(real);
+    let text: string;
+    try {
+      text = fs.readFileSync(real, "utf8");
+    } catch {
+      return;
+    }
+    const logicalDir = path.dirname(logicalCfgPath);
+    const realDir = path.dirname(real);
+    let activeInclude = false;
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+      const sec = line.match(/^\[([^\]]+)\]$/);
+      if (sec) {
+        const header = sec[1].trim();
+        if (/^include$/i.test(header)) {
+          activeInclude = true;
+        } else {
+          const condMatch = header.match(/^includeIf\s+"([^"]+)"$/i);
+          activeInclude = !!condMatch && matchesGitDirIncludeIf(condMatch[1], opts?.cwd, resolvedHome);
+        }
+        continue;
+      }
+      if (!activeInclude) continue;
+      const pm = line.match(/^path\s*=\s*(.+)$/i);
+      if (!pm) continue;
+      const candidateLogical = expandGitIncludePath(pm[1], logicalDir, resolvedHome);
+      if (candidateLogical && fs.existsSync(candidateLogical)) {
+        parseStaticIncludes(candidateLogical, depth + 1);
+      } else {
+        const candidateReal = expandGitIncludePath(pm[1], realDir, resolvedHome);
+        if (candidateReal && fs.existsSync(candidateReal)) {
+          parseStaticIncludes(candidateReal, depth + 1);
+        }
+      }
+    }
+  };
+
+  const globalGitConfig = path.join(resolvedHome, ".gitconfig");
+  const xdgGitConfig = path.join(xdgConfigBase, "git", "config");
+  parseStaticIncludes(globalGitConfig, 0);
+  parseStaticIncludes(xdgGitConfig, 0);
   addLogicalFile(path.join(xdgConfigBase, "git", "ignore"));
   addLogicalFile(path.join(xdgConfigBase, "git", "attributes"));
-  if (opts?.includeNpmrc) {
-    addLogicalFile(path.join(resolvedHome, ".npmrc"));
+
+  // 当指定 cwd 且存在受信任 git 可执行文件时，借助 Git 自身只读解析 global scope 的全部 include / includeIf（含 gitdir / onbranch / hasconfig），
+  // 严格过滤 scope === "global"（忽略仓库 local .git/config 注入的任意 include），并排除凭据文件与 dataDir。
+  if (opts?.cwd && fs.existsSync(opts.cwd)) {
+    const gitBin = resolveTrustedSystemBin("git");
+    if (gitBin) {
+      try {
+        const gitEnv: NodeJS.ProcessEnv = {
+          PATH: TRUSTED_BOOTSTRAP_PATH,
+          LC_ALL: "C",
+          HOME: rawHome,
+          GIT_TERMINAL_PROMPT: "0",
+          ...(rawXdgConfig ? { XDG_CONFIG_HOME: rawXdgConfig } : {}),
+        };
+        const r = spawnSync(
+          gitBin,
+          [
+            "-C",
+            opts.cwd,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "config",
+            "--includes",
+            "--show-scope",
+            "--show-origin",
+            "--null",
+            "--list",
+          ],
+          { env: gitEnv, timeout: 3_000, encoding: "utf8" },
+        );
+        if (r.status === 0 && r.stdout) {
+          const tokens = r.stdout.split("\0");
+          for (let i = 0; i + 2 < tokens.length; i += 3) {
+            const scope = tokens[i];
+            const origin = tokens[i + 1];
+            if (scope !== "global" || !origin.startsWith("file:")) continue;
+            const originPath = origin.slice("file:".length);
+            if (!originPath) continue;
+            const absOrigin = path.isAbsolute(originPath) ? originPath : path.resolve(opts.cwd, originPath);
+            addLogicalFile(absOrigin);
+          }
+        }
+      } catch {
+        // 静态解析已兜底
+      }
+    }
   }
+
   return { readOnlyPaths, symlinks };
 }
 
-/** 按 acpx 实际选中的 agent 仅暴露该单一提供方的配置目录（以及 ~/.acpx），绝不向 Claude 工人暴露 ~/.codex 等其他提供方凭据 */
+const KNOWN_ACPX_PROVIDERS = ["claude", "codex", "gemini", "doubao", "opencode"] as const;
+
+function resolveSelectedAcpxAgentId(h: Pick<Config["harnesses"][string], "agent" | "agentCommand">): string {
+  const agentRaw = (h.agent?.trim() || "").toLowerCase();
+  const cmdFirst = h.agentCommand?.trim().split(/\s+/)[0] || "";
+  const cmdBase = cmdFirst ? path.basename(cmdFirst).toLowerCase() : "";
+  return agentRaw || cmdBase;
+}
+
+export interface StagedAcpxState {
+  dir: string;
+  mountDest: string;
+  extraCmdPaths: string[];
+  cleanup: () => void;
+}
+
+/**
+ * 为一次性 `acpx exec` 调用分配私有 `0700` 状态目录并绑定挂载到 `~/.acpx`：
+ *   - 绝不暴露宿主机 `~/.acpx/sessions` 或 `~/.acpx/queues` 中的跨仓库历史会话；
+ *   - 仅投影经过过滤的 `config.json`（保留全局选项与选定 agent/适配器条目）以及位于 `~/.acpx` 内且被选定 agent 显式引用的本地适配器文件。
+ */
+export function stageIsolatedAcpxState(
+  h: Pick<Config["harnesses"][string], "agent" | "agentCommand">,
+  hostHome: string,
+  rawEnv: NodeJS.ProcessEnv = process.env,
+  dataDir?: string,
+): StagedAcpxState | undefined {
+  if (!hostHome) return undefined;
+  const resolvedHome = safeRealpath(hostHome);
+  const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
+  const hostAcpxDir = path.join(resolvedHome, ".acpx");
+  const realHostAcpxDir = fs.existsSync(hostAcpxDir) ? safeRealpath(hostAcpxDir) : hostAcpxDir;
+  const selectedId = resolveSelectedAcpxAgentId(h);
+  const scoped = createScopedSecretDir("pa-acpx-state-", rawEnv);
+  const extraCmdPaths: string[] = [];
+
+  try {
+    const stateDir = path.join(scoped.dir, "acpx");
+    fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    const hostCfgPath = path.join(hostAcpxDir, "config.json");
+    if (
+      fs.existsSync(hostCfgPath) &&
+      !(resolvedData && isPathInsideOrEqual(safeRealpath(hostCfgPath), resolvedData))
+    ) {
+      try {
+        const st = fs.statSync(hostCfgPath);
+        if (st.isFile() && st.size <= 256 * 1024) {
+          const parsed = JSON.parse(fs.readFileSync(hostCfgPath, "utf8")) as Record<string, unknown>;
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            const outCfg: Record<string, unknown> = {};
+            for (const key of [
+              "defaultAgent",
+              "defaultPermissions",
+              "nonInteractivePermissions",
+              "authPolicy",
+              "ttl",
+              "timeout",
+              "queueMaxDepth",
+              "format",
+              "disableExec",
+              "mcpServers",
+            ]) {
+              if (Object.prototype.hasOwnProperty.call(parsed, key)) {
+                outCfg[key] = parsed[key];
+              }
+            }
+            const adapterCommands: string[] = [];
+            if (parsed.agents && typeof parsed.agents === "object" && !Array.isArray(parsed.agents)) {
+              const filteredAgents: Record<string, unknown> = {};
+              const agentEntries = Object.entries(parsed.agents as Record<string, unknown>);
+              for (const [name, def] of agentEntries) {
+                const lowerName = name.toLowerCase();
+                if (selectedId && !h.agentCommand?.trim() && lowerName !== selectedId) continue;
+                filteredAgents[name] = def;
+                if (def && typeof def === "object" && !Array.isArray(def)) {
+                  const rec = def as Record<string, unknown>;
+                  if (typeof rec.command === "string" && rec.command.trim()) {
+                    adapterCommands.push(rec.command.trim().split(/\s+/)[0]);
+                  } else if (Array.isArray(rec.argv) && typeof rec.argv[0] === "string" && rec.argv[0].trim()) {
+                    adapterCommands.push(rec.argv[0].trim());
+                  }
+                }
+              }
+              if (Object.keys(filteredAgents).length > 0) {
+                outCfg.agents = filteredAgents;
+              }
+            }
+            if (parsed.auth && typeof parsed.auth === "object" && !Array.isArray(parsed.auth)) {
+              const filteredAuth: Record<string, unknown> = {};
+              for (const [k, v] of Object.entries(parsed.auth as Record<string, unknown>)) {
+                const lk = k.toLowerCase();
+                const otherProvider = KNOWN_ACPX_PROVIDERS.find(
+                  (prov) =>
+                    lk.includes(prov) &&
+                    (!selectedId || (!selectedId.startsWith(prov) && selectedId !== `${prov}-code`)),
+                );
+                if (otherProvider) continue;
+                filteredAuth[k] = v;
+              }
+              if (Object.keys(filteredAuth).length > 0) {
+                outCfg.auth = filteredAuth;
+              }
+            }
+            fs.writeFileSync(path.join(stateDir, "config.json"), `${JSON.stringify(outCfg, null, 2)}\n`, {
+              mode: 0o600,
+            });
+
+            // 仅复制被选定 agent 显式引用的 `~/.acpx` 内适配器文件（绝不触及 sessions/queues/logs/cache/history）
+            const forbiddenTopDirs = new Set(["sessions", "queues", "logs", "cache", "history"]);
+            for (const rawCmd of adapterCommands) {
+              const expanded = rawCmd.startsWith("~/") ? path.join(resolvedHome, rawCmd.slice(2)) : rawCmd;
+              if (!path.isAbsolute(expanded)) {
+                extraCmdPaths.push(rawCmd);
+                continue;
+              }
+              const realCmd = fs.existsSync(expanded) ? safeRealpath(expanded) : "";
+              if (!realCmd) continue;
+              if (fs.existsSync(hostAcpxDir) && isPathInsideOrEqual(realCmd, realHostAcpxDir)) {
+                const rel = path.relative(realHostAcpxDir, realCmd);
+                const top = rel.split(path.sep)[0];
+                if (!rel || rel.startsWith("..") || forbiddenTopDirs.has(top)) continue;
+                try {
+                  const cst = fs.statSync(realCmd);
+                  if (cst.isFile() && cst.size <= 4 * 1024 * 1024) {
+                    const dst = path.join(stateDir, rel);
+                    fs.mkdirSync(path.dirname(dst), { recursive: true, mode: 0o700 });
+                    fs.writeFileSync(dst, fs.readFileSync(realCmd), { mode: cst.mode & 0o700 ? 0o700 : 0o600 });
+                  }
+                } catch {
+                  // ignore unreadable adapter file
+                }
+              } else {
+                extraCmdPaths.push(realCmd);
+              }
+            }
+          }
+        }
+      } catch {
+        // 忽略损坏的 config.json，保持空白私有状态目录
+      }
+    }
+    return {
+      dir: stateDir,
+      mountDest: hostAcpxDir,
+      extraCmdPaths: [...new Set(extraCmdPaths)],
+      cleanup: scoped.cleanup,
+    };
+  } catch (err) {
+    scoped.cleanup();
+    throw err;
+  }
+}
+
+/**
+ * 按 acpx 实际选中的 agent 仅暴露该单一提供方的配置目录（从合并展开后的子进程环境解析，
+ * 绝不挂载整个 `~/.acpx` 或向 Claude 工人暴露 `~/.codex` 等其他提供方凭据）。
+ */
 export function selectAcpxAgentConfigPaths(
   h: Pick<Config["harnesses"][string], "agent" | "agentCommand" | "env">,
   hostHome: string,
   hostEnv: NodeJS.ProcessEnv = process.env,
 ): string[] {
+  const effectiveEnv = mergeHarnessEnv(hostEnv, h.env);
+  const resolvedHome = effectiveEnv.HOME?.trim() || hostHome || os.homedir();
+  const xdgConfig = effectiveEnv.XDG_CONFIG_HOME?.trim() || (resolvedHome ? path.join(resolvedHome, ".config") : "");
+  const xdgData = effectiveEnv.XDG_DATA_HOME?.trim() || (resolvedHome ? path.join(resolvedHome, ".local", "share") : "");
   const out: string[] = [];
   const addSub = (sub: string) => {
-    if (hostHome && sub) out.push(path.join(hostHome, sub));
+    if (resolvedHome && sub) out.push(path.join(resolvedHome, sub));
   };
   const addAbs = (p: string | undefined) => {
     const t = p?.trim();
-    if (t) out.push(path.isAbsolute(t) ? t : path.join(hostHome, t));
+    if (t) out.push(path.isAbsolute(t) ? t : path.join(resolvedHome, t));
   };
-  addSub(".acpx");
 
-  const agentRaw = (h.agent?.trim() || "").toLowerCase();
-  const cmdFirst = (h.agentCommand?.trim().split(/\s+/)[0] || "");
-  const cmdBase = cmdFirst ? path.basename(cmdFirst).toLowerCase() : "";
-  const id = agentRaw || cmdBase;
+  const id = resolveSelectedAcpxAgentId(h);
 
   if (id === "claude" || id === "claude-code" || id.startsWith("claude-")) {
-    addSub(".claude");
+    const claudeDir = effectiveEnv.CLAUDE_CONFIG_DIR?.trim();
+    if (claudeDir) addAbs(claudeDir);
+    else addSub(".claude");
     addSub(".claude.json");
-    addAbs(h.env?.CLAUDE_CONFIG_DIR);
   } else if (id === "codex" || id.startsWith("codex-")) {
-    const codexHome = h.env?.CODEX_HOME?.trim();
+    const codexHome = effectiveEnv.CODEX_HOME?.trim();
     if (codexHome) addAbs(codexHome);
     else addSub(".codex");
   } else if (id === "gemini" || id.startsWith("gemini-")) {
-    addSub(".gemini");
-    addAbs(h.env?.GEMINI_CLI_HOME);
+    const geminiHome = effectiveEnv.GEMINI_CLI_HOME?.trim();
+    if (geminiHome) addAbs(geminiHome);
+    else addSub(".gemini");
   } else if (id === "doubao" || id.startsWith("doubao-")) {
-    const mergedDoubaoEnv: NodeJS.ProcessEnv = { ...hostEnv, ...(h.env ?? {}), HOME: hostHome };
-    out.push(...selectDoubaoRuntimePaths(mergedDoubaoEnv));
+    out.push(...selectDoubaoRuntimePaths({ ...effectiveEnv, HOME: resolvedHome }));
   } else if (id === "opencode" || id.startsWith("opencode-")) {
-    addSub(".config/opencode");
-    addSub(".local/share/opencode");
+    if (xdgConfig) out.push(path.join(xdgConfig, "opencode"));
+    if (xdgData) out.push(path.join(xdgData, "opencode"));
   }
   return [...new Set(out)];
 }
@@ -647,6 +1236,7 @@ export function buildWorkspaceIsolation(
     allowGuardLog?: boolean;
     extraWritablePaths?: string[];
     extraReadOnlyPaths?: string[];
+    extraBindMounts?: { src: string; dest: string; mode: "ro" | "rw" }[];
   },
   rawEnv: NodeJS.ProcessEnv = process.env,
 ): IsolationOptions {
@@ -724,11 +1314,10 @@ export function buildWorkspaceIsolation(
     }
   }
 
-  // 最小化允许的个人工具配置（严格只读、仅挂载单个安全配置文件，绝不挂载 ~/.config/git 整目录以防暴露 credentials，并保留 dotfiles 符号链接逻辑路径）
+  // 最小化允许的个人工具配置（严格只读、仅挂载单个安全 Git 配置文件及适用当前仓库的全局 include，绝不挂载 ~/.config/git 整目录或原始 ~/.npmrc，并保留 dotfiles 符号链接逻辑路径）
   const extraSymlinks: { dest: string; target: string }[] = [];
   if (opts.mode !== "llm-none") {
-    const includeNpmrc = opts.mode === "verify" || opts.mode === "worker-write" || opts.mode === "worker-ro";
-    const gitCfgMounts = collectSafeGitConfigMounts(rawEnv, dataDir, { includeNpmrc });
+    const gitCfgMounts = collectSafeGitConfigMounts(rawEnv, dataDir, { cwd: resolvedCwd });
     readOnlyPaths.push(...gitCfgMounts.readOnlyPaths);
     extraSymlinks.push(...gitCfgMounts.symlinks);
   }
@@ -749,6 +1338,7 @@ export function buildWorkspaceIsolation(
     cmdPath: opts.cmdPath,
     extraCmdPaths: opts.extraCmdPaths,
     ...(extraSymlinks.length ? { extraSymlinks } : {}),
+    ...(opts.extraBindMounts?.length ? { extraBindMounts: opts.extraBindMounts } : {}),
   };
 }
 
@@ -956,8 +1546,8 @@ const UNSHARE_ISOLATION_SCRIPT = [
   'ORIG_PATH="${PATH-}"',
   'HAS_ORIG_PATH="${PATH+1}"',
   `export PATH="${TRUSTED_BOOTSTRAP_PATH}"`,
-  'PIVOT_ROOT="$1"; SETPRIV="$2"; DD="$3"; CWD="$4"; SYS_COUNT="$5"; SYM_COUNT="$6"; TM_COUNT="$7"; PRE_COUNT="$8"; POST_COUNT="$9"; M_COUNT="${10}"',
-  "shift 10",
+  'PIVOT_ROOT="$1"; SETPRIV="$2"; DD="$3"; CWD="$4"; SYS_COUNT="$5"; SYM_COUNT="$6"; TM_COUNT="$7"; PRE_COUNT="$8"; POST_COUNT="$9"; EXTRA_COUNT="${10}"; M_COUNT="${11}"',
+  "shift 11",
   "mount -n --make-rprivate /",
   "S=",
   'TMP_STAGE=""',
@@ -1043,6 +1633,15 @@ const UNSHARE_ISOLATION_SCRIPT = [
   '  if [ -d "$p" ]; then [ -d "$S/newroot$p" ] || mkdir -p "$S/newroot$p"; else [ -e "$S/newroot$p" ] || { mkdir -p "$(dirname "$S/newroot$p")"; : > "$S/newroot$p"; }; fi',
   '  mount -n --bind "$p" "$S/newroot$p"',
   '  if [ "$mode" = "ro" ]; then mount -n -o remount,ro,bind "$S/newroot$p"; else mount -n -o remount,rw,bind "$S/newroot$p"; fi',
+  "  i=$((i + 1))",
+  "done",
+  // 第四阶段：异路径投影绑定（如私有 ~/.acpx、脱敏 ~/.npmrc、暂存 Doubao 数据目录）
+  "i=0",
+  'while [ "$i" -lt "$EXTRA_COUNT" ]; do',
+  '  mode="$1"; src="$2"; dest="$3"; shift 3',
+  '  if [ -d "$src" ]; then [ -d "$S/newroot$dest" ] || mkdir -p "$S/newroot$dest"; else [ -e "$S/newroot$dest" ] || { mkdir -p "$(dirname "$S/newroot$dest")"; : > "$S/newroot$dest"; }; fi',
+  '  mount -n --bind "$src" "$S/newroot$dest"',
+  '  if [ "$mode" = "ro" ]; then mount -n -o remount,ro,bind "$S/newroot$dest"; else mount -n -o remount,rw,bind "$S/newroot$dest"; fi',
   "  i=$((i + 1))",
   "done",
   'if [ -n "$DD" ]; then',
@@ -1473,6 +2072,24 @@ export function wrapCredentialIsolatedCommand(
   const preMounts = sortEntries(allMounts.filter((m) => !isStrictlyInsideDataDir(m.path)));
   const postMounts = sortEntries(allMounts.filter((m) => isStrictlyInsideDataDir(m.path)));
 
+  const extraBindMounts: { mode: "ro" | "rw"; src: string; dest: string }[] = [];
+  const seenExtraBindDests = new Set<string>();
+  for (const rawEntry of opts?.extraBindMounts ?? []) {
+    if (!rawEntry?.src || !rawEntry?.dest) continue;
+    if (!fs.existsSync(rawEntry.src)) continue;
+    const realSrc = safeRealpath(rawEntry.src);
+    if (isForbiddenDaemonTarget(realSrc)) continue;
+    const realDest = resolveMountDestRealpath(rawEntry.dest);
+    if (!realDest || realDest === "/") continue;
+    if (resolvedDataDir && (realDest === resolvedDataDir || isPathInsideOrEqual(realDest, resolvedDataDir))) {
+      continue;
+    }
+    if (seenExtraBindDests.has(realDest)) continue;
+    seenExtraBindDests.add(realDest);
+    extraBindMounts.push({ mode: rawEntry.mode, src: realSrc, dest: realDest });
+  }
+  extraBindMounts.sort((a, b) => a.dest.length - b.dest.length || a.dest.localeCompare(b.dest));
+
   // 收集逻辑路径上的目录符号链接（例如 /home/<user> -> /data00/home/<user>），
   // 在空白 tmpfs 根中重建它们使逻辑路径与 realpath 均可用，且绝不暴露未挂载的同级工作区文件。
   const allRealMountTargets = [
@@ -1482,6 +2099,7 @@ export function wrapCredentialIsolatedCommand(
     ...preMounts.map((m) => m.path),
     ...(resolvedDataDir ? [resolvedDataDir] : []),
     ...postMounts.map((m) => m.path),
+    ...extraBindMounts.map((m) => m.dest),
   ];
   const symlinkMap = new Map<string, string>();
   for (const s of systemSymlinks) symlinkMap.set(s.dest, s.target);
@@ -1496,6 +2114,7 @@ export function wrapCredentialIsolatedCommand(
     ...(opts?.writablePaths ?? []),
     ...(opts?.readOnlyPaths ?? []),
     ...(opts?.extraSymlinks ?? []).map((s) => s.dest),
+    ...(opts?.extraBindMounts ?? []).map((m) => m.dest),
     ...pathEnv.split(path.delimiter).filter((d) => path.isAbsolute(d)),
   ];
   for (const [dest, target] of collectDirectorySymlinksAlongPaths(logicalCandidates)) {
@@ -1570,17 +2189,19 @@ export function wrapCredentialIsolatedCommand(
   }
   const isReExposedBy = (p: string, mounts: MountEntry[]): boolean =>
     mounts.some((m) => isPathInsideOrEqual(p, m.path));
+  const isReExposedByExtraBind = (p: string): boolean =>
+    extraBindMounts.some((m) => isPathInsideOrEqual(p, m.dest));
   const maskFiles = [...new Set(rawMasks.map((m) => safeRealpath(m)).filter((m) => fs.existsSync(m)))].filter((m) => {
     // 位于 dataDir 内的文件已被空 tmpfs 遮蔽，仅当被 postMounts 重新暴露时才需额外 /dev/null 遮罩
     if (resolvedDataDir && isPathInsideOrEqual(m, resolvedDataDir)) {
       return isReExposedBy(m, postMounts);
     }
-    // 位于 /tmp、/dev/shm 或已遮蔽用户运行时目录内的文件已被空 tmpfs 隐藏，仅当被 preMounts 重新暴露时才需额外 /dev/null 遮罩
+    // 位于 /tmp、/dev/shm 或已遮蔽用户运行时目录内的文件已被空 tmpfs 隐藏，仅当被 preMounts 或 extraBindMounts 重新暴露时才需额外 /dev/null 遮罩
     if (isHiddenByEphemeralTmpfs(m)) {
-      return isReExposedBy(m, preMounts);
+      return isReExposedBy(m, preMounts) || isReExposedByExtraBind(m);
     }
-    // 空白根下只有落入系统只读根、preMounts 或 postMounts 内的文件才可见，才需要叠加 /dev/null 遮罩
-    return isCoveredBySystemRo(m) || isReExposedBy(m, preMounts) || isReExposedBy(m, postMounts);
+    // 空白根下只有落入系统只读根、preMounts、postMounts 或 extraBindMounts 内的文件才可见，才需要叠加 /dev/null 遮罩
+    return isCoveredBySystemRo(m) || isReExposedBy(m, preMounts) || isReExposedBy(m, postMounts) || isReExposedByExtraBind(m);
   });
 
   const systemRoAll = [...systemRoDirs, ...systemRoFiles];
@@ -1606,6 +2227,9 @@ export function wrapCredentialIsolatedCommand(
     for (const m of postMounts) {
       bwrapArgs.push(m.mode === "ro" ? "--ro-bind" : "--bind", m.path, m.path);
     }
+    for (const em of extraBindMounts) {
+      bwrapArgs.push(em.mode === "ro" ? "--ro-bind" : "--bind", em.src, em.dest);
+    }
     for (const s of fileSymlinks) {
       bwrapArgs.push("--symlink", s.target, s.dest);
     }
@@ -1627,6 +2251,8 @@ export function wrapCredentialIsolatedCommand(
     }
     const shBin = backend.shBin ?? resolveTrustedSystemBin("sh") ?? "/bin/sh";
     const flatten = (list: MountEntry[]): string[] => list.flatMap((m) => [m.mode, m.path]);
+    const flattenExtra = (list: { mode: "ro" | "rw"; src: string; dest: string }[]): string[] =>
+      list.flatMap((m) => [m.mode, m.src, m.dest]);
     const flattenSyms = (list: { target: string; dest: string }[]): string[] => list.flatMap((s) => [s.target, s.dest]);
     const unshareArgs = [
       "--user",
@@ -1650,12 +2276,14 @@ export function wrapCredentialIsolatedCommand(
       String(runtimeMaskDirs.length),
       String(preMounts.length),
       String(postMounts.length),
+      String(extraBindMounts.length),
       String(maskFiles.length),
       ...systemRoAll,
       ...flattenSyms(allSymlinks),
       ...runtimeMaskDirs,
       ...flatten(preMounts),
       ...flatten(postMounts),
+      ...flattenExtra(extraBindMounts),
       ...maskFiles,
       cmd,
       ...args,
@@ -3052,24 +3680,53 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
   const realLark = resolveBin(cfg.bins.lark);
   const baseEnv = prepareHarnessEnv();
   const started = new Date().toISOString();
+  let stagedAcpx: StagedAcpxState | undefined;
+  let stagedDoubao: StagedDoubaoDataDir | undefined;
+  let stagedNpmrc: StagedSanitizedNpmrc | undefined;
   let r: Awaited<ReturnType<typeof runProcess>>;
   try {
     const mode: WorkspaceIsolationMode =
       run.tools === "write" ? "worker-write" : run.tools === "read" ? "worker-ro" : "llm-none";
+    const acpxIsolationEnv = mergeHarnessEnv(process.env, h.env);
+    const hostHome = acpxIsolationEnv.HOME?.trim() || os.homedir();
+    const resolvedDataDir = cfg.dataDir && fs.existsSync(cfg.dataDir) ? safeRealpath(cfg.dataDir) : "";
+    const selectedAgentId = resolveSelectedAcpxAgentId(h);
+    const isDoubaoAcpx = selectedAgentId === "doubao" || selectedAgentId.startsWith("doubao-");
+
+    stagedAcpx = stageIsolatedAcpxState(h, hostHome, acpxIsolationEnv, cfg.dataDir);
+    if (isDoubaoAcpx) {
+      stagedDoubao = stageIsolatedDoubaoDataDir(acpxIsolationEnv, cfg.dataDir);
+    }
+    if (mode !== "llm-none") {
+      stagedNpmrc = stageSanitizedNpmrc(acpxIsolationEnv, cfg.dataDir);
+    }
+
     const acpxExtraRo: string[] = [];
+    const acpxExtraBindMounts: { src: string; dest: string; mode: "ro" | "rw" }[] = [];
     if (baseEnv.env.CREDENTIALS_DIRECTORY) acpxExtraRo.push(baseEnv.env.CREDENTIALS_DIRECTORY);
     // 仅挂载 bin/guard/lark-cli 运行所需的 4 个精确文件，绝不挂载整个 ROOT（防暴露 ROOT/config.yaml 与 ROOT/.worktrees）
     acpxExtraRo.push(...collectLarkGuardReadOnlyFiles());
     if (run.lark !== "none" && fs.existsSync(realLark)) acpxExtraRo.push(realLark);
-    const hostHome = h.env?.HOME?.trim() || process.env.HOME?.trim() || os.homedir();
-    const resolvedDataDir = cfg.dataDir && fs.existsSync(cfg.dataDir) ? safeRealpath(cfg.dataDir) : "";
+    if (stagedAcpx) {
+      acpxExtraBindMounts.push({ src: stagedAcpx.dir, dest: stagedAcpx.mountDest, mode: "rw" });
+    }
+    if (stagedDoubao) {
+      acpxExtraBindMounts.push(...stagedDoubao.bindMounts);
+    }
+    if (stagedNpmrc) {
+      acpxExtraRo.push(stagedNpmrc.dir);
+      acpxExtraBindMounts.push({ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" });
+    }
     const selectedConfigPaths = [
-      ...selectAcpxAgentConfigPaths(h, hostHome),
-      ...(run.lark !== "none" ? [path.join(hostHome, ".lark-cli"), path.join(hostHome, ".config", "lark-cli")] : []),
+      ...selectAcpxAgentConfigPaths(h, hostHome, acpxIsolationEnv),
+      ...(run.lark !== "none" ? selectLarkCliAuthPaths(acpxIsolationEnv) : []),
     ];
     for (const p of selectedConfigPaths) {
       if (!fs.existsSync(p)) continue;
       const real = safeRealpath(p);
+      if (stagedDoubao && isPathInsideOrEqual(real, stagedDoubao.hostDataDir)) {
+        continue;
+      }
       if (resolvedDataDir && (isPathInsideOrEqual(real, resolvedDataDir) || isPathInsideOrEqual(resolvedDataDir, real))) {
         continue;
       }
@@ -3078,22 +3735,28 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
     const agentExec = resolveAcpxAgentExecutable(h);
     const acpxExtraCmds = [
       ...(agentExec ? [agentExec] : []),
+      ...(stagedAcpx?.extraCmdPaths ?? []),
       ...(run.lark !== "none" ? [realLark] : []),
     ];
     const wrapped = wrapCredentialIsolatedCommand(
       cfg.bins.acpx,
       args,
-      process.env,
-      buildWorkspaceIsolation(cfg, {
-        mode,
-        cwd: run.cwd,
-        cmdPath: cfg.bins.acpx,
-        extraCmdPaths: acpxExtraCmds,
-        trustedRepoRoot: run.trustedRepoRoot,
-        disableGitWorktreeMounts: run.disableGitWorktreeMounts,
-        allowGuardLog: run.lark !== "none",
-        extraReadOnlyPaths: acpxExtraRo,
-      }),
+      acpxIsolationEnv,
+      buildWorkspaceIsolation(
+        cfg,
+        {
+          mode,
+          cwd: run.cwd,
+          cmdPath: cfg.bins.acpx,
+          extraCmdPaths: acpxExtraCmds,
+          trustedRepoRoot: run.trustedRepoRoot,
+          disableGitWorktreeMounts: run.disableGitWorktreeMounts,
+          allowGuardLog: run.lark !== "none",
+          extraReadOnlyPaths: acpxExtraRo,
+          extraBindMounts: acpxExtraBindMounts,
+        },
+        acpxIsolationEnv,
+      ),
     );
     const env: NodeJS.ProcessEnv = {
       ...mergeHarnessEnv(baseEnv.env, h.env),
@@ -3104,6 +3767,7 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       PA_GUARD_LOG: path.join(cfg.dataDir, "logs", "guard.log"),
       ...(wrapped.isolated ? isolatedSandboxTempEnv() : {}),
     };
+    if (mode !== "llm-none") applySanitizedNpmrcEnv(env, stagedNpmrc, wrapped.isolated);
     r = await runProcess(wrapped.cmd, wrapped.args, {
       cwd: run.cwd,
       env,
@@ -3115,6 +3779,9 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       onSpawn: run.onSpawn,
     });
   } finally {
+    stagedNpmrc?.cleanup();
+    stagedDoubao?.cleanup();
+    stagedAcpx?.cleanup();
     baseEnv.cleanup();
   }
   fs.writeFileSync(
@@ -4038,6 +4705,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   const started = new Date().toISOString();
   let stagedCodexHome: StagedCodexHome | undefined;
   let stagedAws: StagedAwsProfile | undefined;
+  let stagedNpmrc: StagedSanitizedNpmrc | undefined;
   let oauthLease: CodexOAuthRefreshLease | undefined;
   let r: Awaited<ReturnType<typeof runProcess>>;
   let text = "";
@@ -4085,20 +4753,25 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
     if (h.model) args.push("-m", h.model);
     args.push(...extraToPass, "-");
 
-    const baseIsoPlan = buildWorkspaceIsolation(cfg, {
-      mode: run.tools === "none" ? "llm-none" : "codex-exec",
-      cwd: execCwd,
-      cmdPath: cmd,
-      trustedRepoRoot: run.trustedRepoRoot,
-      disableGitWorktreeMounts: run.disableGitWorktreeMounts,
-      extraWritablePaths: [...(isolatedTmp ? [isolatedTmp] : []), ...(readOutDir ? [readOutDir] : [])],
-      extraReadOnlyPaths: [
-        ...(run.tools !== "none" && fs.existsSync(hostCodexHome) ? [hostCodexHome] : []),
-        ...(baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : []),
-      ],
-    });
+    const codexIsolationEnv = mergeHarnessEnv(process.env, h.env);
+    const baseIsoPlan = buildWorkspaceIsolation(
+      cfg,
+      {
+        mode: run.tools === "none" ? "llm-none" : "codex-exec",
+        cwd: execCwd,
+        cmdPath: cmd,
+        trustedRepoRoot: run.trustedRepoRoot,
+        disableGitWorktreeMounts: run.disableGitWorktreeMounts,
+        extraWritablePaths: [...(isolatedTmp ? [isolatedTmp] : []), ...(readOutDir ? [readOutDir] : [])],
+        extraReadOnlyPaths: [
+          ...(run.tools !== "none" && fs.existsSync(hostCodexHome) ? [hostCodexHome] : []),
+          ...(baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : []),
+        ],
+      },
+      codexIsolationEnv,
+    );
     const runTimeoutMs = (run.timeoutSec + 60) * 1000;
-    const willIsolate = willIsolateCommand(process.env, baseIsoPlan);
+    const willIsolate = willIsolateCommand(codexIsolationEnv, baseIsoPlan);
     if (willIsolate) {
       if (process.platform === "linux" && effectiveCredInfo.needsCredentialStore && effectiveCredInfo.store === "keyring") {
         throw new Error(
@@ -4119,6 +4792,9 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       if (effectiveCredInfo.awsProfile) {
         stagedAws = stageIsolatedAwsProfile(effectiveCredInfo.awsProfile, finalEnv, cfg.dataDir);
       }
+      if (run.tools !== "none") {
+        stagedNpmrc = stageSanitizedNpmrc(codexIsolationEnv, cfg.dataDir);
+      }
       finalEnv = {
         ...finalEnv,
         ...isolatedSandboxTempEnv(),
@@ -4130,6 +4806,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
             }
           : {}),
       };
+      if (run.tools !== "none") applySanitizedNpmrcEnv(finalEnv, stagedNpmrc, true);
     } else if (
       process.platform === "linux" &&
       effectiveCredInfo.needsCredentialStore &&
@@ -4147,25 +4824,34 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       ...(run.tools !== "none" && !stagedCodexHome && fs.existsSync(hostCodexHome) ? [hostCodexHome] : []),
       ...(baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : []),
       ...(stagedAws ? [stagedAws.dir, ...stagedAws.extraReadOnlyPaths] : []),
+      ...(stagedNpmrc ? [stagedNpmrc.dir] : []),
     ];
     const extraRw = [
       ...(isolatedTmp ? [isolatedTmp] : []),
       ...(readOutDir ? [readOutDir] : []),
       ...(stagedCodexHome ? [stagedCodexHome.scratchDir] : []),
     ];
+    const extraBindMounts = stagedNpmrc
+      ? [{ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" as const }]
+      : [];
     const wrapped = wrapCredentialIsolatedCommand(
       cmd,
       args,
-      process.env,
-      buildWorkspaceIsolation(cfg, {
-        mode: run.tools === "none" ? "llm-none" : "codex-exec",
-        cwd: execCwd,
-        cmdPath: cmd,
-        trustedRepoRoot: run.trustedRepoRoot,
-        disableGitWorktreeMounts: run.disableGitWorktreeMounts,
-        extraWritablePaths: extraRw,
-        extraReadOnlyPaths: extraRo,
-      }),
+      codexIsolationEnv,
+      buildWorkspaceIsolation(
+        cfg,
+        {
+          mode: run.tools === "none" ? "llm-none" : "codex-exec",
+          cwd: execCwd,
+          cmdPath: cmd,
+          trustedRepoRoot: run.trustedRepoRoot,
+          disableGitWorktreeMounts: run.disableGitWorktreeMounts,
+          extraWritablePaths: extraRw,
+          extraReadOnlyPaths: extraRo,
+          extraBindMounts,
+        },
+        codexIsolationEnv,
+      ),
     );
     r = await runProcess(wrapped.cmd, wrapped.args, {
       cwd: execCwd,
@@ -4188,6 +4874,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   } finally {
     oauthLease?.release();
     baseEnv.cleanup();
+    stagedNpmrc?.cleanup();
     stagedCodexHome?.cleanup();
     stagedAws?.cleanup();
     if (isolatedTmp) fs.rmSync(isolatedTmp, { recursive: true, force: true });
@@ -4235,24 +4922,40 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   fs.writeFileSync(promptFile, run.prompt, { mode: 0o600 });
   const fd = fs.openSync(promptFile, "r");
   const baseEnv = prepareHarnessEnv();
+  let stagedDoubao: StagedDoubaoDataDir | undefined;
+  let stagedNpmrc: StagedSanitizedNpmrc | undefined;
   let r: Awaited<ReturnType<typeof runProcess>>;
   try {
     const mode: WorkspaceIsolationMode =
       run.tools === "write" ? "worker-write" : run.tools === "read" ? "worker-ro" : "llm-none";
+    const doubaoIsolationEnv = mergeHarnessEnv(process.env, h.env);
+    const resolvedDataDir = cfg.dataDir && fs.existsSync(cfg.dataDir) ? safeRealpath(cfg.dataDir) : "";
+    stagedDoubao = stageIsolatedDoubaoDataDir(doubaoIsolationEnv, cfg.dataDir);
+    if (mode !== "llm-none") {
+      stagedNpmrc = stageSanitizedNpmrc(doubaoIsolationEnv, cfg.dataDir);
+    }
     const doubaoExtraRo: string[] = [];
+    const doubaoExtraBindMounts: { src: string; dest: string; mode: "ro" | "rw" }[] = [];
     if (baseEnv.env.CREDENTIALS_DIRECTORY) doubaoExtraRo.push(baseEnv.env.CREDENTIALS_DIRECTORY);
     doubaoExtraRo.push(...collectLarkGuardReadOnlyFiles());
     if (run.lark !== "none" && fs.existsSync(realLark)) doubaoExtraRo.push(realLark);
-    const doubaoIsolationEnv = mergeHarnessEnv(process.env, h.env);
-    const hostHome = doubaoIsolationEnv.HOME?.trim() || os.homedir();
-    const resolvedDataDir = cfg.dataDir && fs.existsSync(cfg.dataDir) ? safeRealpath(cfg.dataDir) : "";
+    if (stagedDoubao) {
+      doubaoExtraBindMounts.push(...stagedDoubao.bindMounts);
+    }
+    if (stagedNpmrc) {
+      doubaoExtraRo.push(stagedNpmrc.dir);
+      doubaoExtraBindMounts.push({ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" });
+    }
     const doubaoPaths = [
       ...selectDoubaoRuntimePaths(doubaoIsolationEnv),
-      ...(run.lark !== "none" ? [path.join(hostHome, ".lark-cli"), path.join(hostHome, ".config", "lark-cli")] : []),
+      ...(run.lark !== "none" ? selectLarkCliAuthPaths(doubaoIsolationEnv) : []),
     ];
     for (const p of doubaoPaths) {
       if (!fs.existsSync(p)) continue;
       const real = safeRealpath(p);
+      if (stagedDoubao && isPathInsideOrEqual(real, stagedDoubao.hostDataDir)) {
+        continue;
+      }
       if (resolvedDataDir && (isPathInsideOrEqual(real, resolvedDataDir) || isPathInsideOrEqual(resolvedDataDir, real))) {
         continue;
       }
@@ -4273,6 +4976,7 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
           disableGitWorktreeMounts: run.disableGitWorktreeMounts,
           allowGuardLog: run.lark !== "none",
           extraReadOnlyPaths: doubaoExtraRo,
+          extraBindMounts: doubaoExtraBindMounts,
         },
         doubaoIsolationEnv,
       ),
@@ -4287,6 +4991,7 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       PA_GUARD_LOG: path.join(cfg.dataDir, "logs", "guard.log"),
       ...(wrapped.isolated ? isolatedSandboxTempEnv() : {}),
     };
+    if (mode !== "llm-none") applySanitizedNpmrcEnv(env, stagedNpmrc, wrapped.isolated);
     r = await runProcess(wrapped.cmd, wrapped.args, {
       cwd: run.cwd,
       env,
@@ -4297,6 +5002,8 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       onSpawn: run.onSpawn,
     });
   } finally {
+    stagedNpmrc?.cleanup();
+    stagedDoubao?.cleanup();
     baseEnv.cleanup();
     try {
       fs.closeSync(fd);

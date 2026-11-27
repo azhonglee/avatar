@@ -1708,9 +1708,10 @@ export class PersonalWebBridge {
     if (this.store.isConvMutedById(pwConv) || this.store.isConvMutedById(effectiveMsg.conversationId)) return;
     if (this.matchesDirectNativeIdDeny(pwConv)) return;
 
-    // 2) 若同 ID 非背景观测已存在且本次推送与之冲突（文本/@mention 变化、已撤回或触发范围外撤回），
-    //    先向服务端权威回读 readMessage(id)，避免未 ACK 旧推送包重放回滚更新后的编辑或错误复活已撤回消息
-    if (existing && existing.meta.background_only !== true) {
+    // 2) 若同 ID 观测已存在（含 hydrateContext 写入的 background_only 行）且本次推送与之冲突（文本/@mention 变化、已撤回或触发范围外撤回），
+    //    先向服务端权威回读 readMessage(id)，避免未 ACK 旧推送包重放回滚更新后的编辑、把已被移除的 @我 错误晋升为待处理，或复活已撤回消息
+    if (existing) {
+      const existingBackgroundOnly = existing.meta.background_only === true;
       const existingWithdrawn = existing.meta.withdrawn === true;
       const incomingRev = obsRevision({ text: clippedText, meta: { at_me: isAtMe, mentions: effectiveMsg.mentions } });
       const revDiffers = obsRevision(existing) !== incomingRev;
@@ -1746,8 +1747,9 @@ export class PersonalWebBridge {
             authInScope = this.isGroupInScope(effectiveMsg.conversationId, pwConv, ownerId);
           }
           const authOutOfScope = !authInScope;
-          // 权威消息仍与本地已落库版本一致（且未撤回/未越界）：说明本次推送是陈旧重放，直接跳过不回滚
-          if (!existingWithdrawn && !authOutOfScope && obsRevision(existing) === authRev) {
+          // 非背景行且权威消息仍与本地已落库版本一致（未撤回/未越界）：说明本次推送是陈旧重放，直接跳过；
+          // 若原行为 background_only，则仅使用权威回读后的最新版本继续后续范围校验与按需晋升
+          if (!existingBackgroundOnly && !existingWithdrawn && !authOutOfScope && obsRevision(existing) === authRev) {
             return;
           }
         }

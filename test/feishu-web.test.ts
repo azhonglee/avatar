@@ -101,6 +101,8 @@ import {
   collectScopedSshMounts,
   gitCredentialLineMatchesTarget,
   isGitLfsPointerBlob,
+  parseRemote,
+  parseScpGitUrl,
   pushBranch,
   remoteDefaultBranch,
   resolveAuthorizedSshAuthSock,
@@ -112,6 +114,7 @@ import { registerDelivery } from "../src/delivery/index.ts";
 import { runDoctor } from "../src/doctor.ts";
 import { card as cardEffect, comment as commentEffect, effectHandler, move as moveEffect } from "../src/effects.ts";
 import {
+  applySanitizedNpmrcEnv,
   buildWorkspaceIsolation,
   canonicalCodexLockFilePath,
   collectLarkGuardReadOnlyFiles,
@@ -130,9 +133,14 @@ import {
   resolveTrustedBwrapBin,
   resolveTrustedSystemBin,
   runHarness,
+  sanitizeNpmrcContent,
   selectAcpxAgentConfigPaths,
   selectDoubaoRuntimePaths,
+  selectLarkCliAuthPaths,
+  stageIsolatedAcpxState,
   stageIsolatedAwsProfile,
+  stageIsolatedDoubaoDataDir,
+  stageSanitizedNpmrc,
   stageIsolatedCodexHome,
   syncRefreshedCodexAuth,
   workspaceRequiresIsolation,
@@ -15200,17 +15208,17 @@ test("Codex 第十九轮回归：仓库工人默认隔离、可信沙箱引导�
       fs.writeFileSync(path.join(fakeHome, ".codex", "auth.json"), '{"tokens":{"refresh_token":"SECRET_CODEX_RT"}}\n');
       fs.writeFileSync(path.join(fakeHome, ".gemini", "oauth.json"), '{"secret":"SECRET_GEMINI"}\n');
 
-      const claudePaths = selectAcpxAgentConfigPaths({ agent: "claude", env: {} }, fakeHome);
-      assert.ok(claudePaths.includes(path.join(fakeHome, ".acpx")));
+      const claudePaths = selectAcpxAgentConfigPaths({ agent: "claude", env: {} }, fakeHome, {});
+      assert.ok(!claudePaths.includes(path.join(fakeHome, ".acpx")), "不得直接挂载宿主机 ~/.acpx（含历史 sessions）");
       assert.ok(claudePaths.includes(path.join(fakeHome, ".claude")));
       assert.ok(!claudePaths.some((p) => p.includes(".codex") || p.includes(".gemini")), "Claude 代理绝不能暴露 .codex / .gemini");
 
-      const codexPaths = selectAcpxAgentConfigPaths({ agent: "codex", env: {} }, fakeHome);
+      const codexPaths = selectAcpxAgentConfigPaths({ agent: "codex", env: {} }, fakeHome, {});
       assert.ok(codexPaths.includes(path.join(fakeHome, ".codex")));
       assert.ok(!codexPaths.some((p) => p.includes(".claude") || p.includes(".gemini")), "Codex 代理绝不能暴露 .claude / .gemini");
 
-      const unknownPaths = selectAcpxAgentConfigPaths({ agentCommand: "/usr/bin/custom-agent", env: {} }, fakeHome);
-      assert.deepEqual(unknownPaths, [path.join(fakeHome, ".acpx")], "未知自定义代理只应挂载 .acpx");
+      const unknownPaths = selectAcpxAgentConfigPaths({ agentCommand: "/usr/bin/custom-agent", env: {} }, fakeHome, {});
+      assert.deepEqual(unknownPaths, [], "未知自定义代理不挂载任何宿主机提供方目录（~/.acpx 由私有暂存目录投影）");
 
       if (process.platform === "linux" && hasCredentialMountIsolation()) {
         const probeAcpx = path.join(dir, "probe-acpx-r19");
@@ -16625,6 +16633,889 @@ test("Codex 第二十轮回归：剥离 ~/.config/git/credentials、保留符号
     }
   } finally {
     if (httpGitSrv) await new Promise<void>((resolve) => httpGitSrv!.close(() => resolve()));
+    app?.store.db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex 第二十一轮回归：脱敏 .npmrc、私有 ~/.acpx 状态隔离、file-backed Lark 登录态、Doubao 登录态暂存与认证、权威 IM 回读清 deleted、派单残缺 worktree 恢复、background_only 冲突重放校验、子进程环境解析 ACP 配置、scp 绝对路径、SSH Include 通配、Git 全局 include、分槽 store 优先级、非 store 宿主机 HTTPS 凭据、快通道耗尽健康上报", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-r21-"));
+  const dataDir = path.join(dir, "data");
+  fs.mkdirSync(dataDir, { recursive: true });
+  let app: ReturnType<typeof createApp> | undefined;
+  let httpSrv12: http.Server | undefined;
+  let httpSrv13: http.Server | undefined;
+  try {
+    // 1) [R21 #1 P1] .npmrc 脱敏：仅投影非敏感镜像/代理/重试配置，绝不把注册表 token / 密码 / URL 凭据暴露给校验命令或仓库工人
+    {
+      const rawNpmrc = [
+        "registry=https://registry.npmmirror.com",
+        "@corp:registry=https://npm.corp.example/",
+        "strict-ssl=true",
+        "fetch-retries=3",
+        "//registry.npmjs.org/:_authToken=npm_SUPER_SECRET_TOKEN",
+        "//npm.corp.example/:_password=BASE64_SECRET_PASS",
+        "_auth=LEGACY_AUTH_SECRET",
+        "proxy=http://alice:proxysecret@proxy.corp:8080",
+        "https-proxy=https://proxy.corp.example:8443",
+        "disturl=https://user:pass@mirror.example/",
+        "registry=${NPM_SECRET_REGISTRY}",
+      ].join("\n");
+      const sanitized = sanitizeNpmrcContent(rawNpmrc);
+      assert.match(sanitized, /^registry=https:\/\/registry\.npmmirror\.com$/m);
+      assert.match(sanitized, /^@corp:registry=https:\/\/npm\.corp\.example\/$/m);
+      assert.match(sanitized, /^strict-ssl=true$/m);
+      assert.match(sanitized, /^fetch-retries=3$/m);
+      assert.match(sanitized, /^https-proxy=https:\/\/proxy\.corp\.example:8443$/m);
+      assert.ok(!sanitized.includes("npm_SUPER_SECRET_TOKEN"), "不得保留 _authToken");
+      assert.ok(!sanitized.includes("BASE64_SECRET_PASS"), "不得保留 _password");
+      assert.ok(!sanitized.includes("LEGACY_AUTH_SECRET"), "不得保留 _auth");
+      assert.ok(!sanitized.includes("proxysecret"), "不得保留带用户名密码的代理 URL");
+      assert.ok(!sanitized.includes("user:pass"), "不得保留带内嵌凭据的镜像 URL");
+      assert.ok(!sanitized.includes("NPM_SECRET_REGISTRY"), "不得保留环境变量展开");
+
+      const npmHome = path.join(dir, "npm-home");
+      fs.mkdirSync(npmHome, { recursive: true });
+      fs.writeFileSync(path.join(npmHome, ".npmrc"), rawNpmrc, { mode: 0o600 });
+      const gitCfgMounts = collectSafeGitConfigMounts({ HOME: npmHome }, dataDir);
+      assert.ok(!gitCfgMounts.readOnlyPaths.some((p) => p.endsWith(".npmrc")), "collectSafeGitConfigMounts 绝不得挂载原始 ~/.npmrc");
+
+      const staged = stageSanitizedNpmrc({ HOME: npmHome }, dataDir);
+      assert.ok(staged, "含非敏感设置的 .npmrc 应成功生成脱敏暂存文件");
+      try {
+        if (process.platform === "linux" && hasCredentialMountIsolation()) {
+          const workCwd = path.join(dir, "npm-verify-cwd");
+          fs.mkdirSync(workCwd, { recursive: true });
+          const cfgFile = path.join(dir, "npm-cfg.yaml");
+          fs.writeFileSync(
+            cfgFile,
+            `data_dir: ${dataDir}\nowner:\n  open_id: ou_r21_me\nharnesses:\n  codex: { agent: codex }\nroles:\n  brain: codex\n  reviewer: codex\n`,
+          );
+          const cfg = loadConfig(cfgFile);
+          const isoEnv: NodeJS.ProcessEnv = { ...process.env, HOME: npmHome };
+          const wrapped = wrapCredentialIsolatedCommand(
+            "sh",
+            [
+              "-c",
+              `cat "$HOME/.npmrc"; echo "---USERCONFIG---"; cat "$NPM_CONFIG_USERCONFIG"`,
+            ],
+            isoEnv,
+            buildWorkspaceIsolation(
+              cfg,
+              {
+                mode: "verify",
+                cwd: workCwd,
+                extraReadOnlyPaths: [staged!.dir],
+                extraBindMounts: [{ src: staged!.file, dest: staged!.homeMountDest, mode: "ro" }],
+              },
+              isoEnv,
+            ),
+          );
+          const childEnv: NodeJS.ProcessEnv = { ...isoEnv, ...isolatedSandboxTempEnv() };
+          applySanitizedNpmrcEnv(childEnv, staged, wrapped.isolated);
+          const r = await runProcess(wrapped.cmd, wrapped.args, { cwd: workCwd, env: childEnv });
+          assert.equal(r.code, 0, `沙箱校验命令应正常读取脱敏 .npmrc：${r.stderr}`);
+          assert.match(r.stdout, /registry=https:\/\/registry\.npmmirror\.com/);
+          assert.ok(!r.stdout.includes("npm_SUPER_SECRET_TOKEN"), "沙箱内 ~/.npmrc 与 NPM_CONFIG_USERCONFIG 均不得泄漏注册表令牌");
+        }
+      } finally {
+        staged?.cleanup();
+      }
+    }
+
+    // 2) [R21 #2 P1], 3) [R21 #3 P1], 4) [R21 #4 P1], 8) [R21 #8 P2]
+    //    私有 ~/.acpx 状态隔离 + file-backed Lark XDG 数据目录 + Doubao 登录态暂存/认证 + 从合并子进程环境解析 ACP 配置路径
+    {
+      const isoHome = path.join(dir, "iso-home-r21");
+      const xdgCfg = path.join(isoHome, ".config");
+      const xdgData = path.join(isoHome, ".local", "share");
+      const customCodexHome = path.join(dir, "custom-codex-home");
+      const customClaudeDir = path.join(dir, "custom-claude-dir");
+      const customGeminiHome = path.join(dir, "custom-gemini-home");
+      fs.mkdirSync(path.join(isoHome, ".acpx", "sessions"), { recursive: true });
+      fs.mkdirSync(path.join(isoHome, ".acpx", "queues"), { recursive: true });
+      fs.mkdirSync(path.join(isoHome, ".acpx", "adapters"), { recursive: true });
+      fs.mkdirSync(path.join(isoHome, ".lark-cli"), { recursive: true });
+      fs.mkdirSync(path.join(xdgData, "lark-cli"), { recursive: true });
+      fs.mkdirSync(path.join(xdgData, "doubao_cli", "app", "current"), { recursive: true });
+      fs.mkdirSync(path.join(xdgData, "doubao_cli", "doubao-cli-pc-login"), { recursive: true });
+      fs.mkdirSync(path.join(xdgData, "doubao_cli", "keys"), { recursive: true });
+      fs.mkdirSync(path.join(xdgData, "doubao_cli", "logs"), { recursive: true });
+      fs.mkdirSync(path.join(xdgData, "doubao_cli", "agent_mode"), { recursive: true });
+      fs.mkdirSync(customCodexHome, { recursive: true });
+      fs.mkdirSync(customClaudeDir, { recursive: true });
+      fs.mkdirSync(customGeminiHome, { recursive: true });
+
+      fs.writeFileSync(
+        path.join(isoHome, ".acpx", "adapters", "claude-adapter.sh"),
+        "#!/bin/sh\necho CLAUDE_ADAPTER_OK\n",
+        { mode: 0o755 },
+      );
+      fs.writeFileSync(
+        path.join(isoHome, ".acpx", "config.json"),
+        JSON.stringify({
+          defaultPermissions: "approve-reads",
+          agents: {
+            claude: { command: "~/.acpx/adapters/claude-adapter.sh" },
+            codex: { command: "/usr/bin/other-codex" },
+          },
+          auth: {
+            "claude-api": "CLAUDE_AUTH_OK",
+            "codex-api": "CODEX_SECRET_MUST_DROP",
+          },
+        }),
+      );
+      fs.writeFileSync(path.join(isoHome, ".acpx", "sessions", "other-repo.json"), '{"prompt":"SECRET_OTHER_REPO_SESSION"}\n');
+      fs.writeFileSync(path.join(isoHome, ".acpx", "queues", "q1.json"), '{"queued":"SECRET_QUEUE"}\n');
+      fs.writeFileSync(path.join(isoHome, ".lark-cli", "config.json"), '{"appId":"cli_test"}\n');
+      fs.writeFileSync(path.join(xdgData, "lark-cli", "master.key"), "LARK_MASTER_KEY_FILE_BACKED", { mode: 0o600 });
+      fs.writeFileSync(path.join(xdgData, "doubao_cli", "app", "current", "doubao-bin"), "DOUBAO_BIN_OK", { mode: 0o755 });
+      fs.writeFileSync(path.join(xdgData, "doubao_cli", "doubao-cli-pc-login", "account"), "uid_r21_authenticated");
+      fs.writeFileSync(path.join(xdgData, "doubao_cli", "keys", "session.key"), "DOUBAO_SESSION_KEY_OK", { mode: 0o600 });
+      fs.writeFileSync(path.join(xdgData, "doubao_cli", "logs", "host-history.log"), "DOUBAO_PRIVATE_HOST_LOG");
+      fs.writeFileSync(path.join(xdgData, "doubao_cli", "agent_mode", "state.db"), "DOUBAO_HOST_AGENT_HISTORY");
+      fs.writeFileSync(path.join(customCodexHome, "config.toml"), 'model = "custom-inherited-codex"\n');
+
+      // [R21 #3] selectLarkCliAuthPaths 必须包含 XDG_DATA_HOME/lark-cli
+      const larkPaths = selectLarkCliAuthPaths({ HOME: isoHome, XDG_CONFIG_HOME: xdgCfg, XDG_DATA_HOME: xdgData });
+      assert.ok(larkPaths.includes(path.join(isoHome, ".lark-cli")));
+      assert.ok(larkPaths.includes(path.join(xdgCfg, "lark-cli")));
+      assert.ok(larkPaths.includes(path.join(xdgData, "lark-cli")), "必须包含 Linux 文件存储登录态目录 XDG_DATA_HOME/lark-cli");
+
+      // [R21 #4] selectDoubaoRuntimePaths 必须包含 app/current + doubao-cli-pc-login + keys
+      const doubaoPaths = selectDoubaoRuntimePaths({ HOME: isoHome, XDG_CONFIG_HOME: xdgCfg, XDG_DATA_HOME: xdgData });
+      assert.ok(doubaoPaths.includes(path.join(xdgData, "doubao_cli", "app", "current")));
+      assert.ok(doubaoPaths.includes(path.join(xdgData, "doubao_cli", "doubao-cli-pc-login")));
+      assert.ok(doubaoPaths.includes(path.join(xdgData, "doubao_cli", "keys")));
+
+      // [R21 #8] selectAcpxAgentConfigPaths 必须从合并展开的子进程环境解析 CODEX_HOME / CLAUDE_CONFIG_DIR / GEMINI_CLI_HOME
+      const inheritedEnv: NodeJS.ProcessEnv = {
+        HOME: isoHome,
+        CODEX_HOME: customCodexHome,
+        CLAUDE_CONFIG_DIR: customClaudeDir,
+        GEMINI_CLI_HOME: customGeminiHome,
+        CUSTOM_BASE: dir,
+      };
+      const codexInherited = selectAcpxAgentConfigPaths({ agent: "codex", env: {} }, isoHome, inheritedEnv);
+      assert.ok(codexInherited.includes(customCodexHome), "未在 YAML 重复声明时必须继承 daemon 导出的 CODEX_HOME");
+      assert.ok(!codexInherited.includes(path.join(isoHome, ".codex")), "继承 CODEX_HOME 后不应退回挂载 ~/.codex");
+      const claudeInherited = selectAcpxAgentConfigPaths({ agent: "claude", env: {} }, isoHome, inheritedEnv);
+      assert.ok(claudeInherited.includes(customClaudeDir), "必须继承 daemon 导出的 CLAUDE_CONFIG_DIR");
+      const geminiInherited = selectAcpxAgentConfigPaths({ agent: "gemini", env: {} }, isoHome, inheritedEnv);
+      assert.ok(geminiInherited.includes(customGeminiHome), "必须继承 daemon 导出的 GEMINI_CLI_HOME");
+      const codexExpanded = selectAcpxAgentConfigPaths(
+        { agent: "codex", env: { CODEX_HOME: "${CUSTOM_BASE}/custom-codex-home" } },
+        isoHome,
+        inheritedEnv,
+      );
+      assert.ok(codexExpanded.includes(customCodexHome), "YAML 中的 ${VAR} 展开结果必须用于挂载目录");
+
+      if (process.platform === "linux" && hasCredentialMountIsolation()) {
+        // 实跑 [R21 #2 + #3 + #8]：acpx Claude (lark="none") 看不到 ~/.acpx/sessions 与 lark-cli；acpx Codex (lark="read") 可见继承的 CODEX_HOME 与 file-backed lark-cli
+        const probeAcpx = path.join(dir, "probe-acpx-r21");
+        fs.writeFileSync(
+          probeAcpx,
+          [
+            "#!/bin/sh",
+            'echo "ACPX_CFG=$(cat "$HOME/.acpx/config.json" 2>/dev/null | tr -d "\\n")"',
+            'echo "ACPX_SESS=$(test -e "$HOME/.acpx/sessions/other-repo.json" && echo LEAK || echo HIDDEN)"',
+            'echo "ACPX_QUEUE=$(test -e "$HOME/.acpx/queues/q1.json" && echo LEAK || echo HIDDEN)"',
+            'echo "ACPX_ADAPTER=$(test -x "$HOME/.acpx/adapters/claude-adapter.sh" && echo OK || echo NO)"',
+            'echo "ACPX_WRITABLE=$(touch "$HOME/.acpx/worker-temp.txt" 2>/dev/null && echo YES || echo NO)"',
+            'echo "LARK_DATA=$(cat "$XDG_DATA_HOME/lark-cli/master.key" 2>/dev/null || echo HIDDEN)"',
+            'echo "CODEX_INHERITED=$(cat "$CODEX_HOME/config.toml" 2>/dev/null || echo HIDDEN)"',
+          ].join("\n"),
+          { mode: 0o755 },
+        );
+        const probeDoubao = path.join(dir, "probe-doubao-r21");
+        fs.writeFileSync(
+          probeDoubao,
+          [
+            "#!/bin/sh",
+            'cat >/dev/null',
+            'D="$XDG_DATA_HOME/doubao_cli"',
+            'LOCK_OK=$( ( : > "$D/doubao-cli-instance.lock" ) 2>/dev/null && echo YES || echo NO )',
+            'BIN_RO=$( ( echo x >> "$D/app/current/doubao-bin" ) 2>/dev/null && echo WRITABLE || echo RO )',
+            'ACCT=$(cat "$D/doubao-cli-pc-login/account" 2>/dev/null || echo MISSING)',
+            'KEY=$(cat "$D/keys/session.key" 2>/dev/null || echo MISSING)',
+            'LOG_LEAK=$(test -e "$D/logs/host-history.log" && echo LEAK || echo HIDDEN)',
+            'AGENT_LEAK=$(test -e "$D/agent_mode/state.db" && echo LEAK || echo HIDDEN)',
+            'LARK_KEY=$(cat "$XDG_DATA_HOME/lark-cli/master.key" 2>/dev/null || echo HIDDEN)',
+            'echo "LOCK=$LOCK_OK BIN=$BIN_RO ACCT=$ACCT KEY=$KEY LOG=$LOG_LEAK AGENT=$AGENT_LEAK LARK=$LARK_KEY"',
+          ].join("\n"),
+          { mode: 0o755 },
+        );
+        const cfgPath21 = path.join(dir, "r21-harness.yaml");
+        fs.writeFileSync(
+          cfgPath21,
+          [
+            `data_dir: ${path.join(dir, "r21-hdata")}`,
+            `bins: { lark: ${JSON.stringify(path.join(STUBS, "lark-cli"))}, acpx: ${JSON.stringify(probeAcpx)} }`,
+            `owner: { open_id: ou_r21_me }`,
+            "roles: { brain: claude_acp, reviewer: codex_acp }",
+            "harnesses:",
+            "  claude_acp:",
+            "    type: acpx",
+            "    agent: claude",
+            "    env:",
+            `      HOME: ${JSON.stringify(isoHome)}`,
+            `      XDG_CONFIG_HOME: ${JSON.stringify(xdgCfg)}`,
+            `      XDG_DATA_HOME: ${JSON.stringify(xdgData)}`,
+            "  codex_acp:",
+            "    type: acpx",
+            "    agent: codex",
+            "    env:",
+            `      HOME: ${JSON.stringify(isoHome)}`,
+            `      XDG_CONFIG_HOME: ${JSON.stringify(xdgCfg)}`,
+            `      XDG_DATA_HOME: ${JSON.stringify(xdgData)}`,
+            "  doubao_acp:",
+            "    type: acpx",
+            `    agent: doubao`,
+            "    env:",
+            `      HOME: ${JSON.stringify(isoHome)}`,
+            `      XDG_CONFIG_HOME: ${JSON.stringify(xdgCfg)}`,
+            `      XDG_DATA_HOME: ${JSON.stringify(xdgData)}`,
+            "  doubao_direct:",
+            "    type: doubao-cli",
+            `    cmd: ${JSON.stringify(probeDoubao)}`,
+            "    env:",
+            `      HOME: ${JSON.stringify(isoHome)}`,
+            `      XDG_CONFIG_HOME: ${JSON.stringify(xdgCfg)}`,
+            `      XDG_DATA_HOME: ${JSON.stringify(xdgData)}`,
+          ].join("\n") + "\n",
+        );
+        const hCfg = loadConfig(cfgPath21);
+        const workCwd = path.join(dir, "r21-work");
+        fs.mkdirSync(workCwd, { recursive: true });
+
+        // (a) Claude ACP with lark: "none"
+        const resClaude = await runHarness(hCfg, {
+          harness: "claude_acp",
+          prompt: "hi",
+          cwd: workCwd,
+          tools: "read",
+          lark: "none",
+          timeoutSec: 15,
+          logFile: path.join(dir, "claude.log"),
+        });
+        assert.equal(resClaude.ok, true, `claude_acp 探测应成功：${resClaude.text}`);
+        assert.match(resClaude.text, /ACPX_SESS=HIDDEN/, "一次性 worker 绝不能读取 ~/.acpx/sessions 历史会话");
+        assert.match(resClaude.text, /ACPX_QUEUE=HIDDEN/, "一次性 worker 绝不能读取 ~/.acpx/queues");
+        assert.match(resClaude.text, /ACPX_ADAPTER=OK/, "选定 agent 引用的 ~/.acpx 适配器文件必须可用");
+        assert.match(resClaude.text, /ACPX_WRITABLE=YES/, "私有 ~/.acpx 状态目录应对本次调用可写");
+        assert.ok(!fs.existsSync(path.join(isoHome, ".acpx", "worker-temp.txt")), "私有 ~/.acpx 写入不得污染宿主机 ~/.acpx");
+        assert.match(resClaude.text, /CLAUDE_AUTH_OK/, "选定 agent 的配置应保留");
+        assert.ok(!resClaude.text.includes("CODEX_SECRET_MUST_DROP"), "其他 agent 的 auth 不应暴露给 Claude worker");
+        assert.match(resClaude.text, /LARK_DATA=HIDDEN/, "lark=none 时不得暴露 file-backed lark-cli 凭据");
+
+        // (b) Codex ACP with inherited daemon CODEX_HOME + lark: "read"
+        const prevCodexHome = process.env.CODEX_HOME;
+        process.env.CODEX_HOME = customCodexHome;
+        try {
+          const resCodex = await runHarness(hCfg, {
+            harness: "codex_acp",
+            prompt: "hi",
+            cwd: workCwd,
+            tools: "read",
+            lark: "readonly",
+            timeoutSec: 15,
+            logFile: path.join(dir, "codex-acp.log"),
+          });
+          assert.equal(resCodex.ok, true, `codex_acp 探测应成功：${resCodex.text}`);
+          assert.match(resCodex.text, /LARK_DATA=LARK_MASTER_KEY_FILE_BACKED/, "lark!=none 时必须挂载 file-backed XDG_DATA_HOME/lark-cli");
+          assert.match(resCodex.text, /CODEX_INHERITED=model = "custom-inherited-codex"/, "必须挂载子进程继承的 CODEX_HOME");
+        } finally {
+          if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+          else process.env.CODEX_HOME = prevCodexHome;
+        }
+
+        // (c) Direct doubao-cli with lark: "readonly": authenticated login + keys + instance lock + RO app/current + hidden host logs
+        const resDoubao = await runHarness(hCfg, {
+          harness: "doubao_direct",
+          prompt: "hi",
+          cwd: workCwd,
+          tools: "read",
+          lark: "readonly",
+          timeoutSec: 15,
+          logFile: path.join(dir, "doubao-direct.log"),
+        });
+        assert.equal(resDoubao.ok, true, `doubao_direct 探测应成功：${resDoubao.text}`);
+        assert.match(resDoubao.text, /LOCK=YES/, "Doubao 沙箱应可创建私有实例锁");
+        assert.match(resDoubao.text, /BIN=RO/, "Doubao app/current 二进制目录必须保持只读");
+        assert.match(resDoubao.text, /ACCT=uid_r21_authenticated/, "Doubao 登录账号状态必须可见");
+        assert.match(resDoubao.text, /KEY=DOUBAO_SESSION_KEY_OK/, "Doubao 登录密钥必须可见");
+        assert.match(resDoubao.text, /LOG=HIDDEN/, "Doubao 宿主机历史日志不得暴露");
+        assert.match(resDoubao.text, /AGENT=HIDDEN/, "Doubao 宿主机 agent_mode 历史不得暴露");
+        assert.match(resDoubao.text, /LARK=LARK_MASTER_KEY_FILE_BACKED/, "doubao-cli lark!=none 必须挂载 file-backed lark-cli 登录态");
+        assert.ok(!fs.existsSync(path.join(xdgData, "doubao_cli", "doubao-cli-instance.lock")), "隔离运行不得修改宿主机 doubao_cli 锁文件");
+
+        // (d) ACP doubao with lark: "none": staged login/keys also work via acpx, and lark-cli stays hidden
+        const acpxDoubaoProbe = path.join(dir, "probe-acpx-doubao-r21");
+        fs.writeFileSync(
+          acpxDoubaoProbe,
+          [
+            "#!/bin/sh",
+            'D="$XDG_DATA_HOME/doubao_cli"',
+            'echo "ACP_DOUBAO_ACCT=$(cat "$D/doubao-cli-pc-login/account" 2>/dev/null || echo MISSING)"',
+            'echo "ACP_DOUBAO_KEY=$(cat "$D/keys/session.key" 2>/dev/null || echo MISSING)"',
+            'echo "ACP_DOUBAO_LOG=$(test -e "$D/logs/host-history.log" && echo LEAK || echo HIDDEN)"',
+            'echo "ACP_DOUBAO_LARK=$(cat "$XDG_DATA_HOME/lark-cli/master.key" 2>/dev/null || echo HIDDEN)"',
+          ].join("\n"),
+          { mode: 0o755 },
+        );
+        const hCfg2 = { ...hCfg, bins: { ...hCfg.bins, acpx: acpxDoubaoProbe } };
+        const resDoubaoAcp = await runHarness(hCfg2, {
+          harness: "doubao_acp",
+          prompt: "hi",
+          cwd: workCwd,
+          tools: "read",
+          lark: "none",
+          timeoutSec: 15,
+          logFile: path.join(dir, "doubao-acp.log"),
+        });
+        assert.equal(resDoubaoAcp.ok, true);
+        assert.match(resDoubaoAcp.text, /ACP_DOUBAO_ACCT=uid_r21_authenticated/);
+        assert.match(resDoubaoAcp.text, /ACP_DOUBAO_KEY=DOUBAO_SESSION_KEY_OK/);
+        assert.match(resDoubaoAcp.text, /ACP_DOUBAO_LOG=HIDDEN/);
+        assert.match(resDoubaoAcp.text, /ACP_DOUBAO_LARK=HIDDEN/);
+      }
+    }
+
+    // 5) [R21 #5 P1] IM 权威回读确认消息存活时必须清除 deleted，且 verifyFailed 必须先于 deleted 检查以保住游标
+    // 7) [R21 #7 P2] background_only 行遭遇旧版冲突 WS 推送时也必须触发权威回读，绝不用旧文本/@我 晋升
+    // 14) [R21 #14 P2] 快通道任务耗尽重试后必须在主人作用域上下文状态与 Health 中暴露故障
+    {
+      const cfgFile = path.join(dir, "ctx-r21.yaml");
+      fs.writeFileSync(
+        cfgFile,
+        [
+          `data_dir: ${dataDir}`,
+          `bins: { lark: ${JSON.stringify(path.join(STUBS, "lark-cli"))}, acpx: ${JSON.stringify(path.join(STUBS, "acpx"))} }`,
+          `owner: { open_id: ou_owner }`,
+          "harnesses: { codex: { agent: codex } }",
+          "roles: { brain: codex, reviewer: codex }",
+          "context:",
+          "  groups: allowlist",
+          "  groups_allow:",
+          "    - oc_r21_team",
+          "  personal_web:",
+          "    enabled: true",
+          "    fast_lane: true",
+        ].join("\n") + "\n",
+      );
+      app = createApp(loadConfig(cfgFile));
+      app.store.set("owner.open_id", "ou_owner");
+      const ctxSvc = new ContextService(app);
+      const nowMs = Date.now();
+
+      // (5a) 提及搜索返回 deleted=true，群列表返回同修订存活副本；+messages-mget 返回存活正文（省略 deleted）
+      // (5b) 另一条同类冲突但 +messages-mget 漏返回 -> verifyFailed 必须阻断游标推进且不撤回已有观测
+      ctxSvc.store.addObs([
+        {
+          id: "im:om_r21_fail_verify",
+          source: "im",
+          kind: "at_me",
+          conv: "oc_r21_team",
+          conv_name: "研发群",
+          actor_name: "Bob",
+          actor_id: "ou_bob",
+          is_me: false,
+          text: "保留的原始消息",
+          time: nowMs - 20_000,
+          url: "",
+          meta: { at_me: true },
+        },
+      ]);
+      const fakeLark = async (args: string[]) => {
+        if (args[0] === "im" && args[1] === "+messages-search") {
+          if (args.includes("--is-at-me")) {
+            return {
+              has_more: false,
+              messages: [
+                {
+                  message_id: "om_r21_live_after_mget",
+                  chat_id: "oc_r21_team",
+                  chat_type: "group",
+                  chat_name: "研发群",
+                  sender: { id: "ou_alice", name: "Alice", sender_type: "user" },
+                  content: "",
+                  deleted: true,
+                  create_time: String(nowMs - 4000),
+                },
+                {
+                  message_id: "om_r21_fail_verify",
+                  chat_id: "oc_r21_team",
+                  chat_type: "group",
+                  chat_name: "研发群",
+                  sender: { id: "ou_bob", name: "Bob", sender_type: "user" },
+                  content: "",
+                  deleted: true,
+                  create_time: String(nowMs - 3000),
+                },
+              ],
+            };
+          }
+          return { has_more: false, messages: [] };
+        }
+        if (args[0] === "im" && args[1] === "+chat-messages-list") {
+          return {
+            has_more: false,
+            messages: [
+              {
+                message_id: "om_r21_live_after_mget",
+                chat_id: "oc_r21_team",
+                chat_type: "group",
+                chat_name: "研发群",
+                sender: { id: "ou_alice", name: "Alice", sender_type: "user" },
+                content: "@我 权威回读确认存活",
+                mentions: [{ id: "ou_owner", name: "我" }],
+                create_time: String(nowMs - 4000),
+              },
+              {
+                message_id: "om_r21_fail_verify",
+                chat_id: "oc_r21_team",
+                chat_type: "group",
+                chat_name: "研发群",
+                sender: { id: "ou_bob", name: "Bob", sender_type: "user" },
+                content: "存活副本",
+                create_time: String(nowMs - 3000),
+              },
+            ],
+          };
+        }
+        if (args[0] === "im" && args[1] === "+messages-mget") {
+          return {
+            messages: [
+              {
+                message_id: "om_r21_live_after_mget",
+                chat_id: "oc_r21_team",
+                chat_type: "group",
+                chat_name: "研发群",
+                sender: { id: "ou_alice", name: "Alice", sender_type: "user" },
+                content: "@我 权威回读确认存活",
+                mentions: [{ id: "ou_owner", name: "我" }],
+                create_time: String(nowMs - 4000),
+              },
+              // 故意不返回 om_r21_fail_verify 以触发 verifyFailed
+            ],
+          };
+        }
+        return { has_more: false, messages: [] };
+      };
+      (ctxSvc.connectors as unknown as { lark: typeof fakeLark }).lark = fakeLark;
+      const beforeAtMeCursor = app.store.get("ctx.im.cursor.at_me");
+      await ctxSvc.connectors.pullIm();
+      const liveObs = ctxSvc.store.obs("im:om_r21_live_after_mget");
+      assert.ok(liveObs, "权威 +messages-mget 确认存活的消息绝不可被旧 deleted 标记丢弃");
+      assert.equal(liveObs!.text, "@我 权威回读确认存活");
+      assert.equal(liveObs!.meta.withdrawn, undefined);
+      assert.equal(ctxSvc.store.obsPending("im:om_r21_live_after_mget"), true);
+      assert.notEqual(
+        ctxSvc.store.obs("im:om_r21_fail_verify")?.meta.withdrawn,
+        true,
+        "verifyFailed 必须先于 deleted 分支判断，不得在回读失败时撤回原消息",
+      );
+      assert.equal(
+        app.store.get("ctx.im.cursor.at_me"),
+        beforeAtMeCursor,
+        "存在 verifyFailed 时必须保留 at_me 游标等待下轮重试",
+      );
+
+      // (7) background_only 行被旧版 @我 WS 推送重放时，必须触发 readMessage 并按服务端已编辑版本（无 @我）处理而不误晋升
+      saveWorkspaceBinding(app.store, "7001001", "ou_owner");
+      ctxSvc.store.addBackgroundObs([
+        {
+          id: "pw:om_r21_bg_edited",
+          source: "im",
+          kind: "group",
+          conv: "pw_chat:9990001",
+          conv_name: "范围外群",
+          actor_name: "Alice",
+          actor_id: "7002002",
+          is_me: false,
+          text: "已编辑：不再 @你",
+          time: nowMs - 1000,
+          url: "",
+          meta: {
+            chat_type: "group",
+            at_me: false,
+            mentions: [],
+            background_only: true,
+            native_owner_id: "7001001",
+          },
+        },
+      ]);
+      assert.equal(ctxSvc.store.obsPending("pw:om_r21_bg_edited"), false);
+      let readMessageCalls = 0;
+      const baseWebMsg: WebMessage = {
+        id: "om_r21_bg_edited",
+        ownerId: "7001001",
+        actorId: "7002002",
+        conversationId: "9990001",
+        conversationKind: "group",
+        rootId: "",
+        parentId: "",
+        threadId: "",
+        cid: "",
+        kind: MSG_TEXT,
+        senderType: USER_SENDER_TYPE,
+        messageType: "text",
+        createdAtMs: nowMs - 1000,
+        position: 1,
+        threadPosition: 0,
+        sendToChat: true,
+        text: "已编辑：不再 @你",
+        mentions: [],
+        resources: [],
+        unsupported: false,
+        partial: false,
+      };
+      const fakeWebClient = {
+        currentSessionId: () => undefined,
+        readMessage: async () => {
+          readMessageCalls++;
+          return { ...baseWebMsg };
+        },
+        readChat: async () => ({ id: "9990001", name: "范围外群", kind: "group" as const }),
+      };
+      await (
+        ctxSvc.personalWeb as unknown as {
+          handleMessage: (msg: WebMessage, client?: unknown, signal?: AbortSignal) => Promise<void>;
+        }
+      ).handleMessage(
+        {
+          ...baseWebMsg,
+          text: "@我 旧版未编辑正文",
+          mentions: [{ id: "7001001", name: "我", start: 0, end: 2 }],
+        },
+        fakeWebClient,
+      );
+      assert.equal(readMessageCalls, 1, "background_only 冲突推送必须向服务端权威回读 readMessage");
+      const afterBg = ctxSvc.store.obs("pw:om_r21_bg_edited");
+      assert.equal(afterBg?.text, "已编辑：不再 @你", "不得用陈旧推送文本覆盖 background_only 已编辑正文");
+      assert.equal(ctxSvc.store.obsPending("pw:om_r21_bg_edited"), false, "已移除 @我 的范围外消息不得晋升为待处理");
+
+      // (14) 快通道任务重试耗尽后，必须在 ctx.last_error 与 Q.health(app) 中暴露，且主人切换后隔离脱敏
+      ctxSvc.enqueue("fast:pw_chat:9990002:pw:om_r21_fast_fail:g0:h1", {
+        task: "fast",
+        conv: "pw_chat:9990002",
+        conv_name: "核心项目群",
+        trigger_obs_id: "pw:om_r21_fast_fail",
+      });
+      const fastItem = app.ledger.claim("context", 30_000)!;
+      assert.equal(fastItem.id, "context:fast:pw_chat:9990002:pw:om_r21_fast_fail:g0:h1");
+      const exh = ctxSvc.handler().onExhausted!(fastItem as never, "模型超时 120s");
+      app.ledger.transition(fastItem, {
+        state: exh.patch?.state ?? "errored",
+        terminal: true,
+        error: "模型超时 120s",
+      });
+      const ctxStatus = ctxSvc.views.status(false);
+      assert.match(ctxStatus.last_error, /快通道（核心项目群）失败：模型超时 120s/, "耗尽快通道必须写入 ctx.last_error");
+      const hCur = Q.health(app);
+      assert.ok(
+        hCur.failed.some((f) => f.id === fastItem.id && f.kind === "context" && !f.isolated),
+        "health().failed 必须展示当前主人的耗尽快通道任务",
+      );
+      assert.ok(hCur.actionable_failures >= 1, "耗尽快通道必须计入 actionable_failures");
+      assert.equal(Q.overview(app).health.ok, false, "存在未确认快通道失败时 overview.health.ok 必须为 false");
+
+      // 主人切换到 ou_r21_other：旧主人的快通道失败必须被隔离脱敏，不得计入新主人 actionable_failures
+      const appOther: ReturnType<typeof createApp> = {
+        ...app,
+        cfg: { ...app.cfg, owner: { ...app.cfg.owner, open_id: "ou_r21_other" } },
+      };
+      const hOther = Q.health(appOther);
+      const isoRow = hOther.failed.find((f) => f.id === fastItem.id);
+      assert.ok(isoRow?.isolated, "主人变更后快通道失败必须在 health() 中标记 isolated");
+      assert.ok(!isoRow!.summary.includes("核心项目群") && !isoRow!.error.includes("模型超时"), "隔离记录必须脱敏群名与报错");
+      assert.equal(hOther.actionable_failures, 0, "旧主人快通道失败不得计入新主人 actionable_failures");
+    }
+
+    // 6) [R21 #6 P2] 恢复中断后残留的空 worktree 目录与缺失 baseKey
+    {
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: "r21",
+        GIT_AUTHOR_EMAIL: "r21@test",
+        GIT_COMMITTER_NAME: "r21",
+        GIT_COMMITTER_EMAIL: "r21@test",
+      };
+      const repoDir = path.join(dir, "wt-recover-repo");
+      fs.mkdirSync(repoDir, { recursive: true });
+      assert.equal((await runProcess("git", ["init", "-q", "-b", "main", repoDir], { env: gitEnv })).code, 0);
+      fs.writeFileSync(path.join(repoDir, "README.md"), "hello\n");
+      assert.equal((await runProcess("git", ["-C", repoDir, "add", "-A"], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", repoDir, "commit", "-q", "-m", "init"], { env: gitEnv })).code, 0);
+      const expectedHead = (await runProcess("git", ["-C", repoDir, "rev-parse", "HEAD"], { env: gitEnv })).stdout.trim();
+
+      const wtData = path.join(dir, "wt-data");
+      fs.mkdirSync(wtData, { recursive: true });
+      const wtCfgFile = path.join(dir, "wt-r21.yaml");
+      fs.writeFileSync(
+        wtCfgFile,
+        [
+          `data_dir: ${wtData}`,
+          `owner: { open_id: ou_r21_me }`,
+          "harnesses: { codex: { agent: codex } }",
+          "roles: { brain: codex, reviewer: codex }",
+          "dispatch:",
+          "  repos:",
+          `    demo: ${JSON.stringify(repoDir)}`,
+        ].join("\n") + "\n",
+      );
+      const wtApp = createApp(loadConfig(wtCfgFile));
+      try {
+        const dispatcher = new Dispatcher(wtApp.cfg, wtApp.ledger, wtApp.store, wtApp.board);
+        const taskA = { guid: "aaaaaaaa1111", summary: "任务A", description: "repo: demo", dueMs: null, url: "" };
+        // (6a) 模拟 mkdirSync 后、git worktree add 前进程崩溃留下的空目录
+        const emptyCwd = path.join(wtData, "worktrees", "aaaaaaaa");
+        fs.mkdirSync(emptyCwd, { recursive: true });
+        const prepA = await dispatcher.prepareWorkspace(taskA);
+        assert.equal(prepA.base, expectedHead, "残留空目录必须恢复执行 git worktree add 并记录真实基线提交");
+        assert.ok(fs.existsSync(path.join(prepA.cwd, ".git")), "恢复后的 worktree 必须包含合法 .git 指针");
+        assert.equal(wtApp.store.get(`worktree.${taskA.guid}.base`), expectedHead);
+
+        // (6b) 模拟 worktree 已注册但 baseKey 未写入时的重启恢复
+        wtApp.store.db.prepare("DELETE FROM kv WHERE k = ?").run(`worktree.${taskA.guid}.base`);
+        const prepA2 = await dispatcher.prepareWorkspace(taskA);
+        assert.equal(prepA2.base, expectedHead, "缺失 baseKey 的已注册 worktree 必须恢复真实基线提交");
+        assert.equal(wtApp.store.get(`worktree.${taskA.guid}.base`), expectedHead);
+
+        // (6c) 非空但未注册的损坏目录必须显式报错，绝不静默返回空 base
+        const taskB = { guid: "bbbbbbbb2222", summary: "任务B", description: "repo: demo", dueMs: null, url: "" };
+        const badCwd = path.join(wtData, "worktrees", "bbbbbbbb");
+        fs.mkdirSync(badCwd, { recursive: true });
+        fs.writeFileSync(path.join(badCwd, "stray.txt"), "corrupt");
+        await assert.rejects(
+          () => dispatcher.prepareWorkspace(taskB),
+          /不是有效的已注册 Git worktree/,
+          "非空损坏目录不得静默按空基线继续",
+        );
+      } finally {
+        wtApp.store.db.close();
+      }
+    }
+
+    // 9) [R21 #9 P2] scp 风格绝对路径 SSH URL 识别（git@example.com:/srv/project.git）
+    {
+      assert.deepEqual(parseScpGitUrl("git@example.com:/srv/project.git"), {
+        user: "git",
+        host: "example.com",
+        path: "/srv/project.git",
+      });
+      assert.equal(classifyGitRemoteTransport(dir, "git@example.com:/srv/project.git"), "ssh");
+      assert.equal(classifyGitRemoteTransport(dir, "example.com:/srv/project.git"), "ssh");
+      assert.equal(classifyGitRemoteTransport(dir, "git@[::1]:/srv/project.git"), "ssh");
+      assert.equal(classifyGitRemoteTransport(dir, "/srv/project.git"), "local");
+      assert.equal(resolveLocalGitRemoteDir(dir, "git@example.com:/srv/project.git"), undefined);
+      assert.deepEqual(parseRemote("git@example.com:/srv/project.git"), {
+        host: "example.com",
+        path: "srv/project",
+      });
+    }
+
+    // 10) [R21 #10 P2] SSH Include 通配符（Include config.d/*.conf）按主机选择性投影，不暴露无关片段与整个 ~/.ssh
+    {
+      const sshGlobHome = path.join(dir, "ssh-glob-home");
+      const sshDir = path.join(sshGlobHome, ".ssh");
+      const confD = path.join(sshDir, "config.d");
+      fs.mkdirSync(confD, { recursive: true });
+      fs.writeFileSync(path.join(sshDir, "config"), "Include config.d/*.conf\n");
+      fs.writeFileSync(
+        path.join(confD, "work.conf"),
+        [
+          "Host work-alias",
+          "  HostName git.work.internal",
+          "  Port 2222",
+          "  IdentityFile ~/.ssh/id_work_glob",
+        ].join("\n") + "\n",
+      );
+      fs.writeFileSync(
+        path.join(confD, "personal.conf"),
+        [
+          "Host personal-alias",
+          "  HostName git.personal.example",
+          "  IdentityFile ~/.ssh/id_personal_secret",
+        ].join("\n") + "\n",
+      );
+      fs.writeFileSync(path.join(sshDir, "id_work_glob"), "WORK_KEY", { mode: 0o600 });
+      fs.writeFileSync(path.join(sshDir, "id_personal_secret"), "PERSONAL_KEY_NO_LEAK", { mode: 0o600 });
+
+      const mounts = collectScopedSshMounts(["work-alias"], { HOME: sshGlobHome }, dataDir, false);
+      assert.ok(mounts.readOnlyPaths.some((p) => p.endsWith(`${path.sep}config`)), "应挂载 ~/.ssh/config");
+      assert.ok(mounts.readOnlyPaths.some((p) => p.endsWith(`${path.sep}work.conf`)), "应挂载命中的 Include 通配片段 work.conf");
+      assert.ok(mounts.readOnlyPaths.some((p) => p.endsWith(`${path.sep}id_work_glob`)), "应挂载 work.conf 引用的私钥");
+      assert.ok(!mounts.readOnlyPaths.some((p) => p.endsWith(`${path.sep}personal.conf`)), "不得挂载未命中的 personal.conf");
+      assert.ok(!mounts.readOnlyPaths.some((p) => p.endsWith(`${path.sep}id_personal_secret`)), "不得暴露无关片段中的私钥");
+      assert.ok(!mounts.readOnlyPaths.includes(fs.realpathSync(sshDir)), "绝不得整目录挂载 ~/.ssh");
+    }
+
+    // 11) [R21 #11 P2] 保留全局 Git [include] / [includeIf] 配置（如 ~/.config/git/company.inc 中的 pushInsteadOf）
+    {
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: "r21",
+        GIT_AUTHOR_EMAIL: "r21@test",
+        GIT_COMMITTER_NAME: "r21",
+        GIT_COMMITTER_EMAIL: "r21@test",
+      };
+      const incHome = path.join(dir, "git-inc-home");
+      const incXdg = path.join(incHome, ".config");
+      fs.mkdirSync(path.join(incXdg, "git"), { recursive: true });
+      const incRepo = path.join(dir, "git-inc-repo");
+      fs.mkdirSync(incRepo, { recursive: true });
+      assert.equal((await runProcess("git", ["init", "-q", "-b", "main", incRepo], { env: gitEnv })).code, 0);
+      assert.equal(
+        (await runProcess("git", ["-C", incRepo, "remote", "add", "origin", "https://fetch.corp.example/team/app.git"], { env: gitEnv })).code,
+        0,
+      );
+      fs.writeFileSync(
+        path.join(incXdg, "git", "company.inc"),
+        '[url "ssh://git@push.corp.example/"]\n\tpushInsteadOf = https://fetch.corp.example/\n',
+      );
+      fs.writeFileSync(
+        path.join(incHome, ".gitconfig"),
+        `[includeIf "gitdir:${fs.realpathSync(incRepo)}/"]\n\tpath = ~/.config/git/company.inc\n`,
+      );
+      const pushUrlRes = await tryGit(incRepo, ["remote", "get-url", "--push", "origin"], {
+        readOnly: true,
+        extraEnv: { HOME: incHome, XDG_CONFIG_HOME: incXdg },
+      });
+      assert.equal(pushUrlRes.code, 0, `带全局 includeIf 的隔离 git remote get-url 必须成功：${pushUrlRes.stderr}`);
+      assert.equal(
+        pushUrlRes.stdout.trim(),
+        "ssh://git@push.corp.example/team/app.git",
+        "隔离下的受信任交付 Git 命令必须保留 includeIf 中配置的 url.*.pushInsteadOf",
+      );
+    }
+
+    // 12) [R21 #12 P2] 分槽 store 凭据投影严格保持 `store A -> 中间 helper -> store B` 顺序（绝不把 B 提前合并到 A 槽位）
+    {
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: "r21",
+        GIT_AUTHOR_EMAIL: "r21@test",
+        GIT_COMMITTER_NAME: "r21",
+        GIT_COMMITTER_EMAIL: "r21@test",
+      };
+      const slotRepo = path.join(dir, "slot-order-repo");
+      fs.mkdirSync(slotRepo, { recursive: true });
+      assert.equal((await runProcess("git", ["init", "-q", "-b", "main", slotRepo], { env: gitEnv })).code, 0);
+      fs.writeFileSync(path.join(slotRepo, "s.txt"), "s\n");
+      assert.equal((await runProcess("git", ["-C", slotRepo, "add", "-A"], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", slotRepo, "commit", "-q", "-m", "init"], { env: gitEnv })).code, 0);
+      const headSha = (await runProcess("git", ["-C", slotRepo, "rev-parse", "HEAD"], { env: gitEnv })).stdout.trim();
+
+      const midAuth = `Basic ${Buffer.from("miduser:midpass").toString("base64")}`;
+      httpSrv12 = http.createServer((req, res) => {
+        if ((req.headers.authorization ?? "") !== midAuth) {
+          res.statusCode = 401;
+          res.setHeader("WWW-Authenticate", 'Basic realm="r21-slot"');
+          res.end("wrong account");
+          return;
+        }
+        if ((req.url ?? "").startsWith("/org/slot.git/info/refs")) {
+          res.setHeader("Content-Type", "text/plain");
+          res.end(`${headSha}\trefs/heads/main\n`);
+          return;
+        }
+        res.statusCode = 404;
+        res.end("not found");
+      });
+      await new Promise<void>((resolve) => httpSrv12!.listen(0, "127.0.0.1", resolve));
+      const port12 = (httpSrv12.address() as { port: number }).port;
+
+      const slotHome = path.join(dir, "slot-home");
+      fs.mkdirSync(slotHome, { recursive: true });
+      const storeA = path.join(slotHome, "store-a.creds");
+      const storeB = path.join(slotHome, "store-b.creds");
+      // storeA 对目标端口无匹配，storeB 有错误旧账号，中间的 local helper 提供正确账号 miduser:midpass
+      fs.writeFileSync(storeA, "http://other:pass@other.example:9999\n", { mode: 0o600 });
+      fs.writeFileSync(storeB, `http://buser:WRONG_B_PASS@127.0.0.1:${port12}\n`, { mode: 0o600 });
+      fs.writeFileSync(
+        path.join(slotHome, ".gitconfig"),
+        [
+          "[credential]",
+          `\thelper = store --file=${storeA}`,
+          '\thelper = "!f() { test \\"$1\\" = get && printf \'username=miduser\\\\npassword=midpass\\\\n\'; }; f"',
+          `\thelper = store --file=${storeB}`,
+        ].join("\n") + "\n",
+      );
+      const r12 = await tryGit(slotRepo, ["ls-remote", `http://127.0.0.1:${port12}/org/slot.git`], {
+        readOnly: true,
+        extraEnv: { HOME: slotHome },
+      });
+      assert.equal(r12.code, 0, `storeA 无命中时必须先命中中间 helper，绝不可把 storeB 提前合并进 storeA 槽位：${r12.stderr}`);
+      assert.match(r12.stdout, new RegExp(headSha));
+    }
+
+    // 13) [R21 #13 P2] 非 store 宿主机 HTTPS 认证（如 gh auth setup-git / credential-cache 读取宿主机隐藏登录文件）在隔离下仍可用且不暴露宿主机登录目录
+    {
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: "r21",
+        GIT_AUTHOR_EMAIL: "r21@test",
+        GIT_COMMITTER_NAME: "r21",
+        GIT_COMMITTER_EMAIL: "r21@test",
+      };
+      const ghRepo = path.join(dir, "gh-helper-repo");
+      fs.mkdirSync(ghRepo, { recursive: true });
+      assert.equal((await runProcess("git", ["init", "-q", "-b", "main", ghRepo], { env: gitEnv })).code, 0);
+      fs.writeFileSync(path.join(ghRepo, "g.txt"), "g\n");
+      assert.equal((await runProcess("git", ["-C", ghRepo, "add", "-A"], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", ghRepo, "commit", "-q", "-m", "init"], { env: gitEnv })).code, 0);
+      const headSha = (await runProcess("git", ["-C", ghRepo, "rev-parse", "HEAD"], { env: gitEnv })).stdout.trim();
+
+      const ghAuth = `Basic ${Buffer.from("x-access-token:gho_host_only_token").toString("base64")}`;
+      httpSrv13 = http.createServer((req, res) => {
+        if ((req.headers.authorization ?? "") !== ghAuth) {
+          res.statusCode = 401;
+          res.setHeader("WWW-Authenticate", 'Basic realm="r21-gh"');
+          res.end("auth required");
+          return;
+        }
+        if ((req.url ?? "").startsWith("/org/gh.git/info/refs")) {
+          res.setHeader("Content-Type", "text/plain");
+          res.end(`${headSha}\trefs/heads/main\n`);
+          return;
+        }
+        res.statusCode = 404;
+        res.end("not found");
+      });
+      await new Promise<void>((resolve) => httpSrv13!.listen(0, "127.0.0.1", resolve));
+      const port13 = (httpSrv13.address() as { port: number }).port;
+
+      const ghHome = path.join(dir, "gh-home");
+      const ghCfgDir = path.join(ghHome, ".config", "gh");
+      fs.mkdirSync(ghCfgDir, { recursive: true });
+      // 该文件位于 ~/.config/gh，沙箱内不可见；仅宿主机受信任预解析能读到它
+      fs.writeFileSync(path.join(ghCfgDir, "hosts.yml"), "gho_host_only_token", { mode: 0o600 });
+      const fakeGhHelper = path.join(dir, "fake-gh-cred");
+      fs.writeFileSync(
+        fakeGhHelper,
+        [
+          "#!/bin/sh",
+          'if [ "$1" != "get" ]; then exit 0; fi',
+          'TOK=$(cat "$HOME/.config/gh/hosts.yml" 2>/dev/null) || exit 1',
+          'printf "username=x-access-token\\npassword=%s\\n" "$TOK"',
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      fs.writeFileSync(
+        path.join(ghHome, ".gitconfig"),
+        `[credential "http://127.0.0.1:${port13}"]\n\thelper = !${fakeGhHelper}\n`,
+      );
+      const r13 = await tryGit(ghRepo, ["ls-remote", `http://127.0.0.1:${port13}/org/gh.git`], {
+        readOnly: true,
+        extraEnv: { HOME: ghHome },
+      });
+      assert.equal(r13.code, 0, `非 store 宿主机 helper（如 gh auth setup-git）必须经宿主机受信任预解析后在沙箱内完成认证：${r13.stderr}`);
+      assert.match(r13.stdout, new RegExp(headSha));
+    }
+  } finally {
+    if (httpSrv12) await new Promise<void>((resolve) => httpSrv12!.close(() => resolve()));
+    if (httpSrv13) await new Promise<void>((resolve) => httpSrv13!.close(() => resolve()));
     app?.store.db.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }

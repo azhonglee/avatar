@@ -414,6 +414,15 @@ export function isWorkBlockedByOwner(
 
   if (ownerMismatch && isContextHealthWork(w)) return true;
 
+  if (w.kind === "context") {
+    const p = w.payload as Record<string, unknown>;
+    const boundOwner = typeof p?.owner_open_id === "string" ? p.owner_open_id.trim() : "";
+    if (boundOwner && boundOwner !== curOwner) return true;
+    const prevOwnerOpenId = (app.store.get("owner.open_id") ?? "").trim();
+    if (!boundOwner && prevOwnerOpenId && prevOwnerOpenId !== curOwner) return true;
+    return false;
+  }
+
   if (w.kind === "dispatch" || w.kind === "delivery") {
     if (isContextDerivedDispatchBlocked(app, w.id) || (!!w.ref && isContextDerivedDispatchBlocked(app, w.ref))) {
       return true;
@@ -739,8 +748,21 @@ function healthItem(app: App, w: WorkItem, ownerMismatch = false): HealthItem {
     };
   }
   const p = w.payload as Record<string, unknown>;
+  const contextSummary = (): string => {
+    const task = String(p.task ?? w.ref);
+    if (task === "fast") return p.conv_name ? `快通道理解：${String(p.conv_name)}` : "快通道理解";
+    if (task === "cycle") return "工作上下文采集";
+    if (task === "draft") return "回复起草";
+    if (task === "split") return "拆分子项目";
+    if (task === "weekly") return "周报草稿";
+    return task;
+  };
   const summary =
-    w.kind === "effect" ? effectSummary(w.payload as unknown as Effect) : String(p.summary ?? p.name ?? p.action ?? w.ref).slice(0, 120);
+    w.kind === "effect"
+      ? effectSummary(w.payload as unknown as Effect)
+      : w.kind === "context"
+        ? contextSummary().slice(0, 120)
+        : String(p.summary ?? p.name ?? p.action ?? w.ref).slice(0, 120);
   return {
     id: w.id,
     kind: w.kind as HealthItem["kind"],
@@ -759,7 +781,7 @@ function healthItem(app: App, w: WorkItem, ownerMismatch = false): HealthItem {
 export function health(app: App): Health {
   const { ledger, store, cfg } = app;
   const ownerMismatch = hasWorkspaceOwnerMismatch(store, cfg.owner.open_id);
-  const kinds = ["event", "effect", "job", "delivery"] as const;
+  const kinds = ["event", "effect", "job", "delivery", "context"] as const;
   const retrying = kinds.flatMap((k) => ledger.active(k)).filter((w) => w.attempts > 1 || !!w.error).map((w) => healthItem(app, w, ownerMismatch));
 
   // 在 14 天报告窗口内分页扫描全部失败项：

@@ -32,12 +32,13 @@ import { ContextViews, startOfDay } from "./views.ts";
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 
-type CtxPayload =
+type CtxPayload = (
   | { task: "cycle" }
   | { task: "fast"; conv: string; conv_name: string; trigger_obs_id: string; anchor?: FastAnchor; anchors?: FastAnchor[] }
   | { task: "draft"; item_id: string; kind?: CtxDraftKind; auto?: boolean }
   | { task: "weekly"; days: number }
-  | { task: "split"; project_id: string };
+  | { task: "split"; project_id: string }
+) & { owner_open_id?: string };
 
 export class ContextService {
   app: App;
@@ -144,7 +145,11 @@ export class ContextService {
   // ───────── 周期 ─────────
 
   enqueue(id: string, payload: CtxPayload): boolean {
-    const added = this.app.ledger.enqueue({ id: `context:${id}`, kind: "context", ref: payload.task, payload });
+    const boundPayload: CtxPayload = {
+      ...payload,
+      ...(this.cfg.owner.open_id.trim() ? { owner_open_id: this.cfg.owner.open_id.trim() } : {}),
+    };
+    const added = this.app.ledger.enqueue({ id: `context:${id}`, kind: "context", ref: payload.task, payload: boundPayload });
     if (added) this.app.engine.kick();
     return added;
   }
@@ -629,6 +634,9 @@ export class ContextService {
       const updatedTouched = r.touched.filter((t) => !createdIds.has(t.id));
       const preDrafted =
         this.enqueueAutoPreDrafts(r.created, false) + this.enqueueAutoPreDrafts(updatedTouched, true);
+      if (r.fresh > 0 && !this.isWorkspaceOwnerMismatched() && (this.app.store.get("ctx.last_error") ?? "").startsWith("快通道")) {
+        this.app.store.set("ctx.last_error", "");
+      }
       return { fresh: r.fresh, created: r.created.length, nudged, pre_drafted: preDrafted };
     } finally {
       signal?.removeEventListener("abort", onParentAbort);
@@ -947,7 +955,14 @@ export class ContextService {
       },
       onExhausted: (item, err) => {
         const p = item.payload;
-        if (p.task === "cycle" || p.task === "fast") return { patch: { state: "errored" } };
+        if (p.task === "fast") {
+          if (!this.isWorkspaceOwnerMismatched()) {
+            const label = p.conv_name ? `快通道（${p.conv_name}）` : "快通道";
+            this.app.store.set("ctx.last_error", truncate(`${label}失败：${err}`, 1000));
+          }
+          return { patch: { state: "errored" } };
+        }
+        if (p.task === "cycle") return { patch: { state: "errored" } };
         const what = p.task === "draft" ? "起草" : p.task === "split" ? "拆分子项目" : "周报草稿";
         return { patch: { state: "errored" }, effects: [notify(`⚠️ ${what}没有成功：${truncate(err, 300)}`, "failure")] };
       },

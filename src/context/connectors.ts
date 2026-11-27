@@ -978,7 +978,7 @@ export class Connectors {
         }
 
         if (cmp === "a_newer") {
-          existing.m = {
+          const nextRow: Raw = {
             ...existing.m,
             ...row.m,
             ...(mergedChatId ? { chat_id: mergedChatId } : {}),
@@ -988,6 +988,11 @@ export class Connectors {
             ...(mergedParentId ? { parent_id: mergedParentId } : {}),
             ...(mergedRootId ? { root_id: mergedRootId } : {}),
           };
+          if (!rowDeleted) {
+            delete nextRow.deleted;
+            delete nextRow.is_deleted;
+          }
+          existing.m = nextRow;
           if (rowCounter !== undefined) existing.editCounter = rowCounter;
           if (rowTimeMs !== undefined) existing.editTimeMs = rowTimeMs;
           existing.kind = rowEffKind;
@@ -1065,12 +1070,12 @@ export class Connectors {
         const mergedParentId = fresh.parent_id || entry.m.parent_id;
         const mergedRootId = fresh.root_id || entry.m.root_id;
         const freshText = textOf(fresh.content ?? fresh.text ?? "");
-        if (fresh.deleted === true || !freshText) {
+        if (fresh.deleted === true || fresh.is_deleted === true || !freshText) {
           entry.deleted = true;
           entry.needsVerify = false;
           continue;
         }
-        entry.m = {
+        const liveMerged: Raw = {
           ...entry.m,
           ...fresh,
           ...(mergedChatId ? { chat_id: mergedChatId } : {}),
@@ -1080,6 +1085,10 @@ export class Connectors {
           ...(mergedParentId ? { parent_id: mergedParentId } : {}),
           ...(mergedRootId ? { root_id: mergedRootId } : {}),
         };
+        delete liveMerged.deleted;
+        delete liveMerged.is_deleted;
+        entry.m = liveMerged;
+        entry.deleted = false;
         entry.editCounter = parseEditCounter(fresh);
         entry.editTimeMs = parseEditTimeMs(fresh, this.cfg.owner.timezone);
         const sender = fresh.sender ?? entry.m.sender ?? {};
@@ -1190,11 +1199,6 @@ export class Connectors {
       for (const entry of mergedById.values()) {
         const msgId = String(entry.m.message_id ?? entry.m.id ?? "");
         const rawChatId = String(entry.m.chat_id ?? "");
-        if (entry.deleted || entry.m.deleted === true || entry.m.is_deleted === true) {
-          if (msgId) retiredIds.push(`im:${msgId}`);
-          dropped++;
-          continue;
-        }
         if (entry.verifyFailed) {
           for (const s of entry.streams) {
             if (s === "p2p") p2pBlocked = true;
@@ -1206,6 +1210,11 @@ export class Connectors {
               else groupsBlocked = true;
             }
           }
+          continue;
+        }
+        if (entry.deleted || entry.m.deleted === true || entry.m.is_deleted === true) {
+          if (msgId) retiredIds.push(`im:${msgId}`);
+          dropped++;
           continue;
         }
         const m = { ...entry.m };

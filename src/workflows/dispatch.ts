@@ -8,11 +8,13 @@ import { tryGit } from "../delivery/git.ts";
 import { comment, move } from "../effects.ts";
 import { checkpoint, type Ctx, type Handler } from "../engine.ts";
 import {
+  applySanitizedNpmrcEnv,
   buildWorkspaceIsolation,
   isolatedSandboxTempEnv,
   loadPrompt,
   prepareHarnessEnv,
   runHarness,
+  stageSanitizedNpmrc,
   wrapCredentialIsolatedCommand,
 } from "../harness.ts";
 import type { Effect, Ledger, WorkItem } from "../ledger.ts";
@@ -518,6 +520,7 @@ export class Dispatcher {
     const logFile = path.join(this.logDir(p.guid), `verify-${p.round}-${ctx.attempt}.log`);
     const step = this.ledger.startStep({ work_id: it.id, name: `verify#${p.round}`, log: logFile });
     const baseEnv = prepareHarnessEnv();
+    const stagedNpmrc = stageSanitizedNpmrc(process.env, this.cfg.dataDir);
     try {
       const wrapped = wrapCredentialIsolatedCommand(
         "bash",
@@ -527,12 +530,19 @@ export class Dispatcher {
           mode: "verify",
           cwd: p.cwd,
           ...this.trustedRepoOpts(p),
-          extraReadOnlyPaths: baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : [],
+          extraReadOnlyPaths: [
+            ...(baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : []),
+            ...(stagedNpmrc ? [stagedNpmrc.dir] : []),
+          ],
+          extraBindMounts: stagedNpmrc
+            ? [{ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" }]
+            : [],
         }),
       );
       const verifyEnv: NodeJS.ProcessEnv = wrapped.isolated
         ? { ...baseEnv.env, ...isolatedSandboxTempEnv() }
-        : baseEnv.env;
+        : { ...baseEnv.env };
+      applySanitizedNpmrcEnv(verifyEnv, stagedNpmrc, wrapped.isolated);
       const r = await runProcess(wrapped.cmd, wrapped.args, {
         cwd: p.cwd,
         env: verifyEnv,
@@ -553,6 +563,7 @@ export class Dispatcher {
       checkpoint(ctx);
       return { kind: "command", name, status: "error", detail: `无法运行：${String(e)}` };
     } finally {
+      stagedNpmrc?.cleanup();
       baseEnv.cleanup();
     }
   }
@@ -612,10 +623,55 @@ export class Dispatcher {
     const cwd = path.join(this.cfg.dataDir, "worktrees", short);
     const branch = `pa/${short}`;
     const baseKey = `worktree.${t.guid}.base`;
-    if (!fs.existsSync(cwd)) {
+
+    const realPathSafe = (p: string): string => {
+      try {
+        return fs.realpathSync(p);
+      } catch {
+        return path.resolve(p);
+      }
+    };
+    const isRegisteredValidWorktree = async (): Promise<boolean> => {
+      if (!fs.existsSync(path.join(cwd, ".git"))) return false;
+      const wtList = await tryGit(spec.path, ["worktree", "list", "--porcelain"], {
+        cfg: this.cfg,
+        readOnly: true,
+        trustedRepoRoot: spec.path,
+      });
+      if (wtList.code !== 0) return false;
+      const targetReal = realPathSafe(cwd);
+      const registered = wtList.stdout
+        .split(/\r?\n/)
+        .filter((l) => l.startsWith("worktree "))
+        .map((l) => realPathSafe(l.slice("worktree ".length).trim()))
+        .includes(targetReal);
+      if (!registered) return false;
+      const inside = await tryGit(cwd, ["rev-parse", "--is-inside-work-tree"], {
+        cfg: this.cfg,
+        readOnly: true,
+        trustedRepoRoot: spec.path,
+      });
+      return inside.code === 0 && inside.stdout.trim() === "true";
+    };
+
+    let ready = fs.existsSync(cwd) && (await isRegisteredValidWorktree());
+    if (fs.existsSync(cwd) && !ready) {
+      let isEmptyDir = false;
+      try {
+        isEmptyDir = fs.statSync(cwd).isDirectory() && fs.readdirSync(cwd).length === 0;
+      } catch {
+        isEmptyDir = false;
+      }
+      if (!isEmptyDir) {
+        throw new Error(`工作树目录 ${cwd} 已存在且不是有效的已注册 Git worktree，拒绝按空基线继续执行`);
+      }
+    }
+
+    if (!ready) {
       // 预先仅创建本次派单专属空目录并只将该目录开放给 git worktree add，绝不把包含其他在途派单的 worktrees/ 父目录设为可写
       fs.mkdirSync(cwd, { recursive: true });
       try {
+        await tryGit(spec.path, ["worktree", "prune"], { cfg: this.cfg, trustedRepoRoot: spec.path });
         const head = await git(spec.path, ["rev-parse", "HEAD"], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path });
         const hasBranch = (await tryGit(spec.path, ["rev-parse", "--verify", "--quiet", branch], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path })).code === 0;
         await git(
@@ -624,6 +680,7 @@ export class Dispatcher {
           { cfg: this.cfg, trustedRepoRoot: spec.path, extraWritablePaths: [cwd] },
         );
         if (!this.store.get(baseKey)) this.store.set(baseKey, head.trim());
+        ready = true;
       } catch (err) {
         try {
           if (fs.existsSync(cwd) && fs.readdirSync(cwd).length === 0) fs.rmdirSync(cwd);
@@ -633,7 +690,26 @@ export class Dispatcher {
         throw err;
       }
     }
-    const base = this.store.get(baseKey) ?? "";
+
+    let base = (this.store.get(baseKey) ?? "").trim();
+    if (!base && ready) {
+      // 若进程在 git worktree add 完成后、写入 baseKey 前中断，从已注册 worktree 恢复真实基线提交
+      const mb = await tryGit(spec.path, ["merge-base", "HEAD", branch], {
+        cfg: this.cfg,
+        readOnly: true,
+        trustedRepoRoot: spec.path,
+      });
+      const recovered =
+        (mb.code === 0 ? mb.stdout.trim() : "") ||
+        (await git(cwd, ["rev-parse", "HEAD"], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path })).trim();
+      if (recovered) {
+        this.store.set(baseKey, recovered);
+        base = recovered;
+      }
+    }
+    if (!base) {
+      throw new Error(`工作树 ${cwd} 缺少有效基线提交，无法继续代码任务`);
+    }
     return { cwd, branch, base, verify: spec.verify ?? "" };
   }
 }
