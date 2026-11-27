@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Board, SectionKey } from "./board.ts";
 import { deepFind, runProcess } from "./util.ts";
 import type { Store } from "./store.ts";
@@ -19,6 +20,10 @@ export interface EffectHooks {
    * 由通知偏好模块设置。
    */
   gate?: (kind: NotifyKind | undefined, e: Effect) => number | false | undefined;
+  /**
+   * 个人 Web 协议回复执行器（由工作上下文模块注册，只在用户确认草稿后触发，带发送前核验与独立回读确认）。
+   */
+  pwReply?: (args: { chat_id: string; message_id: string; root_id?: string; text: string; cid: string }) => Promise<void>;
 }
 
 export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: Lark, store: Store, hooks: EffectHooks = {}): Handler<Effect> {
@@ -67,6 +72,18 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
             input: e.args.text,
           });
           break;
+        case "pw.reply": {
+          if (!hooks.pwReply) throw new Error("个人 Web 回复未注册");
+          const cid = createHash("sha256").update(`avatar-pw\0${item.id}`).digest("hex").slice(0, 32);
+          await hooks.pwReply({
+            chat_id: e.args.chat_id,
+            message_id: e.args.message_id,
+            root_id: e.args.root_id,
+            text: e.args.text,
+            cid,
+          });
+          break;
+        }
         case "meego.comment": {
           const r = await runProcess(cfg.bins.bytedcli, [
             "meego", "comment", "create", "--project-key", e.args.project_key, "--work-item-id", e.args.work_item_id, "--content", e.args.content, "--json",

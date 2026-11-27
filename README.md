@@ -57,6 +57,7 @@ bin/pa console                         # 打印带令牌的控制台登录链接
 ```
 pa doctor | init | run | brief [morning|evening] [--print] | capture | dispatch | status
 pa context run | today | digest [morning|evening] [--print]   工作上下文：采集理解一轮 / 看今天 / 发晨间卡
+pa context web-login [--out qr.svg] | web-status [--verify] | web-logout   个人 Web 实时通道（可选，需 PA_FEISHU_WEB_KEY）
 pa console [--rotate]                  打印控制台登录链接（--rotate 作废旧令牌）
 pa command <名称> [JSON 参数]          通过统一命令层执行操作（与卡片/控制台按钮一致）
 pa job <名称> | ask <文字> | publish-doc <file.md> [--title] [--parent 节点名]
@@ -84,7 +85,8 @@ src/
   notify-prefs.ts   通知偏好（免打扰时段、按类型开关、失败告警不拦截）
   usage.ts          acpx 用量解析、按天/执行者/任务统计、每日与单任务预算守卫
   candidates.ts     候选任务反馈、准确率统计、分诊校准闭环
-  context/          工作上下文：connectors（采集）· understand（带证据的理解）· store（ctx_* 图谱）·
+  context/          工作上下文：connectors（采集）· feishu-web（个人 Web 协议，基于 ws/qrcode/tough-cookie）·
+                    personal-web（实时桥接与快通道）· understand（带证据的理解）· store（ctx_* 图谱）·
                     views（排序与视图）· drafts（起草）· cards（晨间卡 / 收尾卡 / 提醒 / 草稿）· index（周期、命令、自主等级）
   config.ts / lark.ts / guard.ts / harness.ts / events.ts / board.ts / store.ts
   workflows/        triage.ts / capture.ts / dispatch.ts / brief.ts / agent.ts
@@ -102,6 +104,7 @@ test/               后端单元/引擎/集成/端到端测试（桩程序，不
 - **飞书权限守卫**：分诊和 worker 不能调用 `lark-cli`；superagent 作业只放行读和白名单写操作，审计记入 `<data_dir>/logs/guard.log`。机器人和卡片按钮只响应主人本人。
 - **控制台鉴权与边界**：默认监听 `0.0.0.0`（可设为 `127.0.0.1` 仅限本机），访问需令牌（HttpOnly + SameSite=Strict Cookie），写请求校验同源与 JSON，禁止经 API 修改 `data_dir` / `bins`，日志读取限定在 `data_dir` 内。
 - 守卫不是操作系统级沙箱：`--approve-all` 的 worker 仍可在开发机上执行命令，请只在你信任的仓库上派单。
+- **个人 Web 实时通道边界（可选功能，默认关闭）**：使用飞书网页扫码会话与私有长连接协议，存在上游协议变更失效风险；本地会话 Cookie 强制使用 AES-256-GCM 静态加密（密钥来自 `PA_FEISHU_WEB_KEY` 或 systemd `LoadCredential`）且子 harness 默认剥离相关环境变量，但同 OS 用户下不构成内核级沙箱隔离——如需强隔离请用独立 OS 用户/容器部署。
 
 ## 开发与本地演示
 

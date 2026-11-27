@@ -266,10 +266,20 @@ export class ContextStore {
 
   // ───────── 观测 ─────────
 
-  /** 幂等写入观测；同 ID 已存在且内容变化（消息被编辑）时更新并重新标为待处理。返回新增或变化的数量。 */
+  /**
+   * 幂等写入观测；同 ID 已存在且内容变化（消息被编辑）时更新并重新标为待处理。
+   * 当飞书定时采集（im:*）与个人 Web 实时推送（pw:*）先后收到同一条消息时，按「同说话人 + 同会话类型 + 15 秒内 + 正文规范化一致」
+   * 自动合并，并把开放平台 message_id / chat_id / 群名 / 姓名回填到既有观测，避免重复理解。
+   * 返回新增或变化的数量。
+   */
   addObs(list: Obs[]): number {
     const now = Date.now();
     const get = this.db.prepare("SELECT text FROM ctx_obs WHERE id = ?");
+    const nearIm = this.db.prepare(
+      `SELECT id, conv, conv_name, actor_id, actor_name, text, url, meta FROM ctx_obs
+       WHERE source = 'im' AND is_me = ? AND time BETWEEN ? AND ? AND id LIKE ? LIMIT 30`,
+    );
+    const enrich = this.db.prepare("UPDATE ctx_obs SET conv_name = ?, actor_name = ?, url = ?, meta = ? WHERE id = ?");
     const ins = this.db.prepare(
       `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
@@ -281,6 +291,48 @@ export class ContextStore {
         if (!o.id || !o.time) continue;
         const cur = get.get(o.id) as { text: string } | undefined;
         if (!cur) {
+          if (o.source === "im" && (o.id.startsWith("im:") || o.id.startsWith("pw:"))) {
+            const nt = norm(o.text);
+            if (nt.length >= 2) {
+              const otherPrefix = o.id.startsWith("im:") ? "pw:%" : "im:%";
+              const inChatType = String(o.meta.chat_type ?? "");
+              const cands = nearIm.all(o.is_me ? 1 : 0, o.time - 15_000, o.time + 15_000, otherPrefix) as Row[];
+              const hit = cands.find((c) => {
+                if (norm(String(c.text ?? "")) !== nt) return false;
+                const cMeta = j<Record<string, unknown>>(c.meta, {});
+                const cChatType = String(cMeta.chat_type ?? "");
+                return !inChatType || !cChatType || inChatType === cChatType;
+              });
+              if (hit) {
+                const hitMeta = j<Record<string, unknown>>(hit.meta, {});
+                const isIncomingLark = o.id.startsWith("im:");
+                const mergedMeta = isIncomingLark
+                  ? {
+                      ...hitMeta,
+                      open_message_id: String(o.meta.message_id ?? o.id.slice(3)),
+                      open_chat_id: o.conv,
+                      open_actor_id: o.actor_id,
+                    }
+                  : {
+                      ...hitMeta,
+                      native_message_id: String(o.meta.native_message_id ?? o.id.slice(3)),
+                      native_chat_id: String(o.meta.native_chat_id ?? ""),
+                      native_root_id: String(o.meta.native_root_id ?? ""),
+                    };
+                const curConvName = String(hit.conv_name ?? "");
+                const betterConv =
+                  isIncomingLark && o.conv_name && (!curConvName || curConvName.startsWith("群聊(") || curConvName === "群聊" || /^私聊：\d+$/.test(curConvName))
+                    ? o.conv_name
+                    : curConvName;
+                const curActorName = String(hit.actor_name ?? "");
+                const betterActor =
+                  isIncomingLark && o.actor_name && (!curActorName || /^\d+$/.test(curActorName)) ? o.actor_name : curActorName;
+                const betterUrl = String(hit.url ?? "") || o.url;
+                enrich.run(betterConv, betterActor, betterUrl, JSON.stringify(mergedMeta), String(hit.id));
+                continue;
+              }
+            }
+          }
           ins.run(o.id, o.source, o.kind, o.conv, o.conv_name, o.actor_id, o.actor_name, o.is_me ? 1 : 0, o.time, o.text, o.url, JSON.stringify(o.meta ?? {}), now);
           n++;
         } else if (cur.text !== o.text) {
@@ -290,6 +342,40 @@ export class ContextStore {
       }
     });
     return n;
+  }
+
+  /** 写入背景历史观测（只插未出现过且未跨通道命中的记录，直接标为已处理，供 convWindow 作为上下文背景） */
+  addBackgroundObs(list: Obs[]): number {
+    const now = Date.now();
+    const get = this.db.prepare("SELECT 1 FROM ctx_obs WHERE id = ?");
+    const nearIm = this.db.prepare(
+      `SELECT text FROM ctx_obs WHERE source = 'im' AND is_me = ? AND time BETWEEN ? AND ? LIMIT 30`,
+    );
+    const ins = this.db.prepare(
+      `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+    );
+    let n = 0;
+    this.tx(() => {
+      for (const o of list) {
+        if (!o.id || !o.time) continue;
+        if (get.get(o.id)) continue;
+        const nt = norm(o.text);
+        if (o.source === "im" && nt.length >= 2) {
+          const cands = nearIm.all(o.is_me ? 1 : 0, o.time - 15_000, o.time + 15_000) as { text: string }[];
+          if (cands.some((c) => norm(c.text) === nt)) continue;
+        }
+        ins.run(o.id, o.source, o.kind, o.conv, o.conv_name, o.actor_id, o.actor_name, o.is_me ? 1 : 0, o.time, o.text, o.url, JSON.stringify(o.meta ?? {}), now);
+        n++;
+      }
+    });
+    return n;
+  }
+
+  /** 删除指定观测（用于消息撤回或编辑清空时移除本地旧正文）。 */
+  deleteObs(id: string): boolean {
+    const r = this.db.prepare("DELETE FROM ctx_obs WHERE id = ?").run(id);
+    return Number(r.changes ?? 0) > 0;
   }
 
   obs(id: string): Obs | undefined {

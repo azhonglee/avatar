@@ -246,6 +246,24 @@ const Schema = z.object({
           create_own_todo: z.boolean().default(false),
         })
         .prefault({}),
+      /**
+       * 个人 Web 协议实时通道（基于飞书网页版长连接）：
+       * 无需拉机器人进群即可秒级收到本人所有群聊与私聊推送；对外回复永远需要你确认草稿。
+       */
+      personal_web: z
+        .object({
+          /** 是否启用个人 Web 协议长连接（需先运行 `pa context web-login` 本人扫码登录） */
+          enabled: z.boolean().default(false),
+          /** 收到真实 @我 或对方私聊时，不等 10 分钟定时周期，立刻走单会话快通道理解与提醒 */
+          fast_lane: z.boolean().default(true),
+          /** 同一会话短时间连发多条消息时合并等待的毫秒数 */
+          debounce_ms: z.number().int().min(0).max(30_000).default(2500),
+          /** 快通道识别出高优先级「别人在等你」时是否自动起草回复草稿（仅起草，仍需你确认才发） */
+          pre_draft: z.boolean().default(false),
+          /** 当草稿目标来自个人 Web 原生数字 ID 且尚无开放平台 om_ ID 时，允许你确认后经个人 Web 协议回复（带发送前核验与独立回读确认） */
+          send_replies: z.boolean().default(false),
+        })
+        .prefault({}),
     })
     .prefault({}),
   /** 工作引擎（一般不用改） */
