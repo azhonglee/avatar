@@ -204,6 +204,44 @@ function penaltyScore(grid: Uint8Array, size: number): number {
       if (v === at(r, c + 1) && v === at(r + 1, c) && v === at(r + 1, c + 1)) score += 3;
     }
   }
+  // Rule 3: finder-like 1:1:3:1:1 patterns preceded or followed by 4 light modules (ISO/IEC 18004 §7.8.3.1 N3 = 40)
+  const isFinderLike11 = (get: (k: number) => number): number => {
+    const a =
+      get(0) === 1 &&
+      get(1) === 0 &&
+      get(2) === 1 &&
+      get(3) === 1 &&
+      get(4) === 1 &&
+      get(5) === 0 &&
+      get(6) === 1 &&
+      get(7) === 0 &&
+      get(8) === 0 &&
+      get(9) === 0 &&
+      get(10) === 0;
+    const b =
+      get(0) === 0 &&
+      get(1) === 0 &&
+      get(2) === 0 &&
+      get(3) === 0 &&
+      get(4) === 1 &&
+      get(5) === 0 &&
+      get(6) === 1 &&
+      get(7) === 1 &&
+      get(8) === 1 &&
+      get(9) === 0 &&
+      get(10) === 1;
+    return (a ? 40 : 0) + (b ? 40 : 0);
+  };
+  for (let r = 0; r < size; r++) {
+    for (let c = 0; c <= size - 11; c++) {
+      score += isFinderLike11((k) => at(r, c + k));
+    }
+  }
+  for (let c = 0; c < size; c++) {
+    for (let r = 0; r <= size - 11; r++) {
+      score += isFinderLike11((k) => at(r + k, c));
+    }
+  }
   // Rule 4: dark ratio balance
   let dark = 0;
   for (const v of grid) if (v) dark++;

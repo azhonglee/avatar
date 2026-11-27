@@ -298,12 +298,16 @@ export class ContextStore {
    */
   addObs(list: Obs[], beforeCommit?: () => boolean): number {
     const now = Date.now();
-    const get = this.db.prepare("SELECT kind, conv_name, actor_name, text, url, meta, processed FROM ctx_obs WHERE id = ?");
+    const get = this.db.prepare(
+      "SELECT source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, processed FROM ctx_obs WHERE id = ?",
+    );
     const ins = this.db.prepare(
       `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
     );
-    const upd = this.db.prepare("UPDATE ctx_obs SET kind = ?, conv_name = ?, actor_name = ?, text = ?, url = ?, meta = ?, processed = 0 WHERE id = ?");
+    const upd = this.db.prepare(
+      "UPDATE ctx_obs SET source = ?, kind = ?, conv = ?, conv_name = ?, actor_id = ?, actor_name = ?, is_me = ?, time = ?, text = ?, url = ?, meta = ?, processed = 0 WHERE id = ?",
+    );
     const updMetaOnly = this.db.prepare("UPDATE ctx_obs SET meta = ? WHERE id = ?");
     let n = 0;
     this.tx(() => {
@@ -318,6 +322,7 @@ export class ContextStore {
           const curMeta = j<Record<string, unknown>>(cur.meta, {});
           const wasBgOnly = curMeta.background_only === true;
           const wasWithdrawn = curMeta.withdrawn === true;
+          const wasTombstone = curMeta.tombstone === true;
           const curVer = typeof curMeta.edit_version === "number" && Number.isFinite(curMeta.edit_version) ? curMeta.edit_version : undefined;
           const nextVer = typeof o.meta?.edit_version === "number" && Number.isFinite(o.meta.edit_version) ? o.meta.edit_version : undefined;
           const curEditTime = typeof curMeta.edit_time === "number" && Number.isFinite(curMeta.edit_time) ? curMeta.edit_time : undefined;
@@ -355,6 +360,7 @@ export class ContextStore {
           if (curPollAt !== undefined && nextPollAt !== undefined) nextMeta.poll_observed_at = Math.max(curPollAt, nextPollAt);
           delete nextMeta.background_only;
           delete nextMeta.withdrawn;
+          delete nextMeta.tombstone;
           // 按即将落库的合并后元数据比对修订：未确认的省略（undefined）保留原值且不误触发重开，确认移除（at_me: false）则清除旧标记且后续重复投递幂等
           const revChanged =
             obsRevision({ text: String(cur.text ?? ""), meta: curEffectiveMeta }) !==
@@ -362,10 +368,23 @@ export class ContextStore {
           if (wasBgOnly || wasWithdrawn || revChanged) {
             const prevGen = typeof curMeta.edit_gen === "number" && Number.isFinite(curMeta.edit_gen) ? curMeta.edit_gen : 0;
             const mergedMeta: Record<string, unknown> = { ...nextMeta, edit_gen: prevGen + 1 };
+            const curActorId = String(cur.actor_id ?? "");
+            const curConv = String(cur.conv ?? "");
+            const revivingPlaceholder = wasTombstone || (wasWithdrawn && !curActorId);
+            const nextSource = revivingPlaceholder ? o.source : (o.source || String(cur.source ?? "im"));
+            const nextConv = revivingPlaceholder ? o.conv : (o.conv || curConv);
+            const nextActorId = revivingPlaceholder ? o.actor_id : (o.actor_id || curActorId);
+            const nextIsMe = revivingPlaceholder || !!o.actor_id ? (o.is_me ? 1 : 0) : Number(cur.is_me ?? 0);
+            const nextTime = revivingPlaceholder ? o.time : (Number(cur.time ?? 0) || o.time);
             upd.run(
+              nextSource,
               o.kind,
+              nextConv,
               o.conv_name || String(cur.conv_name ?? ""),
+              nextActorId,
               o.actor_name || String(cur.actor_name ?? ""),
+              nextIsMe,
+              nextTime,
               o.text,
               o.url || String(cur.url ?? ""),
               JSON.stringify(mergedMeta),
@@ -493,6 +512,7 @@ export class ContextStore {
         const now = Date.now();
         const tombstoneMeta: Record<string, unknown> = {
           withdrawn: true,
+          tombstone: true,
           edit_gen: 1,
           ...(incVer !== undefined ? { edit_version: incVer } : {}),
           ...(incEditTime !== undefined ? { edit_time: incEditTime } : {}),
@@ -1035,8 +1055,22 @@ export class ContextStore {
       .run(entity, entityId, obsId, quote.slice(0, 300), time);
   }
 
-  evidence(entity: string, entityId: string, limit = 20): EvidenceRow[] {
-    return this.db.prepare("SELECT * FROM ctx_evidence WHERE entity = ? AND entity_id = ? ORDER BY time DESC LIMIT ?").all(entity, entityId, limit) as unknown as EvidenceRow[];
+  /** 查询实体的证据列表：默认排除已撤回观测的摘录，避免新卡片、视图与委派派单继续携带已撤回原文（审计可显式传 includeWithdrawn: true） */
+  evidence(entity: string, entityId: string, limit = 20, opts?: { includeWithdrawn?: boolean }): EvidenceRow[] {
+    if (opts?.includeWithdrawn) {
+      return this.db
+        .prepare("SELECT * FROM ctx_evidence WHERE entity = ? AND entity_id = ? ORDER BY time DESC LIMIT ?")
+        .all(entity, entityId, limit) as unknown as EvidenceRow[];
+    }
+    return this.db
+      .prepare(
+        `SELECT e.* FROM ctx_evidence e
+         LEFT JOIN ctx_obs o ON o.id = e.obs_id
+         WHERE e.entity = ? AND e.entity_id = ?
+           AND COALESCE(json_extract(o.meta, '$.withdrawn'), 0) = 0
+         ORDER BY e.time DESC LIMIT ?`,
+      )
+      .all(entity, entityId, limit) as unknown as EvidenceRow[];
   }
 
   /** 事项最近一次有效（未撤回）证据所在的会话（起草回复时用） */

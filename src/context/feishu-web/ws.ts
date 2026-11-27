@@ -16,6 +16,7 @@ const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const DEFAULT_MAX_QUEUE_BYTES = 16 * 1024 * 1024; // 16 MiB aggregate cap
 const DEFAULT_MAX_QUEUE_FRAMES = 2048;
 const DEFAULT_MAX_FRAG_FRAMES = 256;
+const DEFAULT_MAX_FRAG_DURATION_MS = 120_000;
 
 const OP_CONT = 0x0;
 const OP_TEXT = 0x1;
@@ -36,12 +37,15 @@ export interface DialWebSocketOptions {
   maxQueueBytes?: number;
   maxQueueFrames?: number;
   maxFragFrames?: number;
+  /** 单条分片消息从首片到末片的最大允许总时长（独立于读空闲超时，防止慢速分片无限占链） */
+  maxFragDurationMs?: number;
   signal?: AbortSignal;
 }
 
 interface Waiter {
   resolve: (frame: WebSocketFrame) => void;
   reject: (err: Error) => void;
+  resetIdle: () => void;
 }
 
 function buildClientFrame(opcode: number, payload: Uint8Array): Buffer {
@@ -160,10 +164,12 @@ export class BinaryWebSocket {
   private readonly maxQueueBytes: number;
   private readonly maxQueueFrames: number;
   private readonly maxFragFrames: number;
+  private readonly maxFragDurationMs: number;
   private readonly rx = new ChunkReader();
   private fragOpcode: number | null = null;
   private fragChunks: Buffer[] = [];
   private fragBytes = 0;
+  private fragTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly queue: WebSocketFrame[] = [];
   private queuedBytes = 0;
   private paused = false;
@@ -177,12 +183,14 @@ export class BinaryWebSocket {
     maxQueueBytes = DEFAULT_MAX_QUEUE_BYTES,
     maxQueueFrames = DEFAULT_MAX_QUEUE_FRAMES,
     maxFragFrames = DEFAULT_MAX_FRAG_FRAMES,
+    maxFragDurationMs = DEFAULT_MAX_FRAG_DURATION_MS,
   ) {
     this.socket = socket;
     this.maxFrameBytes = maxFrameBytes;
     this.maxQueueBytes = Math.max(maxQueueBytes, 1024);
     this.maxQueueFrames = Math.max(maxQueueFrames, 16);
     this.maxFragFrames = Math.max(maxFragFrames, 4);
+    this.maxFragDurationMs = Math.max(maxFragDurationMs, 50);
 
     socket.on("data", (chunk: Buffer) => this.onData(chunk));
     socket.on("error", (err) => this.fail(err));
@@ -250,7 +258,19 @@ export class BinaryWebSocket {
           finish(() => reject(new WebHttpError("http_error", `WebSocket 握手校验失败 (status=${res.statusCode})`, res.statusCode)));
           return;
         }
-        finish(() => resolve(new BinaryWebSocket(socket, head, maxFrameBytes, maxQueueBytes, maxQueueFrames, maxFragFrames)));
+        finish(() =>
+          resolve(
+            new BinaryWebSocket(
+              socket,
+              head,
+              maxFrameBytes,
+              maxQueueBytes,
+              maxQueueFrames,
+              maxFragFrames,
+              opts.maxFragDurationMs ?? DEFAULT_MAX_FRAG_DURATION_MS,
+            ),
+          ),
+        );
       });
 
       req.on("response", (res) => {
@@ -271,8 +291,22 @@ export class BinaryWebSocket {
     });
   }
 
+  private noteInboundActivity(): void {
+    for (const w of this.waiters) {
+      w.resetIdle();
+    }
+  }
+
+  private clearFragTimer(): void {
+    if (this.fragTimer) {
+      clearTimeout(this.fragTimer);
+      this.fragTimer = null;
+    }
+  }
+
   private onData(chunk: Buffer): void {
     if (this.closedErr) return;
+    if (chunk.length > 0) this.noteInboundActivity();
     this.rx.push(chunk);
 
     while (this.rx.length >= 2 && !this.closedErr) {
@@ -357,6 +391,11 @@ export class BinaryWebSocket {
         this.fragOpcode = opcode;
         this.fragChunks = [payload];
         this.fragBytes = payload.length;
+        this.clearFragTimer();
+        this.fragTimer = setTimeout(() => {
+          this.protocolError(`WebSocket 分片消息组装超时 (${this.maxFragDurationMs}ms)`);
+        }, this.maxFragDurationMs);
+        this.fragTimer.unref?.();
       }
       return;
     }
@@ -377,6 +416,7 @@ export class BinaryWebSocket {
       }
       this.fragChunks.push(payload);
       if (fin) {
+        this.clearFragTimer();
         const op = this.fragOpcode;
         const full = Buffer.concat(this.fragChunks, this.fragBytes);
         this.fragOpcode = null;
@@ -418,6 +458,7 @@ export class BinaryWebSocket {
   }
 
   private fail(err: Error): void {
+    this.clearFragTimer();
     if (this.closedErr) return;
     this.closedErr = err;
     while (this.waiters.length) {
@@ -473,32 +514,47 @@ export class BinaryWebSocket {
     if (this.closedErr) return Promise.reject(this.closedErr);
     if (signal?.aborted) return Promise.reject(new Error("WebSocket 读取已取消"));
     return new Promise((resolve, reject) => {
-      const waiter: Waiter = {
-        resolve: (f) => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const clearIdle = () => {
+        if (timer) {
           clearTimeout(timer);
-          signal?.removeEventListener("abort", onAbort);
-          resolve(f);
-        },
-        reject: (err) => {
-          clearTimeout(timer);
-          signal?.removeEventListener("abort", onAbort);
-          reject(err);
-        },
+          timer = null;
+        }
       };
       const remove = () => {
         const idx = this.waiters.indexOf(waiter);
         if (idx >= 0) this.waiters.splice(idx, 1);
+      };
+      const armIdle = () => {
+        clearIdle();
+        timer = setTimeout(() => {
+          remove();
+          this.close();
+          waiter.reject(new Error(`WebSocket 读空闲超时 (${timeoutMs}ms)`));
+        }, timeoutMs);
+      };
+      const waiter: Waiter = {
+        resolve: (f) => {
+          clearIdle();
+          signal?.removeEventListener("abort", onAbort);
+          resolve(f);
+        },
+        reject: (err) => {
+          clearIdle();
+          signal?.removeEventListener("abort", onAbort);
+          reject(err);
+        },
+        resetIdle: () => {
+          if (this.closedErr) return;
+          armIdle();
+        },
       };
       const onAbort = () => {
         remove();
         waiter.reject(new Error("WebSocket 读取已取消"));
       };
       signal?.addEventListener("abort", onAbort, { once: true });
-      const timer = setTimeout(() => {
-        remove();
-        this.close();
-        waiter.reject(new Error(`WebSocket 读空闲超时 (${timeoutMs}ms)`));
-      }, timeoutMs);
+      armIdle();
       this.waiters.push(waiter);
     });
   }

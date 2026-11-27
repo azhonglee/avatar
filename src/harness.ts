@@ -556,6 +556,7 @@ export interface StagedSanitizedGitConfig {
   dir: string;
   file: string;
   homeMountDest: string;
+  bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[];
   cleanup: () => void;
 }
 
@@ -603,6 +604,67 @@ const SAFE_GIT_DIFF_KEYS = new Set([
   "diff.wsErrorHighlight".toLowerCase(),
 ]);
 
+const SAFE_REMOTE_HTTP_GENERIC_KEYS = new Set([
+  "http.sslverify",
+  "http.sslcainfo",
+  "http.sslcapath",
+  "http.sslbackend",
+  "http.proxy",
+  "http.postbuffer",
+  "http.version",
+  "http.lowspeedlimit",
+  "http.lowspeedtime",
+  "http.followredirects",
+  "http.maxrequests",
+]);
+
+const SAFE_REMOTE_CREDENTIAL_GENERIC_KEYS = new Set([
+  "credential.usehttppath",
+  "credential.username",
+]);
+
+function isSafeGitLfsFilterEntry(rawKey: string, rawValue: string): boolean {
+  const lk = rawKey.trim().toLowerCase();
+  const v = rawValue.trim();
+  if (!v || /[\r\n\0]/.test(v)) return false;
+  if (lk === "filter.lfs.clean") return /^git-lfs\s+clean(?:\s+--)?\s+%f$/.test(v);
+  if (lk === "filter.lfs.smudge") return /^git-lfs\s+smudge(?:\s+--skip)?(?:\s+--)?\s+%f$/.test(v);
+  if (lk === "filter.lfs.process") return /^git-lfs\s+filter-process(?:\s+--skip)?$/.test(v);
+  if (lk === "filter.lfs.required") return /^(?:true|false|yes|no|1|0)$/i.test(v);
+  return false;
+}
+
+function gitUrlPrefixMatchesTarget(sectionPattern: string, targetRaw: string): boolean {
+  const pat = sectionPattern.trim();
+  const tgt = targetRaw.trim();
+  if (!pat || !tgt) return false;
+  let patUrl: URL;
+  let tgtUrl: URL;
+  try {
+    patUrl = new URL(pat);
+    tgtUrl = new URL(tgt);
+  } catch {
+    return tgt.toLowerCase().startsWith(pat.toLowerCase());
+  }
+  if (patUrl.protocol !== tgtUrl.protocol) return false;
+  const patHost = patUrl.hostname.toLowerCase();
+  const tgtHost = tgtUrl.hostname.toLowerCase();
+  if (patHost.startsWith("*.")) {
+    const suffix = patHost.slice(1);
+    if (!tgtHost.endsWith(suffix) || tgtHost.length <= suffix.length) return false;
+  } else if (patHost !== tgtHost) {
+    return false;
+  }
+  const defPort = (p: string) => (p === "https:" ? "443" : p === "http:" ? "80" : "");
+  const patPort = patUrl.port || defPort(patUrl.protocol);
+  const tgtPort = tgtUrl.port || defPort(tgtUrl.protocol);
+  if (patPort !== tgtPort) return false;
+  const patPath = patUrl.pathname.replace(/\/+$/, "");
+  if (!patPath) return true;
+  const tgtPath = tgtUrl.pathname.replace(/\/+$/, "");
+  return tgtPath === patPath || tgtPath.startsWith(`${patPath}/`);
+}
+
 function isSafeGitConfigKey(rawKey: string): boolean {
   const lk = rawKey.trim().toLowerCase();
   if (!lk) return false;
@@ -624,20 +686,78 @@ function escapeGitConfigValue(val: string): string {
   return `"${escaped}"`;
 }
 
+function isAllowedRemoteGitConfigEntry(key: string, value: string, allowedRemoteUrls: string[]): boolean {
+  if (/[\r\n\0]/.test(value)) return false;
+  const trimmedKey = key.trim();
+  const lk = trimmedKey.toLowerCase();
+  const hasHttpRemote = allowedRemoteUrls.some((u) => /^https?:\/\//i.test(u.trim()));
+  const hasNonHttpRemote = allowedRemoteUrls.some((u) => !/^https?:\/\//i.test(u.trim()));
+  if (SAFE_REMOTE_HTTP_GENERIC_KEYS.has(lk)) {
+    return hasHttpRemote && isSafeGitConfigValue(value);
+  }
+  if (SAFE_REMOTE_CREDENTIAL_GENERIC_KEYS.has(lk)) {
+    return hasHttpRemote && isSafeGitConfigValue(value);
+  }
+  if (lk === "core.sshcommand") {
+    return hasNonHttpRemote && isSafeGitConfigValue(value);
+  }
+  const firstDot = trimmedKey.indexOf(".");
+  const lastDot = trimmedKey.lastIndexOf(".");
+  if (firstDot <= 0) return false;
+  const section = trimmedKey.slice(0, firstDot).toLowerCase();
+  const subsection = lastDot > firstDot ? trimmedKey.slice(firstDot + 1, lastDot) : "";
+  const varName = trimmedKey.slice(lastDot + 1).toLowerCase();
+
+  if (section === "lfs") {
+    if (!isSafeGitConfigValue(value)) return false;
+    if (!subsection) return true;
+    return allowedRemoteUrls.some((u) => gitUrlPrefixMatchesTarget(subsection, u));
+  }
+  if (!subsection) return false;
+
+  if (section === "http") {
+    if (!hasHttpRemote) return false;
+    // 严格仅保留命中目标远端 URL 的 http.<url>.*（如目标域名的 extraHeader / sslVerify / proxy），绝不暴露其他主机的 extraHeader
+    return allowedRemoteUrls.some((u) => gitUrlPrefixMatchesTarget(subsection, u));
+  }
+  if (section === "credential") {
+    if (!hasHttpRemote) return false;
+    // credential.helper 始终由宿主机 prepareScopedGitHttpCredentials 窄范围解析，绝不把宿主机原始 helper/内联脚本透传进沙箱
+    if (varName !== "usehttppath" && varName !== "username") return false;
+    if (!isSafeGitConfigValue(value)) return false;
+    return allowedRemoteUrls.some((u) => gitUrlPrefixMatchesTarget(subsection, u));
+  }
+  if (section === "url" && (varName === "insteadof" || varName === "pushinsteadof")) {
+    // 无内嵌凭据的 URL 重写规则或明确指向当前已授权目标 URL 的重写规则才允许保留
+    if (isSafeGitConfigValue(subsection) && isSafeGitConfigValue(value)) return true;
+    return allowedRemoteUrls.some((u) => gitUrlPrefixMatchesTarget(subsection, u) || u.startsWith(subsection));
+  }
+  return false;
+}
+
 /**
- * 仅保留全局 Git 配置中的非敏感本地偏好（`user.name/email`、`core.autocrlf`、`color.*`、`init.defaultBranch`、`safe.directory` 等），
+ * 仅保留全局 Git 配置中的非敏感本地偏好（`user.name/email`、`core.autocrlf`、`color.*`、`init.defaultBranch`、`safe.directory`、标准 `filter.lfs.*` 等），
  * 彻底剥离 `http.*`（含 `extraHeader`）、`credential.*`、`url.*`（可能含带令牌的 `insteadOf`）、`alias.*`、`core.sshCommand`、`include*` 等一切凭据或命令注入项。
+ * 若传入 `opts.allowedRemoteUrls`（仅限受信任远程 Git 传输），按目标 URL 窄范围附加匹配目标域的 `http.<url>.*`、`credential.<url>.username/useHttpPath` 与 `url.*` 重写。
  */
-export function sanitizeGitConfigEntries(entries: { key: string; value: string }[]): string {
+export function sanitizeGitConfigEntries(
+  entries: { key: string; value: string }[],
+  opts?: { allowedRemoteUrls?: string[] },
+): string {
+  const allowedRemoteUrls = (opts?.allowedRemoteUrls ?? []).filter(Boolean);
   const bySection = new Map<string, { name: string; value: string }[]>();
   for (const { key, value } of entries) {
     const trimmedKey = key.trim();
-    if (!isSafeGitConfigKey(trimmedKey) || !isSafeGitConfigValue(value)) continue;
+    const keepLocal =
+      (isSafeGitConfigKey(trimmedKey) && isSafeGitConfigValue(value)) || isSafeGitLfsFilterEntry(trimmedKey, value);
+    const keepRemote =
+      !keepLocal &&
+      allowedRemoteUrls.length > 0 &&
+      isAllowedRemoteGitConfigEntry(trimmedKey, value, allowedRemoteUrls);
+    if (!keepLocal && !keepRemote) continue;
     const firstDot = trimmedKey.indexOf(".");
     const lastDot = trimmedKey.lastIndexOf(".");
-    if (firstDot <= 0 || lastDot <= firstDot) {
-      if (firstDot <= 0) continue;
-    }
+    if (firstDot <= 0) continue;
     const section = trimmedKey.slice(0, firstDot).toLowerCase();
     const subsection = lastDot > firstDot ? trimmedKey.slice(firstDot + 1, lastDot) : "";
     const varName = trimmedKey.slice(lastDot + 1);
@@ -694,25 +814,131 @@ function parseRawGitConfigEntries(filePath: string): { key: string; value: strin
   return entries;
 }
 
+interface EffectiveGlobalGitConfigDiscovery {
+  resolvedHome: string;
+  xdgConfigBase: string;
+  explicitGlobalConfig?: string;
+  entries: { key: string; value: string }[];
+  readOnlyPaths: string[];
+  symlinks: { dest: string; target: string }[];
+}
+
+function resolveExplicitGitConfigGlobal(rawEnv: NodeJS.ProcessEnv, resolvedHome: string): string | undefined {
+  const raw = rawEnv.GIT_CONFIG_GLOBAL?.trim();
+  if (!raw || raw === "/dev/null") return undefined;
+  if (raw === "~") return resolvedHome || undefined;
+  if (raw.startsWith("~/")) return resolvedHome ? path.join(resolvedHome, raw.slice(2)) : undefined;
+  return path.resolve(raw);
+}
+
 /**
- * 为不可信仓库工人、代码审查与校验命令投影严格脱敏的全局 Git 配置（绝不把含 `http.extraHeader`、带令牌 `url.*.insteadOf` 或 `credential.*` 的原始 `~/.gitconfig` / included 文件暴露进工人沙箱）。
+ * 统一的宿主机全局 Git 配置发现器（同时供 `collectSafeGitConfigMounts` 与 `stageSanitizedGitConfig` 复用）：
+ *   - 严格遵守 `GIT_CONFIG_GLOBAL`（覆写默认 `~/.gitconfig` 与 `$XDG_CONFIG_HOME/git/config`）；
+ *   - 优先经受信任系统 `git config --includes --show-scope --show-origin --null --list` 解析生效的 global 配置及其全部 `include`/`includeIf`（含 `gitdir`/`onbranch`/`hasconfig`）；
+ *   - 静态解析器兜底，排除 `dataDir`、`.git-credentials` 与 `git/credentials`。
  */
-export function stageSanitizedGitConfig(
+function discoverEffectiveGlobalGitConfig(
   rawEnv: NodeJS.ProcessEnv = process.env,
   dataDir?: string,
-  opts?: { cwd?: string },
-): StagedSanitizedGitConfig | undefined {
+  opts?: { cwd?: string; includeStaticFallbackEntries?: boolean },
+): EffectiveGlobalGitConfigDiscovery | undefined {
   const rawHome = rawEnv.HOME?.trim() || os.homedir();
   if (!rawHome) return undefined;
   const resolvedHome = safeRealpath(rawHome);
   const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
   const rawXdgConfig = rawEnv.XDG_CONFIG_HOME?.trim();
   const xdgConfigBase = rawXdgConfig ? safeRealpath(rawXdgConfig) : path.join(resolvedHome, ".config");
+  const rawGitGlobal = rawEnv.GIT_CONFIG_GLOBAL?.trim();
+  const explicitGlobalConfig = resolveExplicitGitConfigGlobal(rawEnv, resolvedHome);
 
+  const readOnlyPaths: string[] = [];
+  const symlinks: { dest: string; target: string }[] = [];
+  const addedFiles = new Set<string>();
+  const addedSymlinks = new Set<string>();
   const entries: { key: string; value: string }[] = [];
-  const gitBin = resolveTrustedSystemBin("git");
+
+  const addLogicalFile = (logicalPath: string): string | undefined => {
+    try {
+      const lst = fs.lstatSync(logicalPath);
+      const st = fs.statSync(logicalPath);
+      if (!st.isFile() || st.size > 512 * 1024) return undefined;
+      const real = fs.realpathSync(logicalPath);
+      if (!isSafeGitConfigIncludeTarget(real, resolvedData)) return undefined;
+      if (!addedFiles.has(real)) {
+        addedFiles.add(real);
+        readOnlyPaths.push(real);
+      }
+      if (lst.isSymbolicLink()) {
+        const logicalDest = path.join(safeRealpath(path.dirname(logicalPath)), path.basename(logicalPath));
+        if (logicalDest !== real && !addedSymlinks.has(logicalDest)) {
+          addedSymlinks.add(logicalDest);
+          symlinks.push({ dest: logicalDest, target: real });
+        }
+      }
+      return real;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const visitedStatic = new Set<string>();
+  const staticEntryFiles: string[] = [];
+  const parseStaticIncludes = (logicalCfgPath: string, depth: number) => {
+    if (depth > 4) return;
+    const real = addLogicalFile(logicalCfgPath);
+    if (!real || visitedStatic.has(real)) return;
+    visitedStatic.add(real);
+    staticEntryFiles.push(real);
+    let text: string;
+    try {
+      text = fs.readFileSync(real, "utf8");
+    } catch {
+      return;
+    }
+    const logicalDir = path.dirname(logicalCfgPath);
+    const realDir = path.dirname(real);
+    let activeInclude = false;
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+      const sec = line.match(/^\[([^\]]+)\]$/);
+      if (sec) {
+        const header = sec[1].trim();
+        if (/^include$/i.test(header)) {
+          activeInclude = true;
+        } else {
+          const condMatch = header.match(/^includeIf\s+"([^"]+)"$/i);
+          activeInclude = !!condMatch && matchesGitDirIncludeIf(condMatch[1], opts?.cwd, resolvedHome);
+        }
+        continue;
+      }
+      if (!activeInclude) continue;
+      const pm = line.match(/^path\s*=\s*(.+)$/i);
+      if (!pm) continue;
+      const candidateLogical = expandGitIncludePath(pm[1], logicalDir, resolvedHome);
+      if (candidateLogical && fs.existsSync(candidateLogical)) {
+        parseStaticIncludes(candidateLogical, depth + 1);
+      } else {
+        const candidateReal = expandGitIncludePath(pm[1], realDir, resolvedHome);
+        if (candidateReal && fs.existsSync(candidateReal)) {
+          parseStaticIncludes(candidateReal, depth + 1);
+        }
+      }
+    }
+  };
+
+  if (rawGitGlobal === "/dev/null") {
+    // 显式禁用全局配置
+  } else if (explicitGlobalConfig) {
+    parseStaticIncludes(explicitGlobalConfig, 0);
+  } else {
+    parseStaticIncludes(path.join(resolvedHome, ".gitconfig"), 0);
+    parseStaticIncludes(path.join(xdgConfigBase, "git", "config"), 0);
+  }
+
   let usedGit = false;
-  if (gitBin) {
+  const gitBin = resolveTrustedSystemBin("git");
+  if (gitBin && rawGitGlobal !== "/dev/null") {
     try {
       const gitEnv: NodeJS.ProcessEnv = {
         PATH: TRUSTED_BOOTSTRAP_PATH,
@@ -720,6 +946,7 @@ export function stageSanitizedGitConfig(
         HOME: rawHome,
         GIT_TERMINAL_PROMPT: "0",
         ...(rawXdgConfig ? { XDG_CONFIG_HOME: rawXdgConfig } : {}),
+        ...(rawGitGlobal ? { GIT_CONFIG_GLOBAL: rawGitGlobal } : {}),
       };
       const cwdArg = opts?.cwd && fs.existsSync(opts.cwd) ? ["-C", opts.cwd] : [];
       const r = spawnSync(
@@ -739,50 +966,88 @@ export function stageSanitizedGitConfig(
         ],
         { env: gitEnv, timeout: 3_000, encoding: "utf8" },
       );
-      if (r.status === 0 && r.stdout) {
+      if (r.status === 0) {
         usedGit = true;
-        const tokens = r.stdout.split("\0");
-        for (let i = 0; i + 2 < tokens.length; i += 3) {
-          const scope = tokens[i];
-          const origin = tokens[i + 1];
-          const rec = tokens[i + 2];
-          if (scope !== "global" || !rec) continue;
-          if (origin.startsWith("file:")) {
-            const rawOrigin = origin.slice("file:".length);
-            const absOrigin =
-              path.isAbsolute(rawOrigin) || !opts?.cwd ? path.resolve(rawOrigin) : path.resolve(opts.cwd, rawOrigin);
-            if (fs.existsSync(absOrigin) && !isSafeGitConfigIncludeTarget(safeRealpath(absOrigin), resolvedData)) {
-              continue;
+        if (r.stdout) {
+          const tokens = r.stdout.split("\0");
+          for (let i = 0; i + 2 < tokens.length; i += 3) {
+            const scope = tokens[i];
+            const origin = tokens[i + 1];
+            const rec = tokens[i + 2];
+            if (scope !== "global" || !rec) continue;
+            if (origin.startsWith("file:")) {
+              const rawOrigin = origin.slice("file:".length);
+              if (rawOrigin) {
+                const absOrigin =
+                  path.isAbsolute(rawOrigin) || !opts?.cwd ? path.resolve(rawOrigin) : path.resolve(opts.cwd, rawOrigin);
+                if (fs.existsSync(absOrigin) && !isSafeGitConfigIncludeTarget(safeRealpath(absOrigin), resolvedData)) {
+                  continue;
+                }
+                addLogicalFile(absOrigin);
+              }
             }
+            const nl = rec.indexOf("\n");
+            if (nl <= 0) continue;
+            entries.push({ key: rec.slice(0, nl), value: rec.slice(nl + 1) });
           }
-          const nl = rec.indexOf("\n");
-          if (nl <= 0) continue;
-          entries.push({ key: rec.slice(0, nl), value: rec.slice(nl + 1) });
         }
       }
     } catch {
-      // 回退静态读取
+      // 回退静态解析
     }
   }
-  if (!usedGit) {
-    for (const candidate of [path.join(resolvedHome, ".gitconfig"), path.join(xdgConfigBase, "git", "config")]) {
-      if (!fs.existsSync(candidate)) continue;
-      const real = safeRealpath(candidate);
-      if (!isSafeGitConfigIncludeTarget(real, resolvedData)) continue;
-      entries.push(...parseRawGitConfigEntries(real));
+  if (!usedGit && opts?.includeStaticFallbackEntries) {
+    for (const f of staticEntryFiles) {
+      entries.push(...parseRawGitConfigEntries(f));
     }
   }
 
-  const sanitized = sanitizeGitConfigEntries(entries);
+  return {
+    resolvedHome,
+    xdgConfigBase,
+    explicitGlobalConfig,
+    entries,
+    readOnlyPaths,
+    symlinks,
+  };
+}
+
+/**
+ * 为不可信仓库工人、代码审查、校验命令及本地/受控远程 Git 投影脱敏的全局 Git 配置（遵守 `GIT_CONFIG_GLOBAL`）：
+ *   - 默认（无 `allowedRemoteUrls`）：彻底剥离 `http.extraHeader`、带令牌 `url.*.insteadOf` 与 `credential.*`，避免仓库 clean/smudge 过滤器或不可信工人读取无关凭据；
+ *   - 受信任远程 Git（传入 `allowedRemoteUrls`）：按目标 URL 仅投影匹配该目标的 `http.<url>.*`、`credential.<url>.*` 与 `url.*` 重写。
+ */
+export function stageSanitizedGitConfig(
+  rawEnv: NodeJS.ProcessEnv = process.env,
+  dataDir?: string,
+  opts?: { cwd?: string; allowedRemoteUrls?: string[] },
+): StagedSanitizedGitConfig | undefined {
+  const discovered = discoverEffectiveGlobalGitConfig(rawEnv, dataDir, {
+    cwd: opts?.cwd,
+    includeStaticFallbackEntries: true,
+  });
+  if (!discovered) return undefined;
+
+  const sanitized = sanitizeGitConfigEntries(discovered.entries, {
+    allowedRemoteUrls: opts?.allowedRemoteUrls,
+  });
   if (!sanitized) return undefined;
   const scoped = createScopedSecretDir("pa-git-cfg-", rawEnv);
   try {
     const file = path.join(scoped.dir, "gitconfig");
     fs.writeFileSync(file, sanitized, { mode: 0o600 });
+    const homeMountDest = path.join(discovered.resolvedHome, ".gitconfig");
+    const bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[] = [
+      { src: file, dest: homeMountDest, mode: "ro" },
+    ];
+    if (discovered.explicitGlobalConfig && safeRealpath(discovered.explicitGlobalConfig) !== safeRealpath(homeMountDest)) {
+      bindMounts.push({ src: file, dest: discovered.explicitGlobalConfig, mode: "ro" });
+    }
     return {
       dir: scoped.dir,
       file,
-      homeMountDest: path.join(resolvedHome, ".gitconfig"),
+      homeMountDest,
+      bindMounts,
       cleanup: scoped.cleanup,
     };
   } catch (err) {
@@ -888,8 +1153,8 @@ function matchesGitDirIncludeIf(condition: string, cwd: string | undefined, reso
 }
 
 /**
- * 仅收集安全的 Git 只读配置文件（含适用当前工作目录的全局 `[include]` / `[includeIf]` 文件，绝不挂载整个 `~/.config/git` 目录、
- * `~/.config/git/credentials`、`~/.git-credentials` 或原始 `~/.npmrc`），
+ * 仅收集安全的 Git 只读配置文件（共享 `discoverEffectiveGlobalGitConfig`，完整遵守 `GIT_CONFIG_GLOBAL` 与适用 `[include]`/`[includeIf]`，
+ * 绝不挂载整个 `~/.config/git` 目录、`~/.config/git/credentials`、`~/.git-credentials` 或原始 `~/.npmrc`），
  * 并为符号链接 dotfiles（如 `~/.gitconfig -> ~/dotfiles/gitconfig`）保留逻辑路径符号链接，避免 Git 丢失配置且不暴露 dotfiles 其余文件。
  */
 export function collectSafeGitConfigMounts(
@@ -897,141 +1162,17 @@ export function collectSafeGitConfigMounts(
   dataDir?: string,
   opts?: { cwd?: string },
 ): { readOnlyPaths: string[]; symlinks: { dest: string; target: string }[] } {
-  const readOnlyPaths: string[] = [];
+  const discovered = discoverEffectiveGlobalGitConfig(rawEnv, dataDir, { cwd: opts?.cwd });
+  if (!discovered) return { readOnlyPaths: [], symlinks: [] };
+  const rules = collectSafeGitIgnoreAndAttrMounts(rawEnv, dataDir);
+  const readOnlyPaths = [...new Set([...discovered.readOnlyPaths, ...rules.readOnlyPaths])];
+  const seenSym = new Set<string>();
   const symlinks: { dest: string; target: string }[] = [];
-  const addedFiles = new Set<string>();
-  const addedSymlinks = new Set<string>();
-  const rawHome = rawEnv.HOME?.trim() || os.homedir();
-  if (!rawHome) return { readOnlyPaths, symlinks };
-  const resolvedHome = safeRealpath(rawHome);
-  const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
-  const rawXdgConfig = rawEnv.XDG_CONFIG_HOME?.trim();
-  const xdgConfigBase = rawXdgConfig ? safeRealpath(rawXdgConfig) : path.join(resolvedHome, ".config");
-
-  const addLogicalFile = (logicalPath: string): string | undefined => {
-    try {
-      const lst = fs.lstatSync(logicalPath);
-      const st = fs.statSync(logicalPath);
-      if (!st.isFile() || st.size > 512 * 1024) return undefined;
-      const real = fs.realpathSync(logicalPath);
-      if (!isSafeGitConfigIncludeTarget(real, resolvedData)) return undefined;
-      if (!addedFiles.has(real)) {
-        addedFiles.add(real);
-        readOnlyPaths.push(real);
-      }
-      if (lst.isSymbolicLink()) {
-        const logicalDest = path.join(safeRealpath(path.dirname(logicalPath)), path.basename(logicalPath));
-        if (logicalDest !== real && !addedSymlinks.has(logicalDest)) {
-          addedSymlinks.add(logicalDest);
-          symlinks.push({ dest: logicalDest, target: real });
-        }
-      }
-      return real;
-    } catch {
-      return undefined;
-    }
-  };
-
-  const visitedStatic = new Set<string>();
-  const parseStaticIncludes = (logicalCfgPath: string, depth: number) => {
-    if (depth > 4) return;
-    const real = addLogicalFile(logicalCfgPath);
-    if (!real || visitedStatic.has(real)) return;
-    visitedStatic.add(real);
-    let text: string;
-    try {
-      text = fs.readFileSync(real, "utf8");
-    } catch {
-      return;
-    }
-    const logicalDir = path.dirname(logicalCfgPath);
-    const realDir = path.dirname(real);
-    let activeInclude = false;
-    for (const rawLine of text.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith("#") || line.startsWith(";")) continue;
-      const sec = line.match(/^\[([^\]]+)\]$/);
-      if (sec) {
-        const header = sec[1].trim();
-        if (/^include$/i.test(header)) {
-          activeInclude = true;
-        } else {
-          const condMatch = header.match(/^includeIf\s+"([^"]+)"$/i);
-          activeInclude = !!condMatch && matchesGitDirIncludeIf(condMatch[1], opts?.cwd, resolvedHome);
-        }
-        continue;
-      }
-      if (!activeInclude) continue;
-      const pm = line.match(/^path\s*=\s*(.+)$/i);
-      if (!pm) continue;
-      const candidateLogical = expandGitIncludePath(pm[1], logicalDir, resolvedHome);
-      if (candidateLogical && fs.existsSync(candidateLogical)) {
-        parseStaticIncludes(candidateLogical, depth + 1);
-      } else {
-        const candidateReal = expandGitIncludePath(pm[1], realDir, resolvedHome);
-        if (candidateReal && fs.existsSync(candidateReal)) {
-          parseStaticIncludes(candidateReal, depth + 1);
-        }
-      }
-    }
-  };
-
-  const globalGitConfig = path.join(resolvedHome, ".gitconfig");
-  const xdgGitConfig = path.join(xdgConfigBase, "git", "config");
-  parseStaticIncludes(globalGitConfig, 0);
-  parseStaticIncludes(xdgGitConfig, 0);
-  addLogicalFile(path.join(xdgConfigBase, "git", "ignore"));
-  addLogicalFile(path.join(xdgConfigBase, "git", "attributes"));
-
-  // 当指定 cwd 且存在受信任 git 可执行文件时，借助 Git 自身只读解析 global scope 的全部 include / includeIf（含 gitdir / onbranch / hasconfig），
-  // 严格过滤 scope === "global"（忽略仓库 local .git/config 注入的任意 include），并排除凭据文件与 dataDir。
-  if (opts?.cwd && fs.existsSync(opts.cwd)) {
-    const gitBin = resolveTrustedSystemBin("git");
-    if (gitBin) {
-      try {
-        const gitEnv: NodeJS.ProcessEnv = {
-          PATH: TRUSTED_BOOTSTRAP_PATH,
-          LC_ALL: "C",
-          HOME: rawHome,
-          GIT_TERMINAL_PROMPT: "0",
-          ...(rawXdgConfig ? { XDG_CONFIG_HOME: rawXdgConfig } : {}),
-        };
-        const r = spawnSync(
-          gitBin,
-          [
-            "-C",
-            opts.cwd,
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "config",
-            "--includes",
-            "--show-scope",
-            "--show-origin",
-            "--null",
-            "--list",
-          ],
-          { env: gitEnv, timeout: 3_000, encoding: "utf8" },
-        );
-        if (r.status === 0 && r.stdout) {
-          const tokens = r.stdout.split("\0");
-          for (let i = 0; i + 2 < tokens.length; i += 3) {
-            const scope = tokens[i];
-            const origin = tokens[i + 1];
-            if (scope !== "global" || !origin.startsWith("file:")) continue;
-            const originPath = origin.slice("file:".length);
-            if (!originPath) continue;
-            const absOrigin = path.isAbsolute(originPath) ? originPath : path.resolve(opts.cwd, originPath);
-            addLogicalFile(absOrigin);
-          }
-        }
-      } catch {
-        // 静态解析已兜底
-      }
-    }
+  for (const s of [...discovered.symlinks, ...rules.symlinks]) {
+    if (seenSym.has(s.dest)) continue;
+    seenSym.add(s.dest);
+    symlinks.push(s);
   }
-
   return { readOnlyPaths, symlinks };
 }
 
@@ -1239,6 +1380,8 @@ export interface StagedAcpxState {
   extraCmdPaths: string[];
   /** 位于 `~/.acpx` 之外的解释器入口脚本或其静态相对依赖（需以只读挂载入沙箱） */
   extraReadOnlyPaths: string[];
+  /** 宿主机 `~/.acpx/config.json` 已显式定义当前选中 agent 的覆盖命令 */
+  usedHostAgentOverride?: boolean;
   /** `tools === "none"` 时提供的空 MCP 配置文件路径（用于 `--mcp-config`，屏蔽全局与项目 `.acpxrc.json` 中的全部 MCP Server） */
   emptyMcpConfigFile?: string;
   /** 同上，映射到沙箱挂载点下的路径 */
@@ -1338,7 +1481,7 @@ export function stageIsolatedAcpxState(
   hostHome: string,
   rawEnv: NodeJS.ProcessEnv = process.env,
   dataDir?: string,
-  opts?: { tools?: "none" | "read" | "write" },
+  opts?: { tools?: "none" | "read" | "write"; builtinAdapterCommand?: string },
 ): StagedAcpxState | undefined {
   if (!hostHome) return undefined;
   const resolvedHome = safeRealpath(hostHome);
@@ -1364,6 +1507,8 @@ export function stageIsolatedAcpxState(
 
     const hostCfgPath = path.join(hostAcpxDir, "config.json");
     let wroteConfig = false;
+    let usedHostAgentOverride = false;
+    const outCfg: Record<string, unknown> = {};
     if (
       fs.existsSync(hostCfgPath) &&
       !(resolvedData && isPathInsideOrEqual(safeRealpath(hostCfgPath), resolvedData))
@@ -1373,7 +1518,6 @@ export function stageIsolatedAcpxState(
         if (st.isFile() && st.size <= 256 * 1024) {
           const parsed = JSON.parse(fs.readFileSync(hostCfgPath, "utf8")) as Record<string, unknown>;
           if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            const outCfg: Record<string, unknown> = {};
             for (const key of [
               "defaultAgent",
               "defaultPermissions",
@@ -1401,6 +1545,7 @@ export function stageIsolatedAcpxState(
                 const lowerName = name.toLowerCase();
                 if (selectedId && lowerName !== selectedId) continue;
                 filteredAgents[name] = def;
+                usedHostAgentOverride = true;
                 if (def && typeof def === "object" && !Array.isArray(def)) {
                   const rec = def as Record<string, unknown>;
                   if (typeof rec.command === "string" && rec.command.trim()) {
@@ -1434,9 +1579,6 @@ export function stageIsolatedAcpxState(
                 outCfg.auth = filteredAuth;
               }
             }
-            fs.writeFileSync(path.join(stateDir, "config.json"), `${JSON.stringify(outCfg, null, 2)}\n`, {
-              mode: 0o600,
-            });
             wroteConfig = true;
           }
         }
@@ -1445,8 +1587,21 @@ export function stageIsolatedAcpxState(
       }
     }
 
-    if (disableMcp && !wroteConfig) {
-      fs.writeFileSync(path.join(stateDir, "config.json"), `${JSON.stringify({ mcpServers: [] }, null, 2)}\n`, {
+    if (disableMcp && !Object.prototype.hasOwnProperty.call(outCfg, "mcpServers")) {
+      outCfg.mcpServers = [];
+      wroteConfig = true;
+    }
+    // 当用户未在 harness 或宿主机 ~/.acpx/config.json 覆盖当前内置适配器，且已定位到宿主机已安装或缓存的单一适配器二进制时，
+    // 直接在暂存 config.json 中指向该二进制，绕开 acpx 回退到 npm exec 联网查 registry 与在只读 _npx 槽位写锁的问题。
+    if (!hasExplicitAgentCmd && !usedHostAgentOverride && selectedId && opts?.builtinAdapterCommand?.trim()) {
+      outCfg.agents = {
+        ...(isPlainJsonRecord(outCfg.agents) ? outCfg.agents : {}),
+        [selectedId]: { command: opts.builtinAdapterCommand.trim() },
+      };
+      wroteConfig = true;
+    }
+    if (wroteConfig) {
+      fs.writeFileSync(path.join(stateDir, "config.json"), `${JSON.stringify(outCfg, null, 2)}\n`, {
         mode: 0o600,
       });
     }
@@ -1561,6 +1716,7 @@ export function stageIsolatedAcpxState(
       mountDest: hostAcpxDir,
       extraCmdPaths: [...new Set(extraCmdPaths)],
       extraReadOnlyPaths: [...new Set(extraReadOnlyPaths)],
+      ...(usedHostAgentOverride ? { usedHostAgentOverride: true } : {}),
       ...(emptyMcpConfigFile ? { emptyMcpConfigFile, emptyMcpConfigMountedPath } : {}),
       cleanup: scoped.cleanup,
     };
@@ -1637,19 +1793,567 @@ function sanitizeClaudeSettingsForNoTools(raw: string): string | undefined {
   }
 }
 
+export interface ClaudeCredsOrigSnapshot {
+  hostCredPath: string;
+  resolvedCredPath: string;
+  credFileName: string;
+  wasSymlink: boolean;
+  origBytes: Buffer;
+  origJson: Record<string, unknown>;
+  origDev: number;
+  origIno: number;
+  canSyncBack: boolean;
+}
+
 export interface StagedClaudeState {
   hostClaudeDir: string;
   hostClaudeJson: string;
   dir: string;
   claudeJsonFile: string;
+  origCreds?: ClaudeCredsOrigSnapshot;
   bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[];
   symlinks: { dest: string; target: string }[];
   cleanup: () => void;
 }
 
+function hasClaudeOAuthRefreshToken(json: Record<string, unknown>): boolean {
+  const oauth = isPlainJsonRecord(json.claudeAiOauth) ? json.claudeAiOauth : undefined;
+  return !!oauth && typeof oauth.refreshToken === "string" && oauth.refreshToken.trim().length > 0;
+}
+
+function parseClaudeExpiresAtMs(oauth: Record<string, unknown> | undefined): number | undefined {
+  if (!oauth) return undefined;
+  const raw = oauth.expiresAt;
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return raw < 1e12 ? raw * 1000 : raw;
+  }
+  if (typeof raw === "string" && raw.trim()) {
+    const num = Number(raw);
+    if (Number.isFinite(num)) return num < 1e12 ? num * 1000 : num;
+    const parsed = Date.parse(raw);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+export function isClaudeOAuthRefreshNeeded(
+  origJson: Record<string, unknown>,
+  now = Date.now(),
+  runWindowMs = 5 * 60_000,
+): boolean {
+  if (!hasClaudeOAuthRefreshToken(origJson)) return false;
+  const oauth = origJson.claudeAiOauth as Record<string, unknown>;
+  const accessToken = typeof oauth.accessToken === "string" ? oauth.accessToken.trim() : "";
+  if (!accessToken) return true;
+  const expMs = parseClaudeExpiresAtMs(oauth);
+  if (expMs === undefined) return true;
+  const windowMs = Math.max(5 * 60_000, runWindowMs);
+  return expMs <= now + windowMs;
+}
+
+function resolveHostClaudeCredPath(hostClaudeDir: string): { hostCredPath: string; credFileName: string } {
+  const dotPath = path.join(hostClaudeDir, ".credentials.json");
+  if (fs.existsSync(dotPath)) return { hostCredPath: dotPath, credFileName: ".credentials.json" };
+  const plainPath = path.join(hostClaudeDir, "credentials.json");
+  if (fs.existsSync(plainPath)) return { hostCredPath: plainPath, credFileName: "credentials.json" };
+  return { hostCredPath: dotPath, credFileName: ".credentials.json" };
+}
+
+function isSafeClaudeScratchDirForCleanup(scratchDir: string): boolean {
+  if (!scratchDir || !path.isAbsolute(scratchDir)) return false;
+  const base = path.basename(scratchDir);
+  if (!base.startsWith(".pa-claude-state-") && !base.startsWith("pa-claude-state-")) return false;
+  try {
+    const lst = fs.lstatSync(scratchDir);
+    return !lst.isSymbolicLink() && lst.isDirectory() && isCurrentUidOwner(lst);
+  } catch {
+    return false;
+  }
+}
+
+interface ClaudeSyncTargetMeta {
+  hostCredPath: string;
+  resolvedCredPath: string;
+  wasSymlink: boolean;
+  origDev: number;
+  origIno: number;
+  origSha256: string;
+  origExpiresAtMs?: number;
+  origOrgUuid?: string;
+  origJson?: Record<string, unknown>;
+}
+
+function applyValidatedClaudeAuthSyncLocked(meta: ClaudeSyncTargetMeta, scratchCredPath: string): boolean {
+  let nextBytes: Buffer;
+  try {
+    const lst = fs.lstatSync(scratchCredPath);
+    if (
+      lst.isSymbolicLink() ||
+      !lst.isFile() ||
+      !isCurrentUidOwner(lst) ||
+      lst.size <= 0 ||
+      lst.size > MAX_CODEX_AUTH_BYTES
+    ) {
+      return false;
+    }
+    nextBytes = fs.readFileSync(scratchCredPath);
+  } catch {
+    return false;
+  }
+  if (sha256Hex(nextBytes) === meta.origSha256) return false;
+
+  let nextJson: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(nextBytes.toString("utf8")) as unknown;
+    if (!isPlainJsonRecord(parsed)) return false;
+    nextJson = parsed;
+  } catch {
+    return false;
+  }
+  const nextOauth = isPlainJsonRecord(nextJson.claudeAiOauth) ? nextJson.claudeAiOauth : undefined;
+  if (
+    !nextOauth ||
+    typeof nextOauth.accessToken !== "string" ||
+    !nextOauth.accessToken.trim() ||
+    typeof nextOauth.refreshToken !== "string" ||
+    !nextOauth.refreshToken.trim()
+  ) {
+    return false;
+  }
+  if (
+    meta.origOrgUuid &&
+    typeof nextOauth.organizationUuid === "string" &&
+    nextOauth.organizationUuid &&
+    nextOauth.organizationUuid !== meta.origOrgUuid
+  ) {
+    return false;
+  }
+  const nextExpMs = parseClaudeExpiresAtMs(nextOauth);
+  if (meta.origExpiresAtMs !== undefined && nextExpMs !== undefined && nextExpMs < meta.origExpiresAtMs) {
+    return false;
+  }
+
+  const verifyEntryPointsToTarget = (): boolean => {
+    try {
+      const entryLst = fs.lstatSync(meta.hostCredPath);
+      if (meta.wasSymlink) {
+        if (!entryLst.isSymbolicLink()) return false;
+        return fs.realpathSync(meta.hostCredPath) === meta.resolvedCredPath;
+      }
+      return (
+        !entryLst.isSymbolicLink() &&
+        entryLst.isFile() &&
+        Number(entryLst.dev) === meta.origDev &&
+        Number(entryLst.ino) === meta.origIno
+      );
+    } catch {
+      return false;
+    }
+  };
+  if (!verifyEntryPointsToTarget()) return false;
+
+  const roFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  let readFd: number;
+  try {
+    readFd = fs.openSync(meta.resolvedCredPath, roFlags);
+  } catch {
+    return false;
+  }
+  let beforeStat: fs.Stats;
+  let curHostBytes: Buffer;
+  try {
+    beforeStat = fs.fstatSync(readFd);
+    if (
+      !beforeStat.isFile() ||
+      !isCurrentUidOwner(beforeStat) ||
+      beforeStat.size > MAX_CODEX_AUTH_BYTES ||
+      Number(beforeStat.dev) !== meta.origDev ||
+      Number(beforeStat.ino) !== meta.origIno
+    ) {
+      return false;
+    }
+    const buf = Buffer.allocUnsafe(beforeStat.size);
+    let readOff = 0;
+    while (readOff < beforeStat.size) {
+      const n = fs.readSync(readFd, buf, readOff, beforeStat.size - readOff, readOff);
+      if (n <= 0) break;
+      readOff += n;
+    }
+    curHostBytes = buf.subarray(0, readOff);
+  } finally {
+    try {
+      fs.closeSync(readFd);
+    } catch {
+      // ignore
+    }
+  }
+
+  let curHostJson: Record<string, unknown> | undefined;
+  try {
+    const parsedCur = JSON.parse(curHostBytes.toString("utf8")) as unknown;
+    if (isPlainJsonRecord(parsedCur)) curHostJson = parsedCur;
+  } catch {
+    curHostJson = undefined;
+  }
+
+  if (sha256Hex(curHostBytes) !== meta.origSha256) {
+    if (!curHostJson || !isPlainJsonRecord(curHostJson.claudeAiOauth)) return false;
+    const curHostOauth = curHostJson.claudeAiOauth;
+    if (
+      meta.origOrgUuid &&
+      typeof curHostOauth.organizationUuid === "string" &&
+      curHostOauth.organizationUuid &&
+      curHostOauth.organizationUuid !== meta.origOrgUuid
+    ) {
+      return false;
+    }
+    const curHostExpMs = parseClaudeExpiresAtMs(curHostOauth);
+    if (nextExpMs === undefined || curHostExpMs === undefined || nextExpMs <= curHostExpMs) {
+      return false;
+    }
+  }
+
+  const baseJson = meta.origJson ?? curHostJson;
+  if (!baseJson || !isPlainJsonRecord(baseJson.claudeAiOauth)) return false;
+  const baseOauth = baseJson.claudeAiOauth;
+  const tokensChanged =
+    nextOauth.accessToken !== baseOauth.accessToken || nextOauth.refreshToken !== baseOauth.refreshToken;
+  const expAdvanced = nextExpMs !== undefined && (meta.origExpiresAtMs === undefined || nextExpMs > meta.origExpiresAtMs);
+  if (!tokensChanged && !expAdvanced) return false;
+
+  const mergedOauth: Record<string, unknown> = {
+    ...baseOauth,
+    accessToken: nextOauth.accessToken,
+    refreshToken: nextOauth.refreshToken,
+    ...(nextOauth.expiresAt !== undefined ? { expiresAt: nextOauth.expiresAt } : {}),
+    ...(Array.isArray(nextOauth.scopes) ? { scopes: nextOauth.scopes } : {}),
+    ...(typeof nextOauth.subscriptionType === "string" ? { subscriptionType: nextOauth.subscriptionType } : {}),
+    ...(typeof nextOauth.rateLimitTier === "string" ? { rateLimitTier: nextOauth.rateLimitTier } : {}),
+  };
+  const mergedPayload: Record<string, unknown> = {
+    ...baseJson,
+    claudeAiOauth: mergedOauth,
+  };
+  const outBuf = Buffer.from(`${JSON.stringify(mergedPayload, null, 2)}\n`, "utf8");
+
+  const targetDir = path.dirname(meta.resolvedCredPath);
+  const dirSt = fs.lstatSync(targetDir);
+  if (!dirSt.isDirectory() || !isCurrentUidOwner(dirSt)) return false;
+  const tmpPath = path.join(
+    targetDir,
+    `.${path.basename(meta.resolvedCredPath)}.pa-tmp-${process.pid}-${Date.now()}-${randomUUID().slice(0, 8)}`,
+  );
+  const tmpFlags =
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
+  let tmpFd: number | undefined;
+  try {
+    tmpFd = fs.openSync(tmpPath, tmpFlags, 0o600);
+    let written = 0;
+    while (written < outBuf.length) {
+      const n = fs.writeSync(tmpFd, outBuf, written, outBuf.length - written, written);
+      if (n <= 0) throw new Error("short write to temporary Claude credentials");
+      written += n;
+    }
+    try {
+      fs.fchmodSync(tmpFd, 0o600);
+    } catch {
+      // ignore
+    }
+    fs.fsyncSync(tmpFd);
+    fs.closeSync(tmpFd);
+    tmpFd = undefined;
+
+    if (!verifyEntryPointsToTarget()) {
+      fs.rmSync(tmpPath, { force: true });
+      return false;
+    }
+    const preRenameStat = fs.lstatSync(meta.resolvedCredPath);
+    if (
+      preRenameStat.isSymbolicLink() ||
+      !preRenameStat.isFile() ||
+      !isCurrentUidOwner(preRenameStat) ||
+      Number(preRenameStat.dev) !== meta.origDev ||
+      Number(preRenameStat.ino) !== meta.origIno ||
+      preRenameStat.size !== beforeStat.size ||
+      preRenameStat.mtimeMs !== beforeStat.mtimeMs
+    ) {
+      fs.rmSync(tmpPath, { force: true });
+      return false;
+    }
+    fs.renameSync(tmpPath, meta.resolvedCredPath);
+    fsyncDirectoryBestEffort(targetDir);
+    return true;
+  } catch (err) {
+    if (tmpFd !== undefined) {
+      try {
+        fs.closeSync(tmpFd);
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {
+      // ignore
+    }
+    throw err;
+  }
+}
+
+function recoverOrphanedClaudeAuthLocked(
+  db: DatabaseSync,
+  resolvedCredPath: string,
+  expiredLeaseHolder?: string,
+): boolean {
+  const rows = db
+    .prepare(
+      "SELECT holder, pid, scratch_auth_path, scratch_dir, host_auth_path, was_symlink, orig_dev, orig_ino, orig_sha256, orig_auth_mode, orig_account_id, orig_last_refresh, created_at FROM pending_recovery ORDER BY created_at DESC",
+    )
+    .all() as unknown as CodexPendingRecoveryRow[];
+  let recoveredAny = false;
+  for (const rec of rows) {
+    const dead = !isPidAlive(rec.pid);
+    const isExpiredHolder = !!expiredLeaseHolder && rec.holder === expiredLeaseHolder;
+    if (!dead && !isExpiredHolder) continue;
+    try {
+      const origExpMs = rec.orig_last_refresh ? Number(rec.orig_last_refresh) : undefined;
+      const ok = applyValidatedClaudeAuthSyncLocked(
+        {
+          hostCredPath: rec.host_auth_path,
+          resolvedCredPath,
+          wasSymlink: rec.was_symlink !== 0,
+          origDev: rec.orig_dev,
+          origIno: rec.orig_ino,
+          origSha256: rec.orig_sha256,
+          origOrgUuid: rec.orig_account_id ?? undefined,
+          origExpiresAtMs: origExpMs !== undefined && Number.isFinite(origExpMs) ? origExpMs : undefined,
+        },
+        rec.scratch_auth_path,
+      );
+      if (ok) {
+        recoveredAny = true;
+        log("info", "已从崩溃遗留的暂存 Claude 目录原子恢复刷新后的 OAuth 凭据", {
+          holder: rec.holder,
+          resolvedCredPath,
+        });
+      }
+    } catch (err) {
+      log("warn", "恢复崩溃遗留的 Claude OAuth 凭据失败（保留原文件）", {
+        holder: rec.holder,
+        err: errMsg(err),
+      });
+    }
+    if (dead) {
+      if (isSafeClaudeScratchDirForCleanup(rec.scratch_dir)) {
+        try {
+          fs.rmSync(rec.scratch_dir, { recursive: true, force: true });
+        } catch {
+          // ignore
+        }
+      }
+      db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(rec.holder);
+    }
+  }
+  return recoveredAny;
+}
+
+export interface ClaudeOAuthRefreshLease {
+  held: boolean;
+  resolvedCredPath?: string;
+  attachScratch?: (staged: StagedClaudeState) => void;
+  release: () => void;
+}
+
+/** 跨进程协调 Claude 文件态 OAuth（`.credentials.json`）刷新与崩溃恢复，避免单次 refreshToken 被隔离清理丢弃 */
+export async function coordinateClaudeOAuthRefresh(
+  hostClaudeDir: string,
+  opts?: {
+    signal?: AbortSignal;
+    leaseTtlMs?: number;
+    pollIntervalMs?: number;
+    maxWaitMs?: number;
+    runWindowMs?: number;
+  },
+): Promise<ClaudeOAuthRefreshLease> {
+  if (!hostClaudeDir || !fs.existsSync(hostClaudeDir)) {
+    return { held: false, release: () => undefined };
+  }
+  const { hostCredPath } = resolveHostClaudeCredPath(hostClaudeDir);
+  const initial = inspectHostCodexAuth(hostCredPath);
+  if (initial.kind === "broken_symlink") {
+    throw new Error(initial.error);
+  }
+  if (initial.kind !== "ok" || !initial.origJson || !hasClaudeOAuthRefreshToken(initial.origJson)) {
+    return { held: false, release: () => undefined };
+  }
+  if (!initial.canSyncBack) {
+    throw new Error(
+      `宿主机 Claude OAuth 凭据不可安全写回（${initial.unwritableReason ?? "权限不足"}）；为防止隔离沙箱旋转 refreshToken 后丢失新令牌，已中止执行`,
+    );
+  }
+
+  const resolvedCredPath = initial.resolvedAuthPath;
+  const leaseTtlMs = opts?.leaseTtlMs ?? 60_000;
+  const pollMs = opts?.pollIntervalMs ?? 120;
+  const deadline = Date.now() + (opts?.maxWaitMs ?? 180_000);
+  const holder = `${process.pid}:${randomUUID().slice(0, 8)}`;
+
+  const makeAttachScratch = (): ((staged: StagedClaudeState) => void) => (staged: StagedClaudeState) => {
+    const snap = staged.origCreds;
+    if (!snap || !snap.canSyncBack || !hasClaudeOAuthRefreshToken(snap.origJson)) return;
+    const oauth = isPlainJsonRecord(snap.origJson.claudeAiOauth) ? snap.origJson.claudeAiOauth : undefined;
+    const expMs = parseClaudeExpiresAtMs(oauth);
+    try {
+      withCodexAuthSyncLock(snap.resolvedCredPath, (db) => {
+        db.prepare(
+          `INSERT OR REPLACE INTO pending_recovery
+            (holder, pid, scratch_auth_path, scratch_dir, host_auth_path, was_symlink, orig_dev, orig_ino, orig_sha256, orig_auth_mode, orig_account_id, orig_last_refresh, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          holder,
+          process.pid,
+          path.join(staged.dir, snap.credFileName),
+          path.dirname(staged.dir),
+          snap.hostCredPath,
+          snap.wasSymlink ? 1 : 0,
+          snap.origDev,
+          snap.origIno,
+          sha256Hex(snap.origBytes),
+          "claude_oauth",
+          typeof oauth?.organizationUuid === "string" && oauth.organizationUuid ? oauth.organizationUuid : null,
+          expMs !== undefined ? String(expMs) : null,
+          Date.now(),
+        );
+      });
+    } catch {
+      // best-effort recovery registration
+    }
+  };
+
+  for (;;) {
+    if (opts?.signal?.aborted) throw new Error("aborted");
+    const attempt = withCodexAuthSyncLock(resolvedCredPath, (db) => {
+      const now = Date.now();
+      const row = db
+        .prepare("SELECT holder, pid, expires_at FROM refresh_lease WHERE id = 1")
+        .get() as { holder: string; pid: number; expires_at: number } | undefined;
+      if (row && row.expires_at > now && isPidAlive(row.pid)) {
+        return { action: "wait" as const };
+      }
+      recoverOrphanedClaudeAuthLocked(db, resolvedCredPath, row?.holder);
+
+      const cur = inspectHostCodexAuth(hostCredPath);
+      if (cur.kind === "broken_symlink") throw new Error(cur.error);
+      if (cur.kind !== "ok" || !cur.origJson || !hasClaudeOAuthRefreshToken(cur.origJson)) {
+        if (row) db.prepare("DELETE FROM refresh_lease WHERE id = 1").run();
+        return { action: "proceed_unlocked" as const };
+      }
+      if (!cur.canSyncBack) {
+        throw new Error(`宿主机 Claude OAuth 凭据不可安全写回（${cur.unwritableReason ?? "权限不足"}）；已中止执行`);
+      }
+      if (!isClaudeOAuthRefreshNeeded(cur.origJson, now, opts?.runWindowMs)) {
+        if (row) db.prepare("DELETE FROM refresh_lease WHERE id = 1").run();
+        return { action: "proceed_unlocked" as const };
+      }
+      db.prepare("INSERT OR REPLACE INTO refresh_lease (id, holder, pid, expires_at) VALUES (1, ?, ?, ?)").run(
+        holder,
+        process.pid,
+        now + leaseTtlMs,
+      );
+      return { action: "acquired" as const };
+    });
+
+    if (attempt.action === "proceed_unlocked") {
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        process.off("exit", release);
+        try {
+          withCodexAuthSyncLock(resolvedCredPath, (db) => {
+            db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+          });
+        } catch {
+          // ignore
+        }
+      };
+      process.once("exit", release);
+      return { held: false, resolvedCredPath, attachScratch: makeAttachScratch(), release };
+    }
+    if (attempt.action === "acquired") {
+      let released = false;
+      const heartbeat = setInterval(() => {
+        if (released) return;
+        try {
+          withCodexAuthSyncLock(resolvedCredPath, (db) => {
+            db.prepare("UPDATE refresh_lease SET expires_at = ? WHERE id = 1 AND holder = ?").run(
+              Date.now() + leaseTtlMs,
+              holder,
+            );
+          });
+        } catch {
+          // best-effort heartbeat
+        }
+      }, Math.max(500, Math.floor(leaseTtlMs / 3)));
+      heartbeat.unref?.();
+      const release = () => {
+        if (released) return;
+        released = true;
+        clearInterval(heartbeat);
+        process.off("exit", release);
+        try {
+          withCodexAuthSyncLock(resolvedCredPath, (db) => {
+            db.prepare("DELETE FROM pending_recovery WHERE holder = ?").run(holder);
+            db.prepare("DELETE FROM refresh_lease WHERE id = 1 AND holder = ?").run(holder);
+          });
+        } catch {
+          // ignore
+        }
+      };
+      process.once("exit", release);
+      return { held: true, resolvedCredPath, attachScratch: makeAttachScratch(), release };
+    }
+
+    if (Date.now() >= deadline) {
+      throw new Error(`等待宿主机 Claude OAuth 刷新协调锁超时 (${resolvedCredPath})，已中止执行`);
+    }
+    await sleepAbortableMs(pollMs, opts?.signal);
+  }
+}
+
+/** 在清理暂存 Claude 目录前，条件验证并原子写回旋转后的 Claude OAuth `.credentials.json`（绝不覆盖更新的宿主机登录） */
+export function syncRefreshedClaudeAuth(staged: StagedClaudeState): boolean {
+  const snap = staged.origCreds;
+  if (!snap || !snap.canSyncBack || !hasClaudeOAuthRefreshToken(snap.origJson)) return false;
+  const oauth = isPlainJsonRecord(snap.origJson.claudeAiOauth) ? snap.origJson.claudeAiOauth : undefined;
+  const scratchCredPath = path.join(staged.dir, snap.credFileName);
+  try {
+    return withCodexAuthSyncLock(snap.resolvedCredPath, () =>
+      applyValidatedClaudeAuthSyncLocked(
+        {
+          hostCredPath: snap.hostCredPath,
+          resolvedCredPath: snap.resolvedCredPath,
+          wasSymlink: snap.wasSymlink,
+          origDev: snap.origDev,
+          origIno: snap.origIno,
+          origSha256: sha256Hex(snap.origBytes),
+          origExpiresAtMs: parseClaudeExpiresAtMs(oauth),
+          origOrgUuid: typeof oauth?.organizationUuid === "string" && oauth.organizationUuid ? oauth.organizationUuid : undefined,
+          origJson: snap.origJson,
+        },
+        scratchCredPath,
+      ),
+    );
+  } catch (err) {
+    log("warn", "写回刷新后的 Claude .credentials.json 失败（保留原文件）", { err: errMsg(err) });
+    return false;
+  }
+}
+
 /**
  * 为隔离运行的 Claude ACP 工人构造按次隔离的 `0700` 配置目录与脱敏 `~/.claude.json`：
  *   - 仅拷贝运行所需的凭据与设置（`.credentials.json`、`credentials.json`，以及非 `tools="none"` 时的 `settings.json`/`settings.local.json`/`CLAUDE.md`；`tools="none"` 时仅保留安全模型与路由环境变量，剔除 hooks/mcpServers/apiKeyHelper）；
+ *   - 对可写 OAuth 凭据使用持久化 scratch 目录并记录原始快照，支持刷新后原子写回宿主机与崩溃恢复；
  *   - 绝不挂载或复制宿主机 `~/.claude/projects/`、`history.jsonl`、`file-history/`、`todos/`、`debug/`、`session-env/` 等跨仓库会话记录，也剥离 `~/.claude.json` 中的 `projects` 字段。
  */
 export function stageIsolatedClaudeState(
@@ -1673,10 +2377,80 @@ export function stageIsolatedClaudeState(
   const isSafeSource = (realPath: string): boolean =>
     !(resolvedData && (isPathInsideOrEqual(realPath, resolvedData) || isPathInsideOrEqual(resolvedData, realPath)));
 
-  const scoped = createScopedSecretDir("pa-claude-state-", effectiveEnv);
+  // 检查宿主机是否存有文件态 OAuth refreshToken（若有，优先尝试恢复任何已死进程遗留的刷新结果，并在持久化状态目录下创建 scratch 避免 PrivateTmp 丢失）
+  let credInspected: ReturnType<typeof inspectHostCodexAuth> = { kind: "absent" };
+  let credFileName = ".credentials.json";
+  if (fs.existsSync(hostClaudeDir) && isSafeSource(hostClaudeDir)) {
+    const resolvedCred = resolveHostClaudeCredPath(hostClaudeDir);
+    credFileName = resolvedCred.credFileName;
+    credInspected = inspectHostCodexAuth(resolvedCred.hostCredPath);
+    if (credInspected.kind === "broken_symlink") {
+      throw new Error(credInspected.error);
+    }
+    if (
+      credInspected.kind === "ok" &&
+      credInspected.canSyncBack &&
+      credInspected.origJson &&
+      hasClaudeOAuthRefreshToken(credInspected.origJson) &&
+      fs.existsSync(canonicalCodexLockFilePath(credInspected.resolvedAuthPath))
+    ) {
+      const targetResolved = credInspected.resolvedAuthPath;
+      try {
+        const recovered = withCodexAuthSyncLock(targetResolved, (db) => {
+          const row = db
+            .prepare("SELECT holder, pid, expires_at FROM refresh_lease WHERE id = 1")
+            .get() as { holder: string; pid: number; expires_at: number } | undefined;
+          if (row && row.expires_at > Date.now() && isPidAlive(row.pid)) return false;
+          return recoverOrphanedClaudeAuthLocked(db, targetResolved, row?.holder);
+        });
+        if (recovered) {
+          credInspected = inspectHostCodexAuth(resolvedCred.hostCredPath);
+          if (credInspected.kind === "broken_symlink") throw new Error(credInspected.error);
+        }
+      } catch {
+        // best-effort pre-stage recovery
+      }
+    }
+  }
+
+  const hasWritableOAuth =
+    credInspected.kind === "ok" &&
+    credInspected.canSyncBack &&
+    !!credInspected.origJson &&
+    hasClaudeOAuthRefreshToken(credInspected.origJson);
+  if (
+    credInspected.kind === "ok" &&
+    !!credInspected.origJson &&
+    hasClaudeOAuthRefreshToken(credInspected.origJson) &&
+    !credInspected.canSyncBack
+  ) {
+    throw new Error(
+      `宿主机 Claude OAuth 凭据不可安全写回（${credInspected.unwritableReason ?? "权限不足"}）；为防止隔离沙箱旋转 refreshToken 后丢失新令牌，已中止执行`,
+    );
+  }
+
+  let scopedDir = "";
+  let cleanupScoped: () => void;
+  if (hasWritableOAuth && credInspected.kind === "ok") {
+    const persistentBase = resolvePersistentOAuthScratchBase(
+      "claude-scratch",
+      credInspected.resolvedAuthPath,
+      hostClaudeDir,
+      resolvedData,
+    );
+    scopedDir = safeRealpath(fs.mkdtempSync(path.join(persistentBase, ".pa-claude-state-")));
+    fs.chmodSync(scopedDir, 0o700);
+    cleanupScoped = () => fs.rmSync(scopedDir, { recursive: true, force: true });
+  } else {
+    const scoped = createScopedSecretDir("pa-claude-state-", effectiveEnv);
+    scopedDir = scoped.dir;
+    cleanupScoped = scoped.cleanup;
+  }
+
   try {
-    const stageDir = path.join(scoped.dir, "claude");
+    const stageDir = path.join(scopedDir, "claude");
     fs.mkdirSync(stageDir, { recursive: true, mode: 0o700 });
+    let origCreds: ClaudeCredsOrigSnapshot | undefined;
 
     const copyAllowedFile = (srcFile: string, dstFile: string, maxBytes: number) => {
       try {
@@ -1693,8 +2467,24 @@ export function stageIsolatedClaudeState(
     if (fs.existsSync(hostClaudeDir) && isSafeSource(hostClaudeDir)) {
       try {
         if (fs.statSync(hostClaudeDir).isDirectory()) {
-          copyAllowedFile(path.join(hostClaudeDir, ".credentials.json"), path.join(stageDir, ".credentials.json"), 256 * 1024);
-          copyAllowedFile(path.join(hostClaudeDir, "credentials.json"), path.join(stageDir, "credentials.json"), 256 * 1024);
+          if (credInspected.kind === "ok" && isSafeSource(credInspected.resolvedAuthPath)) {
+            fs.writeFileSync(path.join(stageDir, credFileName), credInspected.origBytes, { mode: 0o600 });
+            if (credInspected.origJson) {
+              origCreds = {
+                hostCredPath: credInspected.hostAuthPath,
+                resolvedCredPath: credInspected.resolvedAuthPath,
+                credFileName,
+                wasSymlink: credInspected.wasSymlink,
+                origBytes: credInspected.origBytes,
+                origJson: credInspected.origJson,
+                origDev: credInspected.origDev,
+                origIno: credInspected.origIno,
+                canSyncBack: credInspected.canSyncBack,
+              };
+            }
+          }
+          const otherCredName = credFileName === ".credentials.json" ? "credentials.json" : ".credentials.json";
+          copyAllowedFile(path.join(hostClaudeDir, otherCredName), path.join(stageDir, otherCredName), 256 * 1024);
 
           if (opts?.tools === "none") {
             const settingsSrc = path.join(hostClaudeDir, "settings.json");
@@ -1738,7 +2528,7 @@ export function stageIsolatedClaudeState(
       }
     }
 
-    const claudeJsonFile = path.join(scoped.dir, "claude.json");
+    const claudeJsonFile = path.join(scopedDir, "claude.json");
     let sanitizedHomeJson = "{}\n";
     try {
       const st = fs.statSync(logicalClaudeJson);
@@ -1775,14 +2565,441 @@ export function stageIsolatedClaudeState(
       hostClaudeJson,
       dir: stageDir,
       claudeJsonFile,
+      origCreds,
       bindMounts,
       symlinks,
+      cleanup: cleanupScoped,
+    };
+  } catch (err) {
+    cleanupScoped();
+    throw err;
+  }
+}
+
+export interface StagedAgentState {
+  hostDirsToSkip: string[];
+  bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[];
+  cleanup: () => void;
+}
+
+function sanitizeGeminiSettingsForNoTools(raw: string): string | undefined {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const src = parsed as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of ["selectedAuthType", "model", "theme"] as const) {
+      if (Object.prototype.hasOwnProperty.call(src, key)) out[key] = src[key];
+    }
+    if (isPlainJsonRecord(src.security) && isPlainJsonRecord(src.security.auth)) {
+      out.security = { auth: src.security.auth };
+    }
+    return Object.keys(out).length > 0 ? `${JSON.stringify(out, null, 2)}\n` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 为隔离运行的 Gemini ACP 工人构造按次隔离的 `0700` 可写配置目录：
+ *   - 仅复制运行所需的凭据与设置（`oauth_creds.json`、`google_accounts.json`、`installation_id`、`settings.json`，以及非 `tools="none"` 时的 `GEMINI.md`、`mcp-oauth-tokens.json`）；
+ *   - 绝不暴露宿主机 `~/.gemini/tmp/`（跨项目对话历史与检查点）、`history/`、`sessions/`、`logs/`、`antigravity/` 等历史数据。
+ */
+export function stageIsolatedGeminiState(
+  hostHome: string,
+  effectiveEnv: NodeJS.ProcessEnv = process.env,
+  dataDir?: string,
+  opts?: { tools?: "none" | "read" | "write" },
+): StagedAgentState | undefined {
+  const effectiveHome = effectiveEnv.HOME?.trim() || hostHome || os.homedir();
+  if (!effectiveHome) return undefined;
+  const resolvedHome = safeRealpath(effectiveHome);
+  const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
+  const isSafeSource = (realPath: string): boolean =>
+    !(resolvedData && (isPathInsideOrEqual(realPath, resolvedData) || isPathInsideOrEqual(resolvedData, realPath)));
+
+  const rawGeminiHome = effectiveEnv.GEMINI_CLI_HOME?.trim();
+  const logicalBase = rawGeminiHome
+    ? (path.isAbsolute(rawGeminiHome) ? rawGeminiHome : path.join(resolvedHome, rawGeminiHome))
+    : path.join(resolvedHome, ".gemini");
+  // 若 GEMINI_CLI_HOME 内部存在 `.gemini` 子目录（Gemini CLI 将 GEMINI_CLI_HOME 视作替代 HOME），则目标目录为 `<GEMINI_CLI_HOME>/.gemini`
+  const logicalGeminiDir =
+    rawGeminiHome && fs.existsSync(path.join(logicalBase, ".gemini"))
+      ? path.join(logicalBase, ".gemini")
+      : logicalBase;
+  const hostGeminiDir = fs.existsSync(logicalGeminiDir) ? safeRealpath(logicalGeminiDir) : logicalGeminiDir;
+  const hostBaseDir = fs.existsSync(logicalBase) ? safeRealpath(logicalBase) : logicalBase;
+
+  const scoped = createScopedSecretDir("pa-gemini-state-", effectiveEnv);
+  try {
+    const stageDir = path.join(scoped.dir, "gemini");
+    fs.mkdirSync(stageDir, { recursive: true, mode: 0o700 });
+
+    const copyAllowed = (name: string, maxBytes: number) => {
+      const src = path.join(hostGeminiDir, name);
+      try {
+        const st = fs.statSync(src);
+        if (!st.isFile() || st.size > maxBytes) return;
+        const realSrc = fs.realpathSync(src);
+        if (!isSafeSource(realSrc)) return;
+        fs.writeFileSync(path.join(stageDir, name), fs.readFileSync(realSrc), { mode: 0o600 });
+      } catch {
+        // ignore missing optional file
+      }
+    };
+
+    if (fs.existsSync(hostGeminiDir) && isSafeSource(hostGeminiDir)) {
+      try {
+        if (fs.statSync(hostGeminiDir).isDirectory()) {
+          copyAllowed("oauth_creds.json", 256 * 1024);
+          copyAllowed("google_accounts.json", 256 * 1024);
+          copyAllowed("installation_id", 16 * 1024);
+          if (opts?.tools === "none") {
+            const settingsSrc = path.join(hostGeminiDir, "settings.json");
+            try {
+              const st = fs.statSync(settingsSrc);
+              if (st.isFile() && st.size <= 512 * 1024) {
+                const realSettings = fs.realpathSync(settingsSrc);
+                if (isSafeSource(realSettings)) {
+                  const sanitized = sanitizeGeminiSettingsForNoTools(fs.readFileSync(realSettings, "utf8"));
+                  if (sanitized) fs.writeFileSync(path.join(stageDir, "settings.json"), sanitized, { mode: 0o600 });
+                }
+              }
+            } catch {
+              // ignore
+            }
+          } else {
+            copyAllowed("settings.json", 512 * 1024);
+            copyAllowed("mcp-oauth-tokens.json", 256 * 1024);
+            copyAllowed("GEMINI.md", 1024 * 1024);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    return {
+      hostDirsToSkip: [...new Set([hostGeminiDir, hostBaseDir])],
+      bindMounts: [{ src: stageDir, dest: logicalGeminiDir, mode: "rw" }],
       cleanup: scoped.cleanup,
     };
   } catch (err) {
     scoped.cleanup();
     throw err;
   }
+}
+
+function sanitizeOpenCodeConfigForNoTools(raw: string): string | undefined {
+  try {
+    // 兼容 JSONC（移除整行 // 注释与块注释）
+    const stripped = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    const parsed = JSON.parse(stripped) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const src = parsed as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of ["$schema", "model", "small_model", "provider", "disabled_providers", "enabled_providers"] as const) {
+      if (Object.prototype.hasOwnProperty.call(src, key)) out[key] = src[key];
+    }
+    return Object.keys(out).length > 0 ? `${JSON.stringify(out, null, 2)}\n` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 为隔离运行的 OpenCode ACP 工人构造按次隔离的 `0700` 可写配置与数据目录：
+ *   - 配置目录仅复制 `opencode.json` / `opencode.jsonc` / `config.json`（`tools="none"` 时剥离 `mcp`/`tools`/`plugin`/`agent`/`permission`）及非 `tools="none"` 时的 `AGENTS.md`；
+ *   - 数据目录仅复制 `auth.json`，绝不暴露宿主机 `storage/`、`opencode.db`、`sessions/`、`snapshot/`、`log/` 等跨项目会话数据库。
+ */
+export function stageIsolatedOpenCodeState(
+  hostHome: string,
+  effectiveEnv: NodeJS.ProcessEnv = process.env,
+  dataDir?: string,
+  opts?: { tools?: "none" | "read" | "write" },
+): StagedAgentState | undefined {
+  const effectiveHome = effectiveEnv.HOME?.trim() || hostHome || os.homedir();
+  if (!effectiveHome) return undefined;
+  const resolvedHome = safeRealpath(effectiveHome);
+  const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
+  const isSafeSource = (realPath: string): boolean =>
+    !(resolvedData && (isPathInsideOrEqual(realPath, resolvedData) || isPathInsideOrEqual(resolvedData, realPath)));
+
+  const xdgConfig = effectiveEnv.XDG_CONFIG_HOME?.trim() || path.join(resolvedHome, ".config");
+  const xdgData = effectiveEnv.XDG_DATA_HOME?.trim() || path.join(resolvedHome, ".local", "share");
+  const logicalConfigDir = path.join(xdgConfig, "opencode");
+  const logicalDataDir = path.join(xdgData, "opencode");
+  const hostConfigDir = fs.existsSync(logicalConfigDir) ? safeRealpath(logicalConfigDir) : logicalConfigDir;
+  const hostDataDir = fs.existsSync(logicalDataDir) ? safeRealpath(logicalDataDir) : logicalDataDir;
+
+  const scoped = createScopedSecretDir("pa-opencode-state-", effectiveEnv);
+  try {
+    const stageConfigDir = path.join(scoped.dir, "config");
+    const stageDataDir = path.join(scoped.dir, "data");
+    fs.mkdirSync(stageConfigDir, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(stageDataDir, { recursive: true, mode: 0o700 });
+
+    const copySafe = (src: string, dst: string, maxBytes: number) => {
+      try {
+        const st = fs.statSync(src);
+        if (!st.isFile() || st.size > maxBytes) return;
+        const realSrc = fs.realpathSync(src);
+        if (!isSafeSource(realSrc)) return;
+        fs.writeFileSync(dst, fs.readFileSync(realSrc), { mode: 0o600 });
+      } catch {
+        // ignore
+      }
+    };
+
+    if (fs.existsSync(hostConfigDir) && isSafeSource(hostConfigDir)) {
+      try {
+        if (fs.statSync(hostConfigDir).isDirectory()) {
+          for (const cfgName of ["opencode.json", "opencode.jsonc", "config.json"]) {
+            const src = path.join(hostConfigDir, cfgName);
+            if (!fs.existsSync(src)) continue;
+            if (opts?.tools === "none") {
+              try {
+                const st = fs.statSync(src);
+                if (st.isFile() && st.size <= 512 * 1024) {
+                  const realSrc = fs.realpathSync(src);
+                  if (isSafeSource(realSrc)) {
+                    const sanitized = sanitizeOpenCodeConfigForNoTools(fs.readFileSync(realSrc, "utf8"));
+                    if (sanitized) fs.writeFileSync(path.join(stageConfigDir, cfgName), sanitized, { mode: 0o600 });
+                  }
+                }
+              } catch {
+                // ignore
+              }
+            } else {
+              copySafe(src, path.join(stageConfigDir, cfgName), 512 * 1024);
+            }
+          }
+          if (opts?.tools !== "none") {
+            copySafe(path.join(hostConfigDir, "AGENTS.md"), path.join(stageConfigDir, "AGENTS.md"), 1024 * 1024);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    if (fs.existsSync(hostDataDir) && isSafeSource(hostDataDir)) {
+      try {
+        if (fs.statSync(hostDataDir).isDirectory()) {
+          copySafe(path.join(hostDataDir, "auth.json"), path.join(stageDataDir, "auth.json"), 256 * 1024);
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    return {
+      hostDirsToSkip: [...new Set([hostConfigDir, hostDataDir])],
+      bindMounts: [
+        { src: stageConfigDir, dest: logicalConfigDir, mode: "rw" },
+        { src: stageDataDir, dest: logicalDataDir, mode: "rw" },
+      ],
+      cleanup: scoped.cleanup,
+    };
+  } catch (err) {
+    scoped.cleanup();
+    throw err;
+  }
+}
+
+interface BuiltinAcpxAdapterSpec {
+  family: string;
+  binName: string;
+  extraArgs: readonly string[];
+  packageNames: readonly string[];
+}
+
+const ACPX_BUILTIN_ADAPTERS: Record<string, BuiltinAcpxAdapterSpec> = {
+  claude: {
+    family: "claude",
+    binName: "claude-agent-acp",
+    extraArgs: [],
+    packageNames: ["@agentclientprotocol/claude-agent-acp", "@zed-industries/claude-agent-acp"],
+  },
+  codex: {
+    family: "codex",
+    binName: "codex-acp",
+    extraArgs: [],
+    packageNames: ["@agentclientprotocol/codex-acp", "@zed-industries/codex-acp"],
+  },
+  pi: {
+    family: "pi",
+    binName: "pi-acp",
+    extraArgs: [],
+    packageNames: ["pi-acp"],
+  },
+  opencode: {
+    family: "opencode",
+    binName: "opencode",
+    extraArgs: ["acp"],
+    packageNames: ["opencode-ai"],
+  },
+};
+
+export interface ScopedAcpxAdapterCache {
+  extraCmdPaths: string[];
+  prependPathDirs: string[];
+  bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[];
+  /** 直接写入暂存 `~/.acpx/config.json` 以跳过 `npm exec` 联网解析的适配器命令 */
+  agentCommand?: string;
+}
+
+function acpxBundlesAdapterPackage(acpxBin: string | undefined, packageNames: readonly string[], pathEnv: string): boolean {
+  if (!acpxBin?.trim()) return false;
+  const resolved = resolveBinInPath(acpxBin.trim(), pathEnv);
+  if (!resolved) return false;
+  let cursor = path.dirname(safeRealpath(resolved));
+  for (let depth = 0; depth < 8; depth += 1) {
+    for (const pkg of packageNames) {
+      const manifest = path.join(cursor, "node_modules", ...pkg.split("/"), "package.json");
+      try {
+        if (fs.existsSync(manifest) && fs.statSync(manifest).isFile()) return true;
+      } catch {
+        // ignore
+      }
+    }
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  return false;
+}
+
+function findCachedNpxAdapterEntry(
+  npmCacheRoot: string,
+  spec: BuiltinAcpxAdapterSpec,
+  resolvedDataDir: string,
+): { entryDir: string; hash: string; mtimeMs: number } | undefined {
+  const npxRoot = path.join(npmCacheRoot, "_npx");
+  if (!fs.existsSync(npxRoot)) return undefined;
+  let best: { entryDir: string; hash: string; mtimeMs: number } | undefined;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(npxRoot, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const ent of entries) {
+    if (!ent.isDirectory() || ent.isSymbolicLink()) continue;
+    const entryDir = path.join(npxRoot, ent.name);
+    const pjPath = path.join(entryDir, "package.json");
+    const binPath = path.join(entryDir, "node_modules", ".bin", spec.binName);
+    try {
+      if (!fs.existsSync(pjPath) || !fs.existsSync(binPath)) continue;
+      const realEntry = fs.realpathSync(entryDir);
+      if (resolvedDataDir && (isPathInsideOrEqual(realEntry, resolvedDataDir) || isPathInsideOrEqual(resolvedDataDir, realEntry))) {
+        continue;
+      }
+      const pjSt = fs.statSync(pjPath);
+      if (!pjSt.isFile() || pjSt.size > 256 * 1024) continue;
+      const pj = JSON.parse(fs.readFileSync(pjPath, "utf8")) as Record<string, unknown>;
+      const deps = isPlainJsonRecord(pj.dependencies) ? pj.dependencies : undefined;
+      if (!deps) continue;
+      const matched = spec.packageNames.some((pkg) => Object.prototype.hasOwnProperty.call(deps, pkg));
+      if (!matched) continue;
+      const binSt = fs.statSync(binPath);
+      const mtimeMs = Math.max(pjSt.mtimeMs, binSt.mtimeMs);
+      if (!best || mtimeMs > best.mtimeMs) {
+        best = { entryDir: realEntry, hash: ent.name, mtimeMs };
+      }
+    } catch {
+      // ignore unreadable _npx slot
+    }
+  }
+  return best;
+}
+
+/**
+ * 为隔离运行的内置 acpx 适配器（claude / codex / pi / opencode）复用已安装或已缓存的单一适配器，避免每次隔离运行重新联网下载：
+ *   1. 若 `acpx` 自身 `node_modules` 已内置该包，直接交由 `acpx` 离线直启，不做额外覆盖；
+ *   2. 若宿主机 PATH 已全局安装对应适配器二进制（如 `claude-agent-acp` / `codex-acp` / `opencode`），将其加入 `extraCmdPaths` 按只读挂载并注入暂存 `config.json` 跳过 `npm exec`；
+ *   3. 否则仅在宿主机 npm 缓存（`${NPM_CONFIG_CACHE:-~/.npm}/_npx/*`）与受控每适配器状态缓存中检索与当前所选包名精确匹配的单个 `_npx/<hash>` 目录，
+ *      将其以只读方式绑定挂载至 `/tmp/.pa-npm-cache/_npx/<hash>`，并通过暂存 `config.json` 直接启动其 `node_modules/.bin/<binName>`（既 100% 离线、避免 `npm exec` 在只读槽位写锁，也防止工人投毒缓存，绝不暴露宿主机完整 `~/.npm`）；
+ *   4. 若尚未存在任何缓存且当前为无工具模式（`tools === "none"`），绑定专属按适配器隔离的持久化缓存目录以供后续所有隔离工人离线只读复用。
+ */
+export function stageScopedAcpxAdapterCache(
+  selectedId: string,
+  hostEnv: NodeJS.ProcessEnv = process.env,
+  dataDir?: string,
+  opts?: { tools?: "none" | "read" | "write"; acpxBin?: string },
+): ScopedAcpxAdapterCache | undefined {
+  const family =
+    resolveKnownAcpxProviderFamily(selectedId) ??
+    (selectedId === "pi" || selectedId.startsWith("pi-") ? "pi" : undefined);
+  if (!family) return undefined;
+  const spec = ACPX_BUILTIN_ADAPTERS[family];
+  if (!spec) return undefined;
+
+  const extraCmdPaths: string[] = [];
+  const prependPathDirs: string[] = [];
+  const bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[] = [];
+
+  const pathEnv = hostEnv.PATH || process.env.PATH || "";
+  if (acpxBundlesAdapterPackage(opts?.acpxBin, spec.packageNames, pathEnv)) {
+    return undefined;
+  }
+
+  const installedBin = resolveBinInPath(spec.binName, pathEnv);
+  if (installedBin) {
+    extraCmdPaths.push(spec.binName);
+    const agentCommand = [spec.binName, ...spec.extraArgs].join(" ");
+    return { extraCmdPaths, prependPathDirs, bindMounts, agentCommand };
+  }
+
+  const hostHome = hostEnv.HOME?.trim() || os.homedir();
+  const resolvedHome = hostHome ? safeRealpath(hostHome) : "";
+  const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
+  const hostNpmCache =
+    hostEnv.NPM_CONFIG_CACHE?.trim() ||
+    hostEnv.npm_config_cache?.trim() ||
+    (resolvedHome ? path.join(resolvedHome, ".npm") : "");
+  const persistentAdapterCache = resolvedHome
+    ? path.join(resolvedHome, ".local", "state", "personal-agent", "acpx-adapter-cache", spec.family)
+    : "";
+
+  const searchRoots = [persistentAdapterCache, hostNpmCache].filter(Boolean);
+  let bestHit: { entryDir: string; hash: string; mtimeMs: number } | undefined;
+  for (const root of searchRoots) {
+    const hit = findCachedNpxAdapterEntry(root, spec, resolvedData);
+    if (hit && (!bestHit || hit.mtimeMs > bestHit.mtimeMs)) {
+      bestHit = hit;
+    }
+  }
+  if (bestHit) {
+    const mountedNpxDir = `/tmp/.pa-npm-cache/_npx/${bestHit.hash}`;
+    const mountedBinDir = `${mountedNpxDir}/node_modules/.bin`;
+    const mountedBinPath = `${mountedBinDir}/${spec.binName}`;
+    bindMounts.push({ src: bestHit.entryDir, dest: mountedNpxDir, mode: "ro" });
+    prependPathDirs.push(mountedBinDir);
+    const agentCommand = [mountedBinPath, ...spec.extraArgs].join(" ");
+    return { extraCmdPaths, prependPathDirs, bindMounts, agentCommand };
+  }
+
+  // 首次运行且尚未缓存：仅在无工具模式（无 shell/文件写能力，防不可信仓库工人投毒）下挂载按适配器分区的持久化缓存供后续只读复用
+  if (opts?.tools === "none" && persistentAdapterCache) {
+    const collidesData =
+      !!resolvedData &&
+      (isPathInsideOrEqual(persistentAdapterCache, resolvedData) || isPathInsideOrEqual(resolvedData, persistentAdapterCache));
+    if (!collidesData) {
+      try {
+        fs.mkdirSync(persistentAdapterCache, { recursive: true, mode: 0o700 });
+        const st = fs.lstatSync(persistentAdapterCache);
+        if (!st.isSymbolicLink() && st.isDirectory() && isCurrentUidOwner(st)) {
+          fs.chmodSync(persistentAdapterCache, 0o700);
+          bindMounts.push({ src: safeRealpath(persistentAdapterCache), dest: "/tmp/.pa-npm-cache", mode: "rw" });
+          return { extraCmdPaths, prependPathDirs, bindMounts };
+        }
+      } catch {
+        // fallback to ephemeral tmpfs npm cache
+      }
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -2128,6 +3345,8 @@ export function buildWorkspaceIsolation(
     /** 显式禁止挂载任何外部 worktree `.git` 目录（用于非 Git 派单的空工作区） */
     disableGitWorktreeMounts?: boolean;
     allowGuardLog?: boolean;
+    /** 仅对受信任配置探测/远程 Git 放行原始全局配置；本地 Git 操作（add/commit/checkout/worktree）传 true 隐藏原始 ~/.gitconfig 中的 http.extraHeader 等凭据 */
+    sanitizeGitConfig?: boolean;
     extraWritablePaths?: string[];
     extraReadOnlyPaths?: string[];
     extraSymlinks?: { dest: string; target: string }[];
@@ -2214,7 +3433,7 @@ export function buildWorkspaceIsolation(
   //   - 不可信仓库工人、审查与校验命令（verify / worker-write / worker-ro / codex-exec）只挂载无凭据的 git/ignore 与 git/attributes，
   //     脱敏后的全局偏好由调用方通过 stageSanitizedGitConfig 单独投影，绝不把 ~/.gitconfig 中的 http.extraHeader 或带令牌 URL 暴露给工人。
   const extraSymlinks: { dest: string; target: string }[] = [...(opts.extraSymlinks ?? [])];
-  if (opts.mode === "git-rw" || opts.mode === "git-ro") {
+  if ((opts.mode === "git-rw" || opts.mode === "git-ro") && !opts.sanitizeGitConfig) {
     const gitCfgMounts = collectSafeGitConfigMounts(rawEnv, dataDir, { cwd: resolvedCwd });
     readOnlyPaths.push(...gitCfgMounts.readOnlyPaths);
     extraSymlinks.push(...gitCfgMounts.symlinks);
@@ -2618,6 +3837,9 @@ export function isolatedSandboxTempEnv(): Record<string, string> {
     NPM_CONFIG_CACHE: "/tmp/.pa-npm-cache",
     npm_config_logs_dir: "/tmp/.pa-npm-cache/_logs",
     npm_config_update_notifier: "false",
+    GOPATH: "/tmp/.pa-go",
+    GOMODCACHE: "/tmp/.pa-gomodcache",
+    GOCACHE: "/tmp/.pa-gocache",
   };
 }
 
@@ -3873,6 +5095,7 @@ export interface StagedAwsProfile {
   configFile: string;
   credentialsFile: string;
   extraReadOnlyPaths: string[];
+  bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[];
   cleanup: () => void;
 }
 
@@ -3992,6 +5215,17 @@ export function stageIsolatedAwsProfile(
   };
 
   let needsSsoCache = false;
+  const selectedSsoSessions = new Set<string>();
+  const selectedSsoStartUrls = new Set<string>();
+  const normStartUrl = (u: string) => u.trim().replace(/\/+$/, "").toLowerCase();
+  const recordStartUrl = (u: string | undefined) => {
+    const clean = u?.trim();
+    if (clean) {
+      selectedSsoStartUrls.add(clean);
+      selectedSsoStartUrls.add(normStartUrl(clean));
+    }
+  };
+
   while (queue.length > 0) {
     const { name, depth } = queue.shift()!;
     if (depth > 6 || visitedProfiles.has(name)) continue;
@@ -4011,14 +5245,19 @@ export function stageIsolatedAwsProfile(
       const ssoSession = sec.props.get("sso_session");
       if (ssoSession) {
         needsSsoCache = true;
+        selectedSsoSessions.add(ssoSession.trim());
         if (!visitedSso.has(ssoSession)) {
           visitedSso.add(ssoSession);
           const ssoSec = findConfigTagged("sso-session", ssoSession);
-          if (ssoSec) selectedConfig.push(ssoSec);
+          if (ssoSec) {
+            selectedConfig.push(ssoSec);
+            recordStartUrl(ssoSec.props.get("sso_start_url"));
+          }
         }
       }
       if (sec.props.has("sso_start_url") || sec.props.has("sso_account_id")) {
         needsSsoCache = true;
+        recordStartUrl(sec.props.get("sso_start_url"));
       }
       const svc = sec.props.get("services");
       if (svc && !visitedServices.has(svc)) {
@@ -4033,24 +5272,96 @@ export function stageIsolatedAwsProfile(
 
   if (selectedConfig.length === 0 && selectedCreds.length === 0) return undefined;
 
-  if (needsSsoCache && hostAwsDir) {
-    const ssoCacheDir = path.join(hostAwsDir, "sso", "cache");
-    if (fs.existsSync(ssoCacheDir) && isOutsideDataDir(ssoCacheDir)) {
-      extraReadOnlyPaths.add(safeRealpath(ssoCacheDir));
-    }
-  }
-
   const scoped = createScopedSecretDir("pa-aws-profile-", hostEnv);
   const configFile = path.join(scoped.dir, "config");
   const credentialsFile = path.join(scoped.dir, "credentials");
+  const bindMounts: { src: string; dest: string; mode: "ro" | "rw" }[] = [];
   try {
     fs.writeFileSync(configFile, serializeAwsIniSections(selectedConfig), { mode: 0o600 });
     fs.writeFileSync(credentialsFile, serializeAwsIniSections(selectedCreds), { mode: 0o600 });
+
+    // 严格仅投影当前选中 profile 及其 source_profile 链引用的 SSO 会话缓存文件（绝不整目录挂载 ~/.aws/sso/cache 泄露其他 SSO 会话令牌）
+    if (needsSsoCache && hostAwsDir) {
+      const ssoCacheDir = path.join(hostAwsDir, "sso", "cache");
+      if (fs.existsSync(ssoCacheDir) && isOutsideDataDir(ssoCacheDir)) {
+        const expectedFilenames = new Set<string>();
+        const sha1 = (s: string) => createHash("sha1").update(s, "utf8").digest("hex");
+        for (const sess of selectedSsoSessions) {
+          if (sess) expectedFilenames.add(`${sha1(sess)}.json`);
+        }
+        for (const url of selectedSsoStartUrls) {
+          if (url) expectedFilenames.add(`${sha1(url)}.json`);
+        }
+        const stagedSsoDir = path.join(scoped.dir, "sso-cache");
+        fs.mkdirSync(stagedSsoDir, { recursive: true, mode: 0o700 });
+
+        interface ParsedSsoEntry {
+          name: string;
+          buf: Buffer;
+          json?: Record<string, unknown>;
+        }
+        const candidates: ParsedSsoEntry[] = [];
+        try {
+          for (const ent of fs.readdirSync(ssoCacheDir, { withFileTypes: true })) {
+            if (!ent.isFile() || ent.isSymbolicLink() || !ent.name.endsWith(".json")) continue;
+            const full = path.join(ssoCacheDir, ent.name);
+            if (!isOutsideDataDir(full)) continue;
+            try {
+              const st = fs.statSync(full);
+              if (!st.isFile() || st.size > 256 * 1024) continue;
+              const buf = fs.readFileSync(full);
+              let json: Record<string, unknown> | undefined;
+              try {
+                const p = JSON.parse(buf.toString("utf8")) as unknown;
+                if (isPlainJsonRecord(p)) json = p;
+              } catch {
+                // ignore unparseable json
+              }
+              candidates.push({ name: ent.name, buf, json });
+            } catch {
+              // ignore unreadable cache file
+            }
+          }
+        } catch {
+          // ignore unreadable sso cache dir
+        }
+
+        const matchedNames = new Set<string>();
+        const referencedClientIds = new Set<string>();
+        for (const c of candidates) {
+          const entryStartUrl = typeof c.json?.startUrl === "string" ? normStartUrl(c.json.startUrl) : "";
+          const matchesByHash = expectedFilenames.has(c.name);
+          const matchesByUrl = !!entryStartUrl && selectedSsoStartUrls.has(entryStartUrl);
+          if (matchesByHash || matchesByUrl) {
+            matchedNames.add(c.name);
+            if (typeof c.json?.clientId === "string" && c.json.clientId.trim()) {
+              referencedClientIds.add(c.json.clientId.trim());
+            }
+          }
+        }
+        // 附带所选会话 token 引用的 OIDC 客户端注册缓存（无 startUrl，但 clientId 匹配）
+        for (const c of candidates) {
+          if (matchedNames.has(c.name)) continue;
+          const entryStartUrl = typeof c.json?.startUrl === "string" ? c.json.startUrl.trim() : "";
+          const entryClientId = typeof c.json?.clientId === "string" ? c.json.clientId.trim() : "";
+          if (!entryStartUrl && entryClientId && referencedClientIds.has(entryClientId)) {
+            matchedNames.add(c.name);
+          }
+        }
+        for (const c of candidates) {
+          if (!matchedNames.has(c.name)) continue;
+          fs.writeFileSync(path.join(stagedSsoDir, c.name), c.buf, { mode: 0o600 });
+        }
+        bindMounts.push({ src: stagedSsoDir, dest: ssoCacheDir, mode: "ro" });
+      }
+    }
+
     return {
       dir: scoped.dir,
       configFile,
       credentialsFile,
       extraReadOnlyPaths: [...extraReadOnlyPaths],
+      bindMounts,
       cleanup: scoped.cleanup,
     };
   } catch (err) {
@@ -4670,13 +5981,18 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
   const started = new Date().toISOString();
   let stagedAcpx: StagedAcpxState | undefined;
   let stagedClaude: StagedClaudeState | undefined;
+  let stagedGemini: StagedAgentState | undefined;
+  let stagedOpenCode: StagedAgentState | undefined;
+  let stagedAdapterCache: ScopedAcpxAdapterCache | undefined;
   let stagedDoubao: StagedDoubaoDataDir | undefined;
   let stagedNpmrc: StagedSanitizedNpmrc | undefined;
   let stagedGitCfg: StagedSanitizedGitConfig | undefined;
   let stagedCodexHome: StagedCodexHome | undefined;
   let stagedAws: StagedAwsProfile | undefined;
   let oauthLease: CodexOAuthRefreshLease | undefined;
+  let claudeOAuthLease: ClaudeOAuthRefreshLease | undefined;
   let syncedCodexAuth = false;
+  let syncedClaudeAuth = false;
   let r: Awaited<ReturnType<typeof runProcess>>;
   try {
     const mode: WorkspaceIsolationMode =
@@ -4690,9 +6006,10 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       selectedAgentId === "claude" || selectedAgentId === "claude-code" || selectedAgentId.startsWith("claude-");
     const isDoubaoAcpx = selectedAgentId === "doubao" || selectedAgentId.startsWith("doubao-");
     const isCodexAcpx = selectedAgentId === "codex" || selectedAgentId.startsWith("codex-");
+    const isGeminiAcpx = selectedAgentId === "gemini" || selectedAgentId.startsWith("gemini-");
+    const isOpenCodeAcpx = selectedAgentId === "opencode" || selectedAgentId.startsWith("opencode-");
     const acpxTimeoutMs = (run.timeoutSec + 120) * 1000;
 
-    stagedAcpx = stageIsolatedAcpxState(h, hostHome, acpxIsolationEnv, cfg.dataDir, { tools: run.tools });
     if (isDoubaoAcpx) {
       stagedDoubao = stageIsolatedDoubaoDataDir(acpxIsolationEnv, cfg.dataDir);
     }
@@ -4715,9 +6032,49 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
     );
     const willIsolate = willIsolateCommand(acpxIsolationEnv, basePlan);
 
-    // 隔离模式下为 Claude 工人暂存仅含凭据与设置的私有目录及脱敏 ~/.claude.json，彻底隔离宿主机 projects/ 与 history.jsonl
+    if (willIsolate && !h.agentCommand?.trim()) {
+      stagedAdapterCache = stageScopedAcpxAdapterCache(selectedAgentId, acpxIsolationEnv, cfg.dataDir, {
+        tools: run.tools,
+        acpxBin: cfg.bins.acpx,
+      });
+    }
+    stagedAcpx = stageIsolatedAcpxState(h, hostHome, acpxIsolationEnv, cfg.dataDir, {
+      tools: run.tools,
+      builtinAdapterCommand: willIsolate ? stagedAdapterCache?.agentCommand : undefined,
+    });
+    if (stagedAcpx?.usedHostAgentOverride) {
+      stagedAdapterCache = undefined;
+    }
+
+    // 隔离模式下为 Claude / Gemini / OpenCode 工人暂存仅含凭据与设置的私有目录，彻底隔离跨项目会话历史，并为 Claude 协调 OAuth 刷新写回
     if (isClaudeAcpx && willIsolate) {
+      const effectiveClaudeHome = acpxIsolationEnv.HOME?.trim() || hostHome || os.homedir();
+      if (effectiveClaudeHome) {
+        const resolvedClaudeHome = safeRealpath(effectiveClaudeHome);
+        const explicitClaudeDir = acpxIsolationEnv.CLAUDE_CONFIG_DIR?.trim();
+        const logicalClaudeDir = explicitClaudeDir
+          ? (path.isAbsolute(explicitClaudeDir) ? explicitClaudeDir : path.join(resolvedClaudeHome, explicitClaudeDir))
+          : path.join(resolvedClaudeHome, ".claude");
+        const realClaudeDir = fs.existsSync(logicalClaudeDir) ? safeRealpath(logicalClaudeDir) : logicalClaudeDir;
+        const collidesData =
+          !!resolvedDataDir &&
+          (isPathInsideOrEqual(realClaudeDir, resolvedDataDir) || isPathInsideOrEqual(resolvedDataDir, realClaudeDir));
+        if (!collidesData) {
+          claudeOAuthLease = await coordinateClaudeOAuthRefresh(realClaudeDir, {
+            signal: run.signal,
+            runWindowMs: acpxTimeoutMs + 60_000,
+            maxWaitMs: Math.max(180_000, acpxTimeoutMs + 30_000),
+          });
+        }
+      }
       stagedClaude = stageIsolatedClaudeState(hostHome, acpxIsolationEnv, cfg.dataDir, { tools: run.tools });
+      if (stagedClaude) claudeOAuthLease?.attachScratch?.(stagedClaude);
+    }
+    if (isGeminiAcpx && willIsolate) {
+      stagedGemini = stageIsolatedGeminiState(hostHome, acpxIsolationEnv, cfg.dataDir, { tools: run.tools });
+    }
+    if (isOpenCodeAcpx && willIsolate) {
+      stagedOpenCode = stageIsolatedOpenCodeState(hostHome, acpxIsolationEnv, cfg.dataDir, { tools: run.tools });
     }
 
     // tools === "none" 时显式传入空 --mcp-config，阻断宿主机全局配置与项目 .acpxrc.json 注入 MCP 服务器
@@ -4797,6 +6154,15 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       acpxExtraBindMounts.push(...stagedClaude.bindMounts);
       acpxExtraSymlinks.push(...stagedClaude.symlinks);
     }
+    if (stagedGemini) {
+      acpxExtraBindMounts.push(...stagedGemini.bindMounts);
+    }
+    if (stagedOpenCode) {
+      acpxExtraBindMounts.push(...stagedOpenCode.bindMounts);
+    }
+    if (stagedAdapterCache) {
+      acpxExtraBindMounts.push(...stagedAdapterCache.bindMounts);
+    }
     if (stagedDoubao) {
       acpxExtraBindMounts.push(...stagedDoubao.bindMounts);
     }
@@ -4806,13 +6172,14 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
     }
     if (stagedGitCfg) {
       acpxExtraRo.push(stagedGitCfg.dir);
-      acpxExtraBindMounts.push({ src: stagedGitCfg.file, dest: stagedGitCfg.homeMountDest, mode: "ro" });
+      acpxExtraBindMounts.push(...stagedGitCfg.bindMounts);
     }
     if (stagedCodexHome) {
       acpxExtraRw.push(stagedCodexHome.scratchDir);
     }
     if (stagedAws) {
       acpxExtraRo.push(stagedAws.dir, ...stagedAws.extraReadOnlyPaths);
+      acpxExtraBindMounts.push(...stagedAws.bindMounts);
     }
     const selectedConfigPaths = [
       // acpxIsolationEnv 已完成一次 mergeHarnessEnv 展开，绝不二次展开 ${VAR}
@@ -4823,6 +6190,12 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       if (!fs.existsSync(p)) continue;
       const real = safeRealpath(p);
       if (stagedClaude && (isPathInsideOrEqual(real, stagedClaude.hostClaudeDir) || real === stagedClaude.hostClaudeJson)) {
+        continue;
+      }
+      if (stagedGemini && stagedGemini.hostDirsToSkip.some((d) => isPathInsideOrEqual(real, d))) {
+        continue;
+      }
+      if (stagedOpenCode && stagedOpenCode.hostDirsToSkip.some((d) => isPathInsideOrEqual(real, d))) {
         continue;
       }
       if (stagedDoubao && isPathInsideOrEqual(real, stagedDoubao.hostDataDir)) {
@@ -4840,6 +6213,7 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
     const acpxExtraCmds = [
       ...(agentExec ? [agentExec] : []),
       ...(stagedAcpx?.extraCmdPaths ?? []),
+      ...(stagedAdapterCache?.extraCmdPaths ?? []),
       ...(run.lark !== "none" ? [realLark] : []),
     ];
     const wrapped = wrapCredentialIsolatedCommand(
@@ -4871,10 +6245,14 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       codexNeedsCredentialStore &&
       !!process.env.DBUS_SESSION_BUS_ADDRESS &&
       !childMergedEnv.DBUS_SESSION_BUS_ADDRESS;
+    const adapterPathPrefix =
+      wrapped.isolated && stagedAdapterCache?.prependPathDirs.length
+        ? `${stagedAdapterCache.prependPathDirs.join(path.delimiter)}${path.delimiter}`
+        : "";
     const env: NodeJS.ProcessEnv = {
       ...childMergedEnv,
       ...safeCodexExtraEnv,
-      PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${process.env.PATH ?? ""}`,
+      PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${adapterPathPrefix}${childMergedEnv.PATH ?? process.env.PATH ?? ""}`,
       PA_GUARD_PROFILE: run.lark,
       PA_OWNER_OPEN_ID: cfg.owner.open_id,
       PA_LARK_REAL: realLark,
@@ -4907,10 +6285,18 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       syncedCodexAuth = true;
       syncRefreshedCodexAuth(stagedCodexHome);
     }
+    if (stagedClaude && !syncedClaudeAuth) {
+      syncedClaudeAuth = true;
+      syncRefreshedClaudeAuth(stagedClaude);
+    }
   } finally {
     if (stagedCodexHome && !syncedCodexAuth) {
       syncedCodexAuth = true;
       syncRefreshedCodexAuth(stagedCodexHome);
+    }
+    if (stagedClaude && !syncedClaudeAuth) {
+      syncedClaudeAuth = true;
+      syncRefreshedClaudeAuth(stagedClaude);
     }
     stagedCodexHome?.cleanup();
     oauthLease?.release();
@@ -4918,7 +6304,10 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
     stagedGitCfg?.cleanup();
     stagedNpmrc?.cleanup();
     stagedDoubao?.cleanup();
+    stagedOpenCode?.cleanup();
+    stagedGemini?.cleanup();
     stagedClaude?.cleanup();
+    claudeOAuthLease?.release();
     stagedAcpx?.cleanup();
     baseEnv.cleanup();
   }
@@ -5800,19 +7189,20 @@ export async function coordinateCodexOAuthRefresh(
   }
 }
 
-function resolvePersistentCodexScratchBase(
+function resolvePersistentOAuthScratchBase(
+  subdir: string,
   resolvedAuthPath: string,
-  hostCodexHome: string,
+  hostDir: string,
   resolvedDataDir: string,
 ): string {
   const authParent = safeRealpath(path.dirname(resolvedAuthPath));
-  const realHostCodexHome = safeRealpath(hostCodexHome);
+  const realHostDir = safeRealpath(hostDir);
   const home = os.homedir();
   if (home) {
-    const candidate = path.join(safeRealpath(home), ".local", "state", "personal-agent", "codex-scratch");
+    const candidate = path.join(safeRealpath(home), ".local", "state", "personal-agent", subdir);
     const collides =
-      isPathInsideOrEqual(candidate, realHostCodexHome) ||
-      isPathInsideOrEqual(realHostCodexHome, candidate) ||
+      isPathInsideOrEqual(candidate, realHostDir) ||
+      isPathInsideOrEqual(realHostDir, candidate) ||
       isPathInsideOrEqual(candidate, authParent) ||
       isPathInsideOrEqual(authParent, candidate) ||
       (!!resolvedDataDir && (isPathInsideOrEqual(candidate, resolvedDataDir) || isPathInsideOrEqual(resolvedDataDir, candidate)));
@@ -5925,7 +7315,12 @@ export function stageIsolatedCodexHome(
       authInspected.origJson &&
       hasOAuthRefreshToken(authInspected.origJson)
     ) {
-      scratchBase = resolvePersistentCodexScratchBase(authInspected.resolvedAuthPath, hostCodexHome, resolvedData);
+      scratchBase = resolvePersistentOAuthScratchBase(
+        "codex-scratch",
+        authInspected.resolvedAuthPath,
+        hostCodexHome,
+        resolvedData,
+      );
       scratchPrefix = ".pa-codex-home-";
     }
     scratchDir = safeRealpath(fs.mkdtempSync(path.join(scratchBase, scratchPrefix)));
@@ -6247,8 +7642,9 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       ...(stagedCodexHome ? [stagedCodexHome.scratchDir] : []),
     ];
     const extraBindMounts = [
+      ...(stagedAws ? stagedAws.bindMounts : []),
       ...(stagedNpmrc ? [{ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" as const }] : []),
-      ...(stagedGitCfg ? [{ src: stagedGitCfg.file, dest: stagedGitCfg.homeMountDest, mode: "ro" as const }] : []),
+      ...(stagedGitCfg ? stagedGitCfg.bindMounts : []),
     ];
     const wrapped = wrapCredentialIsolatedCommand(
       cmd,
@@ -6372,7 +7768,7 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
     }
     if (stagedGitCfg) {
       doubaoExtraRo.push(stagedGitCfg.dir);
-      doubaoExtraBindMounts.push({ src: stagedGitCfg.file, dest: stagedGitCfg.homeMountDest, mode: "ro" });
+      doubaoExtraBindMounts.push(...stagedGitCfg.bindMounts);
     }
     const doubaoPaths = [
       ...selectDoubaoRuntimePaths(doubaoIsolationEnv),

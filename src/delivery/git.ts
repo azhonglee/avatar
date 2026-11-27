@@ -5,16 +5,20 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Config } from "../config.ts";
 import {
+  applySanitizedGitConfigEnv,
   buildWorkspaceIsolation,
   collectSafeGitConfigMounts,
+  collectSafeGitIgnoreAndAttrMounts,
   createScopedSecretDir,
   detectGitWorktreeDirs,
   prepareHarnessEnv,
   resolveTrustedSystemBin,
+  stageSanitizedGitConfig,
   willIsolateCommand,
   workspaceRequiresIsolation,
   wrapCredentialIsolatedCommand,
   type IsolationOptions,
+  type StagedSanitizedGitConfig,
 } from "../harness.ts";
 import { errMsg, killGroup, runProcess, type ProcResult } from "../util.ts";
 
@@ -57,16 +61,18 @@ export interface GitRunOpts {
   extraWritablePaths?: string[];
   extraReadOnlyPaths?: string[];
   extraSymlinks?: { dest: string; target: string }[];
+  extraBindMounts?: { src: string; dest: string; mode: "ro" | "rw" }[];
+  extraCmdPaths?: string[];
+  extraGitConfigArgs?: string[];
+  /** 仅限仓库级显式要求 SSH 提交签名且公钥/加密私钥依赖代理时，为单次 `git commit` 窄范围透传 SSH_AUTH_SOCK */
+  allowCommitSigningSshSock?: boolean;
   extraEnv?: Record<string, string>;
 }
 
-/** 仅对授权的远程 Git 传输子命令解析并校验单个 SSH 代理 Unix 套接字路径（绝不开放给普通 worker 或本地 git 命令） */
-export function resolveAuthorizedSshAuthSock(
-  args: string[],
+function resolveValidatedSshAuthSock(
   rawEnv: NodeJS.ProcessEnv = process.env,
   dataDir?: string,
 ): string | undefined {
-  if (!REMOTE_GIT_SUBCMDS.has(args[0] ?? "")) return undefined;
   const rawSock = rawEnv.SSH_AUTH_SOCK?.trim();
   if (!rawSock) return undefined;
   try {
@@ -81,6 +87,16 @@ export function resolveAuthorizedSshAuthSock(
   } catch {
     return undefined;
   }
+}
+
+/** 仅对授权的远程 Git 传输子命令解析并校验单个 SSH 代理 Unix 套接字路径（绝不开放给普通 worker 或本地 git 命令） */
+export function resolveAuthorizedSshAuthSock(
+  args: string[],
+  rawEnv: NodeJS.ProcessEnv = process.env,
+  dataDir?: string,
+): string | undefined {
+  if (!REMOTE_GIT_SUBCMDS.has(args[0] ?? "")) return undefined;
+  return resolveValidatedSshAuthSock(rawEnv, dataDir);
 }
 
 /**
@@ -631,6 +647,8 @@ function buildGitIsolation(
   authorizedSshSock?: string,
   sshMounts?: { readOnlyPaths: string[]; symlinks: { dest: string; target: string }[] },
   rawEnv: NodeJS.ProcessEnv = process.env,
+  sanitizeGitConfig = false,
+  extraBindMounts?: { src: string; dest: string; mode: "ro" | "rw" }[],
 ): IsolationOptions {
   const extraRw = [
     ...(opts?.extraWritablePaths ?? []),
@@ -642,6 +660,7 @@ function buildGitIsolation(
     ...(sshMounts?.readOnlyPaths ?? []),
   ];
   const extraSymlinks = [...(opts?.extraSymlinks ?? []), ...(sshMounts?.symlinks ?? [])];
+  const combinedBindMounts = [...(opts?.extraBindMounts ?? []), ...(extraBindMounts ?? [])];
   if (opts?.cfg) {
     const plan = buildWorkspaceIsolation(
       opts.cfg,
@@ -650,9 +669,12 @@ function buildGitIsolation(
         cwd,
         trustedRepoRoot: opts.trustedRepoRoot,
         disableGitWorktreeMounts: opts.disableGitWorktreeMounts,
+        sanitizeGitConfig,
+        ...(opts.extraCmdPaths?.length ? { extraCmdPaths: opts.extraCmdPaths } : {}),
         extraWritablePaths: extraRw,
         extraReadOnlyPaths: extraRo,
         extraSymlinks,
+        ...(combinedBindMounts.length ? { extraBindMounts: combinedBindMounts } : {}),
       },
       rawEnv,
     );
@@ -664,7 +686,11 @@ function buildGitIsolation(
       ? {}
       : detectGitWorktreeDirs(cwd, { trustedRepoRoot: opts?.trustedRepoRoot });
   const wtTargets = [wt.commonDir, wt.gitDir].filter((p): p is string => !!p);
-  const gitCfg = isoActive ? collectSafeGitConfigMounts(rawEnv, undefined, { cwd }) : { readOnlyPaths: [], symlinks: [] };
+  const gitCfg = isoActive
+    ? sanitizeGitConfig
+      ? collectSafeGitIgnoreAndAttrMounts(rawEnv)
+      : collectSafeGitConfigMounts(rawEnv, undefined, { cwd })
+    : { readOnlyPaths: [], symlinks: [] };
   const combinedRo = [...gitCfg.readOnlyPaths, ...extraRo];
   const combinedSymlinks = [...gitCfg.symlinks, ...extraSymlinks];
   return {
@@ -673,6 +699,7 @@ function buildGitIsolation(
     writablePaths: opts?.readOnly ? extraRw : [cwd, ...wtTargets, ...extraRw],
     readOnlyPaths: opts?.readOnly ? [cwd, ...wtTargets, ...combinedRo] : combinedRo,
     ...(combinedSymlinks.length ? { extraSymlinks: combinedSymlinks } : {}),
+    ...(combinedBindMounts.length ? { extraBindMounts: combinedBindMounts } : {}),
   };
 }
 
@@ -865,35 +892,12 @@ export function rewriteGitCredentialHelperChain(
   return gitConfigArgs;
 }
 
-/**
- * 解析 `git lfs` 实际生效的 LFS 服务端点 URL（按 `git-lfs` 优先级检查 `remote.<target>.lfsurl`、`lfs.pushurl`、`lfs.url`，
- * 同时覆盖 Git 配置（含 `--includes`）与仓库根目录 `.lfsconfig`），避免 SSH origin 搭配独立 HTTPS `lfs.url`/`lfs.pushurl` 时漏授 HTTPS 凭据。
- */
-async function resolveEffectiveLfsUrls(
+async function readLfsConfigKeys(
   cwd: string,
-  spec: { mode: "push" | "fetch"; target?: string },
-  baseUrls: Iterable<string>,
+  keys: string[],
   opts?: GitRunOpts,
 ): Promise<string[]> {
-  const keys: string[] = [];
-  const targetLooksLikeName =
-    !!spec.target &&
-    spec.target !== "." &&
-    spec.target !== ".." &&
-    !/^[a-z][a-z0-9+.-]*:\/\//i.test(spec.target) &&
-    !spec.target.startsWith("/") &&
-    !spec.target.startsWith("./") &&
-    !spec.target.startsWith("../") &&
-    !parseScpGitUrl(spec.target, cwd);
-  if (targetLooksLikeName) {
-    if (spec.mode === "push") keys.push(`remote.${spec.target}.lfspushurl`);
-    keys.push(`remote.${spec.target}.lfsurl`);
-  }
-  if (spec.mode === "push") {
-    keys.push("lfs.pushurl");
-  }
-  keys.push("lfs.url");
-
+  if (keys.length === 0) return [];
   const rawCandidates = new Set<string>();
   const readKey = async (extraCfgArgs: string[], key: string) => {
     const r = await tryGit(cwd, ["config", ...extraCfgArgs, "--get-all", key], { ...opts, readOnly: true });
@@ -903,7 +907,6 @@ async function resolveEffectiveLfsUrls(
       if (v) rawCandidates.add(v);
     }
   };
-
   for (const key of keys) {
     await readKey(["--includes"], key);
   }
@@ -918,6 +921,55 @@ async function resolveEffectiveLfsUrls(
   } catch {
     // no .lfsconfig
   }
+  return [...rawCandidates];
+}
+
+function looksLikeRemoteName(cwd: string, target: string | undefined): target is string {
+  return (
+    !!target &&
+    target !== "." &&
+    target !== ".." &&
+    !/^[a-z][a-z0-9+.-]*:\/\//i.test(target) &&
+    !target.startsWith("/") &&
+    !target.startsWith("./") &&
+    !target.startsWith("../") &&
+    !parseScpGitUrl(target, cwd)
+  );
+}
+
+/** 读取命名远端自身的显式 LFS 覆盖配置（`remote.<name>.lfspushurl` / `remote.<name>.lfsurl`，含 `--includes` 与 `.lfsconfig`）。 */
+async function resolveNamedRemoteLfsOverrides(
+  cwd: string,
+  remote: string,
+  mode: "push" | "fetch",
+  opts?: GitRunOpts,
+): Promise<string[]> {
+  if (!looksLikeRemoteName(cwd, remote)) return [];
+  const keys = mode === "push" ? [`remote.${remote}.lfspushurl`, `remote.${remote}.lfsurl`] : [`remote.${remote}.lfsurl`];
+  return readLfsConfigKeys(cwd, keys, opts);
+}
+
+/**
+ * 解析 `git lfs` 实际生效的 LFS 服务端点 URL（按 `git-lfs` 优先级检查 `remote.<target>.lfspushurl`/`lfsurl`、`lfs.pushurl`、`lfs.url`，
+ * 同时覆盖 Git 配置（含 `--includes`）与仓库根目录 `.lfsconfig`），避免 SSH origin 搭配独立 HTTPS `lfs.url`/`lfs.pushurl` 时漏授 HTTPS 凭据。
+ */
+async function resolveEffectiveLfsUrls(
+  cwd: string,
+  spec: { mode: "push" | "fetch"; target?: string },
+  baseUrls: Iterable<string>,
+  opts?: GitRunOpts,
+): Promise<string[]> {
+  const keys: string[] = [];
+  if (looksLikeRemoteName(cwd, spec.target)) {
+    if (spec.mode === "push") keys.push(`remote.${spec.target}.lfspushurl`);
+    keys.push(`remote.${spec.target}.lfsurl`);
+  }
+  if (spec.mode === "push") {
+    keys.push("lfs.pushurl");
+  }
+  keys.push("lfs.url");
+
+  const rawCandidates = await readLfsConfigKeys(cwd, keys, opts);
 
   const baseHttpUrl = [...baseUrls].find((u) => /^https?:\/\//i.test(u.trim()));
   const out = new Set<string>();
@@ -1272,6 +1324,10 @@ async function prepareScopedGitHttpCredentials(
 
 export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Promise<ProcResult> {
   const isRemote = REMOTE_GIT_SUBCMDS.has(args[0] ?? "");
+  // 仅纯只读配置/URL 探测需要读取宿主机完整全局 Git 配置（尊重 GIT_CONFIG_GLOBAL）；
+  // 所有其他本地操作（add/commit/checkout/worktree 等）与远程操作均使用脱敏后的全局配置，防止 clean/smudge 过滤器读取无关域的 http.extraHeader。
+  const isConfigLookup = args[0] === "config" || (args[0] === "remote" && args[1] === "get-url");
+  const shouldSanitizeGitCfg = !isConfigLookup;
   const effectiveRawEnv: NodeJS.ProcessEnv = opts?.extraEnv
     ? { ...process.env, ...opts.extraEnv }
     : process.env;
@@ -1279,9 +1335,14 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
   const sshUrls = resolvedUrls.filter((u) => classifyGitRemoteTransport(cwd, u) === "ssh");
   const httpUrls = resolvedUrls.filter((u) => classifyGitRemoteTransport(cwd, u) === "http");
   const usesSsh = sshUrls.length > 0;
-  const sshSock = usesSsh ? resolveAuthorizedSshAuthSock(args, effectiveRawEnv, opts?.cfg?.dataDir) : undefined;
+  const sshSock = usesSsh
+    ? resolveAuthorizedSshAuthSock(args, effectiveRawEnv, opts?.cfg?.dataDir)
+    : opts?.allowCommitSigningSshSock
+      ? resolveValidatedSshAuthSock(effectiveRawEnv, opts?.cfg?.dataDir)
+      : undefined;
   const baseEnv = prepareHarnessEnv(process.env, { preserveSshAgent: !!sshSock });
   let scopedHttpCreds: ScopedGitHttpCreds | undefined;
+  let stagedGitCfg: StagedSanitizedGitConfig | undefined;
   try {
     const sshTargets: SshRemoteTarget[] = [];
     const seenSshTarget = new Set<string>();
@@ -1296,8 +1357,22 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
     const sshMounts = usesSsh
       ? collectScopedSshMounts(sshTargets, effectiveRawEnv, opts?.cfg?.dataDir, sshSock ?? false)
       : undefined;
-    const baseIsoPlan = buildGitIsolation(cwd, opts, baseEnv.env.CREDENTIALS_DIRECTORY, sshSock, sshMounts, effectiveRawEnv);
+    const baseIsoPlan = buildGitIsolation(
+      cwd,
+      opts,
+      baseEnv.env.CREDENTIALS_DIRECTORY,
+      sshSock,
+      sshMounts,
+      effectiveRawEnv,
+      shouldSanitizeGitCfg,
+    );
     const willIsolate = willIsolateCommand(effectiveRawEnv, baseIsoPlan);
+    if (willIsolate && shouldSanitizeGitCfg) {
+      stagedGitCfg = stageSanitizedGitConfig(effectiveRawEnv, opts?.cfg?.dataDir, {
+        cwd,
+        ...(isRemote ? { allowedRemoteUrls: resolvedUrls } : {}),
+      });
+    }
     // 仅在启用文件系统隔离且目标为 HTTP(S) 传输时投影目标域凭据，非隔离运行保持宿主机 credential.helper 链原样
     if (willIsolate && httpUrls.length > 0) {
       scopedHttpCreds = await prepareScopedGitHttpCredentials(cwd, httpUrls, effectiveRawEnv, opts);
@@ -1310,17 +1385,42 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
       ...(sshSock ? { SSH_AUTH_SOCK: sshSock } : {}),
     };
     delete childEnv.GIT_EXTERNAL_DIFF;
-    const effectiveOpts: GitRunOpts | undefined = scopedHttpCreds
-      ? {
-          ...opts,
-          extraReadOnlyPaths: [...(opts?.extraReadOnlyPaths ?? []), scopedHttpCreds.credDir],
-        }
-      : opts;
+    if (shouldSanitizeGitCfg) {
+      applySanitizedGitConfigEnv(childEnv, stagedGitCfg, willIsolate);
+    }
+    const extraRo = [
+      ...(opts?.extraReadOnlyPaths ?? []),
+      ...(scopedHttpCreds ? [scopedHttpCreds.credDir] : []),
+      ...(stagedGitCfg ? [stagedGitCfg.dir] : []),
+    ];
+    const effectiveOpts: GitRunOpts | undefined =
+      scopedHttpCreds || stagedGitCfg
+        ? {
+            ...opts,
+            extraReadOnlyPaths: extraRo,
+          }
+        : opts;
     const wrapped = wrapCredentialIsolatedCommand(
       "git",
-      ["-C", cwd, ...GIT_SAFE_ARGS, ...(scopedHttpCreds?.gitConfigArgs ?? []), ...safeSubArgs],
+      [
+        "-C",
+        cwd,
+        ...GIT_SAFE_ARGS,
+        ...(opts?.extraGitConfigArgs ?? []),
+        ...(scopedHttpCreds?.gitConfigArgs ?? []),
+        ...safeSubArgs,
+      ],
       effectiveRawEnv,
-      buildGitIsolation(cwd, effectiveOpts, baseEnv.env.CREDENTIALS_DIRECTORY, sshSock, sshMounts, effectiveRawEnv),
+      buildGitIsolation(
+        cwd,
+        effectiveOpts,
+        baseEnv.env.CREDENTIALS_DIRECTORY,
+        sshSock,
+        sshMounts,
+        effectiveRawEnv,
+        shouldSanitizeGitCfg,
+        stagedGitCfg?.bindMounts,
+      ),
     );
     return await runProcess(wrapped.cmd, wrapped.args, {
       env: childEnv,
@@ -1329,6 +1429,7 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
       group: true,
     });
   } finally {
+    stagedGitCfg?.cleanup();
     scopedHttpCreds?.cleanup();
     baseEnv.cleanup();
   }
@@ -1414,12 +1515,127 @@ export async function removeStaleWorktreeAdminRecord(
   return { removed: removedAny, locked: lockedAny };
 }
 
-/** 有改动就提交（含新文件）；没有改动什么都不做。返回是否提交了。 */
+function isSshPrivateKeyEncrypted(filePath: string): boolean {
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    if (raw.includes("ENCRYPTED")) return true;
+    const m = raw.match(/-----BEGIN OPENSSH PRIVATE KEY-----([\s\S]+?)-----END OPENSSH PRIVATE KEY-----/);
+    if (!m) return false;
+    const buf = Buffer.from(m[1].replace(/\s+/g, ""), "base64");
+    const magic = Buffer.from("openssh-key-v1\0", "ascii");
+    if (buf.length < magic.length + 4 || !buf.subarray(0, magic.length).equals(magic)) return true;
+    const cipherLen = buf.readUInt32BE(magic.length);
+    if (cipherLen === 0 || magic.length + 4 + cipherLen > buf.length) return true;
+    const cipher = buf.subarray(magic.length + 4, magic.length + 4 + cipherLen).toString("ascii");
+    return cipher !== "none";
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * 有改动就提交（含新文件）；没有改动什么都不做。返回是否提交了。
+ *   - 仅当仓库本地 `.git/config` 显式要求 `commit.gpgSign=true` 时才保留提交签名策略（支持窄范围 SSH 签名密钥挂载）；
+ *   - 其余场景（例如宿主机全局 `~/.gitconfig` 设置了个人 `commit.gpgSign=true`）显式使用 `--no-gpg-sign` 执行无签名代理提交，
+ *     与 `personal-agent` 提交身份及 `--no-verify` 保持一致，避免沙箱隐藏宿主机签名代理导致自动提交失败。
+ */
 export async function commitAll(cwd: string, message: string, opts?: GitRunOpts): Promise<boolean> {
   await git(cwd, ["add", "-A"], opts);
   const dirty = (await tryGit(cwd, ["diff", "--cached", "--quiet"], { ...opts, readOnly: true })).code !== 0;
-  if (dirty) await git(cwd, ["commit", "-q", "--no-verify", "-m", message], opts);
-  return dirty;
+  if (!dirty) return false;
+
+  const roOpts: GitRunOpts = { ...opts, readOnly: true };
+  const localSignRes = await tryGit(cwd, ["config", "--local", "--bool", "--get", "commit.gpgSign"], roOpts);
+  const repoRequiresSigning = localSignRes.code === 0 && localSignRes.stdout.trim().toLowerCase() === "true";
+  if (!repoRequiresSigning) {
+    await git(cwd, ["commit", "-q", "--no-verify", "--no-gpg-sign", "-m", message], opts);
+    return true;
+  }
+
+  const fmtRes = await tryGit(cwd, ["config", "--includes", "--get", "gpg.format"], roOpts);
+  const gpgFormat = fmtRes.code === 0 ? fmtRes.stdout.trim().toLowerCase() : "";
+  const keyRes = await tryGit(cwd, ["config", "--includes", "--get", "user.signingkey"], roOpts);
+  const signingKey = keyRes.code === 0 ? keyRes.stdout.trim() : "";
+
+  if (gpgFormat === "ssh" && signingKey) {
+    const effectiveRawEnv: NodeJS.ProcessEnv = opts?.extraEnv ? { ...process.env, ...opts.extraEnv } : process.env;
+    const hostHome = effectiveRawEnv.HOME?.trim() || os.homedir();
+    const dataDir = opts?.cfg?.dataDir;
+    const realData = dataDir && fs.existsSync(dataDir) ? fs.realpathSync(dataDir) : "";
+    const isOutsideData = (p: string): boolean => {
+      if (!realData) return true;
+      try {
+        const real = fs.realpathSync(p);
+        const rel = path.relative(realData, real);
+        return rel !== "" && (rel.startsWith("..") || path.isAbsolute(rel));
+      } catch {
+        return false;
+      }
+    };
+    const signingRo: string[] = [];
+    const signingSymlinks: { dest: string; target: string }[] = [];
+    const addKeyFile = (logicalPath: string) => {
+      try {
+        const lst = fs.lstatSync(logicalPath);
+        const st = fs.statSync(logicalPath);
+        if (!st.isFile() || st.size > 256 * 1024) return;
+        const real = fs.realpathSync(logicalPath);
+        if (!isOutsideData(real)) return;
+        signingRo.push(real);
+        if (lst.isSymbolicLink()) {
+          const logicalDest = path.join(fs.realpathSync(path.dirname(logicalPath)), path.basename(logicalPath));
+          if (logicalDest !== real) signingSymlinks.push({ dest: logicalDest, target: real });
+        }
+      } catch {
+        // ignore missing/unreadable file
+      }
+    };
+
+    const extraCfgArgs = ["-c", "gpg.format=ssh", "-c", `user.signingkey=${signingKey}`];
+    const sshProgRes = await tryGit(cwd, ["config", "--includes", "--get", "gpg.ssh.program"], roOpts);
+    const sshProg = sshProgRes.code === 0 ? sshProgRes.stdout.trim() : "";
+    if (sshProg) extraCfgArgs.push("-c", `gpg.ssh.program=${sshProg}`);
+    const allowedSignersRes = await tryGit(cwd, ["config", "--includes", "--get", "gpg.ssh.allowedSignersFile"], roOpts);
+    const allowedSigners = allowedSignersRes.code === 0 ? allowedSignersRes.stdout.trim() : "";
+    if (allowedSigners) {
+      const resolvedAllowed = allowedSigners.startsWith("~/") && hostHome
+        ? path.join(hostHome, allowedSigners.slice(2))
+        : path.resolve(cwd, allowedSigners);
+      addKeyFile(resolvedAllowed);
+      extraCfgArgs.push("-c", `gpg.ssh.allowedSignersFile=${allowedSigners}`);
+    }
+
+    let needsAgent = false;
+    if (signingKey.startsWith("key::")) {
+      needsAgent = true;
+    } else {
+      const logicalKey = signingKey.startsWith("~/") && hostHome
+        ? path.join(hostHome, signingKey.slice(2))
+        : path.resolve(cwd, signingKey);
+      addKeyFile(logicalKey);
+      if (!logicalKey.endsWith(".pub")) addKeyFile(`${logicalKey}.pub`);
+      needsAgent = logicalKey.endsWith(".pub") || isSshPrivateKeyEncrypted(logicalKey);
+    }
+
+    await git(cwd, ["commit", "-q", "--no-verify", "-m", message], {
+      ...opts,
+      extraGitConfigArgs: [...(opts?.extraGitConfigArgs ?? []), ...extraCfgArgs],
+      extraReadOnlyPaths: [...(opts?.extraReadOnlyPaths ?? []), ...signingRo],
+      extraSymlinks: [...(opts?.extraSymlinks ?? []), ...signingSymlinks],
+      extraCmdPaths: [...(opts?.extraCmdPaths ?? []), sshProg || "ssh-keygen"],
+      allowCommitSigningSshSock: needsAgent,
+    });
+    return true;
+  }
+
+  try {
+    await git(cwd, ["commit", "-q", "--no-verify", "-m", message], opts);
+    return true;
+  } catch (err) {
+    throw new Error(
+      `仓库本地配置了 commit.gpgSign=true（gpg.format=${gpgFormat || "openpgp"}），隔离沙箱已屏蔽宿主机 GPG 代理；请改用 gpg.format=ssh 配置受限签名密钥，或在代理工作树仓库关闭本地 commit.gpgSign：${errMsg(err)}`,
+    );
+  }
 }
 
 /** 当前检出的分支名；游离 HEAD 返回 ""。 */
@@ -1545,8 +1761,9 @@ async function tryGitBuffer(
       "git",
       ["-C", cwd, ...GIT_SAFE_ARGS, ...args],
       process.env,
-      buildGitIsolation(cwd, { ...opts, readOnly: opts?.readOnly ?? true }, baseEnv.env.CREDENTIALS_DIRECTORY),
+      buildGitIsolation(cwd, { ...opts, readOnly: opts?.readOnly ?? true }, baseEnv.env.CREDENTIALS_DIRECTORY, undefined, undefined, process.env, true),
     );
+    if (wrapped.isolated) childEnv.GIT_CONFIG_GLOBAL = "/dev/null";
     return await new Promise((resolve) => {
       const child = spawn(wrapped.cmd, wrapped.args, {
         env: childEnv,
@@ -1805,8 +2022,9 @@ async function targetRevHasLfsAttr(cwd: string, targetRev: string, roOpts: GitRu
         "git",
         ["-C", cwd, ...GIT_SAFE_ARGS, "ls-tree", "-r", "--name-only", "-z", targetRev],
         process.env,
-        buildGitIsolation(cwd, roOpts, streamEnv.env.CREDENTIALS_DIRECTORY),
+        buildGitIsolation(cwd, roOpts, streamEnv.env.CREDENTIALS_DIRECTORY, undefined, undefined, process.env, true),
       );
+      if (lsWrapped.isolated) lsEnv.GIT_CONFIG_GLOBAL = "/dev/null";
       const caOpts: GitRunOpts = {
         ...roOpts,
         extraReadOnlyPaths: [...(roOpts.extraReadOnlyPaths ?? []), ...attrExtraRo],
@@ -1815,8 +2033,9 @@ async function targetRevHasLfsAttr(cwd: string, targetRev: string, roOpts: GitRu
         "git",
         ["-C", cwd, ...GIT_SAFE_ARGS, ...checkAttrArgs],
         process.env,
-        buildGitIsolation(cwd, caOpts, streamEnv.env.CREDENTIALS_DIRECTORY),
+        buildGitIsolation(cwd, caOpts, streamEnv.env.CREDENTIALS_DIRECTORY, undefined, undefined, process.env, true),
       );
+      if (caWrapped.isolated) caEnv.GIT_CONFIG_GLOBAL = "/dev/null";
 
       const lsChild = spawn(lsWrapped.cmd, lsWrapped.args, { env: lsEnv, stdio: ["ignore", "pipe", "pipe"], detached: true });
       const caChild = spawn(caWrapped.cmd, caWrapped.args, { env: caEnv, stdio: ["pipe", "pipe", "pipe"], detached: true });
@@ -2015,8 +2234,9 @@ async function scanOutgoingGitLfs(
       "git",
       ["-C", cwd, ...GIT_SAFE_ARGS, "rev-list", "--objects", "--stdin"],
       process.env,
-      buildGitIsolation(cwd, roOpts, revEnv.env.CREDENTIALS_DIRECTORY),
+      buildGitIsolation(cwd, roOpts, revEnv.env.CREDENTIALS_DIRECTORY, undefined, undefined, process.env, true),
     );
+    if (wrapped.isolated) childEnv.GIT_CONFIG_GLOBAL = "/dev/null";
     const child = spawn(wrapped.cmd, wrapped.args, {
       env: childEnv,
       stdio: ["pipe", "pipe", "pipe"],
@@ -2116,7 +2336,129 @@ export async function branchUsesGitLfs(
 const LFS_UPLOAD_OID_CHUNK = 200;
 
 /**
- * 推送 pa/ 分支。只对我们自己的 pa/ 分支使用 --force-with-lease（返工后历史可能被改写），其他分支普通推送。
+ * 在隔离 `git worktree add` 检出前，检查目标提交树是否引用了本地 `.git/lfs/objects` 中缺失的 Git LFS 对象；
+ * 若有缺失，则通过单独授权的远程 `git lfs fetch <remote> <sha>` 提前拉入本地 LFS 缓存，
+ * 使随后的本地 `git worktree add` 无需任何远端凭据即可完成 LFS smudge 检出。
+ */
+export async function ensureGitLfsObjectsForCheckout(
+  repoPath: string,
+  targetRev: string,
+  opts?: GitRunOpts,
+): Promise<{ fetched: boolean; missingCount: number; remote?: string }> {
+  const roOpts: GitRunOpts = { ...opts, readOnly: true };
+  const hasLfsAttr = await targetRevHasLfsAttr(repoPath, targetRev, roOpts);
+  if (!hasLfsAttr) return { fetched: false, missingCount: 0 };
+
+  const shaRes = await tryGit(repoPath, ["rev-parse", "--verify", `${targetRev}^{commit}`], roOpts);
+  if (shaRes.code !== 0 || !shaRes.stdout.trim()) return { fetched: false, missingCount: 0 };
+  const targetSha = shaRes.stdout.trim();
+
+  let commonGitDir = "";
+  const commonRes = await tryGit(repoPath, ["rev-parse", "--path-format=absolute", "--git-common-dir"], roOpts);
+  if (commonRes.code === 0 && commonRes.stdout.trim()) {
+    commonGitDir = commonRes.stdout.trim();
+  } else {
+    const fallback = await tryGit(repoPath, ["rev-parse", "--git-common-dir"], roOpts);
+    if (fallback.code === 0 && fallback.stdout.trim()) {
+      commonGitDir = path.resolve(repoPath, fallback.stdout.trim());
+    }
+  }
+  if (!commonGitDir) return { fetched: false, missingCount: 0 };
+
+  const lsTree = await tryGitBuffer(repoPath, ["ls-tree", "-r", "-l", "-z", targetSha], roOpts);
+  if (lsTree.code !== 0) {
+    throw new Error(`git ls-tree 检查检出目标 ${targetRev} LFS 对象失败：${lsTree.stderr.trim()}`);
+  }
+  const smallBlobShas: string[] = [];
+  const rawTree = lsTree.stdout.toString("utf8");
+  for (const rec of rawTree.split("\0")) {
+    if (!rec) continue;
+    const tab = rec.indexOf("\t");
+    if (tab <= 0) continue;
+    const header = rec.slice(0, tab).trim().split(/\s+/);
+    if (header.length < 4) continue;
+    const [, objType, objSha, sizeStr] = header;
+    const size = Number(sizeStr);
+    if (objType === "blob" && Number.isFinite(size) && size >= LFS_POINTER_MIN_BYTES && size <= LFS_POINTER_MAX_BYTES) {
+      smallBlobShas.push(objSha);
+    }
+  }
+  if (smallBlobShas.length === 0) return { fetched: false, missingCount: 0 };
+
+  const requiredOids = new Set<string>();
+  for (let i = 0; i < smallBlobShas.length; i += LFS_BATCH_CHUNK_SIZE) {
+    const chunk = smallBlobShas.slice(i, i + LFS_BATCH_CHUNK_SIZE);
+    const batchRes = await tryGitBuffer(repoPath, ["cat-file", "--batch"], {
+      ...roOpts,
+      input: chunk.join("\n") + "\n",
+    });
+    if (batchRes.code !== 0) {
+      throw new Error(`git cat-file --batch 读取检出目标 ${targetRev} LFS 指针失败：${batchRes.stderr.trim()}`);
+    }
+    collectBatchBufferLfsOids(batchRes.stdout, requiredOids, false);
+  }
+  if (requiredOids.size === 0) return { fetched: false, missingCount: 0 };
+
+  const missingOids: string[] = [];
+  for (const oid of requiredOids) {
+    const objPath = path.join(commonGitDir, "lfs", "objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+    if (!fs.existsSync(objPath)) missingOids.push(oid);
+  }
+  if (missingOids.length === 0) return { fetched: false, missingCount: 0 };
+
+  // 选择拉取远端：优先目标分支或当前分支配置的 upstream remote，其次 origin，再其次仓库首个 remote
+  let remote = "";
+  const tryBranchRemote = async (branchName: string): Promise<string> => {
+    if (!branchName || /^[0-9a-f]{40,64}$/i.test(branchName) || branchName === "HEAD") return "";
+    const shortName = branchName.startsWith("refs/heads/") ? branchName.slice("refs/heads/".length) : branchName;
+    const r = await tryGit(repoPath, ["config", "--get", `branch.${shortName}.remote`], roOpts);
+    const v = r.code === 0 ? r.stdout.trim() : "";
+    return v && v !== "." ? v : "";
+  };
+  remote = await tryBranchRemote(targetRev);
+  if (!remote) {
+    const cur = await currentBranch(repoPath, roOpts);
+    if (cur) remote = await tryBranchRemote(cur);
+  }
+  if (!remote) {
+    const remotesRes = await tryGit(repoPath, ["remote"], roOpts);
+    const remotes = remotesRes.code === 0
+      ? remotesRes.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+      : [];
+    if (remotes.includes("origin")) remote = "origin";
+    else if (remotes.length > 0) remote = remotes[0];
+  }
+  if (!remote) return { fetched: false, missingCount: missingOids.length };
+
+  const remoteUrlRes = await tryGit(repoPath, ["remote", "get-url", "--all", remote], roOpts);
+  const fetchUrls = remoteUrlRes.code === 0
+    ? [...new Set(remoteUrlRes.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean))]
+    : [];
+  const effectiveLfsUrls = await resolveEffectiveLfsUrls(repoPath, { mode: "fetch", target: remote }, fetchUrls, roOpts);
+  const localRoDirs: string[] = [];
+  const localSyms: { dest: string; target: string }[] = [];
+  for (const u of [...fetchUrls, ...effectiveLfsUrls]) {
+    const m = resolveLocalGitRemoteMount(repoPath, u);
+    if (!m) continue;
+    localRoDirs.push(m.realDir);
+    localSyms.push(...m.symlinks);
+  }
+
+  const fetchRes = await tryGit(repoPath, ["lfs", "fetch", remote, targetSha], {
+    ...opts,
+    extraReadOnlyPaths: [...new Set([...(opts?.extraReadOnlyPaths ?? []), ...localRoDirs])],
+    ...(localSyms.length ? { extraSymlinks: [...(opts?.extraSymlinks ?? []), ...localSyms] } : {}),
+  });
+  if (fetchRes.code !== 0) {
+    const out = `${fetchRes.stdout}\n${fetchRes.stderr}`.trim();
+    throw new Error(
+      `检出隔离工作树前预拉取 ${missingOids.length} 个缺失 Git LFS 对象失败（remote=${remote}, rev=${targetRev}）：${out.slice(-600)}`,
+    );
+  }
+  return { fetched: true, missingCount: missingOids.length, remote };
+}
+
+/**
  * 保持禁用仓库自定义 hooks（core.hooksPath=/dev/null）；
  * 针对每个实际生效的推送目标（`git remote get-url --push --all` 解析出的 pushurl / pushInsteadOf）：
  *   - 锁定同一不可变提交 `localSha` 执行 LFS 历史扫描、按实际缺失 OID 显式上传（`git lfs push --object-id`，
@@ -2153,6 +2495,10 @@ export async function pushBranch(
 
   // 仅在至少存在一个需要更新的目标远端时按需执行一次 .gitattributes 流式扫描（避免已发布相同提交触发无谓扫描与 git-lfs 预检）
   let precomputedHasLfsAttr: boolean | undefined;
+  let namedRemoteLfsOverrides: string[] | undefined;
+  let extraLfsLocalDirs: string[] = [];
+  let extraLfsLocalSyms: { dest: string; target: string }[] = [];
+  const uploadedNamedRemoteLfsOids = new Set<string>();
 
   for (const pushUrl of effectivePushUrls) {
     const localMount = localMountByUrl.get(pushUrl);
@@ -2207,14 +2553,31 @@ export async function pushBranch(
     }
 
     if (scan.hasLfsAttr || scan.oids.length > 0) {
-      const lfsWritePaths = [...(opts?.extraWritablePaths ?? []), ...(localDir ? [localDir] : [])];
-      const lfsSyms = localSyms.length ? [...(opts?.extraSymlinks ?? []), ...localSyms] : opts?.extraSymlinks;
+      if (namedRemoteLfsOverrides === undefined) {
+        const roOpts = { ...opts, readOnly: true };
+        namedRemoteLfsOverrides = await resolveNamedRemoteLfsOverrides(cwd, remote, "push", roOpts);
+        const configuredLfsUrls = await resolveEffectiveLfsUrls(cwd, { mode: "push", target: remote }, effectivePushUrls, roOpts);
+        const dirs = new Set<string>();
+        const syms: { dest: string; target: string }[] = [];
+        for (const u of configuredLfsUrls) {
+          const m = resolveLocalGitRemoteMount(cwd, u);
+          if (!m) continue;
+          dirs.add(m.realDir);
+          syms.push(...m.symlinks);
+        }
+        extraLfsLocalDirs = [...dirs];
+        extraLfsLocalSyms = syms;
+      }
+      const lfsWritePaths = [
+        ...new Set([...(opts?.extraWritablePaths ?? []), ...(localDir ? [localDir] : []), ...extraLfsLocalDirs]),
+      ];
+      const lfsSyms = [...(opts?.extraSymlinks ?? []), ...localSyms, ...extraLfsLocalSyms];
       // 1) 始终先运行受信任、感知路径的 `git lfs pre-push`，保留客户端 LFS 文件锁校验（lfs.locksverify）
       const prePush = await tryGit(cwd, ["lfs", "pre-push", remote, pushUrl], {
         ...opts,
         input: `${localRef} ${localSha} ${localRef} ${remoteSha}\n`,
         extraWritablePaths: lfsWritePaths,
-        ...(lfsSyms?.length ? { extraSymlinks: lfsSyms } : {}),
+        ...(lfsSyms.length ? { extraSymlinks: lfsSyms } : {}),
       });
       if (prePush.code !== 0) {
         const lfsOut = `${prePush.stdout}\n${prePush.stderr}`.trim();
@@ -2227,16 +2590,21 @@ export async function pushBranch(
         };
       }
 
-      // 2) 当待推送提交含 LFS 指针时，继续按精确缺失 OID 显式上传（解决 split-pushurl 下 pre-push 误按 fetch 缓存跳过对象的问题）
+      // 2) 当待推送提交含 LFS 指针时，继续按精确缺失 OID 显式上传（解决 split-pushurl 下 pre-push 误按 fetch 缓存跳过对象的问题）。
+      // 若命名远端配置了显式 `remote.<remote>.lfspushurl`/`lfsurl`（或仅有单一 pushUrl），必须保留命名远端作为上传目标，
+      // 避免切换为裸 Git URL 后丢失命名远端的独立 LFS 端点覆盖与对应凭据授权。
       if (scan.oids.length > 0) {
-        const lfsTarget =
-          effectivePushUrls.length === 1 ? remote : localDir ? pathToFileURL(localDir).href : pushUrl;
-        for (let i = 0; i < scan.oids.length; i += LFS_UPLOAD_OID_CHUNK) {
-          const oidChunk = scan.oids.slice(i, i + LFS_UPLOAD_OID_CHUNK);
+        const useNamedRemoteLfs = effectivePushUrls.length === 1 || namedRemoteLfsOverrides.length > 0;
+        const lfsTarget = useNamedRemoteLfs ? remote : localDir ? pathToFileURL(localDir).href : pushUrl;
+        const oidsToUpload = useNamedRemoteLfs
+          ? scan.oids.filter((oid) => !uploadedNamedRemoteLfsOids.has(oid))
+          : scan.oids;
+        for (let i = 0; i < oidsToUpload.length; i += LFS_UPLOAD_OID_CHUNK) {
+          const oidChunk = oidsToUpload.slice(i, i + LFS_UPLOAD_OID_CHUNK);
           const lfs = await tryGit(cwd, ["lfs", "push", "--object-id", lfsTarget, ...oidChunk], {
             ...opts,
             extraWritablePaths: lfsWritePaths,
-            ...(lfsSyms?.length ? { extraSymlinks: lfsSyms } : {}),
+            ...(lfsSyms.length ? { extraSymlinks: lfsSyms } : {}),
           });
           if (lfs.code !== 0) {
             const lfsOut = `${lfs.stdout}\n${lfs.stderr}`.trim();
@@ -2244,8 +2612,11 @@ export async function pushBranch(
             return {
               ok: false,
               rejected: missingLfs,
-              message: `检测到分支 ${branch}（含待推送提交历史）涉及 Git LFS 对象，但上传 LFS 对象到 ${pushUrl} 失败（已禁用仓库 hooks 以保障安全；请确认本机已安装 git-lfs 并具备远端推送权限）：${lfsOut.slice(-600)}`,
+              message: `检测到分支 ${branch}（含待推送提交历史）涉及 Git LFS 对象，但上传 LFS 对象到 ${useNamedRemoteLfs ? remote : pushUrl} 失败（已禁用仓库 hooks 以保障安全；请确认本机已安装 git-lfs 并具备远端推送权限）：${lfsOut.slice(-600)}`,
             };
+          }
+          if (useNamedRemoteLfs) {
+            for (const oid of oidChunk) uploadedNamedRemoteLfsOids.add(oid);
           }
         }
       }

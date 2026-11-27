@@ -4,7 +4,7 @@ import { z } from "zod";
 import { isContextDerivedDispatchBlocked } from "../api/queries.ts";
 import type { Board, BoardTask } from "../board.ts";
 import { repoSpec, type Config } from "../config.ts";
-import { removeStaleWorktreeAdminRecord, tryGit } from "../delivery/git.ts";
+import { ensureGitLfsObjectsForCheckout, removeStaleWorktreeAdminRecord, tryGit } from "../delivery/git.ts";
 import { comment, move } from "../effects.ts";
 import { checkpoint, type Ctx, type Handler } from "../engine.ts";
 import {
@@ -540,7 +540,7 @@ export class Dispatcher {
           ],
           extraBindMounts: [
             ...(stagedNpmrc ? [{ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" as const }] : []),
-            ...(stagedGitCfg ? [{ src: stagedGitCfg.file, dest: stagedGitCfg.homeMountDest, mode: "ro" as const }] : []),
+            ...(stagedGitCfg ? stagedGitCfg.bindMounts : []),
           ],
         }),
       );
@@ -688,6 +688,11 @@ export class Dispatcher {
         }
         const head = await git(spec.path, ["rev-parse", "HEAD"], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path });
         const hasBranch = (await tryGit(spec.path, ["rev-parse", "--verify", "--quiet", branch], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path })).code === 0;
+        const checkoutTarget = hasBranch ? branch : head.trim();
+        await ensureGitLfsObjectsForCheckout(spec.path, checkoutTarget, {
+          cfg: this.cfg,
+          trustedRepoRoot: spec.path,
+        });
         await git(
           spec.path,
           hasBranch ? ["worktree", "add", cwd, branch] : ["worktree", "add", "-b", branch, cwd],

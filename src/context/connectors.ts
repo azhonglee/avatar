@@ -595,6 +595,17 @@ export class Connectors {
     return "allowed";
   }
 
+  private explicitMentionsMe(m: Raw, me: string): boolean | undefined {
+    const mentions = m.mentions;
+    if (!Array.isArray(mentions)) return undefined;
+    return mentions.some((x: unknown) => {
+      if (typeof x === "string") return x === me;
+      if (!x || typeof x !== "object") return false;
+      const r = x as Record<string, unknown>;
+      return r.id === me || r.open_id === me || r.user_id === me;
+    });
+  }
+
   private toObs(m: Raw, kind: string, me: string, atMeWindowStartMs?: number, pollObservedAt?: number): Obs | undefined {
     const sender = m.sender ?? {};
     const senderType = String(sender.sender_type ?? sender.type ?? m.sender_type ?? "");
@@ -609,15 +620,17 @@ export class Connectors {
     const editCounter = parseEditCounter(m);
     const editTimeMs = parseEditTimeMs(m, this.cfg.owner.timezone);
     // 独立记录 @我 判定状态：
-    //   - 命中 --is-at-me 时记 at_me: true（确保白名单机器人 kind="bot" 也被识别为真实 @我）；
-    //   - 落在本次 --is-at-me 查询窗口内但未命中时，明确记 at_me: false（用于覆盖已被编辑移除的旧 @我 标记）；
-    //   - 早于 --is-at-me 查询窗口的历史消息未参与本次 @我 检索，省略 at_me 以保留原值不误清。
+    //   - 当抓回正文明确带有 mentions 列表时，无论消息是否早于 --is-at-me 搜索窗口或搜索是否截断，直接以显式 mentions 列表的布尔结果为准（显式移除 @我 必须立即清零旧 at_me: true）；
+    //   - 仅在正文不含 mentions 字段时，才按流标签与 --is-at-me 窗口覆盖决定：命中 at_me 记 true，窗口内未命中记 false，窗口外省略以保留原值。
+    const explicitAtMe = this.explicitMentionsMe(m, me);
     const atMeMeta: Record<string, unknown> =
-      kind === "at_me"
-        ? { at_me: true }
-        : atMeWindowStartMs !== undefined && msgTime >= atMeWindowStartMs
-          ? { at_me: false }
-          : {};
+      explicitAtMe !== undefined
+        ? { at_me: explicitAtMe }
+        : kind === "at_me"
+          ? { at_me: true }
+          : atMeWindowStartMs !== undefined && msgTime >= atMeWindowStartMs
+            ? { at_me: false }
+            : {};
     return {
       id: `im:${m.message_id ?? m.id}`,
       source: "im",
@@ -900,15 +913,7 @@ export class Connectors {
     // 严格区分整数修订计数（edit_version）与归一化毫秒时间戳（update_time / edit_time），仅在同一时钟标尺下比较新旧；
     // 若同一消息在多路拉取中内容或 @mention 状态不同、且两行没有可比时钟（例如一行仅含 update_time、另一行仅含 edit_version），
     // 标记 needsVerify 并通过 `im +messages-mget` 权威回读最新版本，绝不拿时间戳原值压过修订计数。
-    const rowMentionsMe = (m: Raw): boolean | undefined => {
-      if (!Array.isArray(m.mentions)) return undefined;
-      return m.mentions.some((x) => {
-        if (typeof x === "string") return x === me;
-        if (!x || typeof x !== "object") return false;
-        const r = x as Record<string, unknown>;
-        return r.id === me || r.open_id === me || r.user_id === me;
-      });
-    };
+    const rowMentionsMe = (m: Raw): boolean | undefined => this.explicitMentionsMe(m, me);
     // 当抓回的消息正文明确带有 mentions 列表时，以正文的真实 mentions 列表为准，
     // 防止 `--is-at-me` 先按旧索引命中 ID、随后抓正文期间对方已编辑移除 @我 时，旧搜索流标签绕过白名单/群范围约束。
     const rowEffectiveAtMe = (m: Raw, k: string): boolean => {

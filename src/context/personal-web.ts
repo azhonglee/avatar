@@ -20,6 +20,7 @@ import {
   GatewayError,
   isGroupChat,
   isUsableWebMessage,
+  MessageNotFoundError,
   SessionNeedsLoginError,
   UnusableOriginalMessageError,
   USER_SENDER_TYPE,
@@ -1679,7 +1680,16 @@ export class PersonalWebBridge {
       // 必须权威回读确认并撤回旧正文，防止已撤回/清空的原文继续进入后续理解窗口或触发起草
       if (!existing || existing.meta.withdrawn === true) return;
       if (activeClient) {
-        effectiveMsg = await activeClient.readMessage(msg.id, signal);
+        try {
+          effectiveMsg = await activeClient.readMessage(msg.id, signal);
+        } catch (err) {
+          if (err instanceof MessageNotFoundError) {
+            assertSessionActiveForStoreMutation();
+            this.store.retirePendingObs(`pw:${msg.id}`);
+            return;
+          }
+          throw err;
+        }
         authoritativeRead = true;
         assertSessionActiveForStoreMutation();
         if (!hasUsableBody(effectiveMsg)) {
@@ -1723,7 +1733,18 @@ export class PersonalWebBridge {
       if (revDiffers || existingWithdrawn || incomingOutOfScope) {
         if (activeClient) {
           if (!authoritativeRead) {
-            effectiveMsg = await activeClient.readMessage(effectiveMsg.id, signal);
+            try {
+              effectiveMsg = await activeClient.readMessage(effectiveMsg.id, signal);
+            } catch (err) {
+              if (err instanceof MessageNotFoundError) {
+                assertSessionActiveForStoreMutation();
+                if (!existingWithdrawn) {
+                  this.store.retirePendingObs(`pw:${msg.id}`);
+                }
+                return;
+              }
+              throw err;
+            }
             authoritativeRead = true;
           }
           assertSessionActiveForStoreMutation();

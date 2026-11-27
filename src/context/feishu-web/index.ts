@@ -20,6 +20,7 @@ export {
 export {
   FeishuWebClient,
   isUsableWebMessage,
+  MessageNotFoundError,
   SessionNeedsLoginError,
   UnusableOriginalMessageError,
   type FeishuWebClientOptions,

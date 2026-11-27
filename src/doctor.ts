@@ -450,6 +450,12 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
         "检查常驻进程日志确认数据库写入与排除规则解析是否正常",
       );
     }
+    if ((state === "reconnecting" || state === "reverifying") && lastError) {
+      return warn(
+        `${login.owner_name || login.owner_id}（实时长连接重连/复验中，原因：${lastError}；期间由飞书轮询兜底）`,
+        `检查网络连通性与常驻进程日志，如持续失败可运行 ${code("bin/pa context web-login")} 重新扫码登录`,
+      );
+    }
     return ok(`${login.owner_name || login.owner_id}（已登录，当前状态：${state}）`);
   });
 

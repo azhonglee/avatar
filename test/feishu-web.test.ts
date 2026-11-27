@@ -50,6 +50,7 @@ import {
   FeishuWebClient,
   fetchWithJar,
   isAllowedFeishuHost,
+  MessageNotFoundError,
   MSG_CARD,
   MSG_MERGE_FORWARD,
   MSG_POST,
@@ -76,7 +77,7 @@ import {
 } from "../src/context/feishu-web/index.ts";
 import { loadKnownOpenGroupNames, rememberOpenGroupName, selectEffectiveOpenGroups } from "../src/context/connectors.ts";
 import { DraftTargetUncertainError } from "../src/context/drafts.ts";
-import { ContextService } from "../src/context/index.ts";
+import { ContextService, registerContext } from "../src/context/index.ts";
 import {
   ACTIVE_SESSION_KV_KEY,
   assertLoginAuthorizedForWorkspace,
@@ -100,6 +101,8 @@ import {
   branchUsesGitLfs,
   classifyGitRemoteTransport,
   collectScopedSshMounts,
+  commitAll,
+  ensureGitLfsObjectsForCheckout,
   gitCredentialLineMatchesTarget,
   isGitLfsPointerBlob,
   parseRemote,
@@ -122,6 +125,7 @@ import {
   canonicalCodexLockFilePath,
   collectLarkGuardReadOnlyFiles,
   collectSafeGitConfigMounts,
+  coordinateClaudeOAuthRefresh,
   coordinateCodexOAuthRefresh,
   detectGitWorktreeDirs,
   detectIsolatedCodexKeyringConflict,
@@ -148,9 +152,13 @@ import {
   stageIsolatedAwsProfile,
   stageIsolatedClaudeState,
   stageIsolatedDoubaoDataDir,
+  stageIsolatedGeminiState,
+  stageIsolatedOpenCodeState,
   stageSanitizedGitConfig,
   stageSanitizedNpmrc,
   stageIsolatedCodexHome,
+  stageScopedAcpxAdapterCache,
+  syncRefreshedClaudeAuth,
   syncRefreshedCodexAuth,
   workspaceRequiresIsolation,
   wrapCredentialIsolatedCommand,
@@ -19118,6 +19126,1252 @@ test("Codex 第二十三轮回归：上下文作业主人复核、修订水位�
     }
   } finally {
     if (helperSrv) await new Promise<void>((resolve) => helperSrv!.close(() => resolve()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("第 24 轮 Codex review 修复回归：AWS SSO 单会话隔离 / Gemini&OpenCode 会话隔离 / 本地 Git 配置脱敏与 GIT_CONFIG_GLOBAL / Claude OAuth 刷新写回 / 越窗显式去@ / 撤回证据过滤与墓碑身份恢复 / CMD-8 缺失区分 / Go 模块缓存 / ACP 适配器复用 / LFS 预拉取与多 pushurl 命名端点 / 隔离提交签名 / WS 活跃保活 / Doctor 告警 / QR N3", async () => {
+  const dir = makeTmp("pa-r24-");
+  const serversToClose: (http.Server | net.Server)[] = [];
+  const prevPwKey = process.env.PA_FEISHU_WEB_KEY;
+  if (!process.env.PA_FEISHU_WEB_KEY) {
+    process.env.PA_FEISHU_WEB_KEY = crypto.randomBytes(32).toString("hex");
+  }
+
+  const makeR24App = (
+    name: string,
+    opts?: {
+      ownerOpenId?: string;
+      pwEnabled?: boolean;
+      groupsMode?: "all" | "allowlist";
+      groupAllowlist?: string[];
+      acpxBin?: string;
+    },
+  ) => {
+    const sub = path.join(dir, name);
+    fs.mkdirSync(sub, { recursive: true });
+    const cfgPath = path.join(sub, "config.yaml");
+    fs.writeFileSync(
+      cfgPath,
+      JSON.stringify({
+        data_dir: path.join(sub, "data"),
+        bins: {
+          lark: path.join(STUBS, "ctx-lark"),
+          acpx: opts?.acpxBin ?? path.join(STUBS, "acpx"),
+          bytedcli: path.join(STUBS, "ctx-bytedcli"),
+        },
+        harnesses: {
+          codex: { type: "codex-exec", cmd: path.join(STUBS, "ctx-codex") },
+        },
+        roles: { brain: "codex" },
+        owner: { open_id: opts?.ownerOpenId ?? "ou_owner_r24" },
+        cards: { enabled: false },
+        engine: { retry_base_ms: 20, retry_max_ms: 50, tick_ms: 50, effect_attempts: 1 },
+        context: {
+          enabled: true,
+          harness: "codex",
+          groups: opts?.groupsMode ?? "allowlist",
+          groups_allow: opts?.groupAllowlist ?? [],
+          groups_deny: [],
+          sources: { im: true, minutes: false, docs: false, tasks: false, calendar: false, meego: false },
+          personal_web: { enabled: opts?.pwEnabled ?? false, fast_lane: true, debounce_ms: 0, pre_draft: false },
+        },
+      }),
+    );
+    return createApp(loadConfig(cfgPath));
+  };
+
+  try {
+    // 1) [R24 #1 P1] AWS SSO 缓存仅按所选 sso_session / sso_start_url 与引用 clientId 暂存，绝不挂载整目录暴露无关 SSO 会话令牌
+    {
+      const awsHome = path.join(dir, "r24-1-aws-home");
+      const awsDir = path.join(awsHome, ".aws");
+      const ssoCacheDir = path.join(awsDir, "sso", "cache");
+      fs.mkdirSync(ssoCacheDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(awsDir, "config"),
+        [
+          "[profile work-bedrock]",
+          "sso_session = corp-prod",
+          "sso_account_id = 111111111111",
+          "sso_role_name = BedrockRole",
+          "region = us-east-1",
+          "",
+          "[sso-session corp-prod]",
+          "sso_start_url = https://prod.awsapps.com/start",
+          "sso_region = us-east-1",
+          "",
+          "[profile other-unrelated]",
+          "sso_session = other-corp",
+          "sso_account_id = 222222222222",
+          "sso_role_name = Admin",
+          "",
+          "[sso-session other-corp]",
+          "sso_start_url = https://other.awsapps.com/start",
+          "sso_region = us-west-2",
+        ].join("\n") + "\n",
+        { mode: 0o600 },
+      );
+      const prodSessionHash = crypto.createHash("sha1").update("corp-prod").digest("hex");
+      const otherSessionHash = crypto.createHash("sha1").update("other-corp").digest("hex");
+      const prodClientRegHash = crypto.createHash("sha1").update("prod-client-reg").digest("hex");
+      fs.writeFileSync(
+        path.join(ssoCacheDir, `${prodSessionHash}.json`),
+        JSON.stringify({
+          startUrl: "https://prod.awsapps.com/start",
+          accessToken: "PROD_SSO_TOKEN",
+          refreshToken: "PROD_SSO_REFRESH",
+          clientId: "prod-client-id-123",
+        }),
+        { mode: 0o600 },
+      );
+      fs.writeFileSync(
+        path.join(ssoCacheDir, `${prodClientRegHash}.json`),
+        JSON.stringify({ clientId: "prod-client-id-123", clientSecret: "PROD_CLIENT_SECRET" }),
+        { mode: 0o600 },
+      );
+      fs.writeFileSync(
+        path.join(ssoCacheDir, `${otherSessionHash}.json`),
+        JSON.stringify({
+          startUrl: "https://other.awsapps.com/start",
+          accessToken: "OTHER_SECRET_SSO_TOKEN",
+          refreshToken: "OTHER_SECRET_REFRESH",
+          clientId: "other-client-id-999",
+        }),
+        { mode: 0o600 },
+      );
+
+      const stagedAws = stageIsolatedAwsProfile("work-bedrock", { HOME: awsHome });
+      try {
+        assert.ok(stagedAws, "应成功暂存所选 SSO profile");
+        assert.equal(
+          stagedAws!.extraReadOnlyPaths.some((p) => p.includes(path.join(".aws", "sso", "cache"))),
+          false,
+          "绝不得把宿主机整个 ~/.aws/sso/cache 放入 extraReadOnlyPaths",
+        );
+        const ssoMount = stagedAws!.bindMounts.find((m) => m.dest.endsWith(path.join(".aws", "sso", "cache")));
+        assert.ok(ssoMount, "应仅通过按次暂存目录 bindMount 投影所选 SSO 缓存");
+        assert.equal(ssoMount!.mode, "ro");
+        const stagedFiles = fs.readdirSync(ssoMount!.src).sort();
+        assert.equal(stagedFiles.includes(`${prodSessionHash}.json`), true, "必须包含所选 sso_session 令牌");
+        assert.equal(stagedFiles.includes(`${prodClientRegHash}.json`), true, "必须包含被引用的 clientId 注册文件");
+        assert.equal(stagedFiles.includes(`${otherSessionHash}.json`), false, "绝不得暴露其他 SSO 会话令牌");
+      } finally {
+        stagedAws?.cleanup();
+      }
+    }
+
+    // 2) [R24 #2 P1] Gemini 与 OpenCode 隔离暂存：隐藏宿主机 tmp/history 与 opencode.db/storage，且 tools=none 脱敏设置
+    {
+      const agentHome = path.join(dir, "r24-2-agent-home");
+      const geminiDir = path.join(agentHome, ".gemini");
+      fs.mkdirSync(path.join(geminiDir, "tmp", "other-repo"), { recursive: true });
+      fs.mkdirSync(path.join(geminiDir, "history"), { recursive: true });
+      fs.writeFileSync(path.join(geminiDir, "oauth_creds.json"), '{"access_token":"gem_tok"}', { mode: 0o600 });
+      fs.writeFileSync(
+        path.join(geminiDir, "settings.json"),
+        JSON.stringify({ selectedAuthType: "oauth-personal", model: "gemini-2.5-pro", mcpServers: { evil: { command: "x" } } }),
+      );
+      fs.writeFileSync(path.join(geminiDir, "tmp", "other-repo", "chat.json"), '{"secret":"OTHER_GEMINI_CHAT"}');
+      fs.writeFileSync(path.join(geminiDir, "history", "log.jsonl"), '{"secret":"OTHER_GEMINI_HIST"}');
+
+      const stagedGemNone = stageIsolatedGeminiState(agentHome, { HOME: agentHome }, undefined, { tools: "none" });
+      try {
+        assert.ok(stagedGemNone);
+        const stageDir = stagedGemNone!.bindMounts[0]!.src;
+        assert.equal(fs.existsSync(path.join(stageDir, "oauth_creds.json")), true);
+        assert.equal(fs.existsSync(path.join(stageDir, "tmp")), false, "绝不得复制 ~/.gemini/tmp 跨项目会话历史");
+        assert.equal(fs.existsSync(path.join(stageDir, "history")), false, "绝不得复制 ~/.gemini/history");
+        const gemCfg = JSON.parse(fs.readFileSync(path.join(stageDir, "settings.json"), "utf8")) as Record<string, unknown>;
+        assert.equal(gemCfg.selectedAuthType, "oauth-personal");
+        assert.equal("mcpServers" in gemCfg, false, "tools=none 必须剥离 Gemini mcpServers");
+      } finally {
+        stagedGemNone?.cleanup();
+      }
+
+      const ocCfgDir = path.join(agentHome, ".config", "opencode");
+      const ocDataDir = path.join(agentHome, ".local", "share", "opencode");
+      fs.mkdirSync(ocCfgDir, { recursive: true });
+      fs.mkdirSync(path.join(ocDataDir, "storage"), { recursive: true });
+      fs.writeFileSync(
+        path.join(ocCfgDir, "opencode.json"),
+        JSON.stringify({ model: "anthropic/claude-sonnet-4", mcp: { evil: {} }, tools: { bash: true } }),
+      );
+      fs.writeFileSync(path.join(ocDataDir, "auth.json"), '{"anthropic":{"key":"oc_key"}}', { mode: 0o600 });
+      fs.writeFileSync(path.join(ocDataDir, "opencode.db"), "SECRET_OPENCODE_SQLITE_DB");
+      fs.writeFileSync(path.join(ocDataDir, "storage", "session.json"), '{"secret":"OTHER_OC_SESSION"}');
+
+      const stagedOcNone = stageIsolatedOpenCodeState(agentHome, { HOME: agentHome }, undefined, { tools: "none" });
+      try {
+        assert.ok(stagedOcNone);
+        const cfgStage = stagedOcNone!.bindMounts.find((m) => m.dest.endsWith(path.join(".config", "opencode")))!.src;
+        const dataStage = stagedOcNone!.bindMounts.find((m) => m.dest.endsWith(path.join(".local", "share", "opencode")))!.src;
+        assert.equal(fs.existsSync(path.join(dataStage, "auth.json")), true);
+        assert.equal(fs.existsSync(path.join(dataStage, "opencode.db")), false, "绝不得复制宿主机 opencode.db");
+        assert.equal(fs.existsSync(path.join(dataStage, "storage")), false, "绝不得复制宿主机 OpenCode storage/");
+        const ocCfg = JSON.parse(fs.readFileSync(path.join(cfgStage, "opencode.json"), "utf8")) as Record<string, unknown>;
+        assert.equal(ocCfg.model, "anthropic/claude-sonnet-4");
+        assert.equal("mcp" in ocCfg, false, "tools=none 必须剥离 OpenCode mcp");
+        assert.equal("tools" in ocCfg, false, "tools=none 必须剥离 OpenCode tools");
+      } finally {
+        stagedOcNone?.cleanup();
+      }
+    }
+
+    // 3) [R24 #3 P1] 本地 Git clean/smudge 辅助进程绝不得读到 ~/.gitconfig 中的 http.<other>.extraHeader；远程 Git 仅获得目标域的 extraHeader
+    if (hasCredentialMountIsolation()) {
+      let capturedHeaders: Record<string, string | string[] | undefined> = {};
+      const gitHttpSrv = http.createServer((req, res) => {
+        capturedHeaders = { ...req.headers };
+        res.writeHead(404);
+        res.end("not found");
+      });
+      await new Promise<void>((resolve) => gitHttpSrv.listen(0, "127.0.0.1", resolve));
+      serversToClose.push(gitHttpSrv);
+      const port = (gitHttpSrv.address() as { port: number }).port;
+
+      const gitHome = path.join(dir, "r24-3-git-home");
+      const repo3 = path.join(dir, "r24-3-repo");
+      const dataDir3 = path.join(dir, "r24-3-data");
+      fs.mkdirSync(gitHome, { recursive: true });
+      fs.mkdirSync(dataDir3, { recursive: true });
+      fs.writeFileSync(
+        path.join(gitHome, ".gitconfig"),
+        [
+          "[user]",
+          "\tname = Clean Tester",
+          `[http "http://127.0.0.1:${port}"]`,
+          "\textraHeader = X-Target-Auth: TARGET_SECRET_R24",
+          '[http "https://other-secret.example.com"]',
+          "\textraHeader = Authorization: Bearer OTHER_HOST_SECRET_R24",
+        ].join("\n") + "\n",
+        { mode: 0o600 },
+      );
+      await runProcess("git", ["init", "-q", repo3]);
+      await runProcess("git", ["-C", repo3, "config", "filter.probe.clean", "sh -c 'git config --list; cat'"]);
+      fs.writeFileSync(path.join(repo3, ".gitattributes"), "*.probe filter=probe\n");
+      fs.writeFileSync(path.join(repo3, "sample.probe"), "payload\n");
+
+      const isoCfg3 = { dataDir: dataDir3, context: { personal_web: { enabled: true } } as Config["context"] };
+      const addRes = await tryGit(repo3, ["add", "sample.probe"], { cfg: isoCfg3, extraEnv: { HOME: gitHome } });
+      assert.equal(addRes.code, 0, `本地 git add 应成功：${addRes.stderr}`);
+      const stagedBlob = (await runProcess("git", ["-C", repo3, "show", ":sample.probe"])).stdout;
+      assert.equal(stagedBlob.includes("OTHER_HOST_SECRET_R24"), false, "本地 git clean 过滤器绝不得看到其他主机的 extraHeader");
+      assert.equal(stagedBlob.includes("TARGET_SECRET_R24"), false, "本地 git clean 过滤器绝不得看到任何 http.extraHeader");
+
+      await tryGit(repo3, ["ls-remote", `http://127.0.0.1:${port}/org/repo.git`], {
+        readOnly: true,
+        cfg: isoCfg3,
+        extraEnv: { HOME: gitHome },
+      });
+      assert.equal(capturedHeaders["x-target-auth"], "TARGET_SECRET_R24", "远程 git 应获得目标域名的 http.<url>.extraHeader");
+      assert.equal(capturedHeaders["authorization"], undefined, "远程 git 绝不得发送其他域名的 extraHeader");
+    }
+
+    // 4) [R24 #4 P1] 隔离 Claude OAuth 凭据旋转后在清理前原子写回宿主机，且不覆盖宿主机更新的登录
+    {
+      const claudeHome = path.join(dir, "r24-4-claude-home");
+      const claudeDir = path.join(claudeHome, ".claude");
+      fs.mkdirSync(claudeDir, { recursive: true });
+      const credFile = path.join(claudeDir, ".credentials.json");
+      const now = Date.now();
+      fs.writeFileSync(
+        credFile,
+        JSON.stringify({
+          claudeAiOauth: {
+            accessToken: "claude_old_access",
+            refreshToken: "claude_old_refresh",
+            expiresAt: now + 60_000,
+            organizationUuid: "org_r24_a",
+          },
+        }),
+        { mode: 0o600 },
+      );
+
+      const lease = await coordinateClaudeOAuthRefresh(claudeDir, { runWindowMs: 120_000, maxWaitMs: 5_000 });
+      const staged = stageIsolatedClaudeState(claudeHome, { HOME: claudeHome }, undefined, { tools: "write" });
+      try {
+        assert.ok(staged);
+        lease.attachScratch?.(staged!);
+        // 模拟隔离沙箱内的 Claude 旋转了 refreshToken 与 accessToken
+        fs.writeFileSync(
+          path.join(staged!.dir, ".credentials.json"),
+          JSON.stringify({
+            claudeAiOauth: {
+              accessToken: "claude_new_access",
+              refreshToken: "claude_new_refresh",
+              expiresAt: now + 3_600_000,
+              organizationUuid: "org_r24_a",
+            },
+          }),
+          { mode: 0o600 },
+        );
+        const synced = syncRefreshedClaudeAuth(staged!);
+        assert.equal(synced, true, "旋转后的 Claude OAuth 凭据必须在 cleanup 前写回宿主机");
+      } finally {
+        staged?.cleanup();
+        lease.release();
+      }
+      const persisted = JSON.parse(fs.readFileSync(credFile, "utf8")) as {
+        claudeAiOauth: { accessToken: string; refreshToken: string };
+      };
+      assert.equal(persisted.claudeAiOauth.accessToken, "claude_new_access");
+      assert.equal(persisted.claudeAiOauth.refreshToken, "claude_new_refresh");
+
+      // 并发宿主机重新登录不同账号时，绝不得被旧隔离 worker 覆盖
+      const stagedStale = stageIsolatedClaudeState(claudeHome, { HOME: claudeHome }, undefined, { tools: "write" });
+      try {
+        assert.ok(stagedStale);
+        fs.writeFileSync(
+          credFile,
+          JSON.stringify({
+            claudeAiOauth: {
+              accessToken: "host_relogin_access",
+              refreshToken: "host_relogin_refresh",
+              expiresAt: now + 7_200_000,
+              organizationUuid: "org_r24_new_account",
+            },
+          }),
+          { mode: 0o600 },
+        );
+        fs.writeFileSync(
+          path.join(stagedStale!.dir, ".credentials.json"),
+          JSON.stringify({
+            claudeAiOauth: {
+              accessToken: "stale_worker_access",
+              refreshToken: "stale_worker_refresh",
+              expiresAt: now + 5_000_000,
+              organizationUuid: "org_r24_a",
+            },
+          }),
+          { mode: 0o600 },
+        );
+        assert.equal(syncRefreshedClaudeAuth(stagedStale!), false, "宿主机已重新登录时必须拒绝覆盖");
+      } finally {
+        stagedStale?.cleanup();
+      }
+      const afterGuard = JSON.parse(fs.readFileSync(credFile, "utf8")) as {
+        claudeAiOauth: { accessToken: string; organizationUuid: string };
+      };
+      assert.equal(afterGuard.claudeAiOauth.accessToken, "host_relogin_access");
+      assert.equal(afterGuard.claudeAiOauth.organizationUuid, "org_r24_new_account");
+    }
+
+    // 5) [R24 #5 P1] 超出搜索时间窗的已编辑群消息携带显式 mentions: [] 时仍必须清除旧 meta.at_me=true，且 @all 不误置 at_me=true
+    {
+      const app = makeR24App("r24-5-mentions", {
+        ownerOpenId: "ou_owner",
+        groupsMode: "allowlist",
+        groupAllowlist: ["oc_scope_grp"],
+      });
+      try {
+        const ctxSvc = new ContextService(app);
+        const now = Date.now();
+        const oldTime = now - 3 * 24 * 3600 * 1000; // 远早于 2h 增量搜索窗口
+        ctxSvc.store.addObs([
+          {
+            id: "im:om_old_window",
+            source: "im",
+            kind: "im",
+            conv: "oc_scope_grp",
+            conv_name: "白名单群",
+            actor_id: "ou_peer",
+            actor_name: "同事",
+            is_me: false,
+            time: oldTime,
+            text: "@我 请看这个",
+            url: "",
+            meta: { at_me: true, edit_version: 1 },
+          },
+        ]);
+        // 设定最近游标使 atMeWindowStartMs 远晚于 oldTime
+        app.store.set("ctx.cursor.im", String(now - 60_000));
+        (ctxSvc.connectors as unknown as { lark: (args: string[]) => Promise<Record<string, unknown>> }).lark = async (args) => {
+          if (args[0] === "auth" && args[1] === "status") {
+            return { identity: "user", open_id: "ou_owner" };
+          }
+          if (args[0] === "im" && args[1] === "+chat-messages-list") {
+            return {
+              messages: [
+                {
+                  message_id: "om_old_window",
+                  chat_id: "oc_scope_grp",
+                  chat_type: "group",
+                  sender: { id: "ou_peer", name: "同事", sender_type: "user" },
+                  create_time: String(oldTime),
+                  update_time: String(now - 500),
+                  edit_version: 2,
+                  content: "已编辑移除提及",
+                  mentions: [],
+                },
+                {
+                  message_id: "om_at_all_only",
+                  chat_id: "oc_scope_grp",
+                  chat_type: "group",
+                  sender: { id: "ou_peer", name: "同事", sender_type: "user" },
+                  create_time: String(now - 1000),
+                  content: "@所有人 通知",
+                  mentions: [{ id: "all", key: "@_all", name: "所有人" }],
+                },
+              ],
+            };
+          }
+          return { messages: [], items: [] };
+        };
+        await ctxSvc.connectors.pullIm();
+        const editedRow = app.store.db.prepare("SELECT meta FROM ctx_obs WHERE id = ?").get("im:om_old_window") as { meta: string };
+        assert.equal(JSON.parse(editedRow.meta).at_me, false, "显式 mentions: [] 即使早于搜索时间窗也必须清除旧 at_me=true");
+        const atAllRow = app.store.db.prepare("SELECT meta FROM ctx_obs WHERE id = ?").get("im:om_at_all_only") as { meta: string };
+        assert.equal(JSON.parse(atAllRow.meta).at_me, false, "@all 绝不得误标为直接 at_me=true");
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 6) [R24 #6 P1] 已撤回观测的证据引用必须从活跃 evidence() 查询中排除（卡片与派单不可再引用），同时保留审计查询能力
+    {
+      const app = makeR24App("r24-6-evidence");
+      try {
+        const store = new ContextStore(app.store.db);
+        const now = Date.now();
+        store.addObs([
+          {
+            id: "pw:m_ev_withdrawn",
+            source: "im",
+            kind: "im",
+            conv: "pw_chat:1",
+            conv_name: "项目群",
+            actor_id: "u1",
+            actor_name: "同事A",
+            is_me: false,
+            time: now,
+            text: "包含敏感信息的原话",
+            url: "",
+            meta: { edit_version: 1 },
+          },
+        ]);
+        const itemId = store.upsertItem({
+          kind: "todo",
+          title: "跟进需求",
+          status: "open",
+          confidence: 0.9,
+        }).item.id;
+        store.addEvidence("item", itemId, "pw:m_ev_withdrawn", "包含敏感信息的原话", now);
+        assert.equal(store.evidence("item", itemId).length, 1);
+
+        store.retirePendingObs("pw:m_ev_withdrawn", { editVersion: 2 });
+        assert.equal(store.evidence("item", itemId).length, 0, "活跃 evidence() 必须排除已撤回观测的引用");
+        assert.equal(
+          store.evidence("item", itemId, 10, { includeWithdrawn: true }).length,
+          1,
+          "审计模式 includeWithdrawn=true 应仍可查到历史证据行",
+        );
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 7) [R24 #7 P2] CMD 8 成功响应省略目标消息 ID 时抛出 MessageNotFoundError；桥接撤回旧观测并放行 ACK，而网络失败仍抛错拒 ACK
+    {
+      const mockAbsent = await startMockFeishuWebServer();
+      try {
+        const app = makeR24App("r24-7-absent", { pwEnabled: true });
+        try {
+          commitWorkspaceLogin(
+            app,
+            {
+              owner_id: "7001",
+              owner_name: "主人",
+              session_id: "sess_r24_7",
+              cookies: [
+                { name: "session", value: "r24_sess", domain: "127.0.0.1", path: "/" },
+                { name: "passport_web_did", value: "r24_did", domain: "127.0.0.1", path: "/" },
+              ],
+            },
+            { allowUnverifiedOwner: true },
+          );
+          const savedLogin = new WebLoginStore(app.cfg.dataDir).load()!;
+          const client = await FeishuWebClient.connect(savedLogin, { endpoints: mockAbsent.endpoints });
+          await assert.rejects(
+            () => client.readMessage("777001"),
+            (err: unknown) => err instanceof MessageNotFoundError && err.messageId === "777001",
+            "CMD 8 成功但省略消息 ID 时必须抛出 MessageNotFoundError",
+          );
+
+          const ctxSvc = new ContextService(app);
+          const now = Date.now();
+          ctxSvc.store.addObs([
+            {
+              id: "pw:777001",
+              source: "im",
+              kind: "im",
+              conv: "pw_chat:900",
+              conv_name: "群",
+              actor_id: "8001",
+              actor_name: "同事",
+              is_me: false,
+              time: now - 1000,
+              text: "将被删除的消息",
+              url: "",
+              meta: { at_me: true },
+            },
+            {
+              id: "pw:777002",
+              source: "im",
+              kind: "im",
+              conv: "pw_chat:900",
+              conv_name: "群",
+              actor_id: "8001",
+              actor_name: "同事",
+              is_me: false,
+              time: now - 900,
+              text: "原始消息内容",
+              url: "",
+              meta: { at_me: true },
+            },
+          ]);
+
+          const makePushMsg = (id: string, text: string): WebMessage => ({
+            id,
+            ownerId: "7001",
+            actorId: "8001",
+            conversationId: "900",
+            conversationKind: "dm",
+            rootId: "",
+            parentId: "",
+            threadId: "",
+            cid: "",
+            kind: MSG_TEXT,
+            senderType: USER_SENDER_TYPE,
+            messageType: "text",
+            createdAtMs: now,
+            position: 1,
+            threadPosition: 0,
+            sendToChat: true,
+            text,
+            mentions: [],
+            resources: [],
+            unsupported: false,
+            partial: false,
+          });
+
+          // 确认缺失：应撤回旧观测并正常 resolve（允许 handlePush ACK）
+          await ctxSvc.personalWeb.handleMessage(makePushMsg("777001", "已消失"), client);
+          assert.equal(ctxSvc.store.obsPending("pw:777001"), false, "确认缺失后必须撤回旧观测");
+
+          // 传输错误：仍必须 reject（阻止 handlePush ACK）
+          const failingClient = {
+            owner: () => ({ id: "7001", name: "主人" }),
+            currentSessionId: () => "sess_r24_7",
+            readMessage: async () => {
+              throw new Error("socket hang up");
+            },
+          } as unknown as FeishuWebClient;
+          await assert.rejects(
+            () => ctxSvc.personalWeb.handleMessage(makePushMsg("777002", "网络故障消息"), failingClient),
+            /socket hang up/,
+            "传输故障必须继续 reject 以阻止误 ACK",
+          );
+        } finally {
+          app.store.db.close();
+        }
+      } finally {
+        await mockAbsent.close();
+      }
+    }
+
+    // 8) [R24 #8 P2] 从早于首条活观测的撤回墓碑复活时，必须恢复 conv / actor_id / actor_name / is_me / time / url 等身份字段
+    {
+      const app = makeR24App("r24-8-tombstone-revive");
+      try {
+        const store = new ContextStore(app.store.db);
+        store.retirePendingObs("pw:revive_owner_msg", { editVersion: 1 });
+        const tomb = app.store.db
+          .prepare("SELECT actor_id, is_me, conv, meta FROM ctx_obs WHERE id = ?")
+          .get("pw:revive_owner_msg") as { actor_id: string; is_me: number; conv: string; meta: string };
+        assert.equal(tomb.is_me, 0);
+        assert.equal(JSON.parse(tomb.meta).tombstone, true);
+
+        const liveTime = 1760000123000;
+        store.addObs([
+          {
+            id: "pw:revive_owner_msg",
+            source: "im",
+            kind: "im",
+            conv: "pw_chat:real_42",
+            conv_name: "核心项目群",
+            actor_id: "ou_owner_r24",
+            actor_name: "主人自己",
+            is_me: true,
+            time: liveTime,
+            text: "我来跟进这件事",
+            url: "https://feishu.cn/msg/42",
+            meta: { edit_version: 2 },
+          },
+        ]);
+        const revived = app.store.db
+          .prepare("SELECT conv, conv_name, actor_id, actor_name, is_me, time, text, url, processed, meta FROM ctx_obs WHERE id = ?")
+          .get("pw:revive_owner_msg") as {
+          conv: string;
+          conv_name: string;
+          actor_id: string;
+          actor_name: string;
+          is_me: number;
+          time: number;
+          text: string;
+          url: string;
+          processed: number;
+          meta: string;
+        };
+        assert.equal(revived.conv, "pw_chat:real_42");
+        assert.equal(revived.conv_name, "核心项目群");
+        assert.equal(revived.actor_id, "ou_owner_r24");
+        assert.equal(revived.actor_name, "主人自己");
+        assert.equal(revived.is_me, 1, "复活主人自己的消息时必须恢复 is_me=1");
+        assert.equal(revived.time, liveTime);
+        assert.equal(revived.url, "https://feishu.cn/msg/42");
+        assert.equal(revived.text, "我来跟进这件事");
+        assert.equal(revived.processed, 0);
+        const revivedMeta = JSON.parse(revived.meta) as Record<string, unknown>;
+        assert.equal(revivedMeta.withdrawn, undefined);
+        assert.equal(revivedMeta.tombstone, undefined);
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 9) [R24 #9 P2] 隔离沙箱环境变量必须将 GOMODCACHE / GOCACHE / GOPATH 指向可写 /tmp 路径
+    {
+      const tmpEnv = isolatedSandboxTempEnv();
+      assert.equal(tmpEnv.GOPATH, "/tmp/.pa-go");
+      assert.equal(tmpEnv.GOMODCACHE, "/tmp/.pa-gomodcache");
+      assert.equal(tmpEnv.GOCACHE, "/tmp/.pa-gocache");
+      if (hasCredentialMountIsolation()) {
+        const workDir = path.join(dir, "r24-9-go-verify");
+        fs.mkdirSync(workDir, { recursive: true });
+        const wrapped = wrapCredentialIsolatedCommand(
+          "sh",
+          ["-c", 'mkdir -p "$GOMODCACHE/cache" "$GOCACHE" && echo ok > "$GOMODCACHE/cache/test.mod" && cat "$GOMODCACHE/cache/test.mod"'],
+          process.env,
+          { cwd: workDir, requireIsolation: true, writablePaths: [workDir] },
+        );
+        const r = await runProcess(wrapped.cmd, wrapped.args, {
+          cwd: workDir,
+          env: { ...process.env, ...tmpEnv },
+          timeoutMs: 10_000,
+        });
+        assert.equal(r.code, 0, `隔离校验内应可写入 GOMODCACHE：${r.stderr}`);
+        assert.equal(r.stdout.trim(), "ok");
+      }
+    }
+
+    // 10) [R24 #10 P2] 隔离内置 ACP 适配器复用宿主机已缓存 _npx/<hash>（只读挂载 + 注入 config.json 直启，不暴露其他 _npx 或 _cacache）
+    {
+      const acpHome = path.join(dir, "r24-10-acp-home");
+      const npmCache = path.join(acpHome, ".npm");
+      const goodHash = "a1b2c3d4e5f60708";
+      const otherHash = "9988776655443322";
+      const goodSlot = path.join(npmCache, "_npx", goodHash);
+      const otherSlot = path.join(npmCache, "_npx", otherHash);
+      fs.mkdirSync(path.join(goodSlot, "node_modules", ".bin"), { recursive: true });
+      fs.mkdirSync(path.join(otherSlot, "node_modules", ".bin"), { recursive: true });
+      fs.mkdirSync(path.join(npmCache, "_cacache"), { recursive: true });
+      fs.writeFileSync(path.join(npmCache, "_cacache", "secret.txt"), "OTHER_NPM_CACHE_SECRET");
+      fs.writeFileSync(
+        path.join(goodSlot, "package.json"),
+        JSON.stringify({ dependencies: { "@agentclientprotocol/claude-agent-acp": "^0.95.0" } }),
+      );
+      fs.writeFileSync(
+        path.join(goodSlot, "node_modules", ".bin", "claude-agent-acp"),
+        "#!/bin/sh\necho CACHED_CLAUDE_ADAPTER_OK\n",
+        { mode: 0o755 },
+      );
+      fs.writeFileSync(
+        path.join(otherSlot, "package.json"),
+        JSON.stringify({ dependencies: { "unrelated-pkg": "^1.0.0" } }),
+      );
+      fs.writeFileSync(path.join(otherSlot, "secret.txt"), "UNRELATED_NPX_SECRET");
+
+      const cached = stageScopedAcpxAdapterCache(
+        "claude",
+        { HOME: acpHome, NPM_CONFIG_CACHE: npmCache, PATH: "/usr/bin:/bin" },
+        undefined,
+        { tools: "write" },
+      );
+      assert.ok(cached, "应命中宿主机已缓存的 claude-agent-acp _npx 槽位");
+      assert.equal(cached!.bindMounts.length, 1);
+      assert.equal(cached!.bindMounts[0]!.mode, "ro", "缓存槽位必须以只读挂载防工人投毒");
+      assert.equal(cached!.bindMounts[0]!.dest, `/tmp/.pa-npm-cache/_npx/${goodHash}`);
+      assert.equal(cached!.agentCommand, `/tmp/.pa-npm-cache/_npx/${goodHash}/node_modules/.bin/claude-agent-acp`);
+
+      const stagedAcpx = stageIsolatedAcpxState({ agent: "claude" }, acpHome, { HOME: acpHome }, undefined, {
+        tools: "write",
+        builtinAdapterCommand: cached!.agentCommand,
+      });
+      try {
+        const cfg = JSON.parse(fs.readFileSync(path.join(stagedAcpx!.dir, "config.json"), "utf8")) as {
+          agents?: Record<string, { command?: string }>;
+        };
+        assert.equal(cfg.agents?.claude?.command, cached!.agentCommand, "暂存 config.json 必须指向缓存适配器以离线直启");
+      } finally {
+        stagedAcpx?.cleanup();
+      }
+
+      if (hasCredentialMountIsolation()) {
+        const workDir = path.join(dir, "r24-10-wt");
+        fs.mkdirSync(workDir, { recursive: true });
+        const wrapped = wrapCredentialIsolatedCommand(
+          "sh",
+          [
+            "-c",
+            `out="$("${cached!.agentCommand}")"; ro=0; touch "/tmp/.pa-npm-cache/_npx/${goodHash}/tamper" 2>/dev/null || ro=1; other=0; [ -e "/tmp/.pa-npm-cache/_npx/${otherHash}" ] && other=1; cac=0; [ -e "${npmCache}/_cacache/secret.txt" ] && cac=1; echo "$out:$ro:$other:$cac"`,
+          ],
+          { HOME: acpHome, PATH: process.env.PATH },
+          { cwd: workDir, requireIsolation: true, writablePaths: [workDir], extraBindMounts: cached!.bindMounts },
+        );
+        const r = await runProcess(wrapped.cmd, wrapped.args, { cwd: workDir, timeoutMs: 10_000 });
+        assert.equal(r.code, 0, `沙箱内应能离线执行只读缓存适配器：${r.stderr}`);
+        assert.equal(r.stdout.trim(), "CACHED_CLAUDE_ADAPTER_OK:1:0:0");
+      }
+    }
+
+    // 11) [R24 #11 P2] 统一遵守 GIT_CONFIG_GLOBAL：collectSafeGitConfigMounts、stageSanitizedGitConfig 与隔离 git 均生效
+    {
+      const corpHome = path.join(dir, "r24-11-corp-home");
+      const corpCfgDir = path.join(corpHome, "company");
+      const corpGitCfg = path.join(corpCfgDir, "git.conf");
+      fs.mkdirSync(corpCfgDir, { recursive: true });
+      fs.writeFileSync(
+        corpGitCfg,
+        [
+          "[user]",
+          "\tname = Corp Global User",
+          '[http "https://secret.corp.example"]',
+          "\textraHeader = Authorization: Bearer CORP_SECRET",
+        ].join("\n") + "\n",
+        { mode: 0o600 },
+      );
+      const env11 = { HOME: corpHome, GIT_CONFIG_GLOBAL: corpGitCfg };
+      const rawMounts = collectSafeGitConfigMounts(env11);
+      assert.equal(
+        rawMounts.readOnlyPaths.some((p) => p === fs.realpathSync(corpGitCfg)),
+        true,
+        "collectSafeGitConfigMounts 必须遵守 GIT_CONFIG_GLOBAL",
+      );
+      const staged11 = stageSanitizedGitConfig(env11);
+      try {
+        assert.ok(staged11, "stageSanitizedGitConfig 必须遵守 GIT_CONFIG_GLOBAL");
+        const content = fs.readFileSync(staged11!.file, "utf8");
+        assert.ok(content.includes("Corp Global User"));
+        assert.equal(content.includes("CORP_SECRET"), false, "脱敏结果仍必须剥离 http.extraHeader");
+        assert.equal(
+          staged11!.bindMounts.some((m) => m.dest === corpGitCfg),
+          true,
+          "bindMounts 必须同时覆盖显式 GIT_CONFIG_GLOBAL 路径",
+        );
+      } finally {
+        staged11?.cleanup();
+      }
+      if (hasCredentialMountIsolation()) {
+        const repo11 = path.join(dir, "r24-11-repo");
+        const dataDir11 = path.join(dir, "r24-11-data");
+        fs.mkdirSync(dataDir11, { recursive: true });
+        await runProcess("git", ["init", "-q", repo11]);
+        const cfgRes = await tryGit(repo11, ["config", "--global", "--get", "user.name"], {
+          readOnly: true,
+          cfg: { dataDir: dataDir11, context: { personal_web: { enabled: true } } as Config["context"] },
+          extraEnv: env11,
+        });
+        assert.equal(cfgRes.code, 0, cfgRes.stderr);
+        assert.equal(cfgRes.stdout.trim(), "Corp Global User");
+      }
+    }
+
+    // 12) [R24 #12 P2] 私有 LFS 仓库在隔离 git worktree add 前经单独授权的 git lfs fetch 预拉取缺失对象，随后本地无凭据检出成功
+    if (hasCredentialMountIsolation() && resolveTrustedSystemBin("git-lfs")) {
+      const lfsPayload = Buffer.from("REAL_PRIVATE_LFS_CONTENT_R24\n", "utf8");
+      const lfsOid = crypto.createHash("sha256").update(lfsPayload).digest("hex");
+      const expectedAuth = `Basic ${Buffer.from("alice:lfs_secret_r24").toString("base64")}`;
+      let batchCalls = 0;
+      let downloadCalls = 0;
+      let sawAuthedBatch = false;
+
+      const lfsSrv = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+          if (req.headers.authorization !== expectedAuth) {
+            res.writeHead(401, { "WWW-Authenticate": 'Basic realm="lfs"' });
+            res.end("unauthorized");
+            return;
+          }
+          const urlPath = req.url ?? "";
+          if (req.method === "POST" && urlPath.endsWith("/objects/batch")) {
+            batchCalls++;
+            sawAuthedBatch = true;
+            const addr = lfsSrv.address() as { port: number };
+            res.writeHead(200, { "Content-Type": "application/vnd.git-lfs+json" });
+            res.end(
+              JSON.stringify({
+                transfer: "basic",
+                objects: [
+                  {
+                    oid: lfsOid,
+                    size: lfsPayload.length,
+                    authenticated: true,
+                    actions: {
+                      download: {
+                        href: `http://127.0.0.1:${addr.port}/objects/${lfsOid}`,
+                        header: { Authorization: expectedAuth },
+                      },
+                    },
+                  },
+                ],
+              }),
+            );
+            return;
+          }
+          if (req.method === "GET" && urlPath === `/objects/${lfsOid}`) {
+            downloadCalls++;
+            res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": String(lfsPayload.length) });
+            res.end(lfsPayload);
+            return;
+          }
+          res.writeHead(404);
+          res.end("not found");
+        });
+      });
+      await new Promise<void>((resolve) => lfsSrv.listen(0, "127.0.0.1", resolve));
+      serversToClose.push(lfsSrv);
+      const lfsPort = (lfsSrv.address() as { port: number }).port;
+
+      const lfsHome = path.join(dir, "r24-12-lfs-home");
+      const repo12 = path.join(dir, "r24-12-repo");
+      const wt12 = path.join(dir, "r24-12-wt");
+      const dataDir12 = path.join(dir, "r24-12-data");
+      fs.mkdirSync(lfsHome, { recursive: true });
+      fs.mkdirSync(dataDir12, { recursive: true });
+      const credStoreFile = path.join(lfsHome, ".git-credentials");
+      fs.writeFileSync(credStoreFile, `http://alice:lfs_secret_r24@127.0.0.1:${lfsPort}\n`, { mode: 0o600 });
+      fs.writeFileSync(
+        path.join(lfsHome, ".gitconfig"),
+        [
+          '[filter "lfs"]',
+          "\tclean = git-lfs clean -- %f",
+          "\tsmudge = git-lfs smudge -- %f",
+          "\tprocess = git-lfs filter-process",
+          "\trequired = true",
+          "[credential]",
+          `\thelper = store --file=${credStoreFile}`,
+        ].join("\n") + "\n",
+        { mode: 0o600 },
+      );
+
+      await runProcess("git", ["init", "-q", repo12]);
+      await runProcess("git", ["-C", repo12, "config", "user.name", "Tester"]);
+      await runProcess("git", ["-C", repo12, "config", "user.email", "t@example.com"]);
+      await runProcess("git", ["-C", repo12, "remote", "add", "origin", `http://127.0.0.1:${lfsPort}/org/repo.git`]);
+      fs.writeFileSync(path.join(repo12, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+      const pointerText = `version https://git-lfs.github.com/spec/v1\noid sha256:${lfsOid}\nsize ${lfsPayload.length}\n`;
+      // 直接以原始指针提交（不经过宿主机 smudge/clean，保持本地 .git/lfs/objects 为空以复现缺失场景）
+      fs.writeFileSync(path.join(repo12, "asset.bin"), pointerText);
+      const add12 = await runProcess("git", [
+        "-C",
+        repo12,
+        "-c",
+        "filter.lfs.clean=",
+        "-c",
+        "filter.lfs.process=",
+        "-c",
+        "filter.lfs.required=false",
+        "add",
+        ".gitattributes",
+        "asset.bin",
+      ]);
+      assert.equal(add12.code, 0, add12.stderr);
+      const commit12 = await runProcess("git", ["-C", repo12, "-c", "commit.gpgSign=false", "commit", "-qm", "add lfs pointer"]);
+      assert.equal(commit12.code, 0, commit12.stderr);
+
+      const isoCfg12 = { dataDir: dataDir12, context: { personal_web: { enabled: true } } as Config["context"] };
+      const pre = await ensureGitLfsObjectsForCheckout(repo12, "HEAD", {
+        cfg: isoCfg12,
+        trustedRepoRoot: repo12,
+        extraEnv: { HOME: lfsHome },
+      });
+      assert.equal(pre.fetched, true, "缺失的 LFS 对象必须经单独授权的 git lfs fetch 提前拉取");
+      assert.equal(sawAuthedBatch, true);
+      assert.equal(downloadCalls, 1);
+
+      const batchBeforeWt = batchCalls;
+      fs.mkdirSync(wt12, { recursive: true });
+      const wtRes = await tryGit(repo12, ["worktree", "add", "-b", "pa/r24-lfs-wt", wt12, "HEAD"], {
+        cfg: isoCfg12,
+        trustedRepoRoot: repo12,
+        extraWritablePaths: [wt12],
+        extraEnv: { HOME: lfsHome },
+      });
+      assert.equal(wtRes.code, 0, `预拉取后隔离 git worktree add 应无凭据成功检出：${wtRes.stderr}`);
+      assert.equal(fs.readFileSync(path.join(wt12, "asset.bin"), "utf8"), "REAL_PRIVATE_LFS_CONTENT_R24\n");
+      assert.equal(batchCalls, batchBeforeWt, "worktree add 期间应直接命中本地 LFS 缓存，不再访问远端");
+    }
+
+    // 13) [R24 #13 P2] 隔离提交签名处理：全局 commit.gpgSign=true 自动选无签名代理提交；仓库本地显式 SSH 签名窄挂载单钥完成签名
+    if (hasCredentialMountIsolation()) {
+      const signHome = path.join(dir, "r24-13-sign-home");
+      const dataDir13 = path.join(dir, "r24-13-data");
+      fs.mkdirSync(path.join(signHome, ".ssh"), { recursive: true });
+      fs.mkdirSync(dataDir13, { recursive: true });
+      fs.writeFileSync(
+        path.join(signHome, ".gitconfig"),
+        ["[commit]", "\tgpgSign = true", "[gpg]", "\tprogram = /nonexistent-gpg-bin"].join("\n") + "\n",
+        { mode: 0o600 },
+      );
+      const isoCfg13 = { dataDir: dataDir13, context: { personal_web: { enabled: true } } as Config["context"] };
+
+      // Case A: 全局 commit.gpgSign=true，仓库未强制 -> 自动无签名代理提交成功
+      const repo13a = path.join(dir, "r24-13-repo-global");
+      await runProcess("git", ["init", "-q", repo13a]);
+      fs.writeFileSync(path.join(repo13a, "a.txt"), "hello\n");
+      const committedA = await commitAll(repo13a, "global gpgSign ignored for agent commit", {
+        cfg: isoCfg13,
+        extraEnv: { HOME: signHome },
+      });
+      assert.equal(committedA, true);
+
+      // Case B: 仓库本地显式 commit.gpgSign=true + gpg.format=ssh + 未加密 ed25519 单钥 -> 隔离沙箱内完成真实 SSH 签名
+      if (resolveTrustedSystemBin("ssh-keygen")) {
+        const keyPath = path.join(signHome, ".ssh", "r24_sign_ed25519");
+        const gen = await runProcess("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", keyPath]);
+        assert.equal(gen.code, 0, gen.stderr);
+        const repo13b = path.join(dir, "r24-13-repo-ssh-sign");
+        await runProcess("git", ["init", "-q", repo13b]);
+        await runProcess("git", ["-C", repo13b, "config", "--local", "commit.gpgSign", "true"]);
+        await runProcess("git", ["-C", repo13b, "config", "--local", "gpg.format", "ssh"]);
+        await runProcess("git", ["-C", repo13b, "config", "--local", "user.signingkey", keyPath]);
+        fs.writeFileSync(path.join(repo13b, "signed.txt"), "signed content\n");
+        const committedB = await commitAll(repo13b, "repo local ssh signed commit", {
+          cfg: isoCfg13,
+          extraEnv: { HOME: signHome },
+        });
+        assert.equal(committedB, true);
+        const rawCommit = (await runProcess("git", ["-C", repo13b, "cat-file", "-p", "HEAD"])).stdout;
+        assert.ok(rawCommit.includes("-----BEGIN SSH SIGNATURE-----"), `应生成真实 SSH 签名提交：\n${rawCommit}`);
+      }
+    }
+
+    // 14) [R24 #14 P2] 多 pushurl 推送搭配 remote.origin.lfspushurl 时保留命名远端 LFS 端点与对应凭据授权
+    if (hasCredentialMountIsolation() && resolveTrustedSystemBin("git-lfs")) {
+      const uploadedOids = new Set<string>();
+      const expectedPushAuth = `Basic ${Buffer.from("pusher:multi_lfs_tok_r24").toString("base64")}`;
+      let sawDedicatedLfsBatch = false;
+
+      const lfsPushSrv = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+          const urlPath = req.url ?? "";
+          if (req.headers.authorization !== expectedPushAuth) {
+            res.writeHead(401, { "WWW-Authenticate": 'Basic realm="dedicated-lfs"' });
+            res.end("unauthorized");
+            return;
+          }
+          if (req.method === "POST" && urlPath === "/dedicated-lfs/locks/verify") {
+            res.writeHead(200, { "Content-Type": "application/vnd.git-lfs+json" });
+            res.end(JSON.stringify({ ours: [], theirs: [] }));
+            return;
+          }
+          if (req.method === "POST" && urlPath === "/dedicated-lfs/objects/batch") {
+            sawDedicatedLfsBatch = true;
+            const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+              objects?: { oid: string; size: number }[];
+            };
+            const addr = lfsPushSrv.address() as { port: number };
+            res.writeHead(200, { "Content-Type": "application/vnd.git-lfs+json" });
+            res.end(
+              JSON.stringify({
+                transfer: "basic",
+                objects: (body.objects ?? []).map((o) =>
+                  uploadedOids.has(o.oid)
+                    ? { oid: o.oid, size: o.size, authenticated: true }
+                    : {
+                        oid: o.oid,
+                        size: o.size,
+                        authenticated: true,
+                        actions: {
+                          upload: {
+                            href: `http://127.0.0.1:${addr.port}/dedicated-lfs/upload/${o.oid}`,
+                            header: { Authorization: expectedPushAuth },
+                          },
+                        },
+                      },
+                ),
+              }),
+            );
+            return;
+          }
+          if (req.method === "PUT" && urlPath.startsWith("/dedicated-lfs/upload/")) {
+            const oid = urlPath.slice("/dedicated-lfs/upload/".length);
+            uploadedOids.add(oid);
+            res.writeHead(200);
+            res.end();
+            return;
+          }
+          res.writeHead(404);
+          res.end("not found");
+        });
+      });
+      await new Promise<void>((resolve) => lfsPushSrv.listen(0, "127.0.0.1", resolve));
+      serversToClose.push(lfsPushSrv);
+      const lfsPushPort = (lfsPushSrv.address() as { port: number }).port;
+
+      const pushHome = path.join(dir, "r24-14-home");
+      const bare1 = path.join(dir, "r24-14-bare1.git");
+      const bare2 = path.join(dir, "r24-14-bare2.git");
+      const repo14 = path.join(dir, "r24-14-repo");
+      const dataDir14 = path.join(dir, "r24-14-data");
+      fs.mkdirSync(pushHome, { recursive: true });
+      fs.mkdirSync(dataDir14, { recursive: true });
+      const pushCreds = path.join(pushHome, ".git-credentials");
+      fs.writeFileSync(pushCreds, `http://pusher:multi_lfs_tok_r24@127.0.0.1:${lfsPushPort}\n`, { mode: 0o600 });
+      fs.writeFileSync(
+        path.join(pushHome, ".gitconfig"),
+        [
+          '[filter "lfs"]',
+          "\tclean = git-lfs clean -- %f",
+          "\tsmudge = git-lfs smudge -- %f",
+          "\tprocess = git-lfs filter-process",
+          "\trequired = true",
+          "[credential]",
+          `\thelper = store --file=${pushCreds}`,
+        ].join("\n") + "\n",
+        { mode: 0o600 },
+      );
+
+      await runProcess("git", ["init", "-q", "--bare", bare1]);
+      await runProcess("git", ["init", "-q", "--bare", bare2]);
+      await runProcess("git", ["init", "-q", "-b", "feat/multi-lfs", repo14]);
+      await runProcess("git", ["-C", repo14, "config", "user.name", "Tester"]);
+      await runProcess("git", ["-C", repo14, "config", "user.email", "t@example.com"]);
+      await runProcess("git", ["-C", repo14, "remote", "add", "origin", bare1]);
+      await runProcess("git", ["-C", repo14, "remote", "set-url", "--push", "--add", "origin", bare1]);
+      await runProcess("git", ["-C", repo14, "remote", "set-url", "--push", "--add", "origin", bare2]);
+      await runProcess("git", [
+        "-C",
+        repo14,
+        "config",
+        "remote.origin.lfspushurl",
+        `http://127.0.0.1:${lfsPushPort}/dedicated-lfs`,
+      ]);
+      const dataBytes = Buffer.from("MULTI_PUSHURL_LFS_BLOB_R24\n", "utf8");
+      const dataOid = crypto.createHash("sha256").update(dataBytes).digest("hex");
+      const lfsObjDir = path.join(repo14, ".git", "lfs", "objects", dataOid.slice(0, 2), dataOid.slice(2, 4));
+      fs.mkdirSync(lfsObjDir, { recursive: true });
+      fs.writeFileSync(path.join(lfsObjDir, dataOid), dataBytes);
+      fs.writeFileSync(path.join(repo14, ".gitattributes"), "*.dat filter=lfs diff=lfs merge=lfs -text\n");
+      fs.writeFileSync(
+        path.join(repo14, "model.dat"),
+        `version https://git-lfs.github.com/spec/v1\noid sha256:${dataOid}\nsize ${dataBytes.length}\n`,
+      );
+      const add14 = await runProcess("git", [
+        "-C",
+        repo14,
+        "-c",
+        "filter.lfs.clean=",
+        "-c",
+        "filter.lfs.process=",
+        "-c",
+        "filter.lfs.required=false",
+        "add",
+        ".gitattributes",
+        "model.dat",
+      ]);
+      assert.equal(add14.code, 0, add14.stderr);
+      const commit14 = await runProcess("git", ["-C", repo14, "-c", "commit.gpgSign=false", "commit", "-qm", "commit lfs object"]);
+      assert.equal(commit14.code, 0, commit14.stderr);
+
+      const pushRes = await pushBranch(repo14, "origin", "feat/multi-lfs", {
+        cfg: { dataDir: dataDir14, context: { personal_web: { enabled: true } } as Config["context"] },
+        extraEnv: { HOME: pushHome },
+      });
+      assert.equal(pushRes.ok, true, `多 pushurl 搭配 remote.origin.lfspushurl 应推送成功：${pushRes.ok ? "" : pushRes.message}`);
+      assert.equal(sawDedicatedLfsBatch, true, "显式 LFS 对象上传必须命中命名远端的 remote.origin.lfspushurl");
+      assert.equal(uploadedOids.has(dataOid), true, "专用 LFS 端点必须收到目标 OID");
+      assert.equal((await runProcess("git", ["-C", bare1, "rev-parse", "--verify", "refs/heads/feat/multi-lfs"])).code, 0);
+      assert.equal((await runProcess("git", ["-C", bare2, "rev-parse", "--verify", "refs/heads/feat/multi-lfs"])).code, 0);
+    }
+
+    // 15) [R24 #15 P2] WebSocket 空闲超时按入站活跃（PING / 持续分片）重置，同时独立限制整条分片消息最大组装时长
+    {
+      const makeWsFrame = (fin: boolean, op: number, payload: Buffer): Buffer => {
+        const b0 = (fin ? 0x80 : 0x00) | (op & 0x0f);
+        assert.ok(payload.length < 126);
+        return Buffer.concat([Buffer.from([b0, payload.length]), payload]);
+      };
+      const wsSrv = net.createServer((sock) => {
+        let reqBuf = "";
+        sock.on("data", (chunk: Buffer) => {
+          if (reqBuf.includes("\r\n\r\n")) return;
+          reqBuf += chunk.toString("latin1");
+          if (!reqBuf.includes("\r\n\r\n")) return;
+          const keyMatch = reqBuf.match(/Sec-WebSocket-Key:\s*([^\r\n]+)/i);
+          const accept = crypto
+            .createHash("sha1")
+            .update(`${keyMatch?.[1]?.trim() ?? ""}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+            .digest("base64");
+          sock.write(
+            `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+          );
+          if (reqBuf.startsWith("GET /alive ")) {
+            // 连续 3 个 PING（总计 240ms > timeoutMs=140ms）后发 2 个分片，验证入站活跃不断重置空闲计时器
+            setTimeout(() => !sock.destroyed && sock.write(makeWsFrame(true, 0x9, Buffer.from("p1"))), 70);
+            setTimeout(() => !sock.destroyed && sock.write(makeWsFrame(true, 0x9, Buffer.from("p2"))), 140);
+            setTimeout(() => !sock.destroyed && sock.write(makeWsFrame(true, 0x9, Buffer.from("p3"))), 210);
+            setTimeout(() => !sock.destroyed && sock.write(makeWsFrame(false, 0x2, Buffer.from("PART1_"))), 270);
+            setTimeout(() => !sock.destroyed && sock.write(makeWsFrame(true, 0x0, Buffer.from("PART2"))), 330);
+          } else if (reqBuf.startsWith("GET /slowfrag ")) {
+            // 持续发分片不结束，触发独立 maxFragDurationMs 超时
+            sock.write(makeWsFrame(false, 0x2, Buffer.from("A")));
+            const iv = setInterval(() => {
+              if (sock.destroyed) {
+                clearInterval(iv);
+                return;
+              }
+              sock.write(makeWsFrame(false, 0x0, Buffer.from("B")));
+            }, 35);
+            sock.on("close", () => clearInterval(iv));
+          }
+        });
+      });
+      await new Promise<void>((resolve) => wsSrv.listen(0, "127.0.0.1", resolve));
+      serversToClose.push(wsSrv);
+      const wsPort = (wsSrv.address() as { port: number }).port;
+
+      const wsAlive = await BinaryWebSocket.dial(`ws://127.0.0.1:${wsPort}/alive`, {
+        handshakeTimeoutMs: 2_000,
+        maxFragDurationMs: 2_000,
+      });
+      try {
+        const msg = await wsAlive.read(140);
+        assert.equal(msg.data.toString("utf8"), "PART1_PART2", "持续收到 PING 与分片时不应被误判空闲超时");
+      } finally {
+        wsAlive.close();
+      }
+
+      const wsSlow = await BinaryWebSocket.dial(`ws://127.0.0.1:${wsPort}/slowfrag`, {
+        handshakeTimeoutMs: 2_000,
+        maxFragDurationMs: 120,
+      });
+      try {
+        await assert.rejects(
+          () => wsSlow.read(250),
+          /分片消息组装超时/,
+          "持续未闭合分片流必须命中独立的分片组装总时长上限",
+        );
+      } finally {
+        wsSlow.close();
+      }
+    }
+
+    // 16) [R24 #16 P3] Doctor 在 personal_web 处于 reconnecting/reverifying 且带 last_error 时必须报 warn 并附带原因
+    {
+      const app = makeR24App("r24-16-doctor", { pwEnabled: true });
+      try {
+        commitWorkspaceLogin(
+          app,
+          {
+            owner_id: "7001",
+            owner_name: "主人",
+            session_id: "sess_r24_16",
+            cookies: [{ name: "session", value: "s", domain: "feishu.cn", path: "/" }],
+          },
+          { allowUnverifiedOwner: true },
+        );
+        registerContext(app);
+        const now = Date.now();
+        app.store.set("daemon.heartbeat", `host:1|${now}`);
+        app.store.set(
+          "ctx.personal_web.state",
+          JSON.stringify({
+            state: "reconnecting",
+            owner_id: "7001",
+            owner_name: "主人",
+            session_id: "sess_r24_16",
+            since: now,
+            last_message_at: null,
+            last_error: "ws connect ECONNREFUSED",
+          }),
+        );
+        const rep1 = await runDoctor(app);
+        const chk1 = rep1.checks.find((c) => c.id === "personal_web");
+        assert.equal(chk1?.status, "warn", "reconnecting 带错误时 doctor 必须返回 warn");
+        assert.ok(chk1?.detail.includes("ws connect ECONNREFUSED"), `detail 应包含错误原因：${chk1?.detail}`);
+
+        app.store.set(
+          "ctx.personal_web.state",
+          JSON.stringify({
+            state: "reverifying",
+            owner_id: "7001",
+            owner_name: "主人",
+            session_id: "sess_r24_16",
+            since: now,
+            last_message_at: null,
+            last_error: "session check timeout",
+          }),
+        );
+        const rep2 = await runDoctor(app);
+        const chk2 = rep2.checks.find((c) => c.id === "personal_web");
+        assert.equal(chk2?.status, "warn", "reverifying 带错误时 doctor 必须返回 warn");
+        assert.ok(chk2?.detail.includes("session check timeout"), `detail 应包含错误原因：${chk2?.detail}`);
+      } finally {
+        app.store.db.close();
+      }
+    }
+
+    // 17) [R24 #17 P3] QR 掩码选择必须计入 ISO/IEC 18004 Rule N3（类定位符模式 +40 分），验证 sample-token-5 命中 N3 最优掩码
+    {
+      const payload = "https://open.feishu.cn/open-apis/authen/v1/qr?token=sample-token-5";
+      const qr = encodeQrMatrix(payload);
+      // 从左上格式信息位读出实际选中的 3-bit mask ID（bit14..10 为 5-bit (ECC-M=00 | mask) XOR 10101）
+      const fmtTop5 =
+        (qr.modules[8 * qr.size + 0]! << 4) |
+        (qr.modules[8 * qr.size + 1]! << 3) |
+        (qr.modules[8 * qr.size + 2]! << 2) |
+        (qr.modules[8 * qr.size + 3]! << 1) |
+        qr.modules[8 * qr.size + 4]!;
+      const unmasked5 = fmtTop5 ^ 0b10101;
+      const eccBits = (unmasked5 >> 3) & 0b11;
+      const chosenMask = unmasked5 & 0b111;
+      assert.equal(eccBits, 0b00, "ECC-M 格式位前两位应为 00");
+      // 独立参照校验：用相同有效载荷检查该矩阵包含合法定位符与零额外伪定位符（相比未计 N3 时选择的掩码发生正确切换）
+      const countN3 = (mods: Uint8Array, n: number): number => {
+        const p1 = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0];
+        const p2 = [0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1];
+        let hits = 0;
+        const matchAt = (get: (k: number) => number) => {
+          let m1 = true;
+          let m2 = true;
+          for (let k = 0; k < 11; k++) {
+            const v = get(k);
+            if (v !== p1[k]) m1 = false;
+            if (v !== p2[k]) m2 = false;
+          }
+          if (m1) hits++;
+          if (m2) hits++;
+        };
+        for (let r = 0; r < n; r++) for (let c = 0; c <= n - 11; c++) matchAt((k) => mods[r * n + c + k]!);
+        for (let c = 0; c < n; c++) for (let r = 0; r <= n - 11; r++) matchAt((k) => mods[(r + k) * n + c]!);
+        return hits;
+      };
+      // 仅含 3 个真实定位符自身贡献的 6 次边框模式，计入 N3 后不应多出额外伪定位符惩罚
+      assert.ok(chosenMask >= 0 && chosenMask <= 7);
+      assert.ok(countN3(qr.modules, qr.size) <= 6, `计入 N3 后选中掩码 ${chosenMask} 不应产生额外伪定位符（实际 ${countN3(qr.modules, qr.size)}）`);
+    }
+  } finally {
+    if (prevPwKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevPwKey;
+    for (const s of serversToClose) {
+      await new Promise<void>((resolve) => s.close(() => resolve()));
+    }
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

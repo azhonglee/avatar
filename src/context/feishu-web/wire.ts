@@ -206,14 +206,20 @@ export function encodeAckFrame(sid: string, nowMs = Date.now()): Buffer {
 }
 
 /** Unwrap a gateway HTTP response packet and verify status === 0. */
-export function unwrapGatewayPayload(data: Uint8Array): Buffer {
+export function unwrapGatewayPayload(
+  data: Uint8Array,
+  opts: { allowEmptyPayload?: boolean } = {},
+): Buffer {
+  if (data.length === 0) {
+    throw new GatewayError("个人 Web 网关返回空响应", { emptyPayload: true });
+  }
   const packet = parseProto(data, MAX_WIRE_BYTES);
   const status = packet.uint(4);
   if (status !== 0) {
     throw new GatewayError(`个人 Web 网关拒绝请求 (status=${status})`, { status });
   }
   const payload = packet.bytes(5);
-  if (payload.length === 0) {
+  if (payload.length === 0 && !opts.allowEmptyPayload) {
     throw new GatewayError("个人 Web 网关返回空载荷", { emptyPayload: true });
   }
   return payload;

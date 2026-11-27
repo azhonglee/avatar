@@ -64,6 +64,16 @@ export class SessionNeedsLoginError extends WebHttpError {
   }
 }
 
+/** 服务端成功返回 CMD 8 响应但明确不包含目标消息 ID（消息已删除/不可见），用于与网络/解码等瞬态读取故障区分 */
+export class MessageNotFoundError extends Error {
+  readonly messageId: string;
+  constructor(id: string) {
+    super(`无法回读个人消息：${id}`);
+    this.name = "MessageNotFoundError";
+    this.messageId = id;
+  }
+}
+
 export interface FeishuWebClientOptions {
   endpoints?: Partial<WebEndpoints>;
   /**
@@ -429,7 +439,13 @@ export class FeishuWebClient {
   async gateway(
     command: number,
     payload: Uint8Array | undefined,
-    opts: { cid?: string; packet?: Buffer; signal?: AbortSignal; deferCookiePersist?: boolean } = {},
+    opts: {
+      cid?: string;
+      packet?: Buffer;
+      signal?: AbortSignal;
+      deferCookiePersist?: boolean;
+      allowEmptyPayload?: boolean;
+    } = {},
   ): Promise<Buffer> {
     const cid = opts.cid || randomRequestId();
     const packet = opts.packet ?? encodePacket(command, payload, cid);
@@ -464,7 +480,7 @@ export class FeishuWebClient {
     }
     let unpacked: Buffer;
     try {
-      unpacked = unwrapGatewayPayload(res.body);
+      unpacked = unwrapGatewayPayload(res.body, { allowEmptyPayload: opts.allowEmptyPayload });
     } catch (err) {
       this.flushVerifiedCookieDeltaBestEffort();
       throw err;
@@ -489,7 +505,8 @@ export class FeishuWebClient {
   /** Fetch one native message by its numeric message ID (command 8). */
   async readMessage(id: string, signal?: AbortSignal): Promise<WebMessage> {
     const req = new ProtoWriter().str(1, id).finish();
-    const data = await this.gateway(CMD_READ_MESSAGE, req, { signal });
+    // Protobuf 中空的 GetMessagesByIdsResponse 载荷合法编码为 0 字节（位于非空且 status=0 的网关包内），表示确认未查到该消息
+    const data = await this.gateway(CMD_READ_MESSAGE, req, { signal, allowEmptyPayload: true });
     const fields = parseProto(data, MAX_WIRE_BYTES);
     for (const entry of fields.allBytes(1)) {
       const pair = parseProto(entry, MAX_WIRE_BYTES);
@@ -497,7 +514,7 @@ export class FeishuWebClient {
         return decodeMessage(pair.bytes(2), this.ownerId);
       }
     }
-    throw new Error(`无法回读个人消息：${id}`);
+    throw new MessageNotFoundError(id);
   }
 
   /** Read conversation name, kind, and topic mode (command 64), with TTL caching. */
