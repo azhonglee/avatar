@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Config } from "../config.ts";
 import {
   buildWorkspaceIsolation,
+  createScopedSecretDir,
   detectGitWorktreeDirs,
   prepareHarnessEnv,
   workspaceRequiresIsolation,
@@ -84,6 +85,7 @@ function buildGitIsolation(
   filteredCredDir?: string,
   authorizedSshSock?: string,
   allowSshConfig = false,
+  rawEnv: NodeJS.ProcessEnv = process.env,
 ): IsolationOptions {
   const extraRw = [
     ...(opts?.extraWritablePaths ?? []),
@@ -91,7 +93,7 @@ function buildGitIsolation(
   ];
   const sshRo: string[] = [];
   if (allowSshConfig) {
-    const sshDir = path.join(process.env.HOME?.trim() || os.homedir(), ".ssh");
+    const sshDir = path.join(rawEnv.HOME?.trim() || os.homedir(), ".ssh");
     if (fs.existsSync(sshDir)) {
       try {
         const realSsh = fs.realpathSync(sshDir);
@@ -112,31 +114,360 @@ function buildGitIsolation(
     ...sshRo,
   ];
   if (opts?.cfg) {
-    return buildWorkspaceIsolation(opts.cfg, {
-      mode: opts.readOnly ? "git-ro" : "git-rw",
-      cwd,
-      trustedRepoRoot: opts.trustedRepoRoot,
-      disableGitWorktreeMounts: opts.disableGitWorktreeMounts,
-      extraWritablePaths: extraRw,
-      extraReadOnlyPaths: extraRo,
-    });
+    return buildWorkspaceIsolation(
+      opts.cfg,
+      {
+        mode: opts.readOnly ? "git-ro" : "git-rw",
+        cwd,
+        trustedRepoRoot: opts.trustedRepoRoot,
+        disableGitWorktreeMounts: opts.disableGitWorktreeMounts,
+        extraWritablePaths: extraRw,
+        extraReadOnlyPaths: extraRo,
+      },
+      rawEnv,
+    );
   }
-  const isoActive = workspaceRequiresIsolation(undefined, process.env);
+  const isoActive = process.platform === "linux" || workspaceRequiresIsolation(undefined, rawEnv);
   const wt =
     !isoActive || opts?.disableGitWorktreeMounts
       ? {}
       : detectGitWorktreeDirs(cwd, { trustedRepoRoot: opts?.trustedRepoRoot });
   const wtTargets = [wt.commonDir, wt.gitDir].filter((p): p is string => !!p);
+  const homeRo: string[] = [];
+  if (isoActive) {
+    const rawHome = rawEnv.HOME?.trim() || os.homedir();
+    for (const sub of [".gitconfig", ".config/git"]) {
+      const p = path.join(rawHome, sub);
+      if (fs.existsSync(p)) {
+        try {
+          homeRo.push(fs.realpathSync(p));
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+  const combinedRo = [...homeRo, ...extraRo];
   return {
     cwd,
+    requireIsolation: isoActive,
     writablePaths: opts?.readOnly ? extraRw : [cwd, ...wtTargets, ...extraRw],
-    readOnlyPaths: opts?.readOnly ? [cwd, ...wtTargets, ...extraRo] : extraRo,
+    readOnlyPaths: opts?.readOnly ? [cwd, ...wtTargets, ...combinedRo] : combinedRo,
   };
+}
+
+interface ScopedGitHttpCreds {
+  credDir: string;
+  gitConfigArgs: string[];
+  cleanup: () => void;
+}
+
+function defaultPortForProtocol(proto: string): string {
+  return proto === "https:" ? "443" : proto === "http:" ? "80" : "";
+}
+
+function parseHttpUrlSafe(raw: string): URL | undefined {
+  try {
+    const u = new URL(raw.trim());
+    if (u.protocol !== "http:" && u.protocol !== "https:") return undefined;
+    if (!u.hostname) return undefined;
+    return u;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeCredPath(pathname: string): string {
+  const stripped = pathname.replace(/\/+$/, "");
+  return stripped === "/" ? "" : stripped;
+}
+
+/** 按 git-credential-store 匹配语义判断单行凭据是否适用于指定目标 HTTP(S) URL */
+export function gitCredentialLineMatchesTarget(
+  credLine: string,
+  target: URL,
+  useHttpPath: boolean,
+): boolean {
+  const trimmed = credLine.trim();
+  if (!trimmed || trimmed.startsWith("#")) return false;
+  const entry = parseHttpUrlSafe(trimmed);
+  if (!entry) return false;
+  if (entry.protocol !== target.protocol) return false;
+  if (entry.hostname.toLowerCase() !== target.hostname.toLowerCase()) return false;
+  const targetPort = target.port || defaultPortForProtocol(target.protocol);
+  const entryPort = entry.port || defaultPortForProtocol(entry.protocol);
+  if (targetPort !== entryPort) return false;
+  if (target.username && entry.username !== target.username) return false;
+  const entryPath = normalizeCredPath(entry.pathname);
+  const targetPath = normalizeCredPath(target.pathname);
+  if (useHttpPath || entryPath) {
+    if (!entryPath) {
+      // 未限定路径的通配条目在 useHttpPath=true 时仍可匹配同主机目标（与 git credential-store 一致）
+      return true;
+    }
+    return targetPath === entryPath || targetPath.startsWith(`${entryPath}/`);
+  }
+  return true;
+}
+
+function parseStoreHelperFile(helperValue: string, hostHome: string): { isStore: boolean; explicitFile?: string } {
+  const v = helperValue.trim();
+  if (!v) return { isStore: false };
+  if (!/^(?:(?:\/[^\s]*\/)?git-credential-)?store(?:\s|$)/.test(v)) return { isStore: false };
+  const eqMatch = v.match(/(?:^|\s)--file=(?:"([^"]+)"|'([^']+)'|(\S+))/);
+  const spMatch = v.match(/(?:^|\s)--file\s+(?:"([^"]+)"|'([^']+)'|(\S+))/);
+  const rawFile = eqMatch?.[1] ?? eqMatch?.[2] ?? eqMatch?.[3] ?? spMatch?.[1] ?? spMatch?.[2] ?? spMatch?.[3];
+  if (!rawFile) return { isStore: true };
+  const expanded = rawFile.startsWith("~/") && hostHome ? path.join(hostHome, rawFile.slice(2)) : rawFile;
+  return { isStore: true, explicitFile: path.resolve(expanded) };
+}
+
+function extractRemoteTargetSpec(args: string[]): { mode: "push" | "fetch"; target?: string; explicitUrls: string[] } {
+  const sub = args[0] ?? "";
+  const explicitUrls: string[] = [];
+  const collectUrlIfHttp = (s: string | undefined) => {
+    if (s && /^https?:\/\//i.test(s.trim())) explicitUrls.push(s.trim());
+  };
+
+  if (sub === "lfs") {
+    const lfsSub = args[1] ?? "";
+    if (lfsSub === "pre-push") {
+      collectUrlIfHttp(args[3]);
+      return { mode: "push", target: args[2], explicitUrls };
+    }
+    const mode = lfsSub === "push" ? "push" : "fetch";
+    for (let i = 2; i < args.length; i++) {
+      const a = args[i];
+      if (!a || a === "--") continue;
+      if (a.startsWith("-")) continue;
+      collectUrlIfHttp(a);
+      return { mode, target: a, explicitUrls };
+    }
+    return { mode, explicitUrls };
+  }
+
+  const valueFlagsBySub: Record<string, Set<string>> = {
+    push: new Set(["--repo", "--receive-pack", "--exec", "--push-option", "-o"]),
+    "ls-remote": new Set(["--upload-pack", "--sort", "-o", "--server-option"]),
+    fetch: new Set(["--depth", "--shallow-since", "--shallow-exclude", "--upload-pack", "-o", "--server-option", "--negotiation-tip"]),
+    pull: new Set(["--depth", "--shallow-since", "--shallow-exclude", "--upload-pack", "-o", "--server-option", "-s", "--strategy", "-X", "--strategy-option"]),
+    clone: new Set(["-b", "--branch", "-o", "--origin", "--depth", "--reference", "-c", "--config", "--upload-pack", "--separate-git-dir", "--filter"]),
+  };
+  const valFlags = valueFlagsBySub[sub] ?? new Set<string>();
+  const mode = sub === "push" ? "push" : "fetch";
+  let target: string | undefined;
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") {
+      target = args[i + 1];
+      break;
+    }
+    if (a.startsWith("-")) {
+      if (valFlags.has(a)) i++;
+      continue;
+    }
+    target = a;
+    break;
+  }
+  if (!target && (sub === "push" || sub === "fetch" || sub === "pull" || sub === "ls-remote")) {
+    target = "origin";
+  }
+  collectUrlIfHttp(target);
+  return { mode, target, explicitUrls };
+}
+
+function gitCredentialSectionMatchesUrl(sectionUrl: string, target: URL): boolean {
+  const parsed = parseHttpUrlSafe(sectionUrl);
+  if (!parsed) return false;
+  if (parsed.protocol !== target.protocol) return false;
+  if (parsed.hostname.toLowerCase() !== target.hostname.toLowerCase()) return false;
+  const targetPort = target.port || defaultPortForProtocol(target.protocol);
+  const secPort = parsed.port || defaultPortForProtocol(parsed.protocol);
+  if (targetPort !== secPort) return false;
+  if (parsed.username && target.username && parsed.username !== target.username) return false;
+  const secPath = normalizeCredPath(parsed.pathname);
+  if (secPath) {
+    const targetPath = normalizeCredPath(target.pathname);
+    return targetPath === secPath || targetPath.startsWith(`${secPath}/`);
+  }
+  return true;
+}
+
+/**
+ * 仅为受信任的远程 Git 传输子命令（push/fetch/ls-remote/pull/clone/lfs）投影目标域作用域内的 HTTPS 凭据：
+ *   - 绝不向普通 worker 或本地 git 暴露 ~/.git-credentials；
+ *   - 严格按目标协议、主机、端口（及 useHttpPath / 路径前缀）筛选匹配条目，写入 0600 临时文件并以只读挂载注入，用毕立即销毁。
+ */
+async function prepareScopedGitHttpCredentials(
+  cwd: string,
+  args: string[],
+  rawEnv: NodeJS.ProcessEnv,
+  opts?: GitRunOpts,
+): Promise<ScopedGitHttpCreds | undefined> {
+  if (!REMOTE_GIT_SUBCMDS.has(args[0] ?? "")) return undefined;
+  const spec = extractRemoteTargetSpec(args);
+  const rawUrls = new Set<string>(spec.explicitUrls);
+  if (spec.target && spec.target !== "." && !/^https?:\/\//i.test(spec.target)) {
+    const getUrlArgs =
+      spec.mode === "push"
+        ? ["remote", "get-url", "--push", "--all", spec.target]
+        : ["remote", "get-url", "--all", spec.target];
+    const r = await tryGit(cwd, getUrlArgs, { ...opts, readOnly: true });
+    if (r.code === 0) {
+      for (const line of r.stdout.split("\n")) {
+        const u = line.trim();
+        if (u) rawUrls.add(u);
+      }
+    }
+  }
+
+  const targetUrls: URL[] = [];
+  for (const u of rawUrls) {
+    const parsed = parseHttpUrlSafe(u);
+    if (parsed) targetUrls.push(parsed);
+  }
+  if (targetUrls.length === 0) return undefined;
+
+  const hostHome = rawEnv.HOME?.trim() || os.homedir();
+  const xdgConfigHome = rawEnv.XDG_CONFIG_HOME?.trim() || (hostHome ? path.join(hostHome, ".config") : "");
+  const defaultStoreFiles = [
+    ...(hostHome ? [path.join(hostHome, ".git-credentials")] : []),
+    ...(xdgConfigHome ? [path.join(xdgConfigHome, "git", "credentials")] : []),
+  ];
+
+  // 读取宿主机/仓库生效的 credential.helper 与按 URL 限定的 credential.<url>.helper
+  const helperCfg = await tryGit(cwd, ["config", "--get-regexp", "^credential(\\..+)?\\.helper$"], {
+    ...opts,
+    readOnly: true,
+  });
+  const storeFiles = new Set<string>();
+  const urlSpecificHelperKeys = new Set<string>();
+  let hasActiveStoreHelper = false;
+
+  if (helperCfg.code === 0) {
+    // 顺序解析以便尊重 `credential.helper = ""` 清空前序 helper 的 Git 语义，同时保留 subsection URL 路径大小写
+    const activeByKey = new Map<string, string[]>();
+    for (const rawLine of helperCfg.stdout.split("\n")) {
+      const line = rawLine.trimEnd();
+      if (!line) continue;
+      const sp = line.indexOf(" ");
+      const rawKey = sp === -1 ? line : line.slice(0, sp);
+      const val = sp === -1 ? "" : line.slice(sp + 1).trim();
+      let normKey: string;
+      if (/^credential\.helper$/i.test(rawKey)) {
+        normKey = "credential.helper";
+      } else {
+        const subMatch = rawKey.match(/^credential\.(.+)\.helper$/i);
+        if (!subMatch) continue;
+        normKey = `credential.${subMatch[1]}.helper`;
+      }
+      if (!val) {
+        activeByKey.set(normKey, []);
+      } else {
+        const list = activeByKey.get(normKey) ?? [];
+        list.push(val);
+        activeByKey.set(normKey, list);
+      }
+    }
+    for (const [key, helpers] of activeByKey) {
+      if (key === "credential.helper") {
+        for (const hv of helpers) {
+          const parsed = parseStoreHelperFile(hv, hostHome);
+          if (!parsed.isStore) continue;
+          hasActiveStoreHelper = true;
+          if (parsed.explicitFile) storeFiles.add(parsed.explicitFile);
+          else for (const df of defaultStoreFiles) storeFiles.add(df);
+        }
+      } else if (key.startsWith("credential.") && key.endsWith(".helper")) {
+        const pattern = key.slice("credential.".length, -".helper".length);
+        if (!targetUrls.some((t) => gitCredentialSectionMatchesUrl(pattern, t))) continue;
+        for (const hv of helpers) {
+          const parsed = parseStoreHelperFile(hv, hostHome);
+          if (!parsed.isStore) continue;
+          hasActiveStoreHelper = true;
+          urlSpecificHelperKeys.add(key);
+          if (parsed.explicitFile) storeFiles.add(parsed.explicitFile);
+          else for (const df of defaultStoreFiles) storeFiles.add(df);
+        }
+      }
+    }
+  }
+
+  if (!hasActiveStoreHelper || storeFiles.size === 0) return undefined;
+
+  // 检查目标 URL 是否启用 credential.useHttpPath
+  const useHttpPathByTarget = new Map<URL, boolean>();
+  for (const t of targetUrls) {
+    const uhp = await tryGit(cwd, ["config", "--bool", "--get-urlmatch", "credential.useHttpPath", t.href], {
+      ...opts,
+      readOnly: true,
+    });
+    useHttpPathByTarget.set(t, uhp.code === 0 && uhp.stdout.trim() === "true");
+  }
+
+  const dataDir = opts?.cfg?.dataDir;
+  const realData = dataDir && fs.existsSync(dataDir) ? fs.realpathSync(dataDir) : "";
+  const isOutsideDataDir = (p: string): boolean => {
+    if (!realData) return true;
+    try {
+      const real = fs.realpathSync(p);
+      const rel = path.relative(realData, real);
+      return rel !== "" && (rel.startsWith("..") || path.isAbsolute(rel));
+    } catch {
+      return false;
+    }
+  };
+
+  const matchedLines = new Set<string>();
+  for (const file of storeFiles) {
+    if (!file || !fs.existsSync(file) || !isOutsideDataDir(file)) continue;
+    try {
+      const st = fs.statSync(file);
+      if (!st.isFile() || st.size > 4 * 1024 * 1024) continue;
+      const text = fs.readFileSync(file, "utf8");
+      for (const rawLine of text.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith("#")) continue;
+        const matches = targetUrls.some((t) =>
+          gitCredentialLineMatchesTarget(line, t, useHttpPathByTarget.get(t) === true),
+        );
+        if (matches) matchedLines.add(line);
+      }
+    } catch {
+      // ignore unreadable credential file
+    }
+  }
+
+  if (matchedLines.size === 0) return undefined;
+
+  const scoped = createScopedSecretDir("pa-git-http-cred-", rawEnv);
+  const credFile = path.join(scoped.dir, "credentials");
+  try {
+    fs.writeFileSync(credFile, `${[...matchedLines].join("\n")}\n`, { mode: 0o600 });
+    const gitConfigArgs = ["-c", "credential.helper=", "-c", `credential.helper=store --file=${credFile}`];
+    for (const key of urlSpecificHelperKeys) {
+      gitConfigArgs.push("-c", `${key}=`, "-c", `${key}=store --file=${credFile}`);
+    }
+    return {
+      credDir: scoped.dir,
+      gitConfigArgs,
+      cleanup: scoped.cleanup,
+    };
+  } catch (err) {
+    scoped.cleanup();
+    throw err;
+  }
 }
 
 export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Promise<ProcResult> {
   const isRemote = REMOTE_GIT_SUBCMDS.has(args[0] ?? "");
-  const sshSock = resolveAuthorizedSshAuthSock(args, process.env, opts?.cfg?.dataDir);
+  const effectiveRawEnv: NodeJS.ProcessEnv = opts?.extraEnv
+    ? { ...process.env, ...opts.extraEnv }
+    : process.env;
+  const sshSock = resolveAuthorizedSshAuthSock(args, effectiveRawEnv, opts?.cfg?.dataDir);
+  const scopedHttpCreds = isRemote
+    ? await prepareScopedGitHttpCredentials(cwd, args, effectiveRawEnv, opts)
+    : undefined;
   const baseEnv = prepareHarnessEnv(process.env, { preserveSshAgent: !!sshSock });
   try {
     const safeSubArgs = args[0] === "diff" ? ["diff", "--no-ext-diff", ...args.slice(1)] : args;
@@ -147,11 +478,17 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
       ...(sshSock ? { SSH_AUTH_SOCK: sshSock } : {}),
     };
     delete childEnv.GIT_EXTERNAL_DIFF;
+    const effectiveOpts: GitRunOpts | undefined = scopedHttpCreds
+      ? {
+          ...opts,
+          extraReadOnlyPaths: [...(opts?.extraReadOnlyPaths ?? []), scopedHttpCreds.credDir],
+        }
+      : opts;
     const wrapped = wrapCredentialIsolatedCommand(
       "git",
-      ["-C", cwd, ...GIT_SAFE_ARGS, ...safeSubArgs],
-      process.env,
-      buildGitIsolation(cwd, opts, baseEnv.env.CREDENTIALS_DIRECTORY, sshSock, isRemote),
+      ["-C", cwd, ...GIT_SAFE_ARGS, ...(scopedHttpCreds?.gitConfigArgs ?? []), ...safeSubArgs],
+      effectiveRawEnv,
+      buildGitIsolation(cwd, effectiveOpts, baseEnv.env.CREDENTIALS_DIRECTORY, sshSock, isRemote, effectiveRawEnv),
     );
     return await runProcess(wrapped.cmd, wrapped.args, {
       env: childEnv,
@@ -160,6 +497,7 @@ export async function tryGit(cwd: string, args: string[], opts?: GitRunOpts): Pr
       group: true,
     });
   } finally {
+    scopedHttpCreds?.cleanup();
     baseEnv.cleanup();
   }
 }
@@ -212,9 +550,21 @@ export async function remoteUrl(cwd: string, remote: string, opts?: GitRunOpts):
   return r.stdout.trim();
 }
 
-/** 远端默认分支（ls-remote --symref HEAD）；查不到返回 ""。 */
+/** 远端默认分支（ls-remote --symref HEAD）；解析并只读挂载本地镜像（如 url.*.insteadOf 重写），查不到返回 ""。 */
 export async function remoteDefaultBranch(cwd: string, remote: string, opts?: GitRunOpts): Promise<string> {
-  const r = await tryGit(cwd, ["ls-remote", "--symref", remote, "HEAD"], { ...opts, readOnly: true });
+  const urlRes = await tryGit(cwd, ["remote", "get-url", "--all", remote], { ...opts, readOnly: true });
+  const urls =
+    urlRes.code === 0
+      ? urlRes.stdout.split("\n").map((s) => s.trim()).filter(Boolean)
+      : [remote];
+  const localDirs = [
+    ...new Set(urls.map((u) => resolveLocalGitRemoteDir(cwd, u)).filter((p): p is string => !!p)),
+  ];
+  const r = await tryGit(cwd, ["ls-remote", "--symref", remote, "HEAD"], {
+    ...opts,
+    readOnly: true,
+    extraReadOnlyPaths: [...(opts?.extraReadOnlyPaths ?? []), ...localDirs],
+  });
   if (r.code !== 0) return "";
   return r.stdout.match(/^ref:\s+refs\/heads\/(\S+)\s+HEAD/m)?.[1] ?? "";
 }
@@ -252,10 +602,11 @@ export function parseRemote(url: string): RemoteRef | undefined {
 }
 
 const ZERO_OID = "0000000000000000000000000000000000000000";
-// 与 Git LFS 官方 v1Aliases（git-lfs/lfs/pointer.go）完全一致：支持当前 spec/v1 与历史 hawser spec/v1
+// 与 Git LFS 官方 v1Aliases（git-lfs/lfs/pointer.go）完全一致：支持 spec/v1、hawser spec/v1 与 git-media.io/v/2
 const LFS_SPEC_HEADERS = [
   "version https://git-lfs.github.com/spec/v1",
   "version https://hawser.github.com/spec/v1",
+  "version http://git-media.io/v/2",
 ] as const;
 const LFS_SPEC_HEADER_BUFS = LFS_SPEC_HEADERS.map((h) => Buffer.from(h, "utf8"));
 const LFS_POINTER_MIN_BYTES = 80;

@@ -16,7 +16,26 @@ const prompt = fs.readFileSync(0, "utf8");
 const cwd = flag("--cwd");
 const agent = argv[argv.indexOf("exec") - 1];
 const perm = argv.find((a) => ["--approve-all", "--approve-reads", "--deny-all"].includes(a));
-if (process.env.STUB_ACPX_LOG) fs.appendFileSync(process.env.STUB_ACPX_LOG, JSON.stringify({ agent, perm, cwd, head: prompt.slice(0, 60) }) + "\n");
+const rpcUrl = process.env.STUB_RPC_URL;
+const logAcpx = async (entry) => {
+  const line = JSON.stringify(entry) + "\n";
+  if (rpcUrl) {
+    try {
+      const res = await fetch(`${rpcUrl}/acpx-log`, { method: "POST", body: line });
+      if (res.ok) return;
+    } catch {
+      // fall back to local file
+    }
+  }
+  if (process.env.STUB_ACPX_LOG) {
+    try {
+      fs.appendFileSync(process.env.STUB_ACPX_LOG, line);
+    } catch {
+      // ignore in sandbox
+    }
+  }
+};
+await logAcpx({ agent, perm, cwd, head: prompt.slice(0, 60) });
 
 if (prompt.includes("<signal id=")) {
   // 分诊：含“评审/补充/整理”的算任务
@@ -34,17 +53,43 @@ if (prompt.includes("<signal id=")) {
 } else if (prompt.includes("你是一名执行者")) {
   // 崩溃测试：STUB_HANG_FILE 内容为 armed 时，先留下一个未提交的半成品，再记下自己的 pid 并卡住
   const hang = process.env.STUB_HANG_FILE;
-  if (hang && fs.existsSync(hang) && fs.readFileSync(hang, "utf8") === "armed") {
+  let hangArmed = false;
+  let hangViaRpc = false;
+  if (hang) {
+    if (rpcUrl) {
+      try {
+        const res = await fetch(`${rpcUrl}/hang-check?file=${encodeURIComponent(hang)}`);
+        if (res.ok) {
+          hangArmed = (await res.text()) === "armed";
+          hangViaRpc = true;
+        }
+      } catch {
+        // fall back to disk
+      }
+    }
+    if (!hangViaRpc && fs.existsSync(hang)) {
+      hangArmed = fs.readFileSync(hang, "utf8") === "armed";
+    }
+  }
+  if (hang && hangArmed) {
     fs.writeFileSync(path.join(cwd, "partial.txt"), "half done\n");
-    fs.writeFileSync(hang, String(process.pid));
+    if (hangViaRpc && rpcUrl) {
+      await fetch(`${rpcUrl}/hang-mark?file=${encodeURIComponent(hang)}`, { method: "POST", body: String(process.pid) });
+    } else {
+      fs.writeFileSync(hang, String(process.pid));
+    }
     setInterval(() => undefined, 1 << 30);
   } else {
-  fs.writeFileSync(path.join(cwd, "hello.txt"), "hello from " + agent + "\n");
-  if (fs.existsSync(path.join(cwd, ".git"))) {
-    execFileSync("git", ["-C", cwd, "add", "-A"]);
-    execFileSync("git", ["-C", cwd, "-c", "user.name=stub", "-c", "user.email=stub@x", "commit", "-q", "--allow-empty", "-m", "add hello"]);
-  }
-  process.stdout.write(`已完成：新增 hello.txt（${agent}）\n`);
+    fs.writeFileSync(path.join(cwd, "hello.txt"), "hello from " + agent + "\n");
+    if (fs.existsSync(path.join(cwd, ".git"))) {
+      try {
+        execFileSync("git", ["-C", cwd, "add", "-A"], { stdio: "ignore" });
+        execFileSync("git", ["-C", cwd, "-c", "user.name=stub", "-c", "user.email=stub@x", "commit", "-q", "--allow-empty", "-m", "add hello"], { stdio: "ignore" });
+      } catch {
+        // Linux 隔离沙箱将共享 .git 挂载为只读以防工人篡改 hooks/config，由受信任 Dispatcher 自动提交改动
+      }
+    }
+    process.stdout.write(`已完成：新增 hello.txt（${agent}）\n`);
   }
 } else {
   // agent 作业：通过 PATH 上的守卫调用 lark-cli，一次越权、一次正常读取

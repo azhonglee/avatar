@@ -15,7 +15,7 @@ const LINUX_TMPFS_MAGIC = 0x01021994;
 
 export type MountMaskBackend =
   | { kind: "bwrap"; bin: string }
-  | { kind: "unshare"; bin: string; setprivBin: string; pivotRootBin?: string; killChild?: boolean }
+  | { kind: "unshare"; bin: string; setprivBin: string; pivotRootBin?: string; shBin?: string; killChild?: boolean }
   | { kind: "none" };
 let cachedMountMaskBackend: MountMaskBackend | undefined;
 
@@ -36,6 +36,8 @@ export interface IsolationOptions {
   maskFiles?: string[];
   /** 需要保留/解析并只读放行的可执行文件路径（如外部脚本或自定义工具链命令） */
   cmdPath?: string;
+  /** 除主命令外需要只读放行及其 npm 运行时依赖的辅助可执行文件（如 acpx 调用的底层 agent CLI 或 lark-cli） */
+  extraCmdPaths?: string[];
 }
 
 const BROAD_UNSAFE_AUTO_MOUNT_ROOTS = new Set([
@@ -140,20 +142,163 @@ function isPathInsideOrEqual(child: string, parent: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
-function resolvePivotRootBin(): string | undefined {
-  for (const cand of ["/sbin/pivot_root", "/usr/sbin/pivot_root"]) {
-    try {
-      fs.accessSync(cand, fs.constants.X_OK);
-      return cand;
-    } catch {
-      // try next
-    }
-  }
+const TRUSTED_BOOTSTRAP_PATH = "/usr/sbin:/usr/bin:/sbin:/bin";
+const TRUSTED_SYSTEM_BIN_DIRS = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] as const;
+const TRUSTED_BOOTSTRAP_ENV: NodeJS.ProcessEnv = {
+  PATH: TRUSTED_BOOTSTRAP_PATH,
+  LC_ALL: "C",
+};
+
+function isSafeBootstrapDir(dirPath: string, allowCurrentUid: boolean): boolean {
   try {
-    return resolveBin("pivot_root");
+    const st = fs.statSync(dirPath);
+    if (!st.isDirectory()) return false;
+    if ((st.mode & 0o022) !== 0) return false;
+    if (typeof process.getuid === "function") {
+      const uid = process.getuid();
+      if (allowCurrentUid) {
+        if (st.uid !== 0 && st.uid !== uid) return false;
+      } else if (st.uid !== 0) {
+        return false;
+      }
+    }
+    return true;
   } catch {
-    return undefined;
+    return false;
   }
+}
+
+function isSafeBootstrapBinary(binPath: string, opts: { allowCurrentUid?: boolean } = {}): boolean {
+  if (!binPath || !path.isAbsolute(binPath)) return false;
+  const allowCurrentUid = opts.allowCurrentUid === true;
+  try {
+    if (!isSafeBootstrapDir(path.dirname(binPath), allowCurrentUid)) return false;
+    const real = fs.realpathSync(binPath);
+    if (!isSafeBootstrapDir(path.dirname(real), allowCurrentUid)) return false;
+    const st = fs.statSync(real);
+    if (!st.isFile()) return false;
+    if ((st.mode & 0o022) !== 0) return false;
+    if (typeof process.getuid === "function") {
+      const uid = process.getuid();
+      if (allowCurrentUid) {
+        if (st.uid !== 0 && st.uid !== uid) return false;
+      } else if (st.uid !== 0) {
+        return false;
+      }
+    }
+    if (allowCurrentUid) {
+      // 用户级固定安装路径（如 ~/.local/bin/bwrap）绝不得落入当前工作目录或项目仓库根下，防止检出仓库劫持引导程序
+      const realRoot = safeRealpath(ROOT);
+      const realCwd = safeRealpath(process.cwd());
+      if (isPathInsideOrEqual(real, realRoot) || isPathInsideOrEqual(real, realCwd)) return false;
+    }
+    fs.accessSync(real, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 严格仅从 root 拥有的可信系统目录解析沙箱引导程序（sh / unshare / setpriv / pivot_root），绝不搜索进程继承的 PATH */
+export function resolveTrustedSystemBin(name: string): string | undefined {
+  if (!name || name.includes("/") || name.includes("\\")) return undefined;
+  for (const dir of TRUSTED_SYSTEM_BIN_DIRS) {
+    const cand = path.join(dir, name);
+    if (isSafeBootstrapBinary(cand, { allowCurrentUid: false })) return cand;
+  }
+  return undefined;
+}
+
+/**
+ * 解析可信的 bubblewrap（bwrap）引导程序路径：
+ *   1. 优先查 root 拥有的系统目录（/usr/bin、/bin、/usr/local/bin）；
+ *   2. 其次仅检查固定受控安装位置（/home/linuxbrew/.linuxbrew/bin/bwrap 与 ~/.local/bin/bwrap），
+ *      严格校验目录与文件归属 root 或当前 UID、非组/全局可写且不在当前工作目录或仓库根下；
+ *   3. 绝不搜索进程继承的 PATH，避免 npm/项目脚本在 PATH 头部注入恶意 bwrap 并在隔离建立前执行。
+ */
+export function resolveTrustedBwrapBin(): string | undefined {
+  for (const cand of ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]) {
+    if (isSafeBootstrapBinary(cand, { allowCurrentUid: false })) return cand;
+  }
+  const userHome = os.homedir();
+  const userFixed = [
+    "/home/linuxbrew/.linuxbrew/bin/bwrap",
+    ...(userHome ? [path.join(userHome, ".local", "bin", "bwrap")] : []),
+  ];
+  for (const cand of userFixed) {
+    if (isSafeBootstrapBinary(cand, { allowCurrentUid: true })) return cand;
+  }
+  return undefined;
+}
+
+function resolvePivotRootBin(): string | undefined {
+  return resolveTrustedSystemBin("pivot_root");
+}
+
+/** 仅返回 bin/guard/lark-cli 运行所需的 4 个精确只读文件，绝不挂载整个 ROOT（防暴露 ROOT/config.yaml 与 ROOT/.worktrees） */
+export function collectLarkGuardReadOnlyFiles(): string[] {
+  const candidates = [
+    path.join(ROOT, "bin", "guard", "lark-cli"),
+    path.join(ROOT, "src", "guard-cli.ts"),
+    path.join(ROOT, "src", "guard.ts"),
+    path.join(ROOT, "package.json"),
+  ];
+  return candidates.filter((p) => fs.existsSync(p)).map((p) => safeRealpath(p));
+}
+
+/** 按 acpx 实际选中的 agent 仅暴露该单一提供方的配置目录（以及 ~/.acpx），绝不向 Claude 工人暴露 ~/.codex 等其他提供方凭据 */
+export function selectAcpxAgentConfigPaths(
+  h: Pick<Config["harnesses"][string], "agent" | "agentCommand" | "env">,
+  hostHome: string,
+): string[] {
+  const out: string[] = [];
+  const addSub = (sub: string) => {
+    if (hostHome && sub) out.push(path.join(hostHome, sub));
+  };
+  const addAbs = (p: string | undefined) => {
+    const t = p?.trim();
+    if (t) out.push(path.isAbsolute(t) ? t : path.join(hostHome, t));
+  };
+  addSub(".acpx");
+
+  const agentRaw = (h.agent?.trim() || "").toLowerCase();
+  const cmdFirst = (h.agentCommand?.trim().split(/\s+/)[0] || "");
+  const cmdBase = cmdFirst ? path.basename(cmdFirst).toLowerCase() : "";
+  const id = agentRaw || cmdBase;
+
+  if (id === "claude" || id === "claude-code" || id.startsWith("claude-")) {
+    addSub(".claude");
+    addSub(".claude.json");
+    addAbs(h.env?.CLAUDE_CONFIG_DIR);
+  } else if (id === "codex" || id.startsWith("codex-")) {
+    const codexHome = h.env?.CODEX_HOME?.trim();
+    if (codexHome) addAbs(codexHome);
+    else addSub(".codex");
+  } else if (id === "gemini" || id.startsWith("gemini-")) {
+    addSub(".gemini");
+    addAbs(h.env?.GEMINI_CLI_HOME);
+  } else if (id === "doubao" || id.startsWith("doubao-")) {
+    addSub(".doubao");
+    addSub(".config/doubao");
+  } else if (id === "opencode" || id.startsWith("opencode-")) {
+    addSub(".config/opencode");
+    addSub(".local/share/opencode");
+  }
+  return [...new Set(out)];
+}
+
+/** 提取 acpx 选定 agent 对应的底层可执行名/路径，供沙箱挂载其全局 npm 包与运行时依赖 */
+function resolveAcpxAgentExecutable(h: Pick<Config["harnesses"][string], "agent" | "agentCommand">): string | undefined {
+  if (h.agentCommand?.trim()) {
+    return h.agentCommand.trim().split(/\s+/)[0];
+  }
+  const a = (h.agent?.trim() || "").toLowerCase();
+  if (a === "claude" || a === "claude-code") return "claude";
+  if (a === "codex") return "codex";
+  if (a === "gemini") return "gemini";
+  if (a === "doubao") return "doubao";
+  if (a === "opencode") return "opencode";
+  return a || undefined;
 }
 
 function resolveExpectedGitCommonDir(repoRoot: string): string {
@@ -431,6 +576,7 @@ export function buildWorkspaceIsolation(
     mode: WorkspaceIsolationMode;
     cwd?: string;
     cmdPath?: string;
+    extraCmdPaths?: string[];
     /** 受信任的派单仓库根目录：存在时严格校核 worktree `.git` / `commondir` 归属该仓库 */
     trustedRepoRoot?: string;
     /** 显式禁止挂载任何外部 worktree `.git` 目录（用于非 Git 派单的空工作区） */
@@ -442,10 +588,14 @@ export function buildWorkspaceIsolation(
   rawEnv: NodeJS.ProcessEnv = process.env,
 ): IsolationOptions {
   const dataDir = cfg?.dataDir;
-  // 纯无工具推理（llm-none）在未启用个人 Web 时不因轮询 ctx_obs 强制要求 Linux 命名空间，保持 macOS/受限主机兼容；
-  // 所有具备仓库访问能力的进程（verify / worker / codex-exec 审查 / git-rw / git-ro）均对 ctx_obs 启用隔离。
+  // 纯无工具推理（llm-none）在未启用个人 Web 时不因轮询 ctx_obs 强制要求 Linux 命名空间，保持非个人 Web 环境下的 keyring 兼容；
+  // 所有具备仓库访问能力的进程（verify / worker / codex-exec 审查 / git-rw / git-ro）在 Linux 上一律默认启用隔离，
+  // 不依赖启动工作区当前是否已写入密钥或 ctx_obs（避免新工作区或消息到达前启动的工人直接访问同 OS 用户其他工作区的 state.db）。
   const includeContextObs = opts.mode !== "llm-none";
-  const requireIsolation = workspaceRequiresIsolation(cfg, rawEnv, { includeContextObs });
+  const requireIsolation =
+    opts.mode !== "llm-none"
+      ? process.platform === "linux" || workspaceRequiresIsolation(cfg, rawEnv, { includeContextObs: true })
+      : workspaceRequiresIsolation(cfg, rawEnv, { includeContextObs: false });
   const writablePaths: string[] = [];
   const readOnlyPaths: string[] = [];
   const resolvedCwd = opts.cwd ? safeRealpath(opts.cwd) : undefined;
@@ -545,6 +695,7 @@ export function buildWorkspaceIsolation(
     writablePaths,
     readOnlyPaths,
     cmdPath: opts.cmdPath,
+    extraCmdPaths: opts.extraCmdPaths,
   };
 }
 
@@ -623,27 +774,36 @@ function probeMountMaskBackend(): MountMaskBackend {
   if (cachedMountMaskBackend) return cachedMountMaskBackend;
   const { systemRoDirs, systemRoFiles, systemSymlinks } = collectMinimalSystemRoot([]);
   try {
-    const bwrapBin = resolveBin("bwrap");
-    const bwrapProbeArgs: string[] = ["--die-with-parent"];
-    for (const d of systemRoDirs) bwrapProbeArgs.push("--ro-bind", d, d);
-    for (const f of systemRoFiles) bwrapProbeArgs.push("--ro-bind", f, f);
-    for (const s of systemSymlinks) bwrapProbeArgs.push("--symlink", s.target, s.dest);
-    bwrapProbeArgs.push("--dev", "/dev", "--unshare-pid", "--proc", "/proc", "--tmpfs", "/tmp", "--remount-ro", "/", "--", "true");
-    const r = spawnSync(bwrapBin, bwrapProbeArgs, { timeout: 3_000, stdio: "ignore" });
-    if (r.status === 0) {
-      cachedMountMaskBackend = { kind: "bwrap", bin: bwrapBin };
-      return cachedMountMaskBackend;
+    const bwrapBin = resolveTrustedBwrapBin();
+    if (bwrapBin) {
+      const trueBin = resolveTrustedSystemBin("true") ?? "/bin/true";
+      const bwrapProbeArgs: string[] = ["--die-with-parent"];
+      for (const d of systemRoDirs) bwrapProbeArgs.push("--ro-bind", d, d);
+      for (const f of systemRoFiles) bwrapProbeArgs.push("--ro-bind", f, f);
+      for (const s of systemSymlinks) bwrapProbeArgs.push("--symlink", s.target, s.dest);
+      bwrapProbeArgs.push("--dev", "/dev", "--unshare-pid", "--proc", "/proc", "--tmpfs", "/tmp", "--remount-ro", "/", "--", trueBin);
+      const r = spawnSync(bwrapBin, bwrapProbeArgs, {
+        env: TRUSTED_BOOTSTRAP_ENV,
+        timeout: 3_000,
+        stdio: "ignore",
+      });
+      if (r.status === 0) {
+        cachedMountMaskBackend = { kind: "bwrap", bin: bwrapBin };
+        return cachedMountMaskBackend;
+      }
     }
   } catch {
     // 尝试 unshare + pivot_root + setpriv 降权回退
   }
   try {
-    const unshareBin = resolveBin("unshare");
-    const setprivBin = resolveBin("setpriv");
+    const unshareBin = resolveTrustedSystemBin("unshare");
+    const setprivBin = resolveTrustedSystemBin("setpriv");
     const pivotRootBin = resolvePivotRootBin();
-    if (pivotRootBin) {
+    const shBin = resolveTrustedSystemBin("sh");
+    if (unshareBin && setprivBin && pivotRootBin && shBin) {
       const probeScript = [
         "set -e",
+        `export PATH="${TRUSTED_BOOTSTRAP_PATH}"`,
         'PIVOT="$1"; SP="$2"',
         "mount -n --make-rprivate /",
         "S=",
@@ -679,25 +839,29 @@ function probeMountMaskBackend(): MountMaskBackend {
         "--mount-proc",
         "--kill-child",
         "--",
-        "sh",
+        shBin,
         "-c",
         probeScript,
         "_",
         pivotRootBin,
         setprivBin,
       ];
-      const rKill = spawnSync(unshareBin, probeArgsWithKill, { timeout: 3_000, stdio: "ignore" });
+      const rKill = spawnSync(unshareBin, probeArgsWithKill, {
+        env: TRUSTED_BOOTSTRAP_ENV,
+        timeout: 3_000,
+        stdio: "ignore",
+      });
       if (rKill.status === 0) {
-        cachedMountMaskBackend = { kind: "unshare", bin: unshareBin, setprivBin, pivotRootBin, killChild: true };
+        cachedMountMaskBackend = { kind: "unshare", bin: unshareBin, setprivBin, pivotRootBin, shBin, killChild: true };
         return cachedMountMaskBackend;
       }
       const r = spawnSync(
         unshareBin,
-        ["--user", "--map-root-user", "--mount", "--pid", "--fork", "--mount-proc", "--", "sh", "-c", probeScript, "_", pivotRootBin, setprivBin],
-        { timeout: 3_000, stdio: "ignore" },
+        ["--user", "--map-root-user", "--mount", "--pid", "--fork", "--mount-proc", "--", shBin, "-c", probeScript, "_", pivotRootBin, setprivBin],
+        { env: TRUSTED_BOOTSTRAP_ENV, timeout: 3_000, stdio: "ignore" },
       );
       if (r.status === 0) {
-        cachedMountMaskBackend = { kind: "unshare", bin: unshareBin, setprivBin, pivotRootBin, killChild: false };
+        cachedMountMaskBackend = { kind: "unshare", bin: unshareBin, setprivBin, pivotRootBin, shBin, killChild: false };
         return cachedMountMaskBackend;
       }
     }
@@ -736,6 +900,9 @@ const MOUNTINFO_UNESCAPE_AWK = [
 
 const UNSHARE_ISOLATION_SCRIPT = [
   "set -e",
+  'ORIG_PATH="${PATH-}"',
+  'HAS_ORIG_PATH="${PATH+1}"',
+  `export PATH="${TRUSTED_BOOTSTRAP_PATH}"`,
   'PIVOT_ROOT="$1"; SETPRIV="$2"; DD="$3"; CWD="$4"; SYS_COUNT="$5"; SYM_COUNT="$6"; TM_COUNT="$7"; PRE_COUNT="$8"; POST_COUNT="$9"; M_COUNT="${10}"',
   "shift 10",
   "mount -n --make-rprivate /",
@@ -844,6 +1011,7 @@ const UNSHARE_ISOLATION_SCRIPT = [
   "umount -n -l /tmp/.oldroot",
   "rmdir /tmp/.oldroot",
   'if [ -n "$CWD" ]; then cd "$CWD"; fi',
+  'if [ -n "$HAS_ORIG_PATH" ]; then export PATH="$ORIG_PATH"; else unset PATH; fi',
   'exec "$SETPRIV" --bounding-set -all --inh-caps -all --ambient-caps -all --no-new-privs "$@"',
 ].join("\n");
 
@@ -983,7 +1151,206 @@ export function wrapCredentialIsolatedCommand(
     rawReadOnly.push(safeRealpath(credDir));
   }
 
-  // 自动放行当前运行所需的只读可执行文件与工具链目录（Node、cmd、PATH 下的非宽泛工具链），绝不暴露 $HOME 或其他工作区
+  // 自动放行当前运行所需的只读可执行文件及其 npm/独立包运行时依赖（绝不暴露 $HOME、ROOT 或其他工作区）
+  const resolvedRoot = safeRealpath(ROOT);
+  const candidateFileSymlinks: { dest: string; target: string; parentReal: string }[] = [];
+  const collectExecutableRuntimeDeps = (logicalBin: string | undefined, realBin: string | undefined) => {
+    if (!realBin || !fs.existsSync(realBin) || isForbiddenDaemonTarget(realBin)) return;
+    if (!isCoveredBySystemRo(realBin)) rawReadOnly.push(realBin);
+
+    if (logicalBin && path.isAbsolute(logicalBin)) {
+      try {
+        const lst = fs.lstatSync(logicalBin);
+        if (lst.isSymbolicLink()) {
+          const parentReal = safeRealpath(path.dirname(logicalBin));
+          const linkDest = path.join(parentReal, path.basename(logicalBin));
+          candidateFileSymlinks.push({ dest: linkDest, target: fs.readlinkSync(logicalBin), parentReal });
+        }
+      } catch {
+        // ignore stat error on logical path
+      }
+    }
+
+    if (isCoveredBySystemRo(realBin)) return;
+
+    const isSafePkgDir = (dir: string): boolean => {
+      if (!dir || dir === resolvedRoot || isBroadOrUnsafeAutoMount(dir) || isCoveredBySystemRo(dir)) return false;
+      // 严禁因 bin/guard/lark-cli 等内部路径意外把整个 Avatar 仓库挂载进来
+      if (isPathInsideOrEqual(resolvedRoot, dir)) return false;
+      return true;
+    };
+
+    const findNpmPackageRoot = (filePath: string): { pkgRoot: string; fromNodeModules: boolean } | undefined => {
+      const norm = path.resolve(filePath);
+      const parts = norm.split(path.sep).filter(Boolean);
+      const lastNm = parts.lastIndexOf("node_modules");
+      if (lastNm >= 0 && lastNm + 1 < parts.length) {
+        const firstSeg = parts[lastNm + 1];
+        if (firstSeg.startsWith("@") && lastNm + 2 < parts.length) {
+          const pkgRoot = path.sep + parts.slice(0, lastNm + 3).join(path.sep);
+          if (fs.existsSync(pkgRoot) && fs.statSync(pkgRoot).isDirectory()) {
+            return { pkgRoot: safeRealpath(pkgRoot), fromNodeModules: true };
+          }
+        } else if (!firstSeg.startsWith(".")) {
+          const pkgRoot = path.sep + parts.slice(0, lastNm + 2).join(path.sep);
+          if (fs.existsSync(pkgRoot) && fs.statSync(pkgRoot).isDirectory()) {
+            return { pkgRoot: safeRealpath(pkgRoot), fromNodeModules: true };
+          }
+        }
+      }
+      // 独立安装的包目录（非 node_modules 布局）：向上最多查找 4 层 package.json，绝不跨越 ROOT 或 $HOME
+      let cur = path.dirname(norm);
+      for (let depth = 0; depth < 4; depth++) {
+        if (!cur || cur === path.dirname(cur) || cur === resolvedRoot || isBroadOrUnsafeAutoMount(cur)) break;
+        const pj = path.join(cur, "package.json");
+        try {
+          if (fs.existsSync(pj) && fs.statSync(pj).isFile()) {
+            return { pkgRoot: safeRealpath(cur), fromNodeModules: false };
+          }
+        } catch {
+          break;
+        }
+        cur = path.dirname(cur);
+      }
+      return undefined;
+    };
+
+    const found = findNpmPackageRoot(realBin);
+    if (!found) {
+      // 非 npm 包的独立封装脚本（如 ~/scripts/tool 调同目录 tool.mjs）：仅当父目录窄且安全（绝非 ROOT、$HOME、/tmp、dataDir 且不含 config.yaml）时只读挂载该父目录
+      const binDir = path.dirname(realBin);
+      if (isSafePkgDir(binDir) && !fs.existsSync(path.join(binDir, "config.yaml"))) {
+        rawReadOnly.push(binDir);
+      }
+      return;
+    }
+    const { pkgRoot } = found;
+    if (!isSafePkgDir(pkgRoot)) return;
+
+    const visitedPkgs = new Set<string>();
+    const queue: string[] = [pkgRoot];
+    const MAX_PKG_VISITS = 512;
+
+    const resolveDepInAncestors = (fromPkgDir: string, depName: string): { logical: string; real: string } | undefined => {
+      const depSegments = depName.split("/");
+      let cur = fromPkgDir;
+      for (let depth = 0; depth < 12; depth++) {
+        const cand = path.join(cur, "node_modules", ...depSegments);
+        try {
+          if (fs.existsSync(cand) && fs.statSync(cand).isDirectory()) {
+            return { logical: cand, real: safeRealpath(cand) };
+          }
+        } catch {
+          // try parent
+        }
+        const parent = path.dirname(cur);
+        if (!parent || parent === cur || isBroadOrUnsafeAutoMount(parent)) break;
+        cur = parent;
+      }
+      return undefined;
+    };
+
+    while (queue.length > 0 && visitedPkgs.size < MAX_PKG_VISITS) {
+      const curPkg = queue.shift()!;
+      if (visitedPkgs.has(curPkg) || !isSafePkgDir(curPkg)) continue;
+      visitedPkgs.add(curPkg);
+      rawReadOnly.push(curPkg);
+
+      // 若该包位于 pnpm `.pnpm/<id>/node_modules/<pkg>` 中，顺带放行其同级 `.pnpm/<id>/node_modules` 以便符号链接可见
+      const nmParent = path.basename(path.dirname(curPkg)).startsWith("@")
+        ? path.dirname(path.dirname(curPkg))
+        : path.dirname(curPkg);
+      if (path.basename(nmParent) === "node_modules" && nmParent.includes(`${path.sep}.pnpm${path.sep}`)) {
+        if (isSafePkgDir(nmParent)) rawReadOnly.push(nmParent);
+      }
+
+      // 扫描包内自带 node_modules 的外部符号链接（兼容 pnpm / workspace 链接）
+      const nestedNm = path.join(curPkg, "node_modules");
+      try {
+        if (fs.existsSync(nestedNm) && fs.statSync(nestedNm).isDirectory()) {
+          for (const ent of fs.readdirSync(nestedNm, { withFileTypes: true })) {
+            const p = path.join(nestedNm, ent.name);
+            if (ent.name.startsWith("@")) {
+              try {
+                if (fs.statSync(p).isDirectory()) {
+                  for (const sub of fs.readdirSync(p, { withFileTypes: true })) {
+                    const sp = path.join(p, sub.name);
+                    try {
+                      if (fs.lstatSync(sp).isSymbolicLink() && fs.statSync(sp).isDirectory()) {
+                        const sr = safeRealpath(sp);
+                        if (!visitedPkgs.has(sr)) queue.push(sr);
+                      }
+                    } catch {
+                      // ignore broken link
+                    }
+                  }
+                }
+              } catch {
+                // ignore
+              }
+            } else {
+              try {
+                if (fs.lstatSync(p).isSymbolicLink() && fs.statSync(p).isDirectory()) {
+                  const r = safeRealpath(p);
+                  if (!visitedPkgs.has(r)) queue.push(r);
+                }
+              } catch {
+                // ignore
+              }
+            }
+          }
+        }
+      } catch {
+        // ignore unreadable nested node_modules
+      }
+
+      // 递归解析 package.json 中的运行时依赖（dependencies / optionalDependencies / peerDependencies）
+      const pjPath = path.join(curPkg, "package.json");
+      try {
+        const pjSt = fs.statSync(pjPath);
+        if (pjSt.isFile() && pjSt.size <= 1024 * 1024) {
+          const pj = JSON.parse(fs.readFileSync(pjPath, "utf8")) as Record<string, unknown>;
+          const depNames = new Set<string>();
+          for (const field of ["dependencies", "optionalDependencies", "peerDependencies"] as const) {
+            const block = pj[field];
+            if (block && typeof block === "object" && !Array.isArray(block)) {
+              for (const k of Object.keys(block as Record<string, unknown>)) {
+                if (k && !k.includes("..") && !path.isAbsolute(k)) depNames.add(k);
+              }
+            }
+          }
+          for (const depName of depNames) {
+            const resolvedDep = resolveDepInAncestors(curPkg, depName);
+            if (!resolvedDep) continue;
+            if (resolvedDep.logical !== resolvedDep.real) {
+              const depNmDir = depName.includes("/")
+                ? path.dirname(path.dirname(resolvedDep.logical))
+                : path.dirname(resolvedDep.logical);
+              if (isSafePkgDir(depNmDir)) {
+                try {
+                  const lst = fs.lstatSync(resolvedDep.logical);
+                  if (lst.isSymbolicLink()) {
+                    const pReal = safeRealpath(path.dirname(resolvedDep.logical));
+                    candidateFileSymlinks.push({
+                      dest: path.join(pReal, path.basename(resolvedDep.logical)),
+                      target: fs.readlinkSync(resolvedDep.logical),
+                      parentReal: pReal,
+                    });
+                  }
+                } catch {
+                  // ignore
+                }
+              }
+            }
+            if (!visitedPkgs.has(resolvedDep.real)) queue.push(resolvedDep.real);
+          }
+        }
+      } catch {
+        // ignore missing or unparseable package.json
+      }
+    }
+  };
+
   const pathEnv = rawEnv.PATH || process.env.PATH || "";
   const resolvedExec = safeRealpath(process.execPath);
   if (fs.existsSync(resolvedExec) && !isCoveredBySystemRo(resolvedExec)) {
@@ -996,13 +1363,18 @@ export function wrapCredentialIsolatedCommand(
 
   const resolvedCmdLogical = resolveBinInPath(cmd, pathEnv);
   const resolvedCmdReal = resolvedCmdLogical ? safeRealpath(resolvedCmdLogical) : undefined;
-  if (resolvedCmdReal && fs.existsSync(resolvedCmdReal) && !isCoveredBySystemRo(resolvedCmdReal) && !isForbiddenDaemonTarget(resolvedCmdReal)) {
-    rawReadOnly.push(resolvedCmdReal);
-  }
+  collectExecutableRuntimeDeps(resolvedCmdLogical, resolvedCmdReal);
+
   const extraCmdLogical = opts?.cmdPath ? resolveBinInPath(opts.cmdPath, pathEnv) : undefined;
   const extraCmdReal = extraCmdLogical ? safeRealpath(extraCmdLogical) : undefined;
-  if (extraCmdReal && fs.existsSync(extraCmdReal) && !isCoveredBySystemRo(extraCmdReal) && !isForbiddenDaemonTarget(extraCmdReal)) {
-    rawReadOnly.push(extraCmdReal);
+  collectExecutableRuntimeDeps(extraCmdLogical, extraCmdReal);
+
+  const extraCmdLogicalList: (string | undefined)[] = [];
+  for (const rawExtraCmd of opts?.extraCmdPaths ?? []) {
+    const l = rawExtraCmd ? resolveBinInPath(rawExtraCmd, pathEnv) : undefined;
+    const r = l ? safeRealpath(l) : undefined;
+    extraCmdLogicalList.push(l);
+    collectExecutableRuntimeDeps(l, r);
   }
 
   for (const dir of pathEnv.split(path.delimiter)) {
@@ -1067,6 +1439,7 @@ export function wrapCredentialIsolatedCommand(
     opts?.dataDir,
     resolvedCmdLogical,
     extraCmdLogical,
+    ...extraCmdLogicalList,
     ...(opts?.writablePaths ?? []),
     ...(opts?.readOnlyPaths ?? []),
     ...pathEnv.split(path.delimiter).filter((d) => path.isAbsolute(d)),
@@ -1077,9 +1450,24 @@ export function wrapCredentialIsolatedCommand(
     if (allRealMountTargets.some((mp) => mp === dest || isPathInsideOrEqual(mp, dest))) continue;
     symlinkMap.set(dest, target);
   }
-  const allSymlinks = [...symlinkMap.entries()]
+  const dirSymlinks = [...symlinkMap.entries()]
     .map(([dest, target]) => ({ dest, target }))
     .sort((a, b) => a.dest.length - b.dest.length || a.dest.localeCompare(b.dest));
+
+  // 补建未被挂载目录覆盖的可执行/依赖文件符号链接（如绝对路径调用 ~/.npm-global/bin/acpx -> ../lib/node_modules/acpx/dist/cli.js）；
+  // 在 bwrap 中必须放在 --tmpfs /tmp 与 dataDir tmpfs 之后创建，防止 /tmp 下的文件符号链接被 --tmpfs /tmp 抹除。
+  const fileSymlinkMap = new Map<string, string>();
+  for (const fsym of candidateFileSymlinks) {
+    if (symlinkMap.has(fsym.dest) || fileSymlinkMap.has(fsym.dest)) continue;
+    if (allRealMountTargets.some((mp) => isPathInsideOrEqual(fsym.dest, mp) || isPathInsideOrEqual(mp, fsym.dest))) {
+      continue;
+    }
+    fileSymlinkMap.set(fsym.dest, fsym.target);
+  }
+  const fileSymlinks = [...fileSymlinkMap.entries()]
+    .map(([dest, target]) => ({ dest, target }))
+    .sort((a, b) => a.dest.length - b.dest.length || a.dest.localeCompare(b.dest));
+  const allSymlinks = [...dirSymlinks, ...fileSymlinks];
 
   const rawMasks: string[] = [...(opts?.maskFiles ?? [])];
   if (hasCredKeyFile) {
@@ -1144,7 +1532,7 @@ export function wrapCredentialIsolatedCommand(
     for (const p of systemRoAll) {
       bwrapArgs.push("--ro-bind", p, p);
     }
-    for (const s of allSymlinks) {
+    for (const s of dirSymlinks) {
       bwrapArgs.push("--symlink", s.target, s.dest);
     }
     bwrapArgs.push("--dev", "/dev", "--unshare-pid", "--proc", "/proc", "--tmpfs", "/tmp");
@@ -1159,6 +1547,9 @@ export function wrapCredentialIsolatedCommand(
     }
     for (const m of postMounts) {
       bwrapArgs.push(m.mode === "ro" ? "--ro-bind" : "--bind", m.path, m.path);
+    }
+    for (const s of fileSymlinks) {
+      bwrapArgs.push("--symlink", s.target, s.dest);
     }
     if (resolvedDataDir) {
       bwrapArgs.push("--remount-ro", resolvedDataDir);
@@ -1176,6 +1567,7 @@ export function wrapCredentialIsolatedCommand(
     if (!backend.setprivBin || !backend.pivotRootBin) {
       throw new Error("unshare 回退缺少 setpriv 或 pivot_root，无法构建最小只读根挂载视图并永久剥离权限，已按安全策略拒绝执行");
     }
+    const shBin = backend.shBin ?? resolveTrustedSystemBin("sh") ?? "/bin/sh";
     const flatten = (list: MountEntry[]): string[] => list.flatMap((m) => [m.mode, m.path]);
     const flattenSyms = (list: { target: string; dest: string }[]): string[] => list.flatMap((s) => [s.target, s.dest]);
     const unshareArgs = [
@@ -1187,7 +1579,7 @@ export function wrapCredentialIsolatedCommand(
       "--mount-proc",
       ...(backend.killChild !== false ? ["--kill-child"] : []),
       "--",
-      "sh",
+      shBin,
       "-c",
       UNSHARE_ISOLATION_SCRIPT,
       "_",
@@ -1234,6 +1626,29 @@ function findVolatileTmpfsBase(env: NodeJS.ProcessEnv, overrideCandidates?: stri
     }
   }
   return undefined;
+}
+
+/** 创建 0700 临时凭据投影目录（优先放入易失 tmpfs，不可用时回退 os.tmpdir()），并注册进程退出兜底清理 */
+export function createScopedSecretDir(
+  prefix: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { dir: string; cleanup: () => void } {
+  const base = findVolatileTmpfsBase(env) ?? os.tmpdir();
+  const dir = safeRealpath(fs.mkdtempSync(path.join(base, prefix)));
+  fs.chmodSync(dir, 0o700);
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    process.off("exit", cleanup);
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  };
+  process.once("exit", cleanup);
+  return { dir, cleanup };
 }
 
 /**
@@ -1594,19 +2009,24 @@ function inspectCodexConfigPath(
 export function resolveEffectiveCodexCredentialStore(
   env: NodeJS.ProcessEnv,
   extraArgs: string[],
+  opts?: { ignoreProfiles?: boolean },
 ): {
   store?: string;
   codexHome: string;
   hasConfig: boolean;
   provider: string;
+  profile?: string;
   forcedLoginMethod?: string;
   needsCredentialStore: boolean;
+  awsProfile?: string;
   configError?: string;
 } {
   const effectiveHome = env.HOME?.trim() || os.homedir();
   const codexHome = env.CODEX_HOME?.trim() || path.join(effectiveHome, ".codex");
   const configPath = path.join(codexHome, "config.toml");
 
+  let cliProfile: string | undefined;
+  let extraConfigProfile: string | undefined;
   let extraStore: string | undefined;
   let extraProvider: string | undefined;
   let extraForcedLogin: string | undefined;
@@ -1625,6 +2045,13 @@ export function resolveEffectiveCodexCredentialStore(
     for (const [k, v] of Object.entries(entries)) sub[k] = v;
     target[subKey] = sub;
   };
+  const mergeProviderInto = (dst: TomlTable, src: TomlTable | undefined) => {
+    if (!src) return;
+    for (const [k, v] of Object.entries(src)) {
+      if (isPlainTable(v)) mergeSub(dst, k, v);
+      else dst[k] = v;
+    }
+  };
 
   const scanExpr = (expr: string) => {
     const parsed = parseCliConfigAssignment(expr);
@@ -1636,14 +2063,11 @@ export function resolveEffectiveCodexCredentialStore(
         if (segs[0] === "cli_auth_credentials_store" && typeof val === "string") extraStore = val.trim();
         else if (segs[0] === "model_provider" && typeof val === "string" && val.trim()) extraProvider = val.trim();
         else if (segs[0] === "forced_login_method" && typeof val === "string" && val.trim()) extraForcedLogin = val.trim();
+        else if (segs[0] === "profile" && typeof val === "string" && val.trim()) extraConfigProfile = val.trim();
         else if (segs[0] === "model_providers" && isPlainTable(val)) {
           for (const [pName, pDef] of Object.entries(val)) {
             if (!isPlainTable(pDef)) continue;
-            const dst = ensureExtra(pName);
-            for (const [fk, fv] of Object.entries(pDef)) {
-              if (isPlainTable(fv)) mergeSub(dst, fk, fv);
-              else dst[fk] = fv;
-            }
+            mergeProviderInto(ensureExtra(pName), pDef);
           }
         }
       } else if (segs[0] === "model_providers" && segs.length >= 3) {
@@ -1652,7 +2076,7 @@ export function resolveEffectiveCodexCredentialStore(
         if (segs.length === 3) {
           if (isPlainTable(val)) mergeSub(dst, field, val);
           else dst[field] = val;
-        } else if (segs.length === 4 && (field === "http_headers" || field === "env_http_headers")) {
+        } else if (segs.length === 4 && (field === "http_headers" || field === "env_http_headers" || field === "aws")) {
           mergeSub(dst, field, { [segs[3]]: val });
         }
       }
@@ -1666,13 +2090,19 @@ export function resolveEffectiveCodexCredentialStore(
       scanExpr(extraArgs[++i]);
     } else if (a.startsWith("--config=")) {
       scanExpr(a.slice("--config=".length));
+    } else if ((a === "-p" || a === "--profile") && extraArgs[i + 1]) {
+      const p = extraArgs[++i].trim();
+      if (p) cliProfile = p;
+    } else if (a.startsWith("--profile=")) {
+      const p = a.slice("--profile=".length).trim();
+      if (p) cliProfile = p;
     }
   }
 
   let doc: TomlTable | undefined;
   const inspected = inspectCodexConfigPath(codexHome, configPath);
   const hasConfig = inspected.exists;
-  const configError = inspected.error;
+  let configError = inspected.error;
   if (inspected.exists && inspected.rawContent !== undefined) {
     try {
       doc = parseToml(inspected.rawContent);
@@ -1681,31 +2111,83 @@ export function resolveEffectiveCodexCredentialStore(
     }
   }
 
-  const configStore = typeof doc?.cli_auth_credentials_store === "string" ? doc.cli_auth_credentials_store.trim() : undefined;
-  const configProvider = typeof doc?.model_provider === "string" && doc.model_provider.trim() ? doc.model_provider.trim() : undefined;
-  const configForcedLogin =
-    typeof doc?.forced_login_method === "string" && doc.forced_login_method.trim() ? doc.forced_login_method.trim() : undefined;
+  const configDefaultProfile =
+    typeof doc?.profile === "string" && doc.profile.trim() ? doc.profile.trim() : undefined;
+  const effectiveProfile = opts?.ignoreProfiles ? undefined : (cliProfile ?? extraConfigProfile ?? configDefaultProfile);
 
-  const store = extraStore || configStore || undefined;
-  const provider = extraProvider ?? configProvider ?? "openai";
-  const forcedLoginMethod = extraForcedLogin ?? configForcedLogin;
+  // 解析选中的 profile（先读 config.toml 的 [profiles.<name>]，再叠加同目录 <name>.config.toml，损坏链接 fail-closed）
+  let profileTable: TomlTable | undefined;
+  let sidecarDoc: TomlTable | undefined;
+  if (effectiveProfile) {
+    const profilesRoot = isPlainTable(doc?.profiles) ? doc.profiles : undefined;
+    if (profilesRoot && isPlainTable(profilesRoot[effectiveProfile])) {
+      profileTable = profilesRoot[effectiveProfile];
+    }
+    const safeProfileSeg =
+      !effectiveProfile.includes("/") &&
+      !effectiveProfile.includes("\\") &&
+      !effectiveProfile.includes("\0") &&
+      effectiveProfile !== "." &&
+      effectiveProfile !== "..";
+    if (safeProfileSeg) {
+      const sidecarPath = path.join(codexHome, `${effectiveProfile}.config.toml`);
+      const sidecarInspected = inspectCodexConfigPath(codexHome, sidecarPath);
+      if (sidecarInspected.error && !configError) {
+        configError = sidecarInspected.error;
+      } else if (sidecarInspected.exists && sidecarInspected.rawContent !== undefined) {
+        try {
+          sidecarDoc = parseToml(sidecarInspected.rawContent);
+        } catch (err) {
+          if (!configError) {
+            configError = `Codex profile 配置文件 (${sidecarPath}) 解析失败：${errMsg(err)}`;
+          }
+        }
+      }
+    }
+  }
+
+  const strOf = (t: TomlTable | undefined, key: string): string | undefined => {
+    const v = t?.[key];
+    return typeof v === "string" && v.trim() ? v.trim() : undefined;
+  };
+
+  const store =
+    extraStore ??
+    strOf(sidecarDoc, "cli_auth_credentials_store") ??
+    strOf(profileTable, "cli_auth_credentials_store") ??
+    strOf(doc, "cli_auth_credentials_store") ??
+    undefined;
+  const provider =
+    extraProvider ??
+    strOf(sidecarDoc, "model_provider") ??
+    strOf(profileTable, "model_provider") ??
+    strOf(doc, "model_provider") ??
+    "openai";
+  const forcedLoginMethod =
+    extraForcedLogin ??
+    strOf(sidecarDoc, "forced_login_method") ??
+    strOf(profileTable, "forced_login_method") ??
+    strOf(doc, "forced_login_method");
 
   const mergedProviderTable: TomlTable = Object.create(null) as TomlTable;
-  const configProvidersRoot = isPlainTable(doc?.model_providers) ? doc.model_providers : undefined;
-  const configProviderObj = configProvidersRoot && isPlainTable(configProvidersRoot[provider]) ? configProvidersRoot[provider] : undefined;
-  if (configProviderObj) {
-    for (const [k, v] of Object.entries(configProviderObj)) {
-      if (isPlainTable(v)) mergeSub(mergedProviderTable, k, v);
-      else mergedProviderTable[k] = v;
-    }
-  }
-  const extraProviderObj = extraProviders.get(provider);
-  if (extraProviderObj) {
-    for (const [k, v] of Object.entries(extraProviderObj)) {
-      if (isPlainTable(v)) mergeSub(mergedProviderTable, k, v);
-      else mergedProviderTable[k] = v;
-    }
-  }
+  const getProviderFrom = (root: TomlTable | undefined): TomlTable | undefined => {
+    const providersRoot = isPlainTable(root?.model_providers) ? root.model_providers : undefined;
+    return providersRoot && isPlainTable(providersRoot[provider]) ? providersRoot[provider] : undefined;
+  };
+  mergeProviderInto(mergedProviderTable, getProviderFrom(doc));
+  mergeProviderInto(mergedProviderTable, getProviderFrom(profileTable));
+  mergeProviderInto(mergedProviderTable, getProviderFrom(sidecarDoc));
+  mergeProviderInto(mergedProviderTable, extraProviders.get(provider));
+
+  const awsTable = isPlainTable(mergedProviderTable.aws) ? mergedProviderTable.aws : undefined;
+  const explicitAwsProfile = typeof awsTable?.profile === "string" && awsTable.profile.trim() ? awsTable.profile.trim() : undefined;
+  const envAwsProfile = env.AWS_PROFILE?.trim() || env.AWS_DEFAULT_PROFILE?.trim() || undefined;
+  const hasExplicitAwsStaticEnv = !!env.AWS_ACCESS_KEY_ID?.trim() && !!env.AWS_SECRET_ACCESS_KEY?.trim();
+  const awsProfile =
+    explicitAwsProfile ??
+    (provider === "amazon-bedrock" || awsTable
+      ? envAwsProfile ?? (!hasExplicitAwsStaticEnv ? "default" : undefined)
+      : undefined);
 
   let needsCredentialStore = true;
   if (NON_OPENAI_BUILTIN_CODEX_PROVIDERS.has(provider)) {
@@ -1749,10 +2231,203 @@ export function resolveEffectiveCodexCredentialStore(
     codexHome,
     hasConfig,
     provider,
+    ...(effectiveProfile ? { profile: effectiveProfile } : {}),
     forcedLoginMethod,
     needsCredentialStore,
+    ...(awsProfile ? { awsProfile } : {}),
     ...(configError ? { configError } : {}),
   };
+}
+
+export interface StagedAwsProfile {
+  dir: string;
+  configFile: string;
+  credentialsFile: string;
+  extraReadOnlyPaths: string[];
+  cleanup: () => void;
+}
+
+interface IniSection {
+  header: string;
+  lines: string[];
+  props: Map<string, string>;
+}
+
+function parseAwsIniSections(rawText: string): IniSection[] {
+  const sections: IniSection[] = [];
+  let cur: IniSection | undefined;
+  for (const rawLine of rawText.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(";")) continue;
+    const hdr = trimmed.match(/^\[([^\]]+)\]$/);
+    if (hdr) {
+      cur = { header: hdr[1].trim(), lines: [], props: new Map() };
+      sections.push(cur);
+      continue;
+    }
+    if (!cur) continue;
+    cur.lines.push(rawLine);
+    // 仅记录顶层（无前导缩进）的 key = value，供追踪 source_profile / sso_session / services / 文件路径引用
+    if (!/^\s/.test(rawLine)) {
+      const eq = rawLine.indexOf("=");
+      if (eq > 0) {
+        const k = rawLine.slice(0, eq).trim().toLowerCase();
+        const v = rawLine.slice(eq + 1).trim();
+        if (k) cur.props.set(k, v);
+      }
+    }
+  }
+  return sections;
+}
+
+function serializeAwsIniSections(sections: IniSection[]): string {
+  if (!sections.length) return "";
+  return sections.map((s) => `[${s.header}]\n${s.lines.join("\n")}`).join("\n\n") + "\n";
+}
+
+/**
+ * 为隔离沙箱中的 Bedrock / AWS Codex 仅投影选中的单个 AWS profile（及其传递依赖的 source_profile / sso-session / services），
+ * 绝不把整个 ~/.aws 目录或其他无关 AWS 账号凭据暴露给子进程。
+ */
+export function stageIsolatedAwsProfile(
+  profileName: string,
+  hostEnv: NodeJS.ProcessEnv = process.env,
+  dataDir?: string,
+): StagedAwsProfile | undefined {
+  const target = profileName.trim();
+  if (!target) return undefined;
+  const hostHome = hostEnv.HOME?.trim() || os.homedir();
+  const hostAwsDir = hostHome ? path.join(hostHome, ".aws") : "";
+  const hostConfigPath = hostEnv.AWS_CONFIG_FILE?.trim() || (hostAwsDir ? path.join(hostAwsDir, "config") : "");
+  const hostCredsPath =
+    hostEnv.AWS_SHARED_CREDENTIALS_FILE?.trim() || (hostAwsDir ? path.join(hostAwsDir, "credentials") : "");
+
+  const resolvedData = dataDir && fs.existsSync(dataDir) ? safeRealpath(dataDir) : "";
+  const isOutsideDataDir = (p: string): boolean => {
+    if (!resolvedData) return true;
+    const real = safeRealpath(p);
+    return !isPathInsideOrEqual(real, resolvedData) && !isPathInsideOrEqual(resolvedData, real);
+  };
+  const readHostIni = (filePath: string): IniSection[] => {
+    if (!filePath || !fs.existsSync(filePath) || !isOutsideDataDir(filePath)) return [];
+    try {
+      const st = fs.statSync(filePath);
+      if (!st.isFile() || st.size > 4 * 1024 * 1024) return [];
+      return parseAwsIniSections(fs.readFileSync(filePath, "utf8"));
+    } catch {
+      return [];
+    }
+  };
+
+  const configSections = readHostIni(hostConfigPath);
+  const credsSections = readHostIni(hostCredsPath);
+  if (configSections.length === 0 && credsSections.length === 0) return undefined;
+
+  const findConfigProfile = (name: string): IniSection | undefined => {
+    if (name === "default") {
+      return configSections.find((s) => s.header === "default" || s.header === "profile default");
+    }
+    return configSections.find((s) => {
+      const m = s.header.match(/^profile\s+(.+)$/);
+      return (m && m[1].trim() === name) || s.header === name;
+    });
+  };
+  const findCredsProfile = (name: string): IniSection | undefined =>
+    credsSections.find((s) => s.header === name);
+  const findConfigTagged = (prefix: string, name: string): IniSection | undefined =>
+    configSections.find((s) => {
+      const re = new RegExp(`^${prefix}\\s+(.+)$`);
+      const m = s.header.match(re);
+      return !!m && m[1].trim() === name;
+    });
+
+  const selectedConfig: IniSection[] = [];
+  const selectedCreds: IniSection[] = [];
+  const visitedProfiles = new Set<string>();
+  const visitedSso = new Set<string>();
+  const visitedServices = new Set<string>();
+  const extraReadOnlyPaths = new Set<string>();
+  const queue: { name: string; depth: number }[] = [{ name: target, depth: 0 }];
+
+  const addRefPath = (rawPath: string | undefined) => {
+    if (!rawPath) return;
+    const expanded = rawPath.startsWith("~/") && hostHome ? path.join(hostHome, rawPath.slice(2)) : rawPath;
+    if (!path.isAbsolute(expanded)) return;
+    try {
+      if (fs.existsSync(expanded) && isOutsideDataDir(expanded)) {
+        extraReadOnlyPaths.add(safeRealpath(expanded));
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  let needsSsoCache = false;
+  while (queue.length > 0) {
+    const { name, depth } = queue.shift()!;
+    if (depth > 6 || visitedProfiles.has(name)) continue;
+    visitedProfiles.add(name);
+
+    const cfgSec = findConfigProfile(name);
+    const credSec = findCredsProfile(name);
+    if (cfgSec) selectedConfig.push(cfgSec);
+    if (credSec) selectedCreds.push(credSec);
+
+    for (const sec of [cfgSec, credSec]) {
+      if (!sec) continue;
+      const srcProfile = sec.props.get("source_profile");
+      if (srcProfile && !visitedProfiles.has(srcProfile)) {
+        queue.push({ name: srcProfile, depth: depth + 1 });
+      }
+      const ssoSession = sec.props.get("sso_session");
+      if (ssoSession) {
+        needsSsoCache = true;
+        if (!visitedSso.has(ssoSession)) {
+          visitedSso.add(ssoSession);
+          const ssoSec = findConfigTagged("sso-session", ssoSession);
+          if (ssoSec) selectedConfig.push(ssoSec);
+        }
+      }
+      if (sec.props.has("sso_start_url") || sec.props.has("sso_account_id")) {
+        needsSsoCache = true;
+      }
+      const svc = sec.props.get("services");
+      if (svc && !visitedServices.has(svc)) {
+        visitedServices.add(svc);
+        const svcSec = findConfigTagged("services", svc);
+        if (svcSec) selectedConfig.push(svcSec);
+      }
+      addRefPath(sec.props.get("web_identity_token_file"));
+      addRefPath(sec.props.get("ca_bundle"));
+    }
+  }
+
+  if (selectedConfig.length === 0 && selectedCreds.length === 0) return undefined;
+
+  if (needsSsoCache && hostAwsDir) {
+    const ssoCacheDir = path.join(hostAwsDir, "sso", "cache");
+    if (fs.existsSync(ssoCacheDir) && isOutsideDataDir(ssoCacheDir)) {
+      extraReadOnlyPaths.add(safeRealpath(ssoCacheDir));
+    }
+  }
+
+  const scoped = createScopedSecretDir("pa-aws-profile-", hostEnv);
+  const configFile = path.join(scoped.dir, "config");
+  const credentialsFile = path.join(scoped.dir, "credentials");
+  try {
+    fs.writeFileSync(configFile, serializeAwsIniSections(selectedConfig), { mode: 0o600 });
+    fs.writeFileSync(credentialsFile, serializeAwsIniSections(selectedCreds), { mode: 0o600 });
+    return {
+      dir: scoped.dir,
+      configFile,
+      credentialsFile,
+      extraReadOnlyPaths: [...extraReadOnlyPaths],
+      cleanup: scoped.cleanup,
+    };
+  } catch (err) {
+    scoped.cleanup();
+    throw err;
+  }
 }
 
 export interface CodexKeyringConflict {
@@ -1776,12 +2451,17 @@ export function detectIsolatedCodexKeyringConflict(
   if (!harnessName) return undefined;
   const h = cfg.harnesses[harnessName];
   if (!h || h.type !== "codex-exec") return undefined;
-  const isoActive = workspaceRequiresIsolation(cfg, rawEnv, { includeContextObs: opts?.includeContextObs ?? false });
+  // 仓库级审查者（includeContextObs: true）在 Linux 上始终启用默认沙箱隔离，不依赖当前工作区状态
+  const isoActive =
+    opts?.includeContextObs === true ||
+    workspaceRequiresIsolation(cfg, rawEnv, { includeContextObs: false });
   if (!isoActive) return undefined;
 
   const baseEnv: NodeJS.ProcessEnv = opts?.home ? { ...rawEnv, HOME: opts.home } : { ...rawEnv };
   const merged = mergeHarnessEnv(baseEnv, h.env);
-  const { store, codexHome, needsCredentialStore } = resolveEffectiveCodexCredentialStore(merged, h.extraArgs);
+  const { store, codexHome, needsCredentialStore } = resolveEffectiveCodexCredentialStore(merged, h.extraArgs, {
+    ignoreProfiles: opts?.includeContextObs !== true,
+  });
   if (!needsCredentialStore) return undefined;
   const fix =
     '在 ~/.codex/config.toml 中设置 `cli_auth_credentials_store = "file"` 并重新运行 `codex login`，或在常驻进程环境中通过 `OPENAI_API_KEY` / `CODEX_API_KEY` / 自定义供应商 `env_key` 提供 API 密钥';
@@ -2320,20 +3000,16 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       run.tools === "write" ? "worker-write" : run.tools === "read" ? "worker-ro" : "llm-none";
     const acpxExtraRo: string[] = [];
     if (baseEnv.env.CREDENTIALS_DIRECTORY) acpxExtraRo.push(baseEnv.env.CREDENTIALS_DIRECTORY);
-    // bin/guard/lark-cli 依赖 ROOT/src/guard-cli.ts 与真实 lark-cli 可执行文件
-    if (fs.existsSync(ROOT)) acpxExtraRo.push(ROOT);
-    if (fs.existsSync(realLark)) acpxExtraRo.push(realLark);
-    const hostHome = process.env.HOME?.trim() || os.homedir();
+    // 仅挂载 bin/guard/lark-cli 运行所需的 4 个精确文件，绝不挂载整个 ROOT（防暴露 ROOT/config.yaml 与 ROOT/.worktrees）
+    acpxExtraRo.push(...collectLarkGuardReadOnlyFiles());
+    if (run.lark !== "none" && fs.existsSync(realLark)) acpxExtraRo.push(realLark);
+    const hostHome = h.env?.HOME?.trim() || process.env.HOME?.trim() || os.homedir();
     const resolvedDataDir = cfg.dataDir && fs.existsSync(cfg.dataDir) ? safeRealpath(cfg.dataDir) : "";
-    for (const sub of [
-      ".acpx",
-      ".claude",
-      ".claude.json",
-      ".codex",
-      ".gemini",
-      ...(run.lark !== "none" ? [".lark-cli", ".config/lark-cli"] : []),
-    ]) {
-      const p = path.join(hostHome, sub);
+    const selectedConfigPaths = [
+      ...selectAcpxAgentConfigPaths(h, hostHome),
+      ...(run.lark !== "none" ? [path.join(hostHome, ".lark-cli"), path.join(hostHome, ".config", "lark-cli")] : []),
+    ];
+    for (const p of selectedConfigPaths) {
       if (!fs.existsSync(p)) continue;
       const real = safeRealpath(p);
       if (resolvedDataDir && (isPathInsideOrEqual(real, resolvedDataDir) || isPathInsideOrEqual(resolvedDataDir, real))) {
@@ -2341,6 +3017,11 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
       }
       acpxExtraRo.push(real);
     }
+    const agentExec = resolveAcpxAgentExecutable(h);
+    const acpxExtraCmds = [
+      ...(agentExec ? [agentExec] : []),
+      ...(run.lark !== "none" ? [realLark] : []),
+    ];
     const wrapped = wrapCredentialIsolatedCommand(
       cfg.bins.acpx,
       args,
@@ -2349,6 +3030,7 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
         mode,
         cwd: run.cwd,
         cmdPath: cfg.bins.acpx,
+        extraCmdPaths: acpxExtraCmds,
         trustedRepoRoot: run.trustedRepoRoot,
         disableGitWorktreeMounts: run.disableGitWorktreeMounts,
         allowGuardLog: run.lark !== "none",
@@ -2468,25 +3150,30 @@ function parseJwtExpMs(token: string): number | undefined {
 }
 
 /**
- * 判断文件态 Codex OAuth 凭据在本次运行中是否可能触发单次 refresh_token 轮换：
+ * 判断文件态 Codex OAuth 凭据在本次运行窗口（至少 5 分钟，长任务按运行超时上限计算）内是否可能触发单次 refresh_token 轮换：
  *   - 无 refresh_token 时返回 false；
- *   - access_token 缺失/为空，或为 JWT 且已过期 / 5 分钟内过期，或 last_refresh 超过 7 天：返回 true；
- *   - access_token 非 JWT（不透明令牌）时，若 last_refresh 缺失或已超过 55 分钟：返回 true。
+ *   - access_token 缺失/为空，或为 JWT 且在 `now + runWindowMs` 前过期，或 `now + runWindowMs - last_refresh >= 7 天`：返回 true；
+ *   - access_token 非 JWT（不透明令牌）时，若 last_refresh 缺失或 `now + runWindowMs - last_refresh >= 55 分钟`：返回 true。
  */
-export function isCodexOAuthRefreshNeeded(origJson: Record<string, unknown>, now = Date.now()): boolean {
+export function isCodexOAuthRefreshNeeded(
+  origJson: Record<string, unknown>,
+  now = Date.now(),
+  runWindowMs = 5 * 60_000,
+): boolean {
   if (!hasOAuthRefreshToken(origJson)) return false;
+  const windowMs = Math.max(5 * 60_000, runWindowMs);
   const tokens = origJson.tokens as Record<string, unknown>;
   const accessToken = typeof tokens.access_token === "string" ? tokens.access_token.trim() : "";
   if (!accessToken) return true;
   const lastRefreshMs = typeof origJson.last_refresh === "string" ? Date.parse(origJson.last_refresh) : NaN;
   const expMs = parseJwtExpMs(accessToken);
   if (expMs !== undefined) {
-    if (expMs <= now + 5 * 60_000) return true;
-    if (!Number.isFinite(lastRefreshMs) || now - lastRefreshMs >= 7 * 86_400_000) return true;
+    if (expMs <= now + windowMs) return true;
+    if (!Number.isFinite(lastRefreshMs) || now + windowMs - lastRefreshMs >= 7 * 86_400_000) return true;
     return false;
   }
   if (!Number.isFinite(lastRefreshMs)) return true;
-  return now - lastRefreshMs >= 55 * 60_000;
+  return now + windowMs - lastRefreshMs >= 55 * 60_000;
 }
 
 function isCurrentUidOwner(st: fs.Stats): boolean {
@@ -2503,31 +3190,38 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-function getCanonicalCodexLockDir(): string {
-  const uid = typeof process.getuid === "function" ? String(process.getuid()) : "user";
-  const candidate = path.join(os.tmpdir(), `pa-codex-auth-locks-${uid}`);
-  fs.mkdirSync(candidate, { recursive: true, mode: 0o700 });
-  const st = fs.lstatSync(candidate);
-  if (st.isSymbolicLink() || !st.isDirectory() || !isCurrentUidOwner(st)) {
-    throw new Error(`Codex 凭据同步锁目录不安全：${candidate}`);
-  }
-  try {
-    if ((st.mode & 0o077) !== 0) fs.chmodSync(candidate, 0o700);
-  } catch {
-    // ignore chmod error on non-POSIX fs
-  }
-  return candidate;
-}
-
-function canonicalCodexLockFilePath(resolvedAuthPath: string): string {
-  const baseDir = getCanonicalCodexLockDir();
-  const keyHash = createHash("sha256").update(safeRealpath(resolvedAuthPath)).digest("hex").slice(0, 24);
-  return path.join(baseDir, `.codex-auth-sync-${keyHash}.lock.db`);
+/**
+ * 将 Codex OAuth 刷新协调 SQLite 锁放在规范化 `resolvedAuthPath` 同目录下，
+ * 彻底独立于各进程的 `TMPDIR` 或 systemd `PrivateTmp=yes` 私有临时挂载，确保共享同一 `auth.json` 的所有进程命中同一把锁。
+ */
+export function canonicalCodexLockFilePath(resolvedAuthPath: string): string {
+  const realAuth = safeRealpath(resolvedAuthPath);
+  const dir = path.dirname(realAuth);
+  const base = path.basename(realAuth);
+  return path.join(dir, `.${base}.pa-refresh.lock.db`);
 }
 
 function openCodexLockDb(resolvedAuthPath: string): DatabaseSync {
   const lockFile = canonicalCodexLockFilePath(resolvedAuthPath);
+  const lockDir = path.dirname(lockFile);
+  const dirSt = fs.lstatSync(lockDir);
+  if (dirSt.isSymbolicLink() || !dirSt.isDirectory() || !isCurrentUidOwner(dirSt)) {
+    throw new Error(`Codex 凭据同步锁目录不安全：${lockDir}`);
+  }
+  try {
+    const existingSt = fs.lstatSync(lockFile);
+    if (existingSt.isSymbolicLink() || !existingSt.isFile() || !isCurrentUidOwner(existingSt)) {
+      throw new Error(`Codex 凭据同步锁文件不安全：${lockFile}`);
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+  }
   const db = new DatabaseSync(lockFile);
+  try {
+    fs.chmodSync(lockFile, 0o600);
+  } catch {
+    // ignore chmod error on non-POSIX fs
+  }
   db.exec("PRAGMA busy_timeout = 5000");
   db.exec(`
     CREATE TABLE IF NOT EXISTS refresh_lease (
@@ -2743,6 +3437,8 @@ export async function coordinateCodexOAuthRefresh(
     leaseTtlMs?: number;
     pollIntervalMs?: number;
     maxWaitMs?: number;
+    /** 本次运行的预期最持续时长（毫秒）：若令牌可能在该窗口内过期，提前进入刷新协调锁，避免并发拷贝同时旋转 refresh_token */
+    runWindowMs?: number;
   },
 ): Promise<CodexOAuthRefreshLease> {
   if (opts?.needsCredentialStore === false) {
@@ -2792,7 +3488,7 @@ export async function coordinateCodexOAuthRefresh(
           `宿主机 Codex OAuth 凭据不可安全写回（${cur.unwritableReason ?? "权限不足"}）；已中止执行`,
         );
       }
-      if (!isCodexOAuthRefreshNeeded(cur.origJson, now)) {
+      if (!isCodexOAuthRefreshNeeded(cur.origJson, now, opts?.runWindowMs)) {
         if (row) db.prepare("DELETE FROM refresh_lease WHERE id = 1").run();
         return { action: "proceed_unlocked" as const };
       }
@@ -2892,31 +3588,33 @@ export function stageIsolatedCodexHome(
       }
     }
 
-    const hostAuthPath = path.join(hostCodexHome, "auth.json");
-    const authInspected = inspectHostCodexAuth(hostAuthPath);
-    if (authInspected.kind === "broken_symlink") {
-      if (opts.needsCredentialStore !== false) {
+    // 当生效供应商不依赖宿主机 OpenAI/ChatGPT 登录态（如本地模型、Bedrock 或显式 API Key）时，
+    // 绝不检查或拷贝宿主机 auth.json，防止把无关的 ChatGPT refresh_token 暴露给隔离子进程或残留在临时目录中
+    if (opts.needsCredentialStore !== false) {
+      const hostAuthPath = path.join(hostCodexHome, "auth.json");
+      const authInspected = inspectHostCodexAuth(hostAuthPath);
+      if (authInspected.kind === "broken_symlink") {
         throw new Error(authInspected.error);
-      }
-    } else if (authInspected.kind === "ok") {
-      const isOAuth = !!authInspected.origJson && hasOAuthRefreshToken(authInspected.origJson);
-      if (isOAuth && !authInspected.canSyncBack && opts.needsCredentialStore !== false) {
-        throw new Error(
-          `宿主机 Codex OAuth 凭据不可安全写回（${authInspected.unwritableReason ?? "权限不足"}）；为防止隔离沙箱消耗单次 refresh_token 后丢失新令牌，已中止执行`,
-        );
-      }
-      fs.writeFileSync(path.join(scratchDir, "auth.json"), authInspected.origBytes, { mode: 0o600 });
-      if (authInspected.origJson) {
-        origAuth = {
-          hostAuthPath: authInspected.hostAuthPath,
-          resolvedAuthPath: authInspected.resolvedAuthPath,
-          wasSymlink: authInspected.wasSymlink,
-          origBytes: authInspected.origBytes,
-          origJson: authInspected.origJson,
-          origDev: authInspected.origDev,
-          origIno: authInspected.origIno,
-          canSyncBack: authInspected.canSyncBack,
-        };
+      } else if (authInspected.kind === "ok") {
+        const isOAuth = !!authInspected.origJson && hasOAuthRefreshToken(authInspected.origJson);
+        if (isOAuth && !authInspected.canSyncBack) {
+          throw new Error(
+            `宿主机 Codex OAuth 凭据不可安全写回（${authInspected.unwritableReason ?? "权限不足"}）；为防止隔离沙箱消耗单次 refresh_token 后丢失新令牌，已中止执行`,
+          );
+        }
+        fs.writeFileSync(path.join(scratchDir, "auth.json"), authInspected.origBytes, { mode: 0o600 });
+        if (authInspected.origJson) {
+          origAuth = {
+            hostAuthPath: authInspected.hostAuthPath,
+            resolvedAuthPath: authInspected.resolvedAuthPath,
+            wasSymlink: authInspected.wasSymlink,
+            origBytes: authInspected.origBytes,
+            origJson: authInspected.origJson,
+            origDev: authInspected.origDev,
+            origIno: authInspected.origIno,
+            canSyncBack: authInspected.canSyncBack,
+          };
+        }
       }
     }
 
@@ -3281,6 +3979,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   const baseEnv = prepareHarnessEnv();
   const started = new Date().toISOString();
   let stagedCodexHome: StagedCodexHome | undefined;
+  let stagedAws: StagedAwsProfile | undefined;
   let oauthLease: CodexOAuthRefreshLease | undefined;
   let r: Awaited<ReturnType<typeof runProcess>>;
   let text = "";
@@ -3288,7 +3987,9 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   try {
     let finalEnv = mergeHarnessEnv(baseEnv.env, h.env);
     // 在覆盖为临时 CODEX_HOME 前，基于宿主机真实 CODEX_HOME 与原始 extraArgs 解析生效的认证策略与供应商配置
-    const effectiveCredInfo = resolveEffectiveCodexCredentialStore(finalEnv, h.extraArgs);
+    const effectiveCredInfo = resolveEffectiveCodexCredentialStore(finalEnv, h.extraArgs, {
+      ignoreProfiles: run.tools === "none",
+    });
     if (effectiveCredInfo.configError) {
       throw new Error(`${effectiveCredInfo.configError}；为避免将私聊或代码误发往默认供应商，已中止执行`);
     }
@@ -3338,6 +4039,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
         ...(baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : []),
       ],
     });
+    const runTimeoutMs = (run.timeoutSec + 60) * 1000;
     const willIsolate = willIsolateCommand(process.env, baseIsoPlan);
     if (willIsolate) {
       if (process.platform === "linux" && effectiveCredInfo.needsCredentialStore && effectiveCredInfo.store === "keyring") {
@@ -3345,19 +4047,30 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
           `执行者 ${run.harness} 配置了 cli_auth_credentials_store="keyring"，但当前 Linux 隔离沙箱已屏蔽宿主机 D-Bus 会话总线与 XDG_RUNTIME_DIR，无法访问 Secret Service；请在 ~/.codex/config.toml 中改用 cli_auth_credentials_store="file" 并重新运行 codex login，或通过 OPENAI_API_KEY / CODEX_API_KEY / 供应商 env_key 提供 API 密钥`,
         );
       }
-      // 先按规范化目标路径跨进程/跨工作区协调 OAuth 刷新租约，再拷贝最新 auth.json，防止并发隔离 worker 重复消费单次 refresh_token
+      // 先按规范化目标路径跨进程/跨工作区协调 OAuth 刷新租约（覆盖整个运行超时窗口），再拷贝最新 auth.json，防止并发隔离 worker 重复消费单次 refresh_token
       oauthLease = await coordinateCodexOAuthRefresh(hostCodexHome, {
         needsCredentialStore: effectiveCredInfo.needsCredentialStore,
         signal: run.signal,
+        runWindowMs: runTimeoutMs + 60_000,
+        maxWaitMs: Math.max(180_000, runTimeoutMs + 30_000),
       });
       stagedCodexHome = stageIsolatedCodexHome(hostCodexHome, {
         copyUserConfig: run.tools !== "none",
         needsCredentialStore: effectiveCredInfo.needsCredentialStore,
       });
+      if (effectiveCredInfo.awsProfile) {
+        stagedAws = stageIsolatedAwsProfile(effectiveCredInfo.awsProfile, finalEnv, cfg.dataDir);
+      }
       finalEnv = {
         ...finalEnv,
         ...isolatedSandboxTempEnv(),
         CODEX_HOME: stagedCodexHome.scratchDir,
+        ...(stagedAws
+          ? {
+              AWS_CONFIG_FILE: stagedAws.configFile,
+              AWS_SHARED_CREDENTIALS_FILE: stagedAws.credentialsFile,
+            }
+          : {}),
       };
     } else if (
       process.platform === "linux" &&
@@ -3373,8 +4086,9 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
     }
 
     const extraRo = [
-      ...(run.tools !== "none" && fs.existsSync(hostCodexHome) ? [hostCodexHome] : []),
+      ...(run.tools !== "none" && !stagedCodexHome && fs.existsSync(hostCodexHome) ? [hostCodexHome] : []),
       ...(baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : []),
+      ...(stagedAws ? [stagedAws.dir, ...stagedAws.extraReadOnlyPaths] : []),
     ];
     const extraRw = [
       ...(isolatedTmp ? [isolatedTmp] : []),
@@ -3399,7 +4113,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       cwd: execCwd,
       env: finalEnv,
       input: run.prompt,
-      timeoutMs: (run.timeoutSec + 60) * 1000,
+      timeoutMs: runTimeoutMs,
       group: true,
       signal: run.signal,
       onSpawn: run.onSpawn,
@@ -3417,6 +4131,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
     oauthLease?.release();
     baseEnv.cleanup();
     stagedCodexHome?.cleanup();
+    stagedAws?.cleanup();
     if (isolatedTmp) fs.rmSync(isolatedTmp, { recursive: true, force: true });
     if (readOutDir) fs.rmSync(readOutDir, { recursive: true, force: true });
   }
@@ -3468,9 +4183,9 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
       run.tools === "write" ? "worker-write" : run.tools === "read" ? "worker-ro" : "llm-none";
     const doubaoExtraRo: string[] = [];
     if (baseEnv.env.CREDENTIALS_DIRECTORY) doubaoExtraRo.push(baseEnv.env.CREDENTIALS_DIRECTORY);
-    if (fs.existsSync(ROOT)) doubaoExtraRo.push(ROOT);
-    if (fs.existsSync(realLark)) doubaoExtraRo.push(realLark);
-    const hostHome = process.env.HOME?.trim() || os.homedir();
+    doubaoExtraRo.push(...collectLarkGuardReadOnlyFiles());
+    if (run.lark !== "none" && fs.existsSync(realLark)) doubaoExtraRo.push(realLark);
+    const hostHome = h.env?.HOME?.trim() || process.env.HOME?.trim() || os.homedir();
     const resolvedDataDir = cfg.dataDir && fs.existsSync(cfg.dataDir) ? safeRealpath(cfg.dataDir) : "";
     for (const sub of [
       ".doubao",
@@ -3493,6 +4208,7 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
         mode,
         cwd: run.cwd,
         cmdPath: cmd,
+        extraCmdPaths: run.lark !== "none" ? [realLark] : [],
         trustedRepoRoot: run.trustedRepoRoot,
         disableGitWorktreeMounts: run.disableGitWorktreeMounts,
         allowGuardLog: run.lark !== "none",

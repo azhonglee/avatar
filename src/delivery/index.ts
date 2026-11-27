@@ -397,7 +397,16 @@ async function removeStaleWorktreeAdminRecord(
       const wtParent = path.join(cfg.dataDir, "worktrees");
       const gitOpts = { cfg, trustedRepoRoot: spec.path };
       if (d.cwd && fs.existsSync(d.cwd)) {
-        await git(spec.path, ["worktree", "remove", "--force", d.cwd], { ...gitOpts, extraWritablePaths: [wtParent] });
+        const wtParent = path.join(cfg.dataDir, "worktrees");
+        const cwdParent = path.dirname(path.resolve(d.cwd));
+        const resolvedData = path.resolve(cfg.dataDir);
+        const relToData = path.relative(cwdParent, resolvedData);
+        const cwdParentContainsData = relToData === "" || (!relToData.startsWith("..") && !path.isAbsolute(relToData));
+        const extraWritable = [wtParent];
+        if (cwdParent !== "/tmp" && !cwdParentContainsData && fs.existsSync(cwdParent)) {
+          extraWritable.push(cwdParent);
+        }
+        await git(spec.path, ["worktree", "remove", "--force", d.cwd], { ...gitOpts, extraWritablePaths: extraWritable });
         removed.push(`worktree ${d.cwd}`);
       } else if (d.cwd) {
         const stale = await removeStaleWorktreeAdminRecord(spec.path, d.cwd, gitOpts);

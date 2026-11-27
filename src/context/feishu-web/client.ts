@@ -180,6 +180,25 @@ class SessionRetryPolicy {
   }
 }
 
+export class UnusableOriginalMessageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnusableOriginalMessageError";
+  }
+}
+
+/** 统一判定一条个人 Web 消息是否满足可入库/可回复的基本正文与发送者条件（用户消息、有效会话类型、未标记 unsupported、非空正文） */
+export function isUsableWebMessage(m: WebMessage): boolean {
+  return (
+    !!m.id &&
+    !!m.conversationId &&
+    !m.unsupported &&
+    (m.conversationKind === "group" || m.conversationKind === "dm") &&
+    m.senderType === USER_SENDER_TYPE &&
+    !!m.text.trim()
+  );
+}
+
 export class FeishuWebClient {
   private readonly endpoints: WebEndpoints;
   private readonly jar: RecordingCookieJar;
@@ -664,6 +683,9 @@ export class FeishuWebClient {
     const original = await this.readMessage(input.messageId, input.signal);
     if (original.conversationId !== input.chatId) {
       throw new Error("原消息所属会话与草稿目标不一致，拒绝发送");
+    }
+    if (!isUsableWebMessage(original)) {
+      throw new UnusableOriginalMessageError("实时回读原消息已不可用（可能已被撤回、编辑为空或转为不支持类型），已中止发送");
     }
     if (input.requireMentionOwnerId) {
       const liveAtMe =

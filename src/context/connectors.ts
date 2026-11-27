@@ -1086,10 +1086,17 @@ export class Connectors {
           entry.kind =
             mergedChatType.toLowerCase() === "p2p" ? "p2p" : senderId === me ? "mine" : "group";
         } else {
-          // 若 +messages-mget 未返回 mentions 字段，依据权威正文与候选版本的匹配关系推断 kind
-          const matchingCand = entry.candidates.find((c) => c.text === freshText);
-          if (matchingCand) {
-            entry.kind = matchingCand.atMe ? "at_me" : matchingCand.kind;
+          // 若 +messages-mget 未返回 mentions 字段，仅当全部与权威正文一致的候选对是否 @我 达成一致时才推断 kind；
+          // 若候选正文相同却在 @我 归类上冲突，按未决处理并保留游标待下次重试，绝不偏袒先到的 --is-at-me 流
+          const matchingCands = entry.candidates.filter((c) => c.text === freshText);
+          if (matchingCands.length > 0) {
+            const atMeValues = new Set(matchingCands.map((c) => c.atMe));
+            if (atMeValues.size > 1) {
+              entry.verifyFailed = true;
+              continue;
+            }
+            const matched = matchingCands[0];
+            entry.kind = matched.atMe ? "at_me" : matched.kind;
           } else {
             entry.kind =
               mergedChatType.toLowerCase() === "p2p" ? "p2p" : senderId === me ? "mine" : "group";

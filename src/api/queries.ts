@@ -204,16 +204,31 @@ export function isContextDerivedDispatchBlocked(app: Pick<App, "cfg" | "store" |
     }
   }
   const parsedGuid = normalized.startsWith("dispatch:") ? (normalized.split(":")[1] ?? "") : "";
+  const candidateGuids = [...new Set([normalized, w?.ref ?? "", parsedGuid].filter(Boolean))];
   const directOrigin = (app.store.get(`ctx.dispatch_owner.${normalized}`) ?? "").trim();
   const refOrigin = (w?.ref ? app.store.get(`ctx.dispatch_ref_owner.${w.ref}`) : undefined)?.trim() ?? "";
   const idAsRefOrigin = (app.store.get(`ctx.dispatch_ref_owner.${normalized}`) ?? "").trim();
   const parsedGuidOrigin = parsedGuid ? (app.store.get(`ctx.dispatch_ref_owner.${parsedGuid}`) ?? "").trim() : "";
-  const originOwner = directOrigin || refOrigin || idAsRefOrigin || parsedGuidOrigin;
+  const ownTaskOrigin =
+    candidateGuids
+      .map((g) => (app.store.get(`ctx.own_task_owner.${g}`) ?? "").trim())
+      .find(Boolean) ?? "";
+  const originOwner = directOrigin || refOrigin || idAsRefOrigin || parsedGuidOrigin || ownTaskOrigin;
   if (originOwner && originOwner !== curOwner) return true;
-  if (!hasWorkspaceOwnerMismatch(app.store, curOwner)) return false;
+  const prevOwnerOpenId = (app.store.get("owner.open_id") ?? "").trim();
+  const ownerSwitched =
+    hasWorkspaceOwnerMismatch(app.store, curOwner) ||
+    (!!prevOwnerOpenId && prevOwnerOpenId !== curOwner);
+  if (!ownerSwitched) return false;
   if (originOwner) return true;
-  // 兜底兼容升级前已通过 item_delegate 创建但尚未写 ctx.dispatch_owner.<id> 的派单（含同 ref 的完整重试历史与卡片 key）
+  // 兜底兼容升级前已通过 task.create_own 或 item_delegate 创建但尚未写 owner 标记的派单/任务（含同 ref 的完整重试历史与卡片 key）
   try {
+    for (const g of candidateGuids) {
+      const legacyOwn = app.store.db
+        .prepare("SELECT 1 FROM kv WHERE k LIKE 'op.task.create_own.%' AND v = ? LIMIT 1")
+        .get(g);
+      if (legacyOwn) return true;
+    }
     const hasTable = app.store.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ctx_item'").get();
     if (!hasTable) return false;
     const directRow = app.store.db
@@ -249,7 +264,11 @@ export function isContextOwnedTaskBlocked(app: Pick<App, "cfg" | "store" | "ledg
   const curOwner = app.cfg.owner.open_id.trim();
   const ownOrigin = (app.store.get(`ctx.own_task_owner.${guid}`) ?? "").trim();
   if (ownOrigin && ownOrigin !== curOwner) return true;
-  if (!hasWorkspaceOwnerMismatch(app.store, curOwner)) return false;
+  const prevOwnerOpenId = (app.store.get("owner.open_id") ?? "").trim();
+  const ownerSwitched =
+    hasWorkspaceOwnerMismatch(app.store, curOwner) ||
+    (!!prevOwnerOpenId && prevOwnerOpenId !== curOwner);
+  if (!ownerSwitched) return false;
   if (ownOrigin) return true;
   // 兼容升级前通过 task.create_own 创建、仅在 op.task.create_own.* 记录了 guid 的自主任务
   try {
@@ -736,11 +755,13 @@ export function health(app: App): Health {
 
   // 在 14 天报告窗口内分页扫描全部失败项：
   //   1. 精确累计当前主人未确认的可操作失败总数（actionable_failures），不受 200 条展示上限截断；
-  //   2. 展示列表（最多 200 条）优先保留当前主人的失败项，剩余配额再填充旧主人隔离记录，避免旧记录把当前故障挤出界面。
+  //   2. 展示列表（最多 200 条）按优先级依次保留：未确认当前主人失败 → 已确认当前主人失败 → 旧主人隔离记录，
+  //      确保已确认的历史失败或旧主人隔离记录绝不会把可操作的当前故障挤出 Health 页面。
   const cutoff = Date.now() - 14 * DAY;
   const DISPLAY_LIMIT = 200;
   const PAGE_SIZE = 500;
-  const ownFailed: HealthItem[] = [];
+  const actionableOwnFailed: HealthItem[] = [];
+  const acknowledgedOwnFailed: HealthItem[] = [];
   const isolatedFailed: HealthItem[] = [];
   let actionableFailures = 0;
   let before: number | undefined;
@@ -757,18 +778,21 @@ export function health(app: App): Health {
       const item = healthItem(app, w, ownerMismatch);
       if (item.isolated) {
         if (isolatedFailed.length < DISPLAY_LIMIT) isolatedFailed.push(item);
+      } else if (!item.acknowledged) {
+        actionableFailures++;
+        if (actionableOwnFailed.length < DISPLAY_LIMIT) actionableOwnFailed.push(item);
       } else {
-        if (!item.acknowledged) actionableFailures++;
-        if (ownFailed.length < DISPLAY_LIMIT) ownFailed.push(item);
+        if (acknowledgedOwnFailed.length < DISPLAY_LIMIT) acknowledgedOwnFailed.push(item);
       }
     }
     if (page.length < PAGE_SIZE) break;
     before = page[page.length - 1].seq;
   }
-  const failed =
-    ownFailed.length >= DISPLAY_LIMIT
-      ? ownFailed.slice(0, DISPLAY_LIMIT)
-      : [...ownFailed, ...isolatedFailed.slice(0, DISPLAY_LIMIT - ownFailed.length)];
+  const failed: HealthItem[] = [];
+  for (const bucket of [actionableOwnFailed, acknowledgedOwnFailed, isolatedFailed]) {
+    if (failed.length >= DISPLAY_LIMIT) break;
+    failed.push(...bucket.slice(0, DISPLAY_LIMIT - failed.length));
+  }
 
   const hb = store.get("daemon.heartbeat");
   const [owner, at] = hb ? hb.split("|") : [null, null];

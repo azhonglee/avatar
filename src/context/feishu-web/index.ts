@@ -19,7 +19,9 @@ export {
 } from "./auth.ts";
 export {
   FeishuWebClient,
+  isUsableWebMessage,
   SessionNeedsLoginError,
+  UnusableOriginalMessageError,
   type FeishuWebClientOptions,
   type ListenerState,
   type VerifiedReplyInput,

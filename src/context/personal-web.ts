@@ -19,7 +19,9 @@ import {
   FeishuWebClient,
   GatewayError,
   isGroupChat,
+  isUsableWebMessage,
   SessionNeedsLoginError,
+  UnusableOriginalMessageError,
   USER_SENDER_TYPE,
   WebHttpError,
   WebLoginStore,
@@ -878,7 +880,7 @@ export class PersonalWebBridge {
           shouldDeliverInvalid: (msg) => {
             if (!msg.id) return false;
             const existing = this.store.obs(`pw:${msg.id}`);
-            return !!existing && existing.meta.background_only !== true && existing.meta.withdrawn !== true;
+            return !!existing && existing.meta.withdrawn !== true;
           },
           onState: (s, d) => handleState(s, d, true),
           onWarn: (m) => log("warn", m),
@@ -1530,27 +1532,47 @@ export class PersonalWebBridge {
     }
   }
 
-  private isGroupInScope(chatId: string, pwConv: string, ownerId: string): boolean {
+  private isGroupInScope(
+    chatId: string,
+    pwConv: string,
+    ownerId: string,
+    policy?: {
+      groups: "spoken" | "allowlist";
+      groupsAllow: string[];
+      groupsDeny: string[];
+      maxGroups: number;
+      lookbackDays: number;
+    },
+  ): boolean {
+    const groupsMode = policy?.groups ?? this.cfg.context.groups;
+    const groupsAllow = policy?.groupsAllow ?? this.cfg.context.groups_allow;
+    const groupsDeny = policy?.groupsDeny ?? this.cfg.context.groups_deny;
+    const maxGroups = policy?.maxGroups ?? this.cfg.context.max_groups;
+    const lookbackDays = policy?.lookbackDays ?? this.cfg.context.lookback_days;
     const spoken = ownerId ? this.loadPwSpokenGroups(ownerId) : {};
-    const ocDeny = this.confirmedOpenGroupDenyNames();
-    if (this.cfg.context.groups === "allowlist") {
+    const ocDeny = this.confirmedOpenGroupDenyNames(groupsDeny);
+    if (groupsMode === "allowlist") {
       const nativeAllow = [
         ...new Set(
-          this.cfg.context.groups_allow
+          groupsAllow
             .map((s) => s.trim())
             .filter((s) => s.startsWith("pw_chat:") || /^\d+$/.test(s))
             .map((s) => (s.startsWith("pw_chat:") ? s : `pw_chat:${s}`))
-            .filter((k) => !this.isDirectlyDenied(k, this.resolvePwGroupName(k, spoken), ocDeny)),
+            .filter((k) => !this.isDirectlyDenied(k, this.resolvePwGroupName(k, spoken), ocDeny, "group", groupsDeny)),
         ),
-      ].slice(0, this.cfg.context.max_groups);
+      ].slice(0, maxGroups);
       return nativeAllow.includes(pwConv);
     }
     if (!ownerId) return false;
-    const cutoff = Date.now() - this.cfg.context.lookback_days * DAY_MS;
+    const cutoff = Date.now() - lookbackDays * DAY_MS;
     const ranked = Object.entries(spoken)
-      .filter(([k, v]) => v.at >= cutoff && !this.isDirectlyDenied(k, this.resolvePwGroupName(k, spoken) || v.name, ocDeny))
+      .filter(
+        ([k, v]) =>
+          v.at >= cutoff &&
+          !this.isDirectlyDenied(k, this.resolvePwGroupName(k, spoken) || v.name, ocDeny, "group", groupsDeny),
+      )
       .sort((a, b) => b[1].at - a[1].at)
-      .slice(0, this.cfg.context.max_groups);
+      .slice(0, maxGroups);
     return ranked.some(([k]) => k === pwConv || k === chatId);
   }
 
@@ -1623,13 +1645,7 @@ export class PersonalWebBridge {
     const activeClient = client ?? this.client;
     const ownerId = msg.ownerId || activeClient?.owner().id || this.loginStore.load()?.owner_id || "";
     const capturedSessionId = activeClient?.currentSessionId() ?? "";
-    const hasUsableBody = (m: WebMessage): boolean =>
-      !!m.id &&
-      !!m.conversationId &&
-      !m.unsupported &&
-      (m.conversationKind === "group" || m.conversationKind === "dm") &&
-      m.senderType === USER_SENDER_TYPE &&
-      !!m.text.trim();
+    const hasUsableBody = (m: WebMessage): boolean => isUsableWebMessage(m);
 
     const assertSessionActiveForStoreMutation = (): void => {
       if (signal?.aborted) {
@@ -1659,9 +1675,9 @@ export class PersonalWebBridge {
     let authoritativeRead = false;
 
     if (!hasUsableBody(effectiveMsg)) {
-      // 全新空正文/不支持消息直接丢弃；若该 ID 此前已作为活跃观测入库（如原 @我 消息被编辑清空或改为不支持类型），
-      // 必须权威回读确认并撤回旧待处理文本，防止旧正文与 at_me 标记继续触发提醒或起草
-      if (!existing || existing.meta.background_only === true || existing.meta.withdrawn === true) return;
+      // 全新空正文/不支持消息直接丢弃；若该 ID 此前已入库（含待处理/已处理观测以及补读背景消息）且尚未撤回，
+      // 必须权威回读确认并撤回旧正文，防止已撤回/清空的原文继续进入后续理解窗口或触发起草
+      if (!existing || existing.meta.withdrawn === true) return;
       if (activeClient) {
         effectiveMsg = await activeClient.readMessage(msg.id, signal);
         authoritativeRead = true;
@@ -1670,6 +1686,8 @@ export class PersonalWebBridge {
           this.store.retirePendingObs(`pw:${msg.id}`);
           return;
         }
+        // 仅用于上下文的历史背景消息若经权威回读仍有效（本次无效推送为乱序或瞬态误报），绝不提升为待处理工作
+        if (existing.meta.background_only === true) return;
       } else {
         assertSessionActiveForStoreMutation();
         this.store.retirePendingObs(`pw:${msg.id}`);
@@ -2235,15 +2253,26 @@ export class PersonalWebBridge {
   }
 
   /**
-   * 核验共享的 send_replies 发送权限并读取当前生效的 groups_deny 排除规则：
+   * 核验共享的 send_replies 发送权限并读取当前生效的完整群范围与排除策略：
    * 先查本进程配置；若配置来自磁盘文件且文件消失/不可 stat，按 fail-closed 中止新发送；
-   * 若磁盘 config.yaml 被另一进程（如 Web 控制台）修改过，同步读取磁盘最新 send_replies 与 groups_deny 防止跨进程陈旧放行。
+   * 若磁盘 config.yaml 被另一进程（如 Web 控制台）修改过，同步读取磁盘最新的
+   * send_replies、groups、groups_allow、groups_deny、max_groups 与 lookback_days，防止跨进程按陈旧白名单或排除规则放行。
    */
-  private assertSendEnabled(): { groupsDeny: string[] } {
+  private assertSendEnabled(): {
+    groups: "spoken" | "allowlist";
+    groupsAllow: string[];
+    groupsDeny: string[];
+    maxGroups: number;
+    lookbackDays: number;
+  } {
     if (!this.cfg.context.personal_web.send_replies) {
       throw new Error("未开启个人 Web 回复（需在配置中设置 context.personal_web.send_replies: true）");
     }
-    let groupsDeny = this.cfg.context.groups_deny;
+    let groups: "spoken" | "allowlist" = this.cfg.context.groups;
+    let groupsAllow: string[] = this.cfg.context.groups_allow;
+    let groupsDeny: string[] = this.cfg.context.groups_deny;
+    let maxGroups: number = this.cfg.context.max_groups;
+    let lookbackDays: number = this.cfg.context.lookback_days;
     const cfgFile = this.cfg.file;
     if (cfgFile) {
       const curSig = statSignature(cfgFile);
@@ -2253,28 +2282,74 @@ export class PersonalWebBridge {
       if (curSig !== this.initialCfgStat) {
         try {
           const parsed = YAML.parse(fs.readFileSync(cfgFile, "utf8")) as {
-            context?: { personal_web?: { send_replies?: boolean }; groups_deny?: unknown };
+            context?: {
+              personal_web?: { send_replies?: boolean };
+              groups?: unknown;
+              groups_allow?: unknown;
+              groups_deny?: unknown;
+              max_groups?: unknown;
+              lookback_days?: unknown;
+            };
           };
-          if (parsed?.context?.personal_web?.send_replies !== true) {
+          const ctx = parsed?.context;
+          if (ctx?.personal_web?.send_replies !== true) {
             throw new Error("检测到配置文件已关闭 context.personal_web.send_replies，已中止发送");
           }
-          if (parsed?.context?.groups_deny !== undefined) {
-            if (!Array.isArray(parsed.context.groups_deny)) {
+          if (ctx?.groups !== undefined) {
+            if (ctx.groups !== "spoken" && ctx.groups !== "allowlist") {
+              throw new Error("检测到配置文件中的 context.groups 格式非法，已中止发送");
+            }
+            groups = ctx.groups;
+          } else {
+            groups = "spoken";
+          }
+          if (ctx?.groups_allow !== undefined) {
+            if (!Array.isArray(ctx.groups_allow)) {
+              throw new Error("检测到配置文件中的 context.groups_allow 格式非法，已中止发送");
+            }
+            groupsAllow = ctx.groups_allow.map((x) => String(x));
+          } else {
+            groupsAllow = [];
+          }
+          if (ctx?.groups_deny !== undefined) {
+            if (!Array.isArray(ctx.groups_deny)) {
               throw new Error("检测到配置文件中的 context.groups_deny 格式非法，已中止发送");
             }
-            groupsDeny = parsed.context.groups_deny.map((x) => String(x));
+            groupsDeny = ctx.groups_deny.map((x) => String(x));
           } else {
             groupsDeny = [];
           }
+          if (ctx?.max_groups !== undefined) {
+            if (typeof ctx.max_groups !== "number" || !Number.isInteger(ctx.max_groups) || ctx.max_groups < 1 || ctx.max_groups > 200) {
+              throw new Error("检测到配置文件中的 context.max_groups 格式非法，已中止发送");
+            }
+            maxGroups = ctx.max_groups;
+          } else {
+            maxGroups = 40;
+          }
+          if (ctx?.lookback_days !== undefined) {
+            if (typeof ctx.lookback_days !== "number" || !Number.isInteger(ctx.lookback_days) || ctx.lookback_days < 1 || ctx.lookback_days > 30) {
+              throw new Error("检测到配置文件中的 context.lookback_days 格式非法，已中止发送");
+            }
+            lookbackDays = ctx.lookback_days;
+          } else {
+            lookbackDays = 7;
+          }
         } catch (err) {
-          if (err instanceof Error && (err.message.includes("send_replies") || err.message.includes("groups_deny"))) {
+          if (
+            err instanceof Error &&
+            (err.message.includes("send_replies") ||
+              err.message.includes("context.groups") ||
+              err.message.includes("context.max_groups") ||
+              err.message.includes("context.lookback_days"))
+          ) {
             throw err;
           }
           throw new Error("无法核验配置文件中的 context.personal_web.send_replies 开关，按安全原则中止发送");
         }
       }
     }
-    return { groupsDeny };
+    return { groups, groupsAllow, groupsDeny, maxGroups, lookbackDays };
   }
 
   private assertSessionOwner(expectedOwnerId: string, expectedSessionId = ""): WebLogin {
@@ -2438,8 +2513,9 @@ export class PersonalWebBridge {
         },
         {
           onBeforeSend: async ({ rootId, parentId, threaded, original, chat }) => {
-            // 1) 发包认领前再次按实时会话元数据执行全部硬排除规则（静音 / groups_deny / oc_* 排除，DM 与 @我 群均无豁免）
-            const { groupsDeny: liveGroupsDeny } = this.assertSendEnabled();
+            // 1) 发包认领前再次按实时会话元数据与磁盘最新群范围/排除配置执行全部硬排除规则（静音 / groups_deny / oc_* 排除，DM 与 @我 群均无豁免）
+            const livePolicy = this.assertSendEnabled();
+            const liveGroupsDeny = livePolicy.groupsDeny;
             const livePolicyKey = this.nativeExclusionPolicyKey(liveGroupsDeny);
             const liveKind: "group" | "dm" = isGroupChat(chat.kind) ? "group" : "dm";
             const liveLatest = this.store.latestConvObs(pwConv);
@@ -2458,51 +2534,64 @@ export class PersonalWebBridge {
             }
             const verifiedName = liveExcl.verifiedChatName || chat.name.trim() || liveLatest?.conv_name || "";
 
-            // 2) @本人 豁免仅适用于未被硬排除、仅仅在白名单/发言群范围之外的群聊：
-            //    发包认领前必须依据刚回读的权威原消息复核仍存在 @本人，防止监听离线期间对方编辑移除了 @mention
+            // 2) @本人 豁免仅适用于未被硬排除、仅仅在当前生效白名单/发言群范围之外的群聊：
+            //    使用磁盘最新 groups / groups_allow / groups_deny / max_groups / lookback_days 评估范围，
+            //    并依据刚回读的权威原消息复核仍存在 @本人，防止监听离线或跨进程改白名单后误发
+            const liveAtMe =
+              original.actorId !== args.owner_id &&
+              original.mentions.some((m) => m.id === args.owner_id);
             const targetIsOutOfScopeGroup =
               liveKind === "group" &&
-              !this.isGroupInScope(args.chat_id, pwConv, args.owner_id);
-            if (targetIsOutOfScopeGroup) {
-              const liveAtMe =
-                original.actorId !== args.owner_id &&
-                original.mentions.some((m) => m.id === args.owner_id);
-              if (!liveAtMe) {
-                this.store.retirePendingObs(`pw:${args.message_id}`);
-                throw new Error("发送前实时核验发现范围外群原消息已不再 @本人（离线期间可能已被编辑移除 @mention），已中止发送");
-              }
+              !this.isGroupInScope(args.chat_id, pwConv, args.owner_id, livePolicy);
+            if (targetIsOutOfScopeGroup && !liveAtMe) {
+              this.store.retirePendingObs(`pw:${args.message_id}`);
+              throw new Error("发送前实时核验发现范围外群原消息已不再 @本人（离线期间可能已被编辑移除 @mention 或群已移出白名单），已中止发送");
             }
-            const claimed = this.claimDeliveryForSend(
-              {
-                cid: args.cid,
-                owner_id: args.owner_id,
-                chat_id: args.chat_id,
-                message_id: args.message_id,
-                root_id: rootId,
-                parent_id: parentId,
-                text_hash: textHash,
-                threaded,
-                state: "sending",
-                updated_at: Date.now(),
-              },
-              () => {
-                // 在写入 sending 状态的同一 SQLite BEGIN IMMEDIATE 写事务锁内重检授权、硬排除、吊销与撤回，
-                // 彻底消除跨进程 web-logout、muteConv、新增 groups_deny 或消息撤回在读后锁前提交导致的误发竞态
-                const { groupsDeny: lockGroupsDeny } = this.assertSendEnabled();
-                assertTargetNotWithdrawn();
-                assertNotHardExcludedByIdSync(lockGroupsDeny);
-                if (this.isDirectlyDenied(pwConv, verifiedName, undefined, liveKind, lockGroupsDeny)) {
-                  throw new Error("认领发送时检测到目标个人 Web 会话已被静音或命中排除规则，已中止发送");
-                }
-                if (this.nativeExclusionPolicyKey(lockGroupsDeny) !== livePolicyKey) {
-                  throw new Error("认领发送期间会话静音或排除规则发生变更，已按安全策略中止发送");
-                }
-                this.assertSessionOwner(args.owner_id, initialSessionId);
-                if (client.owner().id !== args.owner_id) {
-                  throw new Error("发送前检测到客户端账号不匹配，已中止发送");
-                }
-              },
-            );
+            let retireOutOfScopeAfterRollback = false;
+            let claimed: ReturnType<PersonalWebBridge["claimDeliveryForSend"]>;
+            try {
+              claimed = this.claimDeliveryForSend(
+                {
+                  cid: args.cid,
+                  owner_id: args.owner_id,
+                  chat_id: args.chat_id,
+                  message_id: args.message_id,
+                  root_id: rootId,
+                  parent_id: parentId,
+                  text_hash: textHash,
+                  threaded,
+                  state: "sending",
+                  updated_at: Date.now(),
+                },
+                () => {
+                  // 在写入 sending 状态的同一 SQLite BEGIN IMMEDIATE 写事务锁内重检授权、硬排除、最新群范围、吊销与撤回，
+                  // 彻底消除跨进程 web-logout、muteConv、修改 groups_allow/groups_deny 或消息撤回在读后锁前提交导致的误发竞态
+                  const lockPolicy = this.assertSendEnabled();
+                  const lockGroupsDeny = lockPolicy.groupsDeny;
+                  assertTargetNotWithdrawn();
+                  assertNotHardExcludedByIdSync(lockGroupsDeny);
+                  if (this.isDirectlyDenied(pwConv, verifiedName, undefined, liveKind, lockGroupsDeny)) {
+                    throw new Error("认领发送时检测到目标个人 Web 会话已被静音或命中排除规则，已中止发送");
+                  }
+                  if (this.nativeExclusionPolicyKey(lockGroupsDeny) !== livePolicyKey) {
+                    throw new Error("认领发送期间会话静音或排除规则发生变更，已按安全策略中止发送");
+                  }
+                  if (liveKind === "group" && !this.isGroupInScope(args.chat_id, pwConv, args.owner_id, lockPolicy) && !liveAtMe) {
+                    retireOutOfScopeAfterRollback = true;
+                    throw new Error("认领发送时检测到目标群已移出当前允许范围且原消息未 @本人，已中止发送");
+                  }
+                  this.assertSessionOwner(args.owner_id, initialSessionId);
+                  if (client.owner().id !== args.owner_id) {
+                    throw new Error("发送前检测到客户端账号不匹配，已中止发送");
+                  }
+                },
+              );
+            } catch (err) {
+              if (retireOutOfScopeAfterRollback) {
+                this.store.retirePendingObs(`pw:${args.message_id}`);
+              }
+              throw err;
+            }
             if (!claimed.ok) {
               throw new DeliveryAlreadyClaimedError(claimed.existing);
             }
@@ -2530,6 +2619,10 @@ export class PersonalWebBridge {
         },
       );
     } catch (err) {
+      if (err instanceof UnusableOriginalMessageError) {
+        this.store.retirePendingObs(`pw:${args.message_id}`);
+        throw err;
+      }
       if (err instanceof DeliveryAlreadyClaimedError) {
         const cur = err.existing;
         if (cur.state === "verified" && cur.reply_id) {

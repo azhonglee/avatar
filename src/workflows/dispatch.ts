@@ -345,7 +345,7 @@ export class Dispatcher {
         isContextDerivedDispatchBlocked({ cfg: this.cfg, store: this.store, ledger: this.ledger }, it.ref)
       ) {
         this.finish(it, "errored", "owner_isolated", []);
-        log("warn", "该派单源自旧工作区主人的工作上下文，已按主人隔离中止执行", { work: it.id, task: it.ref });
+        log("warn", "该派单源自旧工作区主人的工作上下文，已按主人隔离中止执行", { work: it.id, reason: "owner_isolated" });
         return;
       }
       if (this.ledger.isCancelled(it.id)) {
@@ -373,7 +373,11 @@ export class Dispatcher {
 
   private finish(it: Item, state: string, reason: string, effects: Effect[], payload?: DispatchPayload): void {
     this.ledger.transition(it, { state, terminal: true, outcome: state, reason, payload }, effects);
-    log(state === "accepted" ? "info" : "warn", "派单结束", { task: it.payload.summary, state, reason });
+    if (reason === "owner_isolated") {
+      log("warn", "派单结束", { work: it.id, state, reason });
+    } else {
+      log(state === "accepted" ? "info" : "warn", "派单结束", { task: it.payload.summary, state, reason });
+    }
   }
 
   /** queued：读取最新的卡片内容，选执行者/审查者，准备工作目录。 */

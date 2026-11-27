@@ -94,11 +94,13 @@ import {
   saveWorkspaceBinding,
   verifyWorkspaceOwnerBinding,
 } from "../src/context/personal-web.ts";
-import { obsRevision, type Obs } from "../src/context/store.ts";
+import { ContextStore, obsRevision, type Obs } from "../src/context/store.ts";
 import {
   branchUsesGitLfs,
+  gitCredentialLineMatchesTarget,
   isGitLfsPointerBlob,
   pushBranch,
+  remoteDefaultBranch,
   resolveAuthorizedSshAuthSock,
   resolveLocalGitRemoteDir,
   tryGit,
@@ -108,6 +110,8 @@ import { runDoctor } from "../src/doctor.ts";
 import { card as cardEffect, comment as commentEffect, effectHandler, move as moveEffect } from "../src/effects.ts";
 import {
   buildWorkspaceIsolation,
+  canonicalCodexLockFilePath,
+  collectLarkGuardReadOnlyFiles,
   coordinateCodexOAuthRefresh,
   detectGitWorktreeDirs,
   detectIsolatedCodexKeyringConflict,
@@ -119,7 +123,11 @@ import {
   mergeHarnessEnv,
   prepareHarnessEnv,
   resolveEffectiveCodexCredentialStore,
+  resolveTrustedBwrapBin,
+  resolveTrustedSystemBin,
   runHarness,
+  selectAcpxAgentConfigPaths,
+  stageIsolatedAwsProfile,
   stageIsolatedCodexHome,
   syncRefreshedCodexAuth,
   workspaceRequiresIsolation,
@@ -10446,13 +10454,21 @@ test("Codex 第十四轮回归：宿主控制套接字隔离、共享 Git 元数
       const subMeta = detectGitWorktreeDirs(subDir, { trustedRepoRoot: superRepo });
       assert.equal(subMeta.gitDir, fs.realpathSync(path.join(superRepo, ".git", "modules", "sub")), "合法 submodule 必须通过受信任父仓校验");
 
-      // 无隔离需求时，即使存在被篡改的 .git 文件也不得提前抛错阻塞工作流
+      // 无工具（llm-none）且无隔离需求时，不要求沙箱也不得因 .git 挂载规划提前抛错；
+      // 而在 Linux 上所有仓库级模式（如 verify）默认强制隔离并校验被篡改的 .git 文件（R19 #1）
       const tamperedDir = path.join(gitBase, "tampered-inactive");
       fs.mkdirSync(tamperedDir, { recursive: true });
       fs.writeFileSync(path.join(tamperedDir, ".git"), "gitdir: /nonexistent/outside/path\n");
       const inactiveCfg = { dataDir: path.join(dir, "empty-data"), context: { personal_web: { enabled: false } } } as never;
-      const inactivePlan = buildWorkspaceIsolation(inactiveCfg, { mode: "verify", cwd: tamperedDir }, {});
-      assert.equal(inactivePlan.requireIsolation, false, "未启用隔离时不得要求沙箱或因 .git 挂载规划提前抛错");
+      const inactiveLlmPlan = buildWorkspaceIsolation(inactiveCfg, { mode: "llm-none", cwd: tamperedDir }, {});
+      assert.equal(inactiveLlmPlan.requireIsolation, false, "无个人 Web 的 llm-none 不得强制要求沙箱");
+      if (process.platform === "linux") {
+        assert.throws(
+          () => buildWorkspaceIsolation(inactiveCfg, { mode: "verify", cwd: tamperedDir }, {}),
+          /worktree \.git 元数据校验失败/,
+          "Linux 上仓库级 verify 模式默认开启隔离并校验 .git 元数据",
+        );
+      }
     }
 
     // 4) [R14 #4 P2] 授权远程 Git 操作（push/fetch/ls-remote/pull/clone/lfs）保留并仅挂载 SSH_AUTH_SOCK，本地 Git 与普通工人均不暴露
@@ -15036,6 +15052,1080 @@ test("Codex 第十八轮回归：最小白名单空根隔离跨工作区、损�
     extraApp1?.store.db.close();
     extraApp2?.store.db.close();
     boardApp?.store.db.close();
+    app?.store.db.close();
+    await mock.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex 第十九轮回归：仓库工人默认隔离、可信沙箱引导程序、最小守卫文件、acpx 单代理配置、个人任务归属派单过滤、owner_isolated 标题脱敏、热加载群白名单发送门控、多文件 npm 全局依赖挂载、不可用原消息拒发、背景消息撤回、冲突 mention 未决、目标域 HTTPS Git 凭据、git-media LFS 别名、本地镜像默认分支、Codex profile 预检与 AWS profile 投影、跳过非 OAuth auth.json、共享目录 OAuth 锁与长任务窗口、Health 可操作失败置顶", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-r19-"));
+  const dataDir = path.join(dir, "data");
+  fs.mkdirSync(dataDir, { recursive: true });
+  const mock = await startMockFeishuWebServer();
+  const prevKey = process.env.PA_FEISHU_WEB_KEY;
+  const prevPath = process.env.PATH;
+  const prevTmpDir = process.env.TMPDIR;
+  let app: ReturnType<typeof createApp> | undefined;
+  let extraApp1: ReturnType<typeof createApp> | undefined;
+  let extraApp2: ReturnType<typeof createApp> | undefined;
+  let httpGitSrv: http.Server | undefined;
+
+  const makeJwt = (expSec: number): string => {
+    const h = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
+    const p = Buffer.from(JSON.stringify({ sub: "user_r19", exp: expSec })).toString("base64url");
+    return `${h}.${p}.sig`;
+  };
+
+  try {
+    // 1) [R19 #1 P1] Linux 上所有仓库级模式默认强制隔离，与启动工作区是否已有密钥或 ctx_obs 无关；llm-none 在无 Web 状态下保持不强制
+    {
+      const freshData = path.join(dir, "fresh-ws-data");
+      fs.mkdirSync(freshData, { recursive: true });
+      const siblingWs = path.join(dir, "sibling-ws-data");
+      fs.mkdirSync(siblingWs, { recursive: true });
+      const siblingSecretDb = path.join(siblingWs, "state.db");
+      fs.writeFileSync(siblingSecretDb, "SIBLING_PRIVATE_FEISHU_MSGS_R19");
+      const freshRepo = path.join(dir, "fresh-repo");
+      fs.mkdirSync(freshRepo, { recursive: true });
+      const freshCfg = { dataDir: freshData, context: { personal_web: { enabled: false } } } as never;
+
+      for (const mode of ["verify", "worker-write", "worker-ro", "codex-exec", "git-rw", "git-ro"] as const) {
+        const plan = buildWorkspaceIsolation(freshCfg, { mode, cwd: freshRepo }, {});
+        assert.equal(plan.requireIsolation, process.platform === "linux", `模式 ${mode} 在 Linux 上必须独立于工作区状态默认启用隔离`);
+      }
+      const llmPlan = buildWorkspaceIsolation(freshCfg, { mode: "llm-none", cwd: freshRepo }, {});
+      assert.equal(llmPlan.requireIsolation, false, "无个人 Web 的 llm-none 不应强制要求隔离");
+
+      if (process.platform === "linux" && hasCredentialMountIsolation()) {
+        const probe = wrapCredentialIsolatedCommand(
+          "sh",
+          ["-c", `test -e ${JSON.stringify(siblingSecretDb)} && echo LEAKED || echo HIDDEN`],
+          process.env,
+          buildWorkspaceIsolation(freshCfg, { mode: "verify", cwd: freshRepo }, {}),
+        );
+        assert.equal(probe.isolated, true);
+        const r = await runProcess(probe.cmd, probe.args, { env: process.env, timeoutMs: 10_000 });
+        assert.equal(r.code, 0, r.stderr);
+        assert.equal(r.stdout.trim(), "HIDDEN", "全新工作区启动的仓库工人必须看不到同用户其他工作区的 state.db");
+      }
+    }
+
+    // 2) [R19 #2 P1] 沙箱引导程序仅从可信目录解析（忽略被污染的 PATH），且 unshare 引导期间强制系统 PATH 并在隔离后恢复任务 PATH
+    {
+      const poisonDir = path.join(dir, "poison-bin");
+      fs.mkdirSync(poisonDir, { recursive: true });
+      const poisonMarker = path.join(dir, "poison-executed.txt");
+      for (const fakeName of ["bwrap", "unshare", "setpriv", "sh", "mount", "awk"]) {
+        fs.writeFileSync(
+          path.join(poisonDir, fakeName),
+          `#!/bin/sh\necho "${fakeName}" >> ${JSON.stringify(poisonMarker)}\nexit 99\n`,
+          { mode: 0o755 },
+        );
+      }
+      process.env.PATH = `${poisonDir}${path.delimiter}${prevPath ?? ""}`;
+      try {
+        const resolvedBwrap = resolveTrustedBwrapBin();
+        if (resolvedBwrap) {
+          assert.ok(!resolvedBwrap.startsWith(poisonDir), `bwrap 绝不得从被污染 PATH 解析：${resolvedBwrap}`);
+        }
+        for (const sysBin of ["sh", "unshare", "setpriv", "pivot_root"]) {
+          const resolved = resolveTrustedSystemBin(sysBin);
+          if (resolved) {
+            assert.ok(
+              ["/usr/bin", "/bin", "/usr/sbin", "/sbin"].some((d) => resolved.startsWith(`${d}/`)),
+              `${sysBin} 必须来自受信任系统目录：${resolved}`,
+            );
+          }
+        }
+        assert.equal(fs.existsSync(poisonMarker), false, "解析可信引导程序期间不得执行污染目录中的脚本");
+
+        if (process.platform === "linux" && hasCredentialMountIsolation()) {
+          const unshareBin = resolveTrustedSystemBin("unshare");
+          const setprivBin = resolveTrustedSystemBin("setpriv");
+          const pivotRootBin = resolveTrustedSystemBin("pivot_root");
+          const shBin = resolveTrustedSystemBin("sh");
+          if (unshareBin && setprivBin && pivotRootBin && shBin) {
+            const taskBinDir = path.join(dir, "task-bin");
+            fs.mkdirSync(taskBinDir, { recursive: true });
+            fs.writeFileSync(path.join(taskBinDir, "r19-task-helper"), "#!/bin/sh\necho TASK_PATH_RESTORED\n", { mode: 0o755 });
+            const taskEnv: NodeJS.ProcessEnv = {
+              ...process.env,
+              PATH: `${poisonDir}${path.delimiter}${taskBinDir}${path.delimiter}${prevPath ?? ""}`,
+            };
+            const wrapped = wrapCredentialIsolatedCommand(
+              "/bin/sh",
+              ["-c", "r19-task-helper"],
+              taskEnv,
+              {
+                requireIsolation: true,
+                cwd: dir,
+                readOnlyPaths: [taskBinDir],
+                forceBackend: { kind: "unshare", bin: unshareBin, setprivBin, pivotRootBin, shBin, killChild: true },
+              },
+            );
+            const r = await runProcess(wrapped.cmd, wrapped.args, { env: taskEnv, timeoutMs: 10_000 });
+            assert.equal(r.code, 0, `unshare 引导应忽略污染 PATH 并在隔离后恢复任务 PATH：${r.stderr}`);
+            assert.equal(r.stdout.trim(), "TASK_PATH_RESTORED");
+            assert.equal(fs.existsSync(poisonMarker), false, "unshare 引导阶段绝不能执行污染 PATH 里的 mount/awk/sh");
+          }
+        }
+      } finally {
+        if (prevPath === undefined) delete process.env.PATH;
+        else process.env.PATH = prevPath;
+      }
+    }
+
+    // 3) [R19 #3 P1] & 4) [R19 #4 P1] 仅挂载 4 个 Lark 守卫文件（不暴露 ROOT/config.yaml 与 ROOT/.worktrees），且 acpx 仅暴露选中 agent 的配置目录
+    {
+      const guardFiles = collectLarkGuardReadOnlyFiles();
+      assert.equal(guardFiles.length, 4, "守卫只读文件集合应精确包含 4 个文件");
+      assert.ok(guardFiles.some((f) => f.endsWith(`${path.sep}bin${path.sep}guard${path.sep}lark-cli`)));
+      assert.ok(guardFiles.some((f) => f.endsWith(`${path.sep}src${path.sep}guard-cli.ts`)));
+      assert.ok(guardFiles.some((f) => f.endsWith(`${path.sep}src${path.sep}guard.ts`)));
+      assert.ok(guardFiles.some((f) => f.endsWith(`${path.sep}package.json`)));
+      assert.ok(!guardFiles.includes(fs.realpathSync(ROOT)), "绝不得把整个 ROOT 目录放进守卫挂载集合");
+
+      const fakeHome = path.join(dir, "fake-home-r19");
+      fs.mkdirSync(path.join(fakeHome, ".acpx"), { recursive: true });
+      fs.mkdirSync(path.join(fakeHome, ".claude"), { recursive: true });
+      fs.mkdirSync(path.join(fakeHome, ".codex"), { recursive: true });
+      fs.mkdirSync(path.join(fakeHome, ".gemini"), { recursive: true });
+      fs.writeFileSync(path.join(fakeHome, ".claude", "settings.json"), '{"claude":true}\n');
+      fs.writeFileSync(path.join(fakeHome, ".codex", "auth.json"), '{"tokens":{"refresh_token":"SECRET_CODEX_RT"}}\n');
+      fs.writeFileSync(path.join(fakeHome, ".gemini", "oauth.json"), '{"secret":"SECRET_GEMINI"}\n');
+
+      const claudePaths = selectAcpxAgentConfigPaths({ agent: "claude", env: {} }, fakeHome);
+      assert.ok(claudePaths.includes(path.join(fakeHome, ".acpx")));
+      assert.ok(claudePaths.includes(path.join(fakeHome, ".claude")));
+      assert.ok(!claudePaths.some((p) => p.includes(".codex") || p.includes(".gemini")), "Claude 代理绝不能暴露 .codex / .gemini");
+
+      const codexPaths = selectAcpxAgentConfigPaths({ agent: "codex", env: {} }, fakeHome);
+      assert.ok(codexPaths.includes(path.join(fakeHome, ".codex")));
+      assert.ok(!codexPaths.some((p) => p.includes(".claude") || p.includes(".gemini")), "Codex 代理绝不能暴露 .claude / .gemini");
+
+      const unknownPaths = selectAcpxAgentConfigPaths({ agentCommand: "/usr/bin/custom-agent", env: {} }, fakeHome);
+      assert.deepEqual(unknownPaths, [path.join(fakeHome, ".acpx")], "未知自定义代理只应挂载 .acpx");
+
+      if (process.platform === "linux" && hasCredentialMountIsolation()) {
+        const probeAcpx = path.join(dir, "probe-acpx-r19");
+        fs.writeFileSync(
+          probeAcpx,
+          [
+            "#!/bin/sh",
+            `echo "ROOT_LIST=$(ls -A ${JSON.stringify(ROOT)} 2>/dev/null | tr '\\n' ',' )"`,
+            `echo "ROOT_DOT_WT=$(test -e ${JSON.stringify(path.join(ROOT, ".git"))} && echo YES || echo NO)"`,
+            `echo "CLAUDE_OK=$(test -f ${JSON.stringify(path.join(fakeHome, ".claude", "settings.json"))} && echo YES || echo NO)"`,
+            `echo "CODEX_LEAK=$(test -f ${JSON.stringify(path.join(fakeHome, ".codex", "auth.json"))} && echo YES || echo NO)"`,
+            `echo "GEMINI_LEAK=$(test -f ${JSON.stringify(path.join(fakeHome, ".gemini", "oauth.json"))} && echo YES || echo NO)"`,
+            'lark-cli im +messages-send --as bot --user-id ou_stranger --text hi >/dev/null 2>&1; echo "GUARD_EXIT=$?"',
+          ].join("\n"),
+          { mode: 0o755 },
+        );
+        const acpxCfgFile = path.join(dir, "acpx-r19.yaml");
+        fs.writeFileSync(
+          acpxCfgFile,
+          [
+            `data_dir: ${path.join(dir, "acpx-data")}`,
+            `bins: { lark: ${JSON.stringify(path.join(STUBS, "lark-cli"))}, acpx: ${JSON.stringify(probeAcpx)} }`,
+            "owner: { open_id: ou_r19 }",
+            "harnesses:",
+            `  cl: { agent: claude, env: { HOME: ${JSON.stringify(fakeHome)} } }`,
+            `  db: { type: doubao-cli, cmd: ${JSON.stringify(probeAcpx)}, env: { HOME: ${JSON.stringify(fakeHome)} } }`,
+            "roles: { brain: cl }",
+          ].join("\n"),
+        );
+        const acpxCfg = loadConfig(acpxCfgFile);
+        const workDir = path.join(dir, "acpx-cwd");
+        fs.mkdirSync(workDir, { recursive: true });
+        const clRes = await runHarness(acpxCfg, {
+          harness: "cl",
+          prompt: "probe",
+          cwd: workDir,
+          tools: "write",
+          lark: "none",
+          timeoutSec: 30,
+          logFile: path.join(dir, "cl.log"),
+        });
+        assert.equal(clRes.ok, true, clRes.text);
+        assert.match(clRes.text, /ROOT_DOT_WT=NO/, "acpx 沙箱内绝不得看到 ROOT/.git 或其他 ROOT 目录内容");
+        assert.doesNotMatch(clRes.text, /config\.yaml/, "acpx 沙箱内绝不得暴露 ROOT/config.yaml");
+        assert.match(clRes.text, /CLAUDE_OK=YES/, "Claude 代理应可读 ~/.claude");
+        assert.match(clRes.text, /CODEX_LEAK=NO/, "Claude 代理绝不得读取 ~/.codex/auth.json");
+        assert.match(clRes.text, /GEMINI_LEAK=NO/, "Claude 代理绝不得读取 ~/.gemini");
+        assert.match(clRes.text, /GUARD_EXIT=13/, "仅挂载 4 个守卫文件时 bin/guard/lark-cli 仍能正常拦截越权调用");
+
+        const dbRes = await runHarness(acpxCfg, {
+          harness: "db",
+          prompt: "probe",
+          cwd: workDir,
+          tools: "write",
+          lark: "none",
+          timeoutSec: 30,
+          logFile: path.join(dir, "db.log"),
+        });
+        assert.equal(dbRes.ok, true, dbRes.text);
+        assert.match(dbRes.text, /ROOT_DOT_WT=NO/, "doubao-cli 沙箱内同样绝不得暴露整个 ROOT");
+        assert.match(dbRes.text, /GUARD_EXIT=13/, "doubao-cli 沙箱内 bin/guard/lark-cli 必须正常运行");
+      }
+    }
+
+    // 8) [R19 #8 P1] 用户全局 npm 多文件可执行程序（~/.npm-global/bin/<tool> -> ../lib/node_modules/<pkg>/dist/cli.mjs + sibling + hoisted dep）在隔离沙箱中正常运行
+    if (process.platform === "linux" && hasCredentialMountIsolation()) {
+      const npmPrefix = path.join(dir, "npm-global");
+      const npmBinDir = path.join(npmPrefix, "bin");
+      const pkgDir = path.join(npmPrefix, "lib", "node_modules", "r19-cli-pkg");
+      const depDir = path.join(npmPrefix, "lib", "node_modules", "r19-helper-dep");
+      fs.mkdirSync(npmBinDir, { recursive: true });
+      fs.mkdirSync(path.join(pkgDir, "dist"), { recursive: true });
+      fs.mkdirSync(depDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(pkgDir, "package.json"),
+        JSON.stringify({ name: "r19-cli-pkg", version: "1.0.0", type: "module", dependencies: { "r19-helper-dep": "1.0.0" } }),
+      );
+      fs.writeFileSync(path.join(pkgDir, "dist", "sibling.mjs"), 'export const SIB = "SIBLING_OK";\n');
+      fs.writeFileSync(
+        path.join(pkgDir, "dist", "cli.mjs"),
+        '#!/usr/bin/env node\nimport { SIB } from "./sibling.mjs";\nimport { DEP } from "r19-helper-dep";\nconsole.log(`${SIB}:${DEP}`);\n',
+        { mode: 0o755 },
+      );
+      fs.writeFileSync(
+        path.join(depDir, "package.json"),
+        JSON.stringify({ name: "r19-helper-dep", version: "1.0.0", type: "module", main: "index.mjs" }),
+      );
+      fs.writeFileSync(path.join(depDir, "index.mjs"), 'export const DEP = "HOISTED_DEP_OK";\n');
+      const binLink = path.join(npmBinDir, "r19-npm-tool");
+      fs.symlinkSync("../lib/node_modules/r19-cli-pkg/dist/cli.mjs", binLink);
+
+      // 8a) 通过 PATH 裸名调用（模拟 ~/.npm-global/bin 在 PATH 中）
+      const npmEnv: NodeJS.ProcessEnv = { ...process.env, PATH: `${npmBinDir}${path.delimiter}${process.env.PATH ?? ""}` };
+      const wrappedByName = wrapCredentialIsolatedCommand("r19-npm-tool", [], npmEnv, {
+        requireIsolation: true,
+        cwd: dir,
+      });
+      const r1 = await runProcess(wrappedByName.cmd, wrappedByName.args, { env: npmEnv, timeoutMs: 10_000 });
+      assert.equal(r1.code, 0, `PATH 下的全局 npm 多文件可执行程序必须可执行：${r1.stderr}`);
+      assert.equal(r1.stdout.trim(), "SIBLING_OK:HOISTED_DEP_OK");
+
+      // 8b) 直接按绝对符号链接路径调用（binDir 不在 PATH 中）
+      const wrappedByAbs = wrapCredentialIsolatedCommand(binLink, [], process.env, {
+        requireIsolation: true,
+        cwd: dir,
+        cmdPath: binLink,
+      });
+      const r2 = await runProcess(wrappedByAbs.cmd, wrappedByAbs.args, { env: process.env, timeoutMs: 10_000 });
+      assert.equal(r2.code, 0, `绝对符号链接路径调用全局 npm 多文件可执行程序必须可执行：${r2.stderr}`);
+      assert.equal(r2.stdout.trim(), "SIBLING_OK:HOISTED_DEP_OK");
+    }
+
+    // 5) [R19 #5 P1] & 6) [R19 #6 P1] & 20) [R19 #20 P2]
+    // 个人自主任务归属过滤派单 + owner_isolated 日志不泄漏旧主人标题 + Health 优先展示未确认可操作失败
+    {
+      const ownerData = path.join(dir, "owner-data");
+      const ownerCfgFile = path.join(dir, "owner-cfg.yaml");
+      fs.writeFileSync(
+        ownerCfgFile,
+        [
+          `data_dir: ${ownerData}`,
+          `bins: { lark: ${JSON.stringify(path.join(STUBS, "lark-cli"))}, acpx: ${JSON.stringify(path.join(STUBS, "acpx"))} }`,
+          "owner: { open_id: ou_new_owner_r19 }",
+          "harnesses: { claude: { agent: claude } }",
+          "roles: { brain: claude }",
+        ].join("\n"),
+      );
+      extraApp1 = createApp(loadConfig(ownerCfgFile));
+      extraApp1.store.set("owner.open_id", "ou_old_owner_r19");
+      extraApp1.store.set("ctx.own_task_owner.guid_own_r19", "ou_old_owner_r19");
+      extraApp1.store.set("op.task.create_own.legacy_r19", "guid_legacy_own_r19");
+
+      const secretTitle = "旧主人绝密并购计划_R19_SECRET";
+      const dId1 = "dispatch:guid_own_r19:1700000001";
+      const dId2 = "dispatch:guid_legacy_own_r19:1700000002";
+      extraApp1.ledger.enqueue({
+        id: dId1,
+        kind: "dispatch",
+        ref: "guid_own_r19",
+        state: "queued",
+        payload: { guid: "guid_own_r19", summary: secretTitle, description: "private" },
+      });
+      extraApp1.ledger.enqueue({
+        id: dId2,
+        kind: "dispatch",
+        ref: "guid_legacy_own_r19",
+        state: "queued",
+        payload: { guid: "guid_legacy_own_r19", summary: "旧版自主任务标题", description: "private" },
+      });
+
+      assert.equal(Q.isContextDerivedDispatchBlocked(extraApp1, dId1), true, "ctx.own_task_owner 标记的任务派单必须被归属隔离拦截");
+      assert.equal(Q.isContextDerivedDispatchBlocked(extraApp1, dId2), true, "遗留 op.task.create_own.* 任务派单在换主后必须被归属隔离拦截");
+      assert.equal(Q.listDispatches(extraApp1, { filter: "all" }).length, 0, "旧主人自主任务派单不得出现在新主人派单列表中");
+      await assert.rejects(
+        () => Q.dispatchDetail(extraApp1!, dId1),
+        /主人隔离阻断/,
+        "旧主人自主任务派单详情必须被阻断访问",
+      );
+
+      // 拦截 stdout 日志，验证 Dispatcher.advance 中止旧主人派单时绝不打印旧主人私密标题
+      const disp = new Dispatcher(extraApp1.cfg, extraApp1.ledger, extraApp1.store, extraApp1.board);
+      const capturedLogs: string[] = [];
+      const origWrite = process.stdout.write.bind(process.stdout);
+      process.stdout.write = ((chunk: unknown, ...rest: unknown[]) => {
+        capturedLogs.push(String(chunk));
+        return origWrite(chunk as string, ...(rest as []));
+      }) as typeof process.stdout.write;
+      try {
+        const w1 = extraApp1.ledger.claim("dispatch", 30_000)!;
+        assert.equal(w1.id, dId1);
+        await disp.advance(w1 as never, { signal: new AbortController().signal, attempt: 1 });
+      } finally {
+        process.stdout.write = origWrite;
+      }
+      const joinedLogs = capturedLogs.join("");
+      assert.ok(!joinedLogs.includes(secretTitle), `owner_isolated 日志绝不能泄漏旧主人私密标题：${joinedLogs}`);
+      assert.ok(joinedLogs.includes(dId1) && joinedLogs.includes("owner_isolated"), "owner_isolated 日志应仅记录 work ID 与 reason");
+      const finished = extraApp1.ledger.get<{ summary?: string }>(dId1);
+      assert.equal(finished?.state, "errored");
+      assert.equal(finished?.reason, "owner_isolated");
+      assert.equal(finished?.payload.summary, secretTitle, "账本原始 payload 标题应原样保留");
+
+      // [R19 #20 P2] 3 条较早的未确认当前主人失败 + 210 条较新的已确认失败：Health 展示列表必须把未确认可操作失败排在前面
+      const now = Date.now();
+      for (let i = 0; i < 3; i++) {
+        const id = `job:r19-actionable-${i}`;
+        extraApp1.ledger.enqueue({ id, kind: "job", ref: `act_${i}`, state: "errored", payload: { name: `act_${i}` } });
+        extraApp1.store.db
+          .prepare("UPDATE work SET terminal = 1, outcome = 'errored', updated = ?, error = ? WHERE id = ?")
+          .run(now - 500_000 + i * 1000, `err-${i}`, id);
+      }
+      for (let i = 0; i < 210; i++) {
+        const id = `job:r19-acked-${i}`;
+        extraApp1.ledger.enqueue({ id, kind: "job", ref: `ack_${i}`, state: "errored", payload: { name: `ack_${i}` } });
+        extraApp1.store.db
+          .prepare("UPDATE work SET terminal = 1, outcome = 'acknowledged', updated = ?, error = ? WHERE id = ?")
+          .run(now - 100_000 + i * 100, `acked-${i}`, id);
+      }
+      const h = Q.health(extraApp1);
+      assert.equal(h.actionable_failures, 3);
+      assert.equal(h.failed.length, 200);
+      const shownActionable = h.failed.filter((f) => !f.acknowledged && !f.isolated);
+      assert.equal(shownActionable.length, 3, "全部 3 条未确认可操作失败必须优先获得 Health 展示位");
+      assert.ok(
+        h.failed.slice(0, 3).every((f) => !f.acknowledged && !f.isolated),
+        "未确认可操作失败必须排在已确认失败之前",
+      );
+    }
+
+    // 7) [R19 #7 P1] & 9) [R19 #9 P2] & 10) [R19 #10 P2]
+    // 跨进程修改 groups_allow 实时生效 + 不可用原消息拒发并撤回 + 补读背景消息经权威确认撤回且绝不提升为待处理
+    {
+      process.env.PA_FEISHU_WEB_KEY = TEST_WEB_KEY;
+      const pwDir = path.join(dir, "pw-r19");
+      const pwData = path.join(pwDir, "data");
+      fs.mkdirSync(pwData, { recursive: true });
+      const pwCfgFile = path.join(pwDir, "config.yaml");
+      const writePwConfig = (groupsAllow: string[]) => {
+        fs.writeFileSync(
+          pwCfgFile,
+          [
+            `data_dir: ${pwData}`,
+            `bins: { lark: ${JSON.stringify(path.join(STUBS, "lark-cli"))}, acpx: ${JSON.stringify(path.join(STUBS, "acpx"))} }`,
+            "owner: { open_id: ou_r19_pw }",
+            "harnesses: { cx: { type: codex-exec, cmd: /bin/true } }",
+            "roles: { brain: cx }",
+            "context:",
+            "  enabled: true",
+            "  understand: false",
+            "  groups: allowlist",
+            `  groups_allow: ${JSON.stringify(groupsAllow)}`,
+            "  groups_deny: []",
+            "  personal_web:",
+            "    enabled: true",
+            "    fast_lane: false",
+            "    send_replies: true",
+          ].join("\n"),
+        );
+      };
+      writePwConfig(["pw_chat:9901"]);
+      app = createApp(loadConfig(pwCfgFile));
+      app.store.set("owner.open_id", "ou_r19_pw");
+      const login = {
+        owner_id: "7001",
+        owner_name: "测试主人",
+        device_id: "dev_r19",
+        saved_at: Date.now(),
+        session_id: "sess_r19",
+        cookies: [
+          { name: "session", value: "s_r19", domain: ".feishu.cn", path: "/", host_only: false, secure: true, http_only: true },
+          { name: "csrf_token", value: "c_r19", domain: ".feishu.cn", path: "/", host_only: false, secure: false, http_only: false },
+        ],
+      };
+      commitWorkspaceLogin(app, login, { allowUnverifiedOwner: true });
+
+      const ctxStore = new ContextStore(app.store.db);
+      const bridge = new PersonalWebBridge(app, ctxStore, {
+        onFastTrigger: () => undefined,
+        onReconnect: () => undefined,
+        onNeedsLogin: () => undefined,
+        clientOptions: { endpoints: mock.endpoints },
+      });
+
+      // 7) 群 9901 初始在 groups_allow 中；模拟另一进程把 9901 从磁盘 config.yaml 的 groups_allow 中移出后，
+      //    非 @本人 消息的新回复必须被拒绝（绝不沿用陈旧内存白名单直接发包）
+      mock.setChatKind("9901", CHAT_KIND_GROUP);
+      mock.setChatName("9901", "白名单群");
+      mock.addMessage(
+        "990101",
+        buildNativeMessage({
+          id: "990101",
+          chatId: "9901",
+          chatKind: CHAT_KIND_GROUP,
+          actorId: "8001",
+          text: "请帮我确认一下排期（未 @本人）",
+        }),
+      );
+      ctxStore.addObs([
+        {
+          id: "pw:990101",
+          source: "im",
+          kind: "group",
+          conv: "pw_chat:9901",
+          conv_name: "白名单群",
+          actor_id: "8001",
+          actor_name: "8001",
+          is_me: false,
+          time: Date.now(),
+          text: "请帮我确认一下排期（未 @本人）",
+          url: "",
+          meta: { transport: "personal_web", native_owner_id: "7001", chat_type: "group" },
+        },
+      ]);
+      // 模拟另一进程更新磁盘 config.yaml 移除 pw_chat:9901（保持内存 app.cfg 不变）
+      await new Promise((r) => setTimeout(r, 20));
+      writePwConfig(["pw_chat:9999"]);
+      const sentBefore7 = mock.sentReplies.length;
+      await assert.rejects(
+        () =>
+          bridge.sendVerifiedReply({
+            owner_id: "7001",
+            chat_id: "9901",
+            message_id: "990101",
+            text: "收到，我来看下",
+            cid: computePwReplyCid({
+              draft_id: "d_r19_7",
+              owner_id: "7001",
+              chat_id: "9901",
+              message_id: "990101",
+              text: "收到，我来看下",
+            }).cid,
+          }),
+        /已不再 @本人|移出/,
+        "磁盘 groups_allow 移除群后，非 @本人 回复必须被拒绝",
+      );
+      assert.equal(mock.sentReplies.length, sentBefore7, "白名单移除后绝不能实际发包");
+
+      // 9) 私聊原消息在监听离线期间被编辑为空（不可用正文）：sendVerifiedReply 必须拒绝发包并撤回本地 pw:* 观测
+      mock.setChatKind("9902", CHAT_KIND_P2P);
+      mock.setChatName("9902", "私聊对象");
+      mock.addMessage(
+        "990201",
+        buildNativeMessage({
+          id: "990201",
+          chatId: "9902",
+          chatKind: CHAT_KIND_P2P,
+          actorId: "8002",
+          text: "   ",
+        }),
+      );
+      ctxStore.addObs([
+        {
+          id: "pw:990201",
+          source: "im",
+          kind: "p2p",
+          conv: "pw_chat:9902",
+          conv_name: "私聊对象",
+          actor_id: "8002",
+          actor_name: "8002",
+          is_me: false,
+          time: Date.now(),
+          text: "离线前的旧私聊内容",
+          url: "",
+          meta: { transport: "personal_web", native_owner_id: "7001", chat_type: "p2p" },
+        },
+      ]);
+      const sentBefore9 = mock.sentReplies.length;
+      await assert.rejects(
+        () =>
+          bridge.sendVerifiedReply({
+            owner_id: "7001",
+            chat_id: "9902",
+            message_id: "990201",
+            text: "好的收到",
+            cid: computePwReplyCid({
+              draft_id: "d_r19_9",
+              owner_id: "7001",
+              chat_id: "9902",
+              message_id: "990201",
+              text: "好的收到",
+            }).cid,
+          }),
+        /实时回读原消息已不可用/,
+        "原消息实时回读为空正文时必须拒绝发送新回复",
+      );
+      assert.equal(mock.sentReplies.length, sentBefore9);
+      assert.equal(ctxStore.obs("pw:990201")?.meta.withdrawn, true, "原消息不可用拒发后应同步撤回本地观测");
+      assert.equal(ctxStore.obsPending("pw:990201"), false);
+
+      // 10) 补读背景消息（background_only: true）收到空/不支持编辑推送时：
+      //     a) 权威回读确认已撤回 -> 标记 withdrawn: true，保持 processed=1 且从后续 convWindow 剔除；
+      //     b) 权威回读仍有效（误报/乱序） -> 保持 background_only: true 且绝不提升为待处理。
+      const nowMs = Date.now();
+      ctxStore.addBackgroundObs([
+        {
+          id: "pw:990301",
+          source: "im",
+          kind: "p2p",
+          conv: "pw_chat:9903",
+          conv_name: "背景会话",
+          actor_id: "8003",
+          actor_name: "8003",
+          is_me: false,
+          time: nowMs - 2000,
+          text: "即将被撤回的历史背景消息",
+          url: "",
+          meta: { transport: "personal_web", native_owner_id: "7001", chat_type: "p2p" },
+        },
+        {
+          id: "pw:990302",
+          source: "im",
+          kind: "p2p",
+          conv: "pw_chat:9903",
+          conv_name: "背景会话",
+          actor_id: "8003",
+          actor_name: "8003",
+          is_me: false,
+          time: nowMs - 1000,
+          text: "仍然有效的历史背景消息",
+          url: "",
+          meta: { transport: "personal_web", native_owner_id: "7001", chat_type: "p2p" },
+        },
+      ]);
+      ctxStore.addObs([
+        {
+          id: "pw:990303",
+          source: "im",
+          kind: "p2p",
+          conv: "pw_chat:9903",
+          conv_name: "背景会话",
+          actor_id: "8003",
+          actor_name: "8003",
+          is_me: false,
+          time: nowMs,
+          text: "最新一条待处理私聊",
+          url: "",
+          meta: { transport: "personal_web", native_owner_id: "7001", chat_type: "p2p" },
+        },
+      ]);
+      mock.setChatKind("9903", CHAT_KIND_P2P);
+      mock.setChatName("9903", "背景会话");
+      const empty990301Buf = buildNativeMessage({
+        id: "990301",
+        chatId: "9903",
+        chatKind: CHAT_KIND_P2P,
+        actorId: "8003",
+        text: "",
+      });
+      mock.addMessage("990301", empty990301Buf);
+      mock.addMessage(
+        "990302",
+        buildNativeMessage({
+          id: "990302",
+          chatId: "9903",
+          chatKind: CHAT_KIND_P2P,
+          actorId: "8003",
+          text: "仍然有效的历史背景消息",
+        }),
+      );
+      const client = await FeishuWebClient.connect(login, { endpoints: mock.endpoints });
+      const invalidPush1 = decodeMessage(empty990301Buf, "7001");
+      const invalidPush2 = decodeMessage(
+        buildNativeMessage({
+          id: "990302",
+          chatId: "9903",
+          chatKind: CHAT_KIND_P2P,
+          actorId: "8003",
+          text: "",
+        }),
+        "7001",
+      );
+      await bridge.handleMessage(invalidPush1, client);
+      await bridge.handleMessage(invalidPush2, client);
+      assert.equal(ctxStore.obs("pw:990301")?.meta.withdrawn, true, "经权威确认撤回的补读背景消息必须标为 withdrawn");
+      assert.equal(ctxStore.obsPending("pw:990301"), false, "撤回的背景消息绝不能进入待处理队列");
+      assert.equal(ctxStore.obs("pw:990302")?.meta.withdrawn, undefined, "权威回读仍有效的背景消息不应被误撤回");
+      assert.equal(ctxStore.obs("pw:990302")?.meta.background_only, true, "有效背景消息应保持 background_only");
+      assert.equal(ctxStore.obsPending("pw:990302"), false, "权威回读矛盾时绝不能把背景消息提升为待处理工作");
+      const win = ctxStore.convWindow("pw_chat:9903", 10, 10, "7001");
+      assert.ok(!win.some((o: Obs) => o.id === "pw:990301"), "已撤回的补读背景消息绝不得出现在后续 convWindow 中");
+      assert.ok(win.some((o: Obs) => o.id === "pw:990302"), "仍有效的背景消息应继续保留在 convWindow 中");
+      delete process.env.PA_FEISHU_WEB_KEY;
+    }
+
+    // 11) [R19 #11 P2] 相同正文但 @我 归类冲突且 +messages-mget 缺失 mentions 时，必须视为未决并保留游标重试
+    {
+      const connDir = path.join(dir, "conn-r19");
+      const connData = path.join(connDir, "data");
+      fs.mkdirSync(connData, { recursive: true });
+      const connCfgFile = path.join(connDir, "config.yaml");
+      fs.writeFileSync(
+        connCfgFile,
+        [
+          `data_dir: ${connData}`,
+          `bins: { lark: ${JSON.stringify(path.join(STUBS, "lark-cli"))}, acpx: ${JSON.stringify(path.join(STUBS, "acpx"))} }`,
+          "owner: { open_id: ou_r19_conn }",
+          "harnesses: { claude: { agent: claude } }",
+          "roles: { brain: claude }",
+          "context:",
+          "  enabled: true",
+          "  groups: allowlist",
+          '  groups_allow: ["oc_r19_grp"]',
+          "  sources: { meego: false, im: true, minutes: false, calendar: false, tasks: false, docs: false }",
+        ].join("\n"),
+      );
+      extraApp2 = createApp(loadConfig(connCfgFile));
+      extraApp2.store.set("owner.open_id", "ou_r19_conn");
+      const fakeLark = extraApp2.lark as unknown as {
+        authStatus: () => Promise<unknown>;
+        run: (argv: string[]) => Promise<unknown>;
+      };
+      fakeLark.authStatus = async () => ({ identity: "user", user: { open_id: "ou_r19_conn", name: "测试" } });
+      const nowSec = Math.floor(Date.now() / 1000);
+      fakeLark.run = async (argv: string[]) => {
+        if (argv[0] === "im" && argv[1] === "+messages-search") {
+          if (argv.includes("--is-at-me")) {
+            return {
+              has_more: false,
+              messages: [
+                {
+                  message_id: "om_r19_conflict",
+                  chat_id: "oc_r19_grp",
+                  chat_type: "group",
+                  chat_name: "测试群",
+                  sender: { id: "ou_bob", name: "Bob", sender_type: "user" },
+                  content: "同样的一句话正文",
+                  create_time: String(nowSec * 1000),
+                },
+              ],
+            };
+          }
+          return { has_more: false, messages: [] };
+        }
+        if (argv[0] === "im" && argv[1] === "+chat-messages-list") {
+          return {
+            has_more: false,
+            messages: [
+              {
+                message_id: "om_r19_conflict",
+                chat_id: "oc_r19_grp",
+                chat_type: "group",
+                chat_name: "测试群",
+                sender: { id: "ou_bob", name: "Bob", sender_type: "user" },
+                content: "同样的一句话正文",
+                create_time: String(nowSec * 1000),
+                mentions: [],
+              },
+            ],
+          };
+        }
+        if (argv[0] === "im" && argv[1] === "+messages-mget") {
+          // 刻意省略 mentions 字段，仅返回正文
+          return {
+            messages: [
+              {
+                message_id: "om_r19_conflict",
+                chat_id: "oc_r19_grp",
+                chat_type: "group",
+                chat_name: "测试群",
+                sender: { id: "ou_bob", name: "Bob", sender_type: "user" },
+                content: "同样的一句话正文",
+                create_time: String(nowSec * 1000),
+              },
+            ],
+          };
+        }
+        return {};
+      };
+      const ctxSvc = new ContextService(extraApp2);
+      await ctxSvc.connectors.pullIm();
+      assert.equal(
+        ctxSvc.store.obs("im:om_r19_conflict"),
+        undefined,
+        "相同正文但 @我 冲突且 +messages-mget 无 mentions 时绝不得提交陈旧候选",
+      );
+      assert.equal(extraApp2.store.get("ctx.im.at_me"), undefined, "冲突未决时必须保留 at_me 游标待重试");
+    }
+
+    // 12) [R19 #12 P2] & 13) [R19 #13 P2] & 14) [R19 #14 P2]
+    // 目标域 HTTPS Git 凭据投影 + git-media.io/v/2 LFS 别名 + remoteDefaultBranch 挂载本地镜像
+    {
+      // 13) git-media.io/v/2 别名指针校验与历史扫描
+      const gitMediaPtr = [
+        "version http://git-media.io/v/2",
+        "oid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "size 128",
+        "",
+      ].join("\n");
+      assert.equal(isGitLfsPointerBlob(gitMediaPtr), true, "必须识别 http://git-media.io/v/2 官方别名指针");
+
+      const lfsRepo = path.join(dir, "lfs-git-media-repo");
+      fs.mkdirSync(lfsRepo, { recursive: true });
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: "r19",
+        GIT_AUTHOR_EMAIL: "r19@test",
+        GIT_COMMITTER_NAME: "r19",
+        GIT_COMMITTER_EMAIL: "r19@test",
+      };
+      assert.equal((await runProcess("git", ["init", "-q", "-b", "main", lfsRepo], { env: gitEnv })).code, 0);
+      fs.writeFileSync(path.join(lfsRepo, "asset.bin"), gitMediaPtr);
+      assert.equal((await runProcess("git", ["-C", lfsRepo, "add", "-A"], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", lfsRepo, "commit", "-q", "-m", "add git-media ptr"], { env: gitEnv })).code, 0);
+      // 下一个提交删除该文件且没有 .gitattributes，验证仅靠历史扫描仍能检出 git-media 指针
+      fs.rmSync(path.join(lfsRepo, "asset.bin"));
+      assert.equal((await runProcess("git", ["-C", lfsRepo, "add", "-A"], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", lfsRepo, "commit", "-q", "-m", "rm asset"], { env: gitEnv })).code, 0);
+      assert.equal(await branchUsesGitLfs(lfsRepo, "main"), true, "历史提交中的 git-media.io/v/2 指针必须被 LFS 扫描检出");
+
+      // 14) remoteDefaultBranch 解析 url.*.insteadOf 重写的本地镜像并只读挂载
+      const bareMirror = path.join(dir, "bare-mirror.git");
+      const workMirrorRepo = path.join(dir, "work-mirror-repo");
+      fs.mkdirSync(bareMirror, { recursive: true });
+      fs.mkdirSync(workMirrorRepo, { recursive: true });
+      assert.equal((await runProcess("git", ["init", "-q", "--bare", "-b", "develop", bareMirror], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["init", "-q", "-b", "develop", workMirrorRepo], { env: gitEnv })).code, 0);
+      fs.writeFileSync(path.join(workMirrorRepo, "README.md"), "hi\n");
+      assert.equal((await runProcess("git", ["-C", workMirrorRepo, "add", "-A"], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", workMirrorRepo, "commit", "-q", "-m", "init"], { env: gitEnv })).code, 0);
+      const fakePlatformUrl = "https://github.example.com/org/mirror-demo.git";
+      assert.equal((await runProcess("git", ["-C", workMirrorRepo, "remote", "add", "origin", fakePlatformUrl], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", workMirrorRepo, "config", `url.${bareMirror}.insteadOf`, fakePlatformUrl], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", workMirrorRepo, "push", "-q", "origin", "develop"], { env: gitEnv })).code, 0);
+      assert.equal((await runProcess("git", ["-C", workMirrorRepo, "checkout", "-q", "-b", "pa/feature"], { env: gitEnv })).code, 0);
+      const defaultBr = await remoteDefaultBranch(workMirrorRepo, "origin");
+      assert.equal(defaultBr, "develop", "remoteDefaultBranch 必须在隔离下挂载 insteadOf 本地镜像并正确解析远端 HEAD");
+
+      // 12) 受信任远程 Git 操作仅投影目标域的 credential.helper=store 凭据，且绝不暴露其他域凭据
+      assert.equal(
+        gitCredentialLineMatchesTarget("https://u:p@git.a.example:8443/org", new URL("https://git.a.example:8443/org/repo.git"), true),
+        true,
+      );
+      assert.equal(
+        gitCredentialLineMatchesTarget("https://u:p@git.b.example", new URL("https://git.a.example/org/repo.git"), false),
+        false,
+      );
+      assert.equal(
+        gitCredentialLineMatchesTarget("https://u:p@git.a.example/other", new URL("https://git.a.example/org/repo.git"), true),
+        false,
+      );
+
+      // 搭建真实需要 HTTP Basic Auth 的本地 Git dumb-HTTP 端点，实测隔离下的 tryGit ls-remote
+      const dumbHead = (await runProcess("git", ["-C", workMirrorRepo, "rev-parse", "refs/heads/develop"], { env: gitEnv })).stdout.trim();
+      const expectedAuth = `Basic ${Buffer.from("r19user:r19pass").toString("base64")}`;
+      let receivedAuth = "";
+      httpGitSrv = http.createServer((req, res) => {
+        const auth = req.headers.authorization ?? "";
+        if (auth !== expectedAuth) {
+          res.statusCode = 401;
+          res.setHeader("WWW-Authenticate", 'Basic realm="r19-git"');
+          res.end("auth required");
+          return;
+        }
+        receivedAuth = auth;
+        if ((req.url ?? "").startsWith("/org/repo.git/info/refs")) {
+          res.setHeader("Content-Type", "text/plain");
+          res.end(`${dumbHead}\trefs/heads/develop\n`);
+          return;
+        }
+        res.statusCode = 404;
+        res.end("not found");
+      });
+      await new Promise<void>((resolve) => httpGitSrv!.listen(0, "127.0.0.1", resolve));
+      const gitPort = (httpGitSrv.address() as { port: number }).port;
+      const gitHome = path.join(dir, "git-home-r19");
+      fs.mkdirSync(gitHome, { recursive: true });
+      fs.writeFileSync(path.join(gitHome, ".gitconfig"), "[credential]\n\thelper = store\n");
+      fs.writeFileSync(
+        path.join(gitHome, ".git-credentials"),
+        [
+          `http://r19user:r19pass@127.0.0.1:${gitPort}`,
+          "https://other:UNRELATED_SECRET@other.internal.example",
+        ].join("\n") + "\n",
+        { mode: 0o600 },
+      );
+      const lsRes = await tryGit(
+        workMirrorRepo,
+        ["ls-remote", `http://127.0.0.1:${gitPort}/org/repo.git`],
+        { readOnly: true, extraEnv: { HOME: gitHome } },
+      );
+      assert.equal(lsRes.code, 0, `隔离下受信任远程 Git 应通过目标域凭据完成 HTTP 认证：${lsRes.stderr}`);
+      assert.equal(receivedAuth, expectedAuth);
+      assert.match(lsRes.stdout, new RegExp(dumbHead));
+
+      if (process.platform === "linux" && hasCredentialMountIsolation()) {
+        // 普通仓库工人绝不能看到 ~/.git-credentials
+        const workerProbe = wrapCredentialIsolatedCommand(
+          "sh",
+          ["-c", `test -e ${JSON.stringify(path.join(gitHome, ".git-credentials"))} && echo LEAK || echo SAFE`],
+          { ...process.env, HOME: gitHome },
+          buildWorkspaceIsolation({ dataDir, context: { personal_web: { enabled: false } } } as never, { mode: "worker-ro", cwd: workMirrorRepo }, { ...process.env, HOME: gitHome }),
+        );
+        const wp = await runProcess(workerProbe.cmd, workerProbe.args, { env: { ...process.env, HOME: gitHome }, timeoutMs: 10_000 });
+        assert.equal(wp.code, 0, wp.stderr);
+        assert.equal(wp.stdout.trim(), "SAFE", "普通工人绝不能访问宿主机 ~/.git-credentials");
+      }
+    }
+
+    // 15) [R19 #15 P2] & 16) [R19 #16 P2] & 17) [R19 #17 P2] & 18) [R19 #18 P2] & 19) [R19 #19 P2]
+    // Codex --profile 预检 + AWS profile 窄投影 + 非 OAuth 跳过 auth.json + 共享目录 OAuth 锁 + 长任务窗口租约
+    {
+      // 15) 基础 config.toml 为 keyring，但 --profile api_review 或 <name>.config.toml 切到自定义 API-key 供应商
+      const codexProfHome = path.join(dir, "codex-prof-home");
+      fs.mkdirSync(codexProfHome, { recursive: true });
+      fs.writeFileSync(
+        path.join(codexProfHome, "config.toml"),
+        [
+          'cli_auth_credentials_store = "keyring"',
+          'model_provider = "openai"',
+          "",
+          "[profiles.api_review]",
+          'model_provider = "corp_api"',
+          "",
+          "[model_providers.corp_api]",
+          'name = "Corp"',
+          'base_url = "https://api.corp.example/v1"',
+          'env_key = "CORP_API_KEY"',
+          "",
+          "[profiles.bedrock_prof]",
+          'model_provider = "my_bedrock"',
+          "",
+          "[model_providers.my_bedrock]",
+          'name = "Bedrock"',
+          'aws = { profile = "bedrock_work", region = "us-west-2" }',
+        ].join("\n"),
+      );
+      const profEnv = { HOME: dir, CODEX_HOME: codexProfHome, CORP_API_KEY: "sk-corp" };
+      const baseRes = resolveEffectiveCodexCredentialStore(profEnv, []);
+      assert.equal(baseRes.needsCredentialStore, true, "未选 profile 时应命中基础 openai+keyring");
+      const profRes = resolveEffectiveCodexCredentialStore(profEnv, ["--profile", "api_review"]);
+      assert.equal(profRes.provider, "corp_api");
+      assert.equal(profRes.needsCredentialStore, false, "选中 API-key profile 后不应再要求 keyring");
+      const ignoredProfRes = resolveEffectiveCodexCredentialStore(profEnv, ["--profile", "api_review"], { ignoreProfiles: true });
+      assert.equal(ignoredProfRes.needsCredentialStore, true, "tools=none (ignoreProfiles) 不应受 profile 影响");
+
+      // sidecar <name>.config.toml 生效且损坏链接必须报错
+      fs.writeFileSync(path.join(codexProfHome, "sidecar_ok.config.toml"), 'cli_auth_credentials_store = "file"\nmodel_provider = "corp_api"\n');
+      const scOk = resolveEffectiveCodexCredentialStore(profEnv, ["-p", "sidecar_ok"]);
+      assert.equal(scOk.store, "file");
+      assert.equal(scOk.needsCredentialStore, false);
+      fs.symlinkSync("/nonexistent/r19-broken-sidecar.toml", path.join(codexProfHome, "broken_sc.config.toml"));
+      const scBad = resolveEffectiveCodexCredentialStore(profEnv, ["--profile=broken_sc"]);
+      assert.ok(scBad.configError, "损坏的 profile sidecar 符号链接必须返回 configError (fail-closed)");
+
+      const bedrockProfRes = resolveEffectiveCodexCredentialStore(profEnv, ["--profile", "bedrock_prof"]);
+      assert.equal(bedrockProfRes.awsProfile, "bedrock_work");
+      assert.equal(bedrockProfRes.needsCredentialStore, false);
+
+      // doctor / keyring 冲突预检：reviewer 使用 --profile api_review 不报冲突
+      const krCfg = {
+        dataDir,
+        context: { personal_web: { enabled: true } },
+        harnesses: {
+          rev: { type: "codex-exec", cmd: "codex", extraArgs: ["--profile", "api_review"], env: { CODEX_HOME: codexProfHome, CORP_API_KEY: "sk-corp" } },
+          base: { type: "codex-exec", cmd: "codex", extraArgs: [], env: { CODEX_HOME: codexProfHome } },
+        },
+      } as never;
+      if (process.platform === "linux") {
+        assert.equal(detectIsolatedCodexKeyringConflict(krCfg, {}, "rev", { includeContextObs: true }), undefined, "走 API-key profile 的 reviewer 不应报 keyring 冲突");
+        assert.equal(detectIsolatedCodexKeyringConflict(krCfg, {}, "base", { includeContextObs: true })?.severity, "error", "未切 profile 的 keyring reviewer 必须报错");
+      }
+
+      // 16) AWS profile 窄投影：仅提取选中的 bedrock_work + source_profile + sso-session，严禁泄漏 admin_secret
+      const awsHome = path.join(dir, "aws-home");
+      const awsDir = path.join(awsHome, ".aws");
+      fs.mkdirSync(awsDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(awsDir, "config"),
+        [
+          "[profile bedrock_work]",
+          "region = us-west-2",
+          "source_profile = base_acct",
+          "sso_session = corp_sso",
+          "",
+          "[profile base_acct]",
+          "region = us-east-1",
+          "",
+          "[sso-session corp_sso]",
+          "sso_start_url = https://corp.awsapps.com/start",
+          "",
+          "[profile admin_secret]",
+          "region = ap-northeast-1",
+          "role_arn = arn:aws:iam::999999999999:role/SuperAdmin",
+        ].join("\n"),
+        { mode: 0o600 },
+      );
+      fs.writeFileSync(
+        path.join(awsDir, "credentials"),
+        [
+          "[base_acct]",
+          "aws_access_key_id = AKIA_BASE_R19",
+          "aws_secret_access_key = SECRET_BASE_R19",
+          "",
+          "[admin_secret]",
+          "aws_access_key_id = AKIA_ADMIN_LEAK",
+          "aws_secret_access_key = SECRET_ADMIN_LEAK",
+        ].join("\n"),
+        { mode: 0o600 },
+      );
+      const stagedAws = stageIsolatedAwsProfile("bedrock_work", { HOME: awsHome }, dataDir);
+      assert.ok(stagedAws, "应成功投影选中的 AWS profile");
+      try {
+        const projCfg = fs.readFileSync(stagedAws!.configFile, "utf8");
+        const projCred = fs.readFileSync(stagedAws!.credentialsFile, "utf8");
+        assert.ok(projCfg.includes("[profile bedrock_work]") && projCfg.includes("[profile base_acct]") && projCfg.includes("[sso-session corp_sso]"));
+        assert.ok(!projCfg.includes("admin_secret") && !projCfg.includes("SuperAdmin"), "投影 config 绝不得包含无关 AWS profile");
+        assert.ok(projCred.includes("AKIA_BASE_R19") && !projCred.includes("AKIA_ADMIN_LEAK"), "投影 credentials 绝不得包含无关账号密钥");
+      } finally {
+        stagedAws!.cleanup();
+      }
+      assert.equal(fs.existsSync(stagedAws!.dir), false, "cleanup 必须彻底清理 AWS 投影目录");
+
+      // 16b) 实跑隔离下的 codex-exec（Bedrock profile + host auth.json）：沙箱内必须可读投影 AWS profile 且绝不可见 admin_secret 或 host auth.json
+      if (process.platform === "linux" && hasCredentialMountIsolation()) {
+        const bedrockCodexHome = path.join(dir, "codex-bedrock-live");
+        fs.mkdirSync(bedrockCodexHome, { recursive: true });
+        fs.writeFileSync(
+          path.join(bedrockCodexHome, "config.toml"),
+          [
+            'model_provider = "my_bedrock"',
+            "[model_providers.my_bedrock]",
+            'name = "Bedrock"',
+            'aws = { profile = "bedrock_work", region = "us-west-2" }',
+          ].join("\n"),
+        );
+        fs.writeFileSync(
+          path.join(bedrockCodexHome, "auth.json"),
+          JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "tok", refresh_token: "HOST_RT_MUST_NOT_APPEAR" } }),
+          { mode: 0o600 },
+        );
+        const probeCodex = path.join(dir, "probe-codex-aws.sh");
+        fs.writeFileSync(
+          probeCodex,
+          [
+            "#!/bin/sh",
+            'OUT=""',
+            'while [ "$#" -gt 0 ]; do',
+            '  if [ "$1" = "-o" ]; then OUT="$2"; shift 2; continue; fi',
+            "  shift",
+            "done",
+            'CFG_CONT="$(cat "$AWS_CONFIG_FILE" 2>/dev/null || true)"',
+            'CRED_CONT="$(cat "$AWS_SHARED_CREDENTIALS_FILE" 2>/dev/null || true)"',
+            'HAS_AUTH=$(test -e "$CODEX_HOME/auth.json" && echo YES || echo NO)',
+            'HAS_HOST_AUTH=$(test -e ' + JSON.stringify(path.join(bedrockCodexHome, "auth.json")) + ' && echo YES || echo NO)',
+            'RES="HAS_BEDROCK=$(echo "$CFG_CONT" | grep -q bedrock_work && echo YES || echo NO);HAS_ADMIN=$(echo "$CRED_CONT" | grep -q AKIA_ADMIN_LEAK && echo YES || echo NO);HAS_BASE=$(echo "$CRED_CONT" | grep -q AKIA_BASE_R19 && echo YES || echo NO);HAS_AUTH=$HAS_AUTH;HAS_HOST_AUTH=$HAS_HOST_AUTH"',
+            'if [ -n "$OUT" ]; then printf "%s\\n" "$RES" > "$OUT"; fi',
+            'printf "%s\\n" "$RES"',
+          ].join("\n"),
+          { mode: 0o755 },
+        );
+        const awsRunCfgFile = path.join(dir, "aws-run-r19.yaml");
+        fs.writeFileSync(
+          awsRunCfgFile,
+          [
+            `data_dir: ${path.join(dir, "aws-run-data")}`,
+            `bins: { lark: ${JSON.stringify(path.join(STUBS, "lark-cli"))}, acpx: ${JSON.stringify(path.join(STUBS, "acpx"))} }`,
+            "owner: { open_id: ou_r19_aws }",
+            "harnesses:",
+            `  cx_aws: { type: codex-exec, cmd: ${JSON.stringify(probeCodex)}, env: { HOME: ${JSON.stringify(awsHome)}, CODEX_HOME: ${JSON.stringify(bedrockCodexHome)} } }`,
+            "roles: { brain: cx_aws }",
+            "context: { personal_web: { enabled: true } }",
+          ].join("\n"),
+        );
+        const awsRunCfg = loadConfig(awsRunCfgFile);
+        const awsRes = await runHarness(awsRunCfg, {
+          harness: "cx_aws",
+          prompt: "hello",
+          cwd: dir,
+          tools: "none",
+          lark: "none",
+          timeoutSec: 30,
+          logFile: path.join(dir, "cx-aws.log"),
+        });
+        assert.equal(awsRes.ok, true, awsRes.text);
+        assert.match(awsRes.text, /HAS_BEDROCK=YES/, "隔离 Bedrock Codex 必须能读取投影后的 bedrock_work profile");
+        assert.match(awsRes.text, /HAS_BASE=YES/, "隔离 Bedrock Codex 必须能读取 source_profile (base_acct) 凭据");
+        assert.match(awsRes.text, /HAS_ADMIN=NO/, "隔离 Bedrock Codex 绝不得看到无关的 admin_secret AWS 凭据");
+        assert.match(awsRes.text, /HAS_AUTH=NO/, "非 OAuth Bedrock 供应商绝不得拷贝宿主机 auth.json 到临时 CODEX_HOME");
+        assert.match(awsRes.text, /HAS_HOST_AUTH=NO/, "隔离沙箱绝不得暴露宿主机 CODEX_HOME/auth.json");
+      }
+
+      // 17) needsCredentialStore=false 时，stageIsolatedCodexHome 绝不拷贝宿主机 auth.json
+      const noAuthCodexHome = path.join(dir, "codex-no-oauth-home");
+      fs.mkdirSync(noAuthCodexHome, { recursive: true });
+      fs.writeFileSync(
+        path.join(noAuthCodexHome, "auth.json"),
+        JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "tok", refresh_token: "DO_NOT_COPY_RT" } }),
+        { mode: 0o600 },
+      );
+      const stagedNoAuth = stageIsolatedCodexHome(noAuthCodexHome, { copyUserConfig: false, needsCredentialStore: false });
+      try {
+        assert.equal(stagedNoAuth.origAuth, undefined, "不需要凭据库时 origAuth 必须为 undefined");
+        assert.equal(fs.existsSync(path.join(stagedNoAuth.scratchDir, "auth.json")), false, "不需要凭据库时绝不得拷贝宿主机 auth.json");
+      } finally {
+        stagedNoAuth.cleanup();
+      }
+
+      // 18) OAuth 刷新锁位于规范化 auth.json 同目录，完全不受 TMPDIR 差异影响
+      const sharedAuthDir = path.join(dir, "shared-codex-auth");
+      fs.mkdirSync(sharedAuthDir, { recursive: true });
+      const sharedAuthFile = path.join(sharedAuthDir, "auth.json");
+      fs.writeFileSync(sharedAuthFile, "{}", { mode: 0o600 });
+      process.env.TMPDIR = path.join(dir, "tmp-proc-a");
+      const lockPathA = canonicalCodexLockFilePath(sharedAuthFile);
+      process.env.TMPDIR = path.join(dir, "tmp-proc-b");
+      const lockPathB = canonicalCodexLockFilePath(sharedAuthFile);
+      if (prevTmpDir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = prevTmpDir;
+      assert.equal(lockPathA, lockPathB, "不同 TMPDIR 下共享同一 auth.json 的进程必须使用同一把锁");
+      assert.equal(path.dirname(lockPathA), fs.realpathSync(sharedAuthDir), "锁文件必须位于规范化 auth.json 所在目录而非临时目录");
+
+      // 19) isCodexOAuthRefreshNeeded 与 coordinateCodexOAuthRefresh 必须按运行超时窗口判断刷新需求
+      const nowMs = Date.now();
+      const sixMinJwt = makeJwt(Math.floor((nowMs + 6 * 60_000) / 1000));
+      const sixMinAuth = {
+        auth_mode: "chatgpt",
+        last_refresh: new Date(nowMs - 60_000).toISOString(),
+        tokens: { access_token: sixMinJwt, refresh_token: "rt_r19_window" },
+      };
+      assert.equal(isCodexOAuthRefreshNeeded(sixMinAuth, nowMs, 5 * 60_000), false, "6 分钟后过期的令牌在 5 分钟窗口内无需锁");
+      assert.equal(isCodexOAuthRefreshNeeded(sixMinAuth, nowMs, 16 * 60_000), true, "6 分钟后过期的令牌在 16 分钟运行窗口内必须提前拿刷新锁");
+
+      fs.writeFileSync(sharedAuthFile, JSON.stringify(sixMinAuth), { mode: 0o600 });
+      const leaseShort = await coordinateCodexOAuthRefresh(sharedAuthDir, { runWindowMs: 5 * 60_000 });
+      assert.equal(leaseShort.held, false, "短窗口下不应占用刷新锁");
+      leaseShort.release();
+      const leaseLong = await coordinateCodexOAuthRefresh(sharedAuthDir, { runWindowMs: 16 * 60_000, leaseTtlMs: 10_000 });
+      assert.equal(leaseLong.held, true, "长运行窗口覆盖令牌过期时间时必须持有刷新租约锁");
+      leaseLong.release();
+    }
+  } finally {
+    if (httpGitSrv) await new Promise<void>((resolve) => httpGitSrv!.close(() => resolve()));
+    if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
+    else process.env.PA_FEISHU_WEB_KEY = prevKey;
+    if (prevPath === undefined) delete process.env.PATH;
+    else process.env.PATH = prevPath;
+    if (prevTmpDir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = prevTmpDir;
+    extraApp1?.store.db.close();
+    extraApp2?.store.db.close();
     app?.store.db.close();
     await mock.close();
     fs.rmSync(dir, { recursive: true, force: true });
