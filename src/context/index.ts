@@ -469,9 +469,10 @@ export class ContextService {
   start(): { stop(): void } {
     const c = this.cfg.context;
     const legacy = legacyPersonalWebArtifacts(this.cfg);
-    if (legacy.files.length || legacy.envKeys.length) {
-      log("warn", "发现旧版遗留的个人 Web 会话凭据，同一系统用户下的 worker 仍可能读到；请运行 pa context web-logout 并移除 PA_FEISHU_WEB_KEY", {
+    if (legacy.files.length || legacy.externalFiles.length || legacy.envKeys.length) {
+      log("warn", `发现旧版遗留的个人 Web 会话凭据，同一系统用户下的 worker 仍可能读到；请清理残留文件并移除 ${legacy.envKeys.join(" / ") || "旧凭据变量"}`, {
         files: legacy.files,
+        external_files: legacy.externalFiles,
         env: legacy.envKeys,
       });
     }

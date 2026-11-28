@@ -162,17 +162,33 @@ describe("feishu-web gateway client bridge, store dedup, drafts, and env scrub",
       await bridge.handleGatewayEvent({ seq: 99, kind: "delete", message_id: "m-atme", chat_id: "chat-1", created_at: Date.now() });
       assert.equal(svc.store.obs("pw:m-atme"), undefined, "recalled message must be deleted locally");
 
-      // 6) 网关没给会话名、又存在按名称的排除规则（敏感群）：丢弃，不按“未命中”放行
-      bridge.handleGatewayMessage(makeGatewayMsg({ id: "m-noname", conversationId: "chat-1", chatName: "" }));
-      assert.equal(svc.store.obs("pw:m-noname"), undefined, "missing chat name must not bypass name-based deny rules");
+      // 6) 网关未能核验会话名（chatNameResolved=false）且存在按名称排除规则：丢弃，不按“未命中”放行
+      bridge.handleGatewayMessage(makeGatewayMsg({ id: "m-noname-unresolved", conversationId: "chat-1", chatName: "", chatNameResolved: false }));
+      assert.equal(svc.store.obs("pw:m-noname-unresolved"), undefined, "unresolved missing chat name must not bypass name-based deny rules");
+
+      // 7) 网关成功核验但飞书会话本身无名（如真实私聊 chatName="", chatNameResolved=true）：不得因存在 groups_deny 而误丢私聊
+      bridge.handleGatewayMessage(
+        makeGatewayMsg({ id: "m-dm-noname", conversationId: "dm-1", conversationKind: "dm", actorId: "actor-dm-1", chatName: "", chatNameResolved: true, mentions: [] }),
+      );
+      assert.ok(svc.store.obs("pw:m-dm-noname"), "resolved empty-name DM must be accepted even when name-based groups_deny exists");
+      assert.ok(triggers.includes("pw:m-dm-noname"));
+
+      // 8) 私聊无名但本地 pwAlias 已知对方为已静音联系人：仍必须拦截
+      svc.store.setPwAlias("actor", "actor-muted-dm", "王五");
+      svc.store.muteConv("oc_dm_ww", "私聊：王五", true);
+      bridge.handleGatewayMessage(
+        makeGatewayMsg({ id: "m-dm-muted-alias", conversationId: "dm-muted", conversationKind: "dm", actorId: "actor-muted-dm", chatName: "", chatNameResolved: true, mentions: [] }),
+      );
+      assert.equal(svc.store.obs("pw:m-dm-muted-alias"), undefined, "muted DM identified via actor alias must still be blocked");
     } finally {
       app.store.db.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("sends readback_only and client deny rules to the gateway, resets the cursor on db epoch change, and detects legacy credentials", async () => {
+  it("sends readback_only and split client_deny/client_deny_exact rules, resets cursor on db epoch change, and safely isolates legacy credentials", async () => {
     const dir = makeTmp("pa-pw-epoch-");
+    const extDir = makeTmp("pa-pw-ext-");
     const app = makeApp(dir);
     const svc = new ContextService(app);
     const bridge = svc.personalWeb;
@@ -197,14 +213,17 @@ describe("feishu-web gateway client bridge, store dedup, drafts, and env scrub",
         },
       };
 
-      // 关闭 send_replies 后的收尾请求必须带 readback_only，并把客户端排除规则交给网关按实时会话名核对
+      // 关闭 send_replies 后的收尾请求必须带 readback_only；groups_deny 进子串 client_deny，静音会话名进精确 client_deny_exact
       app.cfg.context.personal_web.send_replies = false;
       app.store.set("ctx.pw_reply_started.cid-readback-01", String(Date.now()));
       svc.store.muteConv("oc_muted_grp", "静音外部群", true);
+      svc.store.muteConv("oc_dm_zs", "私聊：张三", true);
       await bridge.sendVerifiedReply({ chat_id: "chat-1", message_id: "m1", text: "测试", cid: "cid-readback-01" });
       assert.equal(captured?.readback_only, true);
       assert.ok((captured?.client_deny as string[]).includes("敏感群"));
-      assert.ok((captured?.client_deny as string[]).includes("静音外部群"));
+      assert.ok(!(captured?.client_deny as string[]).includes("张三"), "静音私聊名不得进入子串 client_deny 误拦无关群");
+      assert.ok((captured?.client_deny_exact as string[]).includes("静音外部群"));
+      assert.ok((captured?.client_deny_exact as string[]).includes("张三"));
 
       // 网关事件库实例变化：重置游标
       app.store.set("ctx.pw_gateway.cursor", "50");
@@ -215,15 +234,34 @@ describe("feishu-web gateway client bridge, store dedup, drafts, and env scrub",
       assert.equal(bridge.cursor(), 0, "db epoch change must reset the local cursor");
       assert.equal(app.store.get("ctx.pw_gateway.db_epoch"), "epoch-b");
 
-      // 旧版进程内个人 Web 残留的凭据文件与密钥变量能被检测到
-      fs.writeFileSync(path.join(app.cfg.dataDir, "feishu-web.json"), "{}");
-      const legacy = legacyPersonalWebArtifacts(app.cfg, { PA_FEISHU_WEB_KEY: "old-key" });
-      assert.deepEqual(legacy.files, [path.join(app.cfg.dataDir, "feishu-web.json")]);
-      assert.deepEqual(legacy.envKeys, ["PA_FEISHU_WEB_KEY"]);
+      // 旧版残留检测：区分 dataDir 内文件（含 .lock.db-journal）与外部 PA_FEISHU_WEB_CRED_FILE，且忽略目录防 EISDIR
+      const localCred = path.join(app.cfg.dataDir, "feishu-web.json");
+      const localJournal = `${localCred}.lock.db-journal`;
+      const extCred = path.join(extDir, "shared-gw-cred.json");
+      fs.writeFileSync(localCred, "{}");
+      fs.writeFileSync(localJournal, "");
+      fs.writeFileSync(extCred, "{}");
+
+      const legacy = legacyPersonalWebArtifacts(app.cfg, { PA_FEISHU_WEB_KEY: "old-key", PA_FEISHU_WEB_CRED_FILE: extCred });
+      assert.deepEqual(legacy.files.sort(), [localCred, localJournal].sort());
+      assert.deepEqual(legacy.externalFiles, [extCred], "外部 PA_FEISHU_WEB_CRED_FILE 必须单独列出而非混入可自动删除的 files");
+      assert.deepEqual(legacy.envKeys, ["PA_FEISHU_WEB_KEY", "PA_FEISHU_WEB_CRED_FILE"]);
+
+      // PA_FEISHU_WEB_CRED_FILE 指向目录时不得收集为普通文件（防 rmSync 抛 EISDIR）
+      const legacyDir = legacyPersonalWebArtifacts(app.cfg, { PA_FEISHU_WEB_CRED_FILE: extDir });
+      assert.equal(legacyDir.externalFiles.length, 0);
+
+      // doctor 体检项 personal_web_legacy 报告具体残留环境变量名与外部文件提示
+      const doc = await runDoctor(app, { env: { ...process.env, PA_FEISHU_WEB_CRED_FILE: extCred } });
+      const legacyCheck = doc.checks.find((c) => c.id === "personal_web_legacy");
+      assert.equal(legacyCheck?.status, "warn");
+      assert.match(legacyCheck?.detail ?? "", /shared-gw-cred\.json/);
+      assert.match(legacyCheck?.fix ?? "", /PA_FEISHU_WEB_CRED_FILE/);
     } finally {
       bridge.stop();
       app.store.db.close();
       fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(extDir, { recursive: true, force: true });
     }
   });
 

@@ -46,6 +46,8 @@ export interface GatewayMessagePayload {
   conversationId: string;
   conversationKind: "dm" | "group" | "";
   chatName: string;
+  /** 网关是否成功核验过该会话的名称（true 表示 readChat 成功或命中缓存，即使会话本身无名也可放心按 ID 放行；false 表示未能核验） */
+  chatNameResolved?: boolean;
   actorId: string;
   senderType: number;
   text: string;
@@ -135,8 +137,10 @@ export interface GatewayReplyRequest {
   expected_owner_id?: string;
   /** 只允许对已发出（created）的回复做回读核验，拒绝任何新发送（客户端已关闭 send_replies 时使用） */
   readback_only?: boolean;
-  /** 客户端侧的排除规则（会话 ID 或名称关键字），网关在发送前用实时会话名一并核对 */
+  /** 客户端侧的排除规则（会话 ID 或子串关键字），网关在发送前用实时会话名一并核对 */
   client_deny?: string[];
+  /** 客户端侧的精确会话名排除规则（如静音会话名、oc_ 反查群名），网关仅做精确/规范化私聊名匹配，不做子串误拦 */
+  client_deny_exact?: string[];
 }
 
 export interface GatewayReplyResult {

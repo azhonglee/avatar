@@ -354,14 +354,20 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
 
   add("personal_web_legacy", "旧版个人 Web 凭据残留", async () => {
     const legacy = legacyPersonalWebArtifacts(cfg, env);
-    if (!legacy.files.length && !legacy.envKeys.length) return ok("未发现旧版遗留的个人 Web 会话凭据");
+    if (!legacy.files.length && !legacy.externalFiles.length && !legacy.envKeys.length) return ok("未发现旧版遗留的个人 Web 会话凭据");
     const parts = [
       ...(legacy.files.length ? [`数据目录中仍有会话凭据文件 ${legacy.files.join("、")}`] : []),
+      ...(legacy.externalFiles.length ? [`环境变量指向外部凭据文件 ${legacy.externalFiles.join("、")}`] : []),
       ...(legacy.envKeys.length ? [`运行环境中仍设置了 ${legacy.envKeys.join("、")}`] : []),
+    ];
+    const fixes = [
+      ...(legacy.files.length ? [`运行 ${code("pa context web-logout")} 删除数据目录内的残留文件`] : []),
+      ...(legacy.externalFiles.length ? [`核实外部凭据文件是否仍被新网关使用后再决定是否手动删除`] : []),
+      ...(legacy.envKeys.length ? [`从 Avatar 运行环境移除 ${legacy.envKeys.map((k) => code(k)).join("、")}`] : []),
     ];
     return warn(
       `${parts.join("；")}：同一系统用户下的 worker 仍可能读到个人飞书会话`,
-      `运行 ${code("pa context web-logout")} 删除残留文件，并从 Avatar 运行环境移除 ${code("PA_FEISHU_WEB_KEY")}；登录态只保留在独立网关`,
+      `${fixes.join("，")}；登录态只保留在独立网关`,
     );
   });
 

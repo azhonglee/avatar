@@ -130,15 +130,48 @@ export function createGatewayClientForConfig(
   });
 }
 
+function isRegularFile(filePath: string): boolean {
+  try {
+    return fs.lstatSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function isInsideDir(filePath: string, dir: string): boolean {
+  const rel = path.relative(path.resolve(dir), path.resolve(filePath));
+  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
 /**
- * 旧版（进程内个人 Web）遗留在 Avatar 侧的会话凭据：加密 Cookie 文件及其锁文件、仍在环境里的密钥变量。
- * 现在登录态只应存在于独立网关，这些残留会让 Avatar 与同用户 worker 仍能接触到会话。
+ * 旧版（进程内个人 Web）遗留在 Avatar 侧的会话凭据：
+ *   - `files`：仅包含 `cfg.dataDir` 内的普通文件（`feishu-web.json` 及其锁文件），可由 `pa context web-logout` 安全自动清理；
+ *   - `externalFiles`：位于 `cfg.dataDir` 外的 `PA_FEISHU_WEB_CRED_FILE` 路径（可能同时被新网关回退读取，只提示不自动删）；
+ *   - `envKeys`：运行环境中仍设置的旧环境变量名。
  */
-export function legacyPersonalWebArtifacts(cfg: Pick<Config, "dataDir">, env: NodeJS.ProcessEnv = process.env): { files: string[]; envKeys: string[] } {
-  const base = [path.join(cfg.dataDir, "feishu-web.json"), env.PA_FEISHU_WEB_CRED_FILE?.trim() ? path.resolve(env.PA_FEISHU_WEB_CRED_FILE.trim()) : ""].filter(Boolean);
-  const files = [...new Set(base.flatMap((f) => [f, `${f}.lock`, `${f}.lock.db`]))].filter((f) => fs.existsSync(f));
+export function legacyPersonalWebArtifacts(
+  cfg: Pick<Config, "dataDir">,
+  env: NodeJS.ProcessEnv = process.env,
+): { files: string[]; externalFiles: string[]; envKeys: string[] } {
+  const suffixes = (f: string) => [f, `${f}.lock`, `${f}.lock.db`, `${f}.lock.db-journal`];
+  const localBase = path.join(cfg.dataDir, "feishu-web.json");
+  const files = new Set<string>();
+  const externalFiles = new Set<string>();
+
+  for (const f of suffixes(localBase)) {
+    if (isRegularFile(f)) files.add(f);
+  }
+  const extRaw = env.PA_FEISHU_WEB_CRED_FILE?.trim();
+  if (extRaw) {
+    const extResolved = path.resolve(extRaw);
+    for (const f of suffixes(extResolved)) {
+      if (!isRegularFile(f)) continue;
+      if (isInsideDir(f, cfg.dataDir)) files.add(f);
+      else externalFiles.add(f);
+    }
+  }
   const envKeys = ["PA_FEISHU_WEB_KEY", "PA_FEISHU_WEB_CRED_FILE"].filter((k) => !!env[k]?.trim());
-  return { files, envKeys };
+  return { files: [...files], externalFiles: [...externalFiles], envKeys };
 }
 
 /** 核验网关上报的个人账号与当前 Avatar 工作区的绑定关系，防止指向错误网关实例导致跨账号混库。 */
@@ -512,34 +545,46 @@ export class PersonalWebBridge {
   private hasNameBasedExclusions(): boolean {
     const idOnly = (r: string) => r.startsWith("pw_chat:") || /^\d+$/.test(r);
     return (
-      this.cfg.context.groups_deny.some((d) => !!d.trim() && !idOnly(d.trim())) ||
-      this.store.mutedConvs().some((m) => !m.conv.startsWith("pw_chat:"))
+      this.cfg.context.groups_deny.some((d) => {
+        const r = d.trim();
+        if (!r || idOnly(r)) return false;
+        return r.startsWith("oc_") ? !!this.openGroupName(r) : true;
+      }) ||
+      this.store.mutedConvs().some((m) => {
+        if (m.conv.startsWith("pw_chat:")) return false;
+        return !!realConvName(m.name) || (m.conv.startsWith("oc_") && !!this.openGroupName(m.conv));
+      })
     );
   }
 
   /**
-   * 交给网关在发送前用实时会话名核对的规则：groups_deny 原样、oc_ 规则换成 lark-cli 记下的群名、
-   * 静音会话的 pw_chat ID 与真实会话名。网关以“ID 相等 / 名称包含关键字 / 规范化私聊名一致”匹配。
+   * 交给网关在发送前用实时会话名核对的规则：
+   *   - `rules`（子串关键字 / ID）：groups_deny 非 oc_ 规则与静音会话的 pw_chat: ID；
+   *   - `exactNames`（精确匹配，不做子串）：oc_ 反查群名与静音会话真实名称（避免静音私聊“张三”误拦“张三的评审群”）。
    */
-  private clientDenyRules(): string[] {
-    const out = new Set<string>();
-    const addOc = (oc: string) => {
+  private clientDenyRules(): { rules: string[]; exactNames: string[] } {
+    const rules = new Set<string>();
+    const exactNames = new Set<string>();
+    const addOcName = (oc: string) => {
       const name = this.openGroupName(oc);
-      if (name) out.add(name);
+      if (name) exactNames.add(name);
     };
     for (const raw of this.cfg.context.groups_deny) {
       const r = raw.trim();
       if (!r) continue;
-      out.add(r);
-      if (r.startsWith("oc_")) addOc(r);
+      if (r.startsWith("oc_")) addOcName(r);
+      else rules.add(r);
     }
     for (const m of this.store.mutedConvs()) {
-      if (m.conv.startsWith("pw_chat:")) out.add(m.conv);
-      if (m.conv.startsWith("oc_")) addOc(m.conv);
+      if (m.conv.startsWith("pw_chat:")) rules.add(m.conv);
+      if (m.conv.startsWith("oc_")) addOcName(m.conv);
       const name = realConvName(m.name);
-      if (name) out.add(name);
+      if (name) exactNames.add(name);
     }
-    return [...out].filter((r) => r.length <= MAX_CLIENT_DENY_RULE_LEN).slice(0, MAX_CLIENT_DENY_RULES);
+    return {
+      rules: [...rules].filter((r) => r.length <= MAX_CLIENT_DENY_RULE_LEN).slice(0, MAX_CLIENT_DENY_RULES),
+      exactNames: [...exactNames].filter((r) => r.length <= MAX_CLIENT_DENY_RULE_LEN).slice(0, MAX_CLIENT_DENY_RULES),
+    };
   }
 
   private loadSpokenGroups(): Set<string> {
@@ -594,11 +639,13 @@ export class PersonalWebBridge {
 
     if (!isHuman && !this.botAllowed(text)) return;
 
-    const chatName = msg.chatName.trim();
+    const rawChatName = msg.chatName.trim();
+    const chatName = rawChatName || (msg.conversationKind === "dm" ? this.store.pwAlias("actor", msg.actorId) : "");
     if (this.isDeniedChat(msg.conversationId, chatName)) return;
-    // 不知道会话名就无法核对按名称的排除/静音规则：宁可丢弃也不放行（每 10 分钟的飞书采集仍会按规则兜底）
-    if (!chatName && this.hasNameBasedExclusions()) {
-      log("warn", "个人 Web 网关消息缺少会话名，无法核对按名称的排除规则，已丢弃", { chat_id: msg.conversationId, message_id: msg.id });
+    // 仅当网关明确未能核验会话名（chatNameResolved === false）且本地存在按名称排除规则时丢弃；
+    // 飞书私聊或未命名群在 readChat 成功返回空名（chatNameResolved === true）时正常放行，避免误丢真实私聊
+    if (!chatName && msg.chatNameResolved === false && this.hasNameBasedExclusions()) {
+      log("warn", "个人 Web 网关未能解析会话名，无法核对按名称的排除规则，已丢弃", { chat_id: msg.conversationId, message_id: msg.id });
       return;
     }
 
@@ -785,6 +832,7 @@ export class PersonalWebBridge {
     }
 
     const expectedOwner = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim() || undefined;
+    const deny = this.clientDenyRules();
     this.app.store.set(startedKey, String(Date.now()));
     try {
       const res = await client.sendReply({
@@ -795,7 +843,8 @@ export class PersonalWebBridge {
         cid: args.cid,
         ...(expectedOwner ? { expected_owner_id: expectedOwner } : {}),
         ...(readbackOnly ? { readback_only: true } : {}),
-        client_deny: this.clientDenyRules(),
+        client_deny: deny.rules,
+        ...(deny.exactNames.length ? { client_deny_exact: deny.exactNames } : {}),
       });
       this.app.store.db.prepare("DELETE FROM kv WHERE k = ?").run(startedKey);
       return res;

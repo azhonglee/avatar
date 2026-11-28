@@ -139,11 +139,28 @@ async function main(): Promise<void> {
 async function context(app: ReturnType<typeof createApp>, rest: string[]): Promise<void> {
   const [sub, ...more] = rest;
 
-  // 清理旧版（进程内个人 Web）遗留在 Avatar 侧的会话凭据；登录态现在只应存在于独立网关
+  // 清理旧版（进程内个人 Web）遗留在 Avatar 数据目录内的会话凭据；外部 PA_FEISHU_WEB_CRED_FILE 仅提示不自动删（避免误删新网关凭据）
   if (sub === "web-logout") {
     const legacy = legacyPersonalWebArtifacts(app.cfg);
-    for (const f of legacy.files) fs.rmSync(f, { force: true });
-    console.log(legacy.files.length ? `已删除旧版个人 Web 凭据：\n${legacy.files.map((f) => `  ${f}`).join("\n")}` : "未发现旧版个人 Web 凭据文件。");
+    const removed: string[] = [];
+    const failed: string[] = [];
+    for (const f of legacy.files) {
+      try {
+        fs.rmSync(f, { force: true });
+        removed.push(f);
+      } catch (e) {
+        failed.push(`${f}（${errMsg(e)}）`);
+      }
+    }
+    console.log(removed.length ? `已删除数据目录内的旧版个人 Web 凭据：\n${removed.map((f) => `  ${f}`).join("\n")}` : "数据目录内未发现旧版个人 Web 凭据文件。");
+    if (failed.length) {
+      console.log(`⚠️ 以下文件删除失败，请检查权限后手动删除：\n${failed.map((f) => `  ${f}`).join("\n")}`);
+    }
+    if (legacy.externalFiles.length) {
+      console.log(
+        `⚠️ 检测到数据目录外的 PA_FEISHU_WEB_CRED_FILE 文件（为避免误删独立网关凭据未自动删除，请核实后再手动处理）：\n${legacy.externalFiles.map((f) => `  ${f}`).join("\n")}`,
+      );
+    }
     if (legacy.envKeys.length) {
       console.log(`请从 Avatar 的运行环境（shell / systemd 单元）中移除：${legacy.envKeys.join("、")}，然后重启 pa run。`);
     }

@@ -1,7 +1,8 @@
 # 独立部署边界容器：仅包含 feishu-gateway 与其最小运行时依赖，不包含 Avatar 业务代码或 harness 工具。
 # 构建：docker build -f deploy/Dockerfile.gateway --build-arg GW_GID=$(getent group feishu-gw-client | cut -d: -f3) -t feishu-gateway .
 #   socket 以 0660 创建、属组为容器内的 GW_GID；宿主机上运行 Avatar 的用户必须属于同一个 gid 的组，否则连接会报 EACCES。
-#   默认 GW_UID/GW_GID 为 10001，可用 --build-arg 改成宿主机上 feishu-gw-client 组的 gid。
+#   默认 GW_UID/GW_GID 为 10001；宿主机建组建议指定显式非冲突 GID（如 sudo groupadd --system -g 10001 feishu-gw-client），
+#   避免宿主机自动分配到 999 与 Alpine 内置 ping(999) 组冲突导致构建报错。
 # 运行（通过共享卷挂载 Unix Socket 给 Avatar，密钥通过 env-file 或 Docker secrets 注入）：
 #   docker run -d --name feishu-gateway \
 #     --read-only --tmpfs /tmp:noexec,nosuid,size=16m \

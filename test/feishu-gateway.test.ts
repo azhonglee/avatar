@@ -696,12 +696,36 @@ describe("independent feishu-gateway daemon (Unix socket, scope isolation, SSE c
         client.sendReply({ chat_id: "chat-alpha", message_id: "orig-100", text: "关掉开关后不应发出", cid: "cid-readback-only-1", readback_only: true }),
         (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 403 && e.code === "reply_disabled" && e.permanent === true,
       );
-      // 2c) 客户端名称规则按实时会话名（“架构评审群”）核对，命中即拒绝
+      // 2c) 客户端关键字规则按实时会话名（“架构评审群”）核对，精确规则 client_deny_exact 不做子串误拦
       await assert.rejects(
         client.sendReply({ chat_id: "chat-alpha", message_id: "orig-100", text: "客户端规则命中", cid: "cid-client-deny-1", client_deny: ["评审"] }),
         (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 403 && e.code === "chat_denied" && e.permanent === true,
       );
+      await assert.rejects(
+        client.sendReply({ chat_id: "chat-alpha", message_id: "orig-100", text: "精确名命中", cid: "cid-client-exact-hit", client_deny_exact: ["架构评审群"] }),
+        (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 403 && e.code === "chat_denied" && e.permanent === true,
+      );
+      await assert.rejects(
+        client.sendReply({
+          chat_id: "chat-alpha",
+          message_id: "orig-100",
+          text: "非法规则",
+          cid: "cid-bad-exact-1",
+          client_deny_exact: [123 as unknown as string],
+        }),
+        (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 400 && e.code === "invalid_request",
+      );
       assert.equal(mockFeishu.getSendCount(), 1, "readback_only 与客户端排除规则都不能发包");
+      // 精确名 "架构" 不得误拦 "架构评审群"（允许发送）
+      const rExactNoHit = await client.sendReply({
+        chat_id: "chat-alpha",
+        message_id: "orig-100",
+        text: "短精确名不误拦",
+        cid: "cid-client-exact-ok",
+        client_deny_exact: ["架构"],
+      });
+      assert.equal(rExactNoHit.verified, true);
+      assert.equal(mockFeishu.getSendCount(), 2);
 
       // 2d) 事件库实例标识稳定，续拉游标覆盖被过滤的事件
       const st1 = await client.status();
@@ -757,9 +781,9 @@ describe("independent feishu-gateway daemon (Unix socket, scope isolation, SSE c
       } finally {
         (gwService as unknown as { inFlightCids: Set<string> }).inFlightCids.delete("cid-ambiguous-01");
       }
-      assert.equal(mockFeishu.getSendCount(), 1);
+      assert.equal(mockFeishu.getSendCount(), 2);
 
-      // 6) Created (readback-only) completes verification even after allow_reply is turned back to false
+      // 6) Created (readback-only) completes verification even after allow_reply is turned back to false AND client sends readback_only=true
       const prevSendCount = mockFeishu.getSendCount();
       gwCfg.allow_reply = false;
       gwStore.saveDelivery({
@@ -774,26 +798,43 @@ describe("independent feishu-gateway daemon (Unix socket, scope isolation, SSE c
         text_hash: gwStore.getDelivery("cid-reply-0001")!.text_hash,
         updated_at: Date.now(),
       });
-      const rRecovered = await client.sendReply({ chat_id: "chat-alpha", message_id: "orig-100", text: "收到，周四上线", cid: "cid-reply-0001" });
+      const rRecovered = await client.sendReply({
+        chat_id: "chat-alpha",
+        message_id: "orig-100",
+        text: "收到，周四上线",
+        cid: "cid-reply-0001",
+        readback_only: true,
+      });
       assert.equal(rRecovered.verified, true);
       assert.equal(gwStore.getDelivery("cid-reply-0001")?.status, "verified", "回读恢复后必须落库为 verified");
-      assert.equal(mockFeishu.getSendCount(), prevSendCount, "created 状态回读恢复绝不二次发包，即使 allow_reply=false 也可完成核验");
+      assert.equal(mockFeishu.getSendCount(), prevSendCount, "created 状态回读恢复绝不二次发包，即使 allow_reply=false 且 readback_only=true 也可完成核验");
 
-      // 6b) 查会话名失败且没有缓存名：即使网关没有命中的排除规则也不确认（客户端可能有按名称的规则）
+      // 6b) 查会话名失败且无缓存名拒绝 ACK；readChat 成功返回空名（私聊）正常落库且标记 chatNameResolved=true
       const failingClient = {
         owner: () => ({ id: "10001", name: "Owner" }),
         readChat: async () => {
           throw new Error("readChat timeout");
         },
       } as unknown as Parameters<FeishuGatewayService["handleMessage"]>[1];
+      const emptyNameClient = {
+        owner: () => ({ id: "10001", name: "Owner" }),
+        readChat: async () => ({ id: "dm-empty", name: "", kind: 1, mode: 0 }),
+      } as unknown as Parameters<FeishuGatewayService["handleMessage"]>[1];
       const unnamed = makeWebMsg({ id: "msg-unnamed-1", conversationId: "chat-unnamed", text: "@Owner 帮忙看下" });
       const prevDeny = gwCfg.deny_chats;
       gwCfg.deny_chats = [];
       try {
-        await assert.rejects(gwService.handleMessage(unnamed, failingClient), /无缓存名称/, "网关没有排除规则时也不能在无名称的情况下放行");
+        await assert.rejects(gwService.handleMessage(unnamed, failingClient), /查询会话名称失败/, "网关没有排除规则时也不能在查名失败且无缓存的情况下放行");
+        const evDmEmpty = await gwService.handleMessage(
+          makeWebMsg({ id: "msg-dm-empty", conversationId: "dm-empty", conversationKind: "dm", text: "你好" }),
+          emptyNameClient,
+        );
+        assert.equal(evDmEmpty?.kind, "message");
+        assert.equal(evDmEmpty.kind === "message" ? evDmEmpty.message.chatNameResolved : false, true, "readChat 成功返回空名应标记 chatNameResolved=true");
         gwStore.upsertChat("chat-unnamed", "临时项目群");
         const ev = await gwService.handleMessage(unnamed, failingClient);
         assert.equal(ev?.kind === "message" ? ev.message.chatName : "", "临时项目群", "有缓存名时用缓存名下发");
+        assert.equal(ev?.kind === "message" ? ev.message.chatNameResolved : false, true);
       } finally {
         gwCfg.deny_chats = prevDeny;
       }

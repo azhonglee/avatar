@@ -173,20 +173,20 @@ export class GatewayStore {
       );
       CREATE INDEX IF NOT EXISTS idx_gw_deliveries_updated ON gw_deliveries(updated_at);
     `);
+    // 建库时原子初始化 db_epoch（INSERT OR IGNORE 防并发覆盖，且保持后续 status() 纯读）
+    this.db.prepare("INSERT OR IGNORE INTO gw_kv(k, v) VALUES ('db_epoch', ?)").run(crypto.randomUUID());
   }
 
   close(): void {
     this.db.close();
   }
 
-  /** 事件库实例标识：首次建库时随机生成，库被删除重建后会变化，供客户端判断是否需要重置游标 */
+  /** 事件库实例标识：首次建库时原子生成，库被删除重建后会变化，供客户端判断是否需要重置游标 */
   dbEpoch(): string {
-    let epoch = this.getKv("db_epoch");
-    if (!epoch) {
-      epoch = crypto.randomUUID();
-      this.setKv("db_epoch", epoch);
-    }
-    return epoch;
+    const existing = this.getKv("db_epoch");
+    if (existing) return existing;
+    this.db.prepare("INSERT OR IGNORE INTO gw_kv(k, v) VALUES ('db_epoch', ?)").run(crypto.randomUUID());
+    return this.getKv("db_epoch") ?? "";
   }
 
   getKv(k: string): string | undefined {
