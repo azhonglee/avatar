@@ -5,21 +5,23 @@
 #        sudo groupadd --system feishu-gw-client
 #        sudo useradd --system --home-dir /var/lib/feishu-gateway --create-home --shell /usr/sbin/nologin feishu-gw
 #        sudo usermod -aG feishu-gw-client <运行 Avatar 的用户名>
-#   2. 准备加密密钥与读写分离双令牌（仅 root / systemd 可读，勿放进代码目录）：
-#        sudo install -d -m 0700 /etc/feishu-gateway
-#        openssl rand -hex 32 | sudo tee /etc/feishu-gateway/feishu-gw-key >/dev/null
-#        openssl rand -base64 32 | tr '+/' '-_' | tr -d '=' | sudo tee /etc/feishu-gateway/read-token >/dev/null
-#        openssl rand -base64 32 | tr '+/' '-_' | tr -d '=' | sudo tee /etc/feishu-gateway/reply-token >/dev/null
-#        sudo chmod 0600 /etc/feishu-gateway/*
-#   3. 准备配置文件 /etc/feishu-gateway/gateway.yaml：
-#        data_dir: /var/lib/feishu-gateway
-#        listen:
-#          socket: /run/feishu-gateway/gateway.sock
-#          socket_mode: "0660"
-#        allow_reply: false
-#   4. 首次以 feishu-gw 身份扫码登录：
-#        sudo -u feishu-gw FEISHU_GW_CONFIG=/etc/feishu-gateway/gateway.yaml \
-#          FEISHU_GW_KEY="$(sudo cat /etc/feishu-gateway/feishu-gw-key)" \
+#   2. 准备目录与密钥（配置目录允许 feishu-gw 遍历，secrets 子目录仅 root/systemd 可读）：
+#        sudo install -d -m 0750 -o root -g feishu-gw /etc/feishu-gateway
+#        sudo install -d -m 0700 -o root -g root /etc/feishu-gateway/secrets
+#        openssl rand -hex 32 | sudo tee /etc/feishu-gateway/secrets/feishu-gw-key >/dev/null
+#        openssl rand -base64 32 | tr '+/' '-_' | tr -d '=' | sudo tee /etc/feishu-gateway/secrets/read-token >/dev/null
+#        openssl rand -base64 32 | tr '+/' '-_' | tr -d '=' | sudo tee /etc/feishu-gateway/secrets/reply-token >/dev/null
+#        sudo chmod 0600 /etc/feishu-gateway/secrets/*
+#   3. 准备配置文件 /etc/feishu-gateway/gateway.yaml（仅 feishu-gw 可读，不给 feishu-gw-client 权限）：
+#        sudo install -m 0600 -o feishu-gw -g root /opt/avatar/gateway.example.yaml /etc/feishu-gateway/gateway.yaml
+#        # 将其中 data_dir 改为 /var/lib/feishu-gateway，listen.socket 改为 /run/feishu-gateway/gateway.sock，
+#        # listen.socket_mode 保持 "0660"，allow_reply 默认 false
+#   4. 首次以 feishu-gw 身份通过 systemd Credential 扫码登录（密钥不进入进程 argv / cmdline）：
+#        sudo systemd-run --pty --wait --collect \
+#          -p User=feishu-gw -p Group=feishu-gw-client -p SupplementaryGroups=feishu-gw \
+#          -p StateDirectory=feishu-gateway -p StateDirectoryMode=0700 \
+#          -p Environment=FEISHU_GW_CONFIG=/etc/feishu-gateway/gateway.yaml \
+#          -p LoadCredential=feishu-gw-key:/etc/feishu-gateway/secrets/feishu-gw-key \
 #          /opt/avatar/bin/feishu-gateway login
 #   5. 安装并启动服务：
 #        sudo cp deploy/feishu-gateway.service /etc/systemd/system/
@@ -28,7 +30,7 @@
 #
 # 隔离效果：
 #   - Avatar 及其 --approve-all harness worker 仅属于 feishu-gw-client 组，只能连接 /run/feishu-gateway/gateway.sock；
-#   - /var/lib/feishu-gateway (0700) 中的加密 Cookie、SQLite 缓存和 /etc/feishu-gateway/feishu-gw-key 对 Avatar 不可读。
+#   - /var/lib/feishu-gateway (0700) 中的加密 Cookie、SQLite 缓存和 /etc/feishu-gateway/secrets/* 对 Avatar 不可读。
 
 [Unit]
 Description=Feishu Personal Web Gateway (isolated daemon)
@@ -39,6 +41,7 @@ Wants=network-online.target
 Type=simple
 User=feishu-gw
 Group=feishu-gw-client
+SupplementaryGroups=feishu-gw
 UMask=0077
 WorkingDirectory=/opt/avatar
 Environment=FEISHU_GW_CONFIG=/etc/feishu-gateway/gateway.yaml
@@ -52,10 +55,10 @@ RuntimeDirectoryMode=0750
 StateDirectory=feishu-gateway
 StateDirectoryMode=0700
 
-# 通过 systemd Credential 注入密钥与令牌（不暴露到全局环境变量）
-LoadCredential=feishu-gw-key:/etc/feishu-gateway/feishu-gw-key
-LoadCredential=read-token:/etc/feishu-gateway/read-token
-LoadCredential=reply-token:/etc/feishu-gateway/reply-token
+# 通过 systemd Credential 注入密钥与令牌（不暴露到全局环境变量或 cmdline）
+LoadCredential=feishu-gw-key:/etc/feishu-gateway/secrets/feishu-gw-key
+LoadCredential=read-token:/etc/feishu-gateway/secrets/read-token
+LoadCredential=reply-token:/etc/feishu-gateway/secrets/reply-token
 
 # 系统级加固
 NoNewPrivileges=true

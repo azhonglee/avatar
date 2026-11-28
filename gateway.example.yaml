@@ -6,7 +6,10 @@
 data_dir: ~/.feishu-gateway
 
 listen:
-  # 方式 1（推荐）：Unix Domain Socket（配合独立 OS 用户 feishu-gw + 属组 feishu-gw-client + mode 0660 形成内核级边界）
+  # 方式 1（推荐）：Unix Domain Socket
+  # - 单用户本机调试可放在 ~/.feishu-gateway/run/gateway.sock（mode 0600）
+  # - 跨 OS 用户部署（如 User=feishu-gw, Group=feishu-gw-client）必须放到 0750 的共享运行目录（如 /run/feishu-gateway/gateway.sock，mode 0660），
+  #   因为 ~/.feishu-gateway 自身为 0700，其他用户无法穿越其父目录
   socket: ~/.feishu-gateway/run/gateway.sock
   socket_mode: "0660"         # 仅允许属主可读写且禁止 other 权限（如 0600 或 0660）
 

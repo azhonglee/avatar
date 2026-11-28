@@ -41,8 +41,9 @@ async function main(): Promise<void> {
     allowPositionals: true,
   });
 
-  const cfgPath = values.config?.trim() || defaultGatewayConfigPath();
-  const cfg = loadGatewayConfig(cfgPath);
+  const explicitCfg = values.config?.trim() || process.env.FEISHU_GW_CONFIG?.trim();
+  const cfgPath = explicitCfg || defaultGatewayConfigPath();
+  const cfg = loadGatewayConfig(cfgPath, { required: !!explicitCfg });
   const store = new GatewayStore(cfg.dataDir);
 
   try {
@@ -67,7 +68,7 @@ async function main(): Promise<void> {
           process.once("SIGTERM", shutdown);
         });
         console.log("正在停止飞书个人 Web 网关…");
-        service.stop();
+        await service.stop();
         await server.stop();
         return;
       }

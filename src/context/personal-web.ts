@@ -73,8 +73,8 @@ export interface ResolvedGatewayClientConfig {
   endpointLabel: string;
 }
 
-function readSystemdCredential(names: string[]): string {
-  const dir = process.env.CREDENTIALS_DIRECTORY?.trim();
+function readSystemdCredential(names: string[], env: NodeJS.ProcessEnv = process.env): string {
+  const dir = env.CREDENTIALS_DIRECTORY?.trim();
   if (!dir) return "";
   for (const name of names) {
     try {
@@ -88,7 +88,10 @@ function readSystemdCredential(names: string[]): string {
 }
 
 /** 从配置指定的环境变量（或 systemd LoadCredential）解析网关地址与读写分离双令牌。 */
-export function resolveGatewayClientConfig(pwCfg: Config["context"]["personal_web"]): ResolvedGatewayClientConfig {
+export function resolveGatewayClientConfig(
+  pwCfg: Config["context"]["personal_web"],
+  env: NodeJS.ProcessEnv = process.env,
+): ResolvedGatewayClientConfig {
   const socketRaw = pwCfg.gateway_socket.trim();
   const urlRaw = pwCfg.gateway_url.trim();
   const socketPath = socketRaw ? path.resolve(expandHome(socketRaw)) : undefined;
@@ -97,18 +100,21 @@ export function resolveGatewayClientConfig(pwCfg: Config["context"]["personal_we
   const replyEnvName = pwCfg.reply_token_env.trim();
 
   const readToken =
-    (readEnvName ? process.env[readEnvName]?.trim() : "") ||
-    readSystemdCredential(["feishu-gw-read-token", "read-token"]);
+    (readEnvName ? env[readEnvName]?.trim() : "") ||
+    readSystemdCredential(["feishu-gw-read-token", "read-token"], env);
   const replyToken =
-    (replyEnvName ? process.env[replyEnvName]?.trim() : "") ||
-    readSystemdCredential(["feishu-gw-reply-token", "reply-token"]);
+    (replyEnvName ? env[replyEnvName]?.trim() : "") ||
+    readSystemdCredential(["feishu-gw-reply-token", "reply-token"], env);
 
   const endpointLabel = socketPath ? `unix://${socketPath}` : (baseUrl ?? "(未配置)");
   return { socketPath, baseUrl, readToken, replyToken, endpointLabel };
 }
 
-export function createGatewayClientForConfig(pwCfg: Config["context"]["personal_web"]): FeishuGatewayClient {
-  const resolved = resolveGatewayClientConfig(pwCfg);
+export function createGatewayClientForConfig(
+  pwCfg: Config["context"]["personal_web"],
+  env: NodeJS.ProcessEnv = process.env,
+): FeishuGatewayClient {
+  const resolved = resolveGatewayClientConfig(pwCfg, env);
   if (resolved.readToken && resolved.replyToken && resolved.readToken === resolved.replyToken) {
     throw new Error("安全约束违规：read_token 与 reply_token 的值不能相同，请为读写配置不同令牌");
   }
@@ -174,6 +180,10 @@ export class PersonalWebBridge {
     if (seq > this.cursor()) {
       this.app.store.set(CURSOR_KV_KEY, String(Math.floor(seq)));
     }
+  }
+
+  private resetCursor(seq = 0): void {
+    this.app.store.set(CURSOR_KV_KEY, String(Math.max(0, Math.floor(seq))));
   }
 
   private loadSavedState(): PersistedState | undefined {
@@ -311,6 +321,7 @@ export class PersonalWebBridge {
       const onOuterAbort = () => streamCtrl.abort();
       signal.addEventListener("abort", onOuterAbort, { once: true });
       let accountMismatch = false;
+      let cursorResetReconnect = false;
 
       try {
         if (!everConnected) {
@@ -324,6 +335,16 @@ export class PersonalWebBridge {
             try {
               applyGatewayStatus(st);
               reconnectDelayMs = 1_000;
+              if (this.cursor() > st.latest_seq) {
+                log("warn", "检测到网关事件游标回退（网关数据库可能已重建），重置本地游标并重新订阅", {
+                  local_cursor: this.cursor(),
+                  gateway_latest_seq: st.latest_seq,
+                });
+                this.resetCursor(0);
+                this.hooks.onReconnect();
+                cursorResetReconnect = true;
+                streamCtrl.abort();
+              }
             } catch (err) {
               accountMismatch = true;
               const msg = errMsg(err);
@@ -336,11 +357,14 @@ export class PersonalWebBridge {
             }
           },
           onGap: (gap) => {
-            log("warn", "个人 Web 网关缓存已滚动淘汰部分旧事件，将触发一次飞书常规采集补齐", {
+            log("warn", "个人 Web 网关缓存已滚动淘汰或重置，将触发一次飞书常规采集补齐", {
               after: gap.after,
               min_seq: gap.min_seq,
               latest_seq: gap.latest_seq,
             });
+            if (gap.after > gap.latest_seq) {
+              this.resetCursor(0);
+            }
             this.hooks.onReconnect();
           },
           onEvent: async (ev) => {
@@ -393,6 +417,9 @@ export class PersonalWebBridge {
         signal.removeEventListener("abort", onOuterAbort);
       }
 
+      if (cursorResetReconnect && !signal.aborted) {
+        continue;
+      }
       if (accountMismatch && !signal.aborted) {
         await waitAbortable(Math.max(watchMs, 5_000), signal);
       }
@@ -600,6 +627,7 @@ export class PersonalWebBridge {
 
   /** 快通道理解前经网关只读接口补读该会话的历史背景消息（最多 15 条，标记为已处理背景）。 */
   async hydrateContext(anchor: FastAnchor, conv: string, convName: string, signal?: AbortSignal): Promise<number> {
+    if (this.isDeniedChat(anchor.conversationId, convName)) return 0;
     const existing = this.store.convObs(conv, Date.now() - 24 * 3_600_000, 6);
     if (existing.length >= 5) return 0;
     let client: FeishuGatewayClient;
@@ -610,6 +638,9 @@ export class PersonalWebBridge {
     }
     try {
       const resp = await client.readContext({ anchor, limit: 15 }, signal);
+      if (resp.owner_id) {
+        verifyGatewayOwnerForWorkspace(this.app, resp.owner_id);
+      }
       if (!resp.messages.length) return 0;
       const ownerId = resp.owner_id || this.state.owner_id;
       const ownerName = this.app.store.get("ctx.owner_name") || resp.owner_name || this.state.owner_name || "我";
@@ -682,6 +713,7 @@ export class PersonalWebBridge {
       throw new PermanentEffectError(`个人 Web 网关客户端未就绪：${errMsg(err)}`, err);
     }
 
+    const expectedOwner = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim() || undefined;
     this.app.store.set(startedKey, String(Date.now()));
     try {
       const res = await client.sendReply({
@@ -690,15 +722,45 @@ export class PersonalWebBridge {
         root_id: args.root_id,
         text: args.text,
         cid: args.cid,
+        ...(expectedOwner ? { expected_owner_id: expectedOwner } : {}),
       });
+      this.app.store.db.prepare("DELETE FROM kv WHERE k = ?").run(startedKey);
       return res;
     } catch (err) {
+      if (isDefinitePreSendGatewayError(err)) {
+        this.app.store.db.prepare("DELETE FROM kv WHERE k = ?").run(startedKey);
+      }
       if (err instanceof GatewayHttpError && err.permanent) {
         throw new PermanentEffectError(err.message, err);
       }
       throw err;
     }
   }
+}
+
+const PRE_SEND_GATEWAY_ERROR_CODES = new Set([
+  "missing_reply_token",
+  "unauthorized",
+  "insufficient_scope",
+  "reply_disabled",
+  "chat_denied",
+  "invalid_request",
+  "text_too_large",
+  "invalid_cid",
+  "unusable_original",
+  "needs_login",
+  "account_mismatch",
+  "gateway_connect_failed",
+  "upstream_rejected",
+]);
+
+const PRE_SEND_NET_CODES = new Set(["ECONNREFUSED", "ENOENT", "EACCES", "ENOTFOUND"]);
+
+/** 确定未向飞书发出消息的客户端/网关前置错误：允许清理本地 started 标记，避免热关闭 send_replies 被绕过。 */
+function isDefinitePreSendGatewayError(err: unknown): boolean {
+  if (err instanceof GatewayHttpError) return PRE_SEND_GATEWAY_ERROR_CODES.has(err.code);
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" && PRE_SEND_NET_CODES.has(code);
 }
 
 function waitAbortable(ms: number, signal: AbortSignal): Promise<void> {

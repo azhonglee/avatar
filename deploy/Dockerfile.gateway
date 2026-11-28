@@ -2,7 +2,8 @@
 # 构建：docker build -f deploy/Dockerfile.gateway -t feishu-gateway .
 # 运行（通过共享卷挂载 Unix Socket 给 Avatar，密钥通过 env-file 或 Docker secrets 注入）：
 #   docker run -d --name feishu-gateway \
-#     --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+#     --read-only --tmpfs /tmp:noexec,nosuid,size=16m \
+#     --cap-drop=ALL --security-opt=no-new-privileges \
 #     -v feishu-gw-data:/data \
 #     -v /run/feishu-gateway:/run/feishu-gateway \
 #     -v /etc/feishu-gateway/gateway.yaml:/etc/feishu-gateway/gateway.yaml:ro \
@@ -30,5 +31,6 @@ RUN chmod +x /app/bin/feishu-gateway \
 USER feishu-gw
 ENV FEISHU_GW_CONFIG=/etc/feishu-gateway/gateway.yaml
 
-ENTRYPOINT ["/app/bin/feishu-gateway"]
+# 直接以 Node 作为 PID 1 启动，避免 Alpine 无 bash 且确保 SIGTERM 直达网关进程
+ENTRYPOINT ["node", "--experimental-strip-types", "--disable-warning=ExperimentalWarning", "/app/src/gateway/cli.ts"]
 CMD ["run"]

@@ -106,17 +106,26 @@ export class GatewayStore {
   constructor(dataDir: string) {
     this.dataDir = dataDir;
     fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    try {
+      fs.chmodSync(dataDir, 0o700);
+    } catch {
+      // ignore if platform does not support chmod
+    }
     this.dbPath = path.join(dataDir, "gateway.db");
     this.tokensFile = path.join(dataDir, "tokens.json");
-    this.db = new DatabaseSync(this.dbPath);
+    // 预建 0600 数据库文件，消除首次建库时的短暂 0644 窗口
+    const dbFd = fs.openSync(this.dbPath, "a", 0o600);
+    fs.closeSync(dbFd);
     try {
       fs.chmodSync(this.dbPath, 0o600);
     } catch {
       // ignore if platform does not support chmod
     }
+    this.db = new DatabaseSync(this.dbPath);
     this.db.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = FULL;
+      PRAGMA temp_store = MEMORY;
       PRAGMA busy_timeout = 5000;
 
       CREATE TABLE IF NOT EXISTS gw_kv (
@@ -216,6 +225,14 @@ export class GatewayStore {
     return row?.name ?? "";
   }
 
+  private safeRollback(): void {
+    try {
+      this.db.exec("ROLLBACK");
+    } catch {
+      // SQLite may already have rolled back automatically
+    }
+  }
+
   /**
    * 原子写入一条个人 Web 消息并分配单调递增 seq。
    * 只有此事务提交成功后，上层才会向飞书发送 WS ACK。
@@ -244,7 +261,7 @@ export class GatewayStore {
         message: msg,
       };
     } catch (e) {
-      this.db.exec("ROLLBACK");
+      this.safeRollback();
       throw e;
     }
   }
@@ -273,7 +290,29 @@ export class GatewayStore {
         created_at: now,
       };
     } catch (e) {
-      this.db.exec("ROLLBACK");
+      this.safeRollback();
+      throw e;
+    }
+  }
+
+  /** 擦除命中新增 deny_chats 规则的历史消息正文（重启生效，确保已缓存的敏感会话不再被补拉下发）。 */
+  scrubDeniedMessages(isDenied: (chatId: string, chatName: string) => boolean): number {
+    const rows = this.db
+      .prepare("SELECT DISTINCT chat_id, chat_name FROM gw_events WHERE kind = 'message' AND payload IS NOT NULL")
+      .all() as Array<{ chat_id: string; chat_name: string }>;
+    const deniedChats = rows.filter((r) => isDenied(r.chat_id, r.chat_name) || isDenied(r.chat_id, this.getChatName(r.chat_id)));
+    if (!deniedChats.length) return 0;
+    let scrubbed = 0;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const stmt = this.db.prepare("UPDATE gw_events SET payload = NULL WHERE kind = 'message' AND chat_id = ? AND payload IS NOT NULL");
+      for (const r of deniedChats) {
+        scrubbed += Number(stmt.run(r.chat_id).changes);
+      }
+      this.db.exec("COMMIT");
+      return scrubbed;
+    } catch (e) {
+      this.safeRollback();
       throw e;
     }
   }
@@ -342,7 +381,11 @@ export class GatewayStore {
       }
     }
 
-    const truncated = safeAfter > 0 && stats.min_seq > 0 && safeAfter < stats.min_seq - 1;
+    const truncated =
+      safeAfter > 0 &&
+      ((stats.min_seq > 0 && safeAfter < stats.min_seq - 1) ||
+        (stats.min_seq === 0 && safeAfter < stats.latest_seq) ||
+        safeAfter > stats.latest_seq);
     return {
       events,
       min_seq: stats.min_seq,
@@ -413,10 +456,17 @@ export class GatewayStore {
   prune(eventRetentionDays: number, deliveryRetentionDays: number, now = Date.now()): { events: number; deliveries: number } {
     const evCutoff = now - eventRetentionDays * 86_400_000;
     const delCutoff = now - deliveryRetentionDays * 86_400_000;
-    const r1 = this.db.prepare("DELETE FROM gw_events WHERE created_at < ?").run(evCutoff);
-    this.db.prepare("DELETE FROM gw_messages WHERE updated_at < ? AND message_id NOT IN (SELECT DISTINCT message_id FROM gw_events)").run(evCutoff);
-    const r2 = this.db.prepare("DELETE FROM gw_deliveries WHERE status = 'verified' AND updated_at < ?").run(delCutoff);
-    return { events: Number(r1.changes), deliveries: Number(r2.changes) };
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const r1 = this.db.prepare("DELETE FROM gw_events WHERE created_at < ?").run(evCutoff);
+      this.db.prepare("DELETE FROM gw_messages WHERE updated_at < ? AND message_id NOT IN (SELECT DISTINCT message_id FROM gw_events)").run(evCutoff);
+      const r2 = this.db.prepare("DELETE FROM gw_deliveries WHERE status = 'verified' AND updated_at < ?").run(delCutoff);
+      this.db.exec("COMMIT");
+      return { events: Number(r1.changes), deliveries: Number(r2.changes) };
+    } catch (e) {
+      this.safeRollback();
+      throw e;
+    }
   }
 
   /** 解析或自动生成读写分离双令牌（read_token != reply_token）。 */

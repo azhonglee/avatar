@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { parseArgs } from "node:util";
 import { createApp, initApp, runConfiguredJob, runDaemon, runDispatchOnce, sendBrief } from "./app.ts";
 import { loadConfig } from "./config.ts";
-import { createGatewayClientForConfig, resolveGatewayClientConfig } from "./context/personal-web.ts";
+import { createGatewayClientForConfig, resolveGatewayClientConfig, verifyGatewayOwnerForWorkspace } from "./context/personal-web.ts";
 import { decide, type Profile } from "./guard.ts";
 import { consoleBaseUrl, isLoopbackHost, resolveConsoleHost, serverToken } from "./server/index.ts";
 import { formatReport, runDoctor } from "./doctor.ts";
@@ -153,6 +153,7 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
     }
     const client = createGatewayClientForConfig(pwCfg);
     const st = await client.status({ verify });
+    if (st.owner_id) verifyGatewayOwnerForWorkspace(app, st.owner_id);
     console.log(`网关账号：${st.logged_in ? `${st.owner_name || st.owner_id}（ID: ${st.owner_id}）` : `未登录（${st.credential_status}）`}`);
     console.log(`运行状态：${st.state}，网关回复开关 allow_reply=${st.allow_reply}，缓存事件 ${st.cached_events} 条（seq ${st.min_seq}..${st.latest_seq}）`);
     console.log(`本地游标：seq=${app.store.get("ctx.pw_gateway.cursor") ?? "0"}`);

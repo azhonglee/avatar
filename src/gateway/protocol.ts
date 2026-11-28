@@ -127,6 +127,8 @@ export interface GatewayReplyRequest {
   root_id?: string;
   text: string;
   cid: string;
+  /** 可选：调用方期望网关当前绑定的个人账号 ID，不匹配时原子拒绝（防跨账号误发） */
+  expected_owner_id?: string;
 }
 
 export interface GatewayReplyResult {

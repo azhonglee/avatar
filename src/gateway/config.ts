@@ -53,12 +53,20 @@ export function defaultGatewayConfigPath(): string {
   return process.env.FEISHU_GW_CONFIG?.trim() || path.join(GATEWAY_ROOT, "gateway.yaml");
 }
 
-export function loadGatewayConfig(file = defaultGatewayConfigPath()): GatewayConfig {
+export function loadGatewayConfig(file = defaultGatewayConfigPath(), opts: { required?: boolean } = {}): GatewayConfig {
+  const required = opts.required ?? !!process.env.FEISHU_GW_CONFIG?.trim();
   let raw: unknown = {};
-  if (fs.existsSync(file)) {
+  try {
     raw = YAML.parse(fs.readFileSync(file, "utf8")) ?? {};
-  } else if (process.env.FEISHU_GW_CONFIG?.trim()) {
-    throw new Error(`找不到网关配置文件 ${file}`);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" && !required) {
+      raw = {};
+    } else if (code === "ENOENT") {
+      throw new Error(`找不到网关配置文件 ${file}`);
+    } else {
+      throw new Error(`无法读取网关配置文件 ${file}：${e instanceof Error ? e.message : String(e)}`);
+    }
   }
   const parsed = GatewaySchema.safeParse(raw);
   if (!parsed.success) {
@@ -66,7 +74,7 @@ export function loadGatewayConfig(file = defaultGatewayConfigPath()): GatewayCon
   }
   const cfg = parsed.data;
   const socketRaw = cfg.listen.socket.trim();
-  const host = cfg.listen.host.trim();
+  const host = cfg.listen.host.trim().replace(/^\[|\]$/g, "");
   const port = cfg.listen.port;
   const useTcp = host.length > 0 || port > 0;
 
@@ -94,6 +102,7 @@ export function loadGatewayConfig(file = defaultGatewayConfigPath()): GatewayCon
 
   return {
     ...cfg,
+    listen: { ...cfg.listen, host },
     dataDir,
     file,
     socketPath,

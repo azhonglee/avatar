@@ -21,9 +21,11 @@ import {
   GatewayHttpError,
   MAX_CONTEXT_LIMIT,
   MAX_REPLY_TEXT_BYTES,
+  type GatewayAnchor,
   type GatewayContextRequest,
   type GatewayContextResponse,
   type GatewayEvent,
+  type GatewayEventsResponse,
   type GatewayHealth,
   type GatewayMessagePayload,
   type GatewayReplyRequest,
@@ -44,6 +46,8 @@ import type { GatewayPersistedState, GatewayStore } from "./store.ts";
 export const GATEWAY_BOUND_OWNER_KEY = "bound_owner_id";
 const CRED_WATCH_INTERVAL_MS = 3_000;
 const PRUNE_INTERVAL_MS = 3_600_000;
+const LAST_MSG_PERSIST_INTERVAL_MS = 15_000;
+const MAX_INT32 = 0x7fffffff;
 
 export interface GatewayServiceOptions {
   clientOptions?: FeishuWebClientOptions;
@@ -62,6 +66,10 @@ function normalizeChatName(name: string): string {
 
 function hashReplyText(text: string): string {
   return crypto.createHash("sha256").update(text.replace(/\r\n/g, "\n").trim(), "utf8").digest("hex");
+}
+
+function isCredentialDeniedError(err: unknown): boolean {
+  return err instanceof SessionNeedsLoginError || (err instanceof WebHttpError && err.code === "credential_denied");
 }
 
 function isDefinitiveNonCreationError(err: unknown): boolean {
@@ -86,6 +94,41 @@ function waitAbortable(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+function validateAnchor(raw: unknown): GatewayAnchor {
+  if (!raw || typeof raw !== "object") {
+    throw new GatewayHttpError(400, "invalid_request", "缺少有效的 anchor 对象", true);
+  }
+  const a = raw as Record<string, unknown>;
+  if (typeof a.id !== "string" || !a.id.trim()) {
+    throw new GatewayHttpError(400, "invalid_request", "缺少有效的 anchor.id", true);
+  }
+  if (typeof a.conversationId !== "string" || !a.conversationId.trim()) {
+    throw new GatewayHttpError(400, "invalid_request", "缺少有效的 anchor.conversationId", true);
+  }
+  const pos = a.position ?? 0;
+  if (typeof pos !== "number" || !Number.isSafeInteger(pos) || pos < 0 || pos > MAX_INT32) {
+    throw new GatewayHttpError(400, "invalid_request", "anchor.position 必须是 0..2147483647 范围内的整数", true);
+  }
+  for (const field of ["rootId", "parentId", "threadId"] as const) {
+    if (a[field] !== undefined && typeof a[field] !== "string") {
+      throw new GatewayHttpError(400, "invalid_request", `anchor.${field} 必须是字符串`, true);
+    }
+  }
+  const createdAtMs = a.createdAtMs ?? 0;
+  if (typeof createdAtMs !== "number" || !Number.isFinite(createdAtMs) || createdAtMs < 0) {
+    throw new GatewayHttpError(400, "invalid_request", "anchor.createdAtMs 必须是非负有限数字", true);
+  }
+  return {
+    id: a.id.trim(),
+    conversationId: a.conversationId.trim(),
+    rootId: (a.rootId as string | undefined) ?? "",
+    parentId: (a.parentId as string | undefined) ?? "",
+    threadId: (a.threadId as string | undefined) ?? "",
+    position: pos,
+    createdAtMs,
+  };
+}
+
 /** 核验登录账号与当前网关数据目录的绑定关系，避免误扫他人账号污染网关缓存。 */
 export function verifyLoginForGateway(store: GatewayStore, login: WebLogin, opts: { forceSwitch?: boolean } = {}): void {
   const bound = (store.getKv(GATEWAY_BOUND_OWNER_KEY) ?? "").trim();
@@ -105,7 +148,9 @@ export class FeishuGatewayService {
   private readonly inFlightCids = new Set<string>();
   private client: FeishuWebClient | undefined;
   private stopCtrl: AbortController | undefined;
+  private supervisorPromise: Promise<void> | undefined;
   private pruneTimer: NodeJS.Timeout | undefined;
+  private lastMsgPersistedAt = 0;
   private state: GatewayPersistedState;
 
   constructor(cfg: GatewayConfig, store: GatewayStore, opts: GatewayServiceOptions = {}) {
@@ -114,6 +159,12 @@ export class FeishuGatewayService {
     this.opts = opts;
     this.loginStore = new WebLoginStore(cfg.dataDir);
     this.emitter.setMaxListeners(128);
+    if (this.hasDenyRules()) {
+      const scrubbed = this.store.scrubDeniedMessages((chatId, chatName) => this.isDeniedChat(chatId, chatName));
+      if (scrubbed > 0) {
+        this.log("info", "已按最新 deny_chats 规则擦除历史缓存消息", { scrubbed });
+      }
+    }
     const saved = this.store.loadState();
     const login = this.loginStore.load();
     this.state = saved ?? {
@@ -145,14 +196,20 @@ export class FeishuGatewayService {
     return () => this.emitter.off("status", listener);
   }
 
-  private persistState(patch: Partial<GatewayPersistedState>): void {
+  private persistState(patch: Partial<GatewayPersistedState>, broadcast = true): void {
     this.state = { ...this.state, ...patch };
     try {
       this.store.saveState(this.state);
     } catch {
-      // ignore storage failure while reporting state
+      // ignore storage failure while reporting state (e.g., during shutdown)
     }
-    this.emitter.emit("status", this.status());
+    if (broadcast) {
+      try {
+        this.emitter.emit("status", this.status());
+      } catch {
+        // ignore if store was closed during shutdown
+      }
+    }
   }
 
   private sessionKeyOf(login: WebLogin | undefined): string {
@@ -180,10 +237,28 @@ export class FeishuGatewayService {
     return false;
   }
 
+  /** 按游标拉取事件，并对输出层再次执行网关 deny_chats 兜底过滤。 */
+  listEvents(after = 0, limit = 200): GatewayEventsResponse {
+    const page = this.store.listEvents(after, limit);
+    if (!this.hasDenyRules()) return page;
+    return {
+      ...page,
+      events: page.events.filter((ev) => {
+        if (ev.kind === "delete") return true;
+        return !this.isDeniedChat(ev.chat_id, ev.message.chatName || this.store.getChatName(ev.chat_id));
+      }),
+    };
+  }
+
   status(): GatewayStatus {
     const inspected = this.loginStore.inspect();
     const login = inspected.status === "ok" ? inspected.login : undefined;
-    const stats = this.store.seqStats();
+    let stats = { min_seq: 0, latest_seq: 0, cached_events: 0 };
+    try {
+      stats = this.store.seqStats();
+    } catch {
+      // ignore if DB already closed
+    }
     let state = this.state.state;
     let lastError = this.state.last_error;
 
@@ -253,17 +328,22 @@ export class FeishuGatewayService {
       this.persistState({ owner_id: owner.id, owner_name: owner.name });
       return { ...this.status(), owner_id: owner.id, owner_name: owner.name, verified: true };
     } catch (e) {
-      const permanent = e instanceof SessionNeedsLoginError;
+      const permanent = isCredentialDeniedError(e);
       throw new GatewayHttpError(503, permanent ? "needs_login" : "verify_failed", errMsg(e), permanent, this.status());
     }
   }
 
-  start(): { stop(): void } {
-    this.stop();
+  start(): { stop(): Promise<void> } {
+    this.stopCtrl?.abort();
     const ctrl = new AbortController();
     this.stopCtrl = ctrl;
-    void this.runSupervisor(ctrl.signal);
+    this.supervisorPromise = this.runSupervisor(ctrl.signal).catch((e) => {
+      if (!ctrl.signal.aborted) {
+        this.log("error", "网关监管循环异常退出", { err: errMsg(e) });
+      }
+    });
     const pruneMs = this.opts.pruneIntervalMs ?? PRUNE_INTERVAL_MS;
+    if (this.pruneTimer) clearInterval(this.pruneTimer);
     this.pruneTimer = setInterval(() => {
       try {
         const res = this.store.prune(this.cfg.retention_days, this.cfg.delivery_retention_days);
@@ -278,13 +358,16 @@ export class FeishuGatewayService {
     return { stop: () => this.stop() };
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     this.stopCtrl?.abort();
     this.stopCtrl = undefined;
     if (this.pruneTimer) {
       clearInterval(this.pruneTimer);
       this.pruneTimer = undefined;
     }
+    const p = this.supervisorPromise;
+    this.supervisorPromise = undefined;
+    if (p) await p;
     this.client = undefined;
   }
 
@@ -381,7 +464,7 @@ export class FeishuGatewayService {
           onWarn: (m) => this.log("warn", m),
         });
       } catch (err) {
-        if (signal.aborted) return;
+        if (signal.aborted) break;
         this.client = undefined;
         if (sessionCtrl.signal.aborted) continue;
 
@@ -469,16 +552,28 @@ export class FeishuGatewayService {
     };
 
     const ev = this.store.appendMessage(payload);
-    this.persistState({ last_message_at: Date.now() });
+    const now = Date.now();
+    this.state = { ...this.state, last_message_at: now };
+    if (now - this.lastMsgPersistedAt >= LAST_MSG_PERSIST_INTERVAL_MS) {
+      this.lastMsgPersistedAt = now;
+      this.persistState({ last_message_at: now }, false);
+    }
     this.emitter.emit("event", ev);
     return ev;
   }
 
-  /** 只读上下文补读：受网关 deny_chats 强制约束，仅返回有界历史消息。 */
+  /** 只读上下文补读：受网关 deny_chats 强制约束，严格校验 anchor 参数，仅返回有界历史消息。 */
   async readContext(req: GatewayContextRequest, signal?: AbortSignal): Promise<GatewayContextResponse> {
-    const anchor = req?.anchor;
-    if (!anchor || typeof anchor.id !== "string" || !anchor.id || typeof anchor.conversationId !== "string" || !anchor.conversationId) {
-      throw new GatewayHttpError(400, "invalid_request", "缺少有效的 anchor.id 或 anchor.conversationId", true);
+    if (!req || typeof req !== "object") {
+      throw new GatewayHttpError(400, "invalid_request", "请求体必须是 JSON 对象", true);
+    }
+    const anchor = validateAnchor(req.anchor);
+    let limit = 15;
+    if (req.limit !== undefined) {
+      if (typeof req.limit !== "number" || !Number.isFinite(req.limit)) {
+        throw new GatewayHttpError(400, "invalid_request", "limit 必须是有限数字", true);
+      }
+      limit = Math.max(1, Math.min(MAX_CONTEXT_LIMIT, Math.floor(req.limit)));
     }
     if (this.isDeniedChat(anchor.conversationId, "")) {
       throw new GatewayHttpError(403, "chat_denied", `会话 ${anchor.conversationId} 已被网关排除`, true);
@@ -503,7 +598,6 @@ export class FeishuGatewayService {
       throw new GatewayHttpError(403, "chat_denied", `会话「${chatName || anchor.conversationId}」已被网关排除`, true);
     }
 
-    const limit = Math.max(1, Math.min(MAX_CONTEXT_LIMIT, Math.floor(req.limit ?? 15)));
     const history = await client.readContext(anchor, { limit, signal });
     const owner = client.owner();
     const messages: GatewayMessagePayload[] = [];
@@ -539,16 +633,26 @@ export class FeishuGatewayService {
 
   /**
    * 受控个人 Web 回复（仅允许经独立 reply_token 调用）：
+   *   - 先检查 inFlightCids 并发锁，避免同一 cid 并发重试被误杀为永久 ambiguous_delivery；
    *   - 网关侧独立持久化 sending / created / verified 状态机（按固定 cid 防跨进程重发）；
-   *   - 强制校验 allow_reply 开关与网关 deny_chats；
+   *   - 强制校验 allow_reply 开关、expected_owner_id 绑定与网关 deny_chats；
    *   - 发送前核验原消息可用，发送后独立回读核验。
    */
   async sendReply(req: GatewayReplyRequest, signal?: AbortSignal): Promise<VerifiedReplyResult> {
-    if (!req || typeof req.chat_id !== "string" || !req.chat_id.trim()) {
+    if (!req || typeof req !== "object") {
+      throw new GatewayHttpError(400, "invalid_request", "请求体必须是 JSON 对象", true);
+    }
+    if (typeof req.chat_id !== "string" || !req.chat_id.trim()) {
       throw new GatewayHttpError(400, "invalid_request", "缺少有效的 chat_id", true);
     }
     if (typeof req.message_id !== "string" || !req.message_id.trim()) {
       throw new GatewayHttpError(400, "invalid_request", "缺少有效的 message_id", true);
+    }
+    if (req.root_id !== undefined && typeof req.root_id !== "string") {
+      throw new GatewayHttpError(400, "invalid_request", "root_id 必须是字符串", true);
+    }
+    if (req.expected_owner_id !== undefined && typeof req.expected_owner_id !== "string") {
+      throw new GatewayHttpError(400, "invalid_request", "expected_owner_id 必须是字符串", true);
     }
     if (typeof req.text !== "string" || !req.text.trim()) {
       throw new GatewayHttpError(400, "invalid_request", "回复正文不能为空", true);
@@ -560,44 +664,60 @@ export class FeishuGatewayService {
       throw new GatewayHttpError(400, "invalid_cid", "cid 格式无效（需 8-128 位字母/数字/._:-）", true);
     }
 
+    const expectedOwner = req.expected_owner_id?.trim() ?? "";
     const textHash = hashReplyText(req.text);
-    const prev = this.store.getDelivery(req.cid);
-    if (prev) {
-      if (prev.chat_id !== req.chat_id || prev.text_hash !== textHash) {
-        throw new GatewayHttpError(409, "cid_mismatch", `幂等键 ${req.cid} 已被其他会话或正文占用，拒绝复发`, true);
-      }
-      if (prev.status === "verified") {
-        return {
-          replyId: prev.reply_id,
-          rootId: prev.root_id,
-          parentId: prev.parent_id,
-          threadId: prev.thread_id,
-          verified: true,
-        };
-      }
-      if (prev.status === "sending") {
-        throw new GatewayHttpError(
-          409,
-          "ambiguous_delivery",
-          "上次个人 Web 发送结果不明确（对方可能已经收到），为避免重复发送已停止自动重试；请先在飞书核实",
-          true,
-        );
-      }
-    }
 
-    const readbackOnly = prev?.status === "created" && !!prev.reply_id;
-    if (!readbackOnly && !this.cfg.allow_reply) {
-      throw new GatewayHttpError(403, "reply_disabled", "网关未开启回复权限（需在 gateway.yaml 中设置 allow_reply: true）", true);
-    }
-    if (!readbackOnly && this.isDeniedChat(req.chat_id, "")) {
-      throw new GatewayHttpError(403, "chat_denied", `目标会话 ${req.chat_id} 已被网关排除，拒绝发送个人 Web 回复`, true);
-    }
-
+    // 必须先拿 inFlightCids 锁再读 gw_deliveries，避免并发重试看到正在进行中的 sending 误判为永久失败
     if (this.inFlightCids.has(req.cid)) {
       throw new GatewayHttpError(409, "delivery_in_flight", `幂等键 ${req.cid} 正在处理中，请稍后重试`, false);
     }
     this.inFlightCids.add(req.cid);
+
     try {
+      if (expectedOwner) {
+        const currentOwner = this.client?.owner().id || this.store.getKv(GATEWAY_BOUND_OWNER_KEY) || this.loginStore.load()?.owner_id || "";
+        if (currentOwner && currentOwner !== expectedOwner) {
+          throw new GatewayHttpError(
+            409,
+            "account_mismatch",
+            `网关当前账号 ${currentOwner} 与客户端期望绑定账号 ${expectedOwner} 不一致，拒绝发送回复`,
+            true,
+          );
+        }
+      }
+
+      const prev = this.store.getDelivery(req.cid);
+      if (prev) {
+        if (prev.chat_id !== req.chat_id || prev.text_hash !== textHash || (prev.parent_id && prev.parent_id !== req.message_id)) {
+          throw new GatewayHttpError(409, "cid_mismatch", `幂等键 ${req.cid} 已被其他会话、目标消息或正文占用，拒绝复发`, true);
+        }
+        if (prev.status === "verified") {
+          return {
+            replyId: prev.reply_id,
+            rootId: prev.root_id,
+            parentId: prev.parent_id,
+            threadId: prev.thread_id,
+            verified: true,
+          };
+        }
+        if (prev.status === "sending") {
+          throw new GatewayHttpError(
+            409,
+            "ambiguous_delivery",
+            "上次个人 Web 发送结果不明确（对方可能已经收到），为避免重复发送已停止自动重试；请先在飞书核实",
+            true,
+          );
+        }
+      }
+
+      const readbackOnly = prev?.status === "created" && !!prev.reply_id;
+      if (!readbackOnly && !this.cfg.allow_reply) {
+        throw new GatewayHttpError(403, "reply_disabled", "网关未开启回复权限（需在 gateway.yaml 中设置 allow_reply: true）", true);
+      }
+      if (!readbackOnly && this.isDeniedChat(req.chat_id, "")) {
+        throw new GatewayHttpError(403, "chat_denied", `目标会话 ${req.chat_id} 已被网关排除，拒绝发送个人 Web 回复`, true);
+      }
+
       let client = this.client;
       if (!client) {
         const inspected = this.loginStore.inspect();
@@ -615,6 +735,14 @@ export class FeishuGatewayService {
         } catch (e) {
           throw new GatewayHttpError(409, "account_mismatch", errMsg(e), true);
         }
+        if (expectedOwner && inspected.login.owner_id !== expectedOwner) {
+          throw new GatewayHttpError(
+            409,
+            "account_mismatch",
+            `网关登录账号 ${inspected.login.owner_id} 与客户端期望绑定账号 ${expectedOwner} 不一致，拒绝发送回复`,
+            true,
+          );
+        }
         try {
           client = await FeishuWebClient.connect(
             inspected.login,
@@ -625,30 +753,46 @@ export class FeishuGatewayService {
             signal,
           );
         } catch (e) {
-          if (e instanceof SessionNeedsLoginError) {
+          if (isCredentialDeniedError(e)) {
             throw new GatewayHttpError(503, "needs_login", errMsg(e), true);
           }
           throw new GatewayHttpError(502, "gateway_connect_failed", errMsg(e), false);
         }
       }
 
+      if (expectedOwner && client.owner().id !== expectedOwner) {
+        throw new GatewayHttpError(
+          409,
+          "account_mismatch",
+          `网关在线账号 ${client.owner().id} 与客户端期望绑定账号 ${expectedOwner} 不一致，拒绝发送回复`,
+          true,
+        );
+      }
+
       if (readbackOnly && prev) {
-        const res = await client.verifyReplyReadback({
-          replyId: prev.reply_id,
-          chatId: prev.chat_id,
-          rootId: prev.root_id,
-          parentId: prev.parent_id,
-          cid: req.cid,
-          text: req.text,
-          threaded: prev.threaded,
-        });
-        this.store.saveDelivery({
-          ...prev,
-          status: "verified",
-          thread_id: res.threadId,
-          updated_at: Date.now(),
-        });
-        return res;
+        try {
+          const res = await client.verifyReplyReadback({
+            replyId: prev.reply_id,
+            chatId: prev.chat_id,
+            rootId: prev.root_id,
+            parentId: prev.parent_id,
+            cid: req.cid,
+            text: req.text,
+            threaded: prev.threaded,
+          });
+          this.store.saveDelivery({
+            ...prev,
+            status: "verified",
+            thread_id: res.threadId,
+            updated_at: Date.now(),
+          });
+          return res;
+        } catch (err) {
+          if (isCredentialDeniedError(err)) {
+            throw new GatewayHttpError(503, "needs_login", errMsg(err), true);
+          }
+          throw new GatewayHttpError(502, "readback_failed", errMsg(err), false);
+        }
       }
 
       let entered = false;
@@ -704,6 +848,9 @@ export class FeishuGatewayService {
         if (entered && !created) {
           if (isDefinitiveNonCreationError(err)) {
             this.store.deleteDelivery(req.cid);
+            if (isCredentialDeniedError(err)) {
+              throw new GatewayHttpError(503, "needs_login", errMsg(err), true);
+            }
             throw new GatewayHttpError(502, "upstream_rejected", errMsg(err), false);
           }
           throw new GatewayHttpError(
@@ -716,7 +863,7 @@ export class FeishuGatewayService {
         if (!entered && (err instanceof UnusableOriginalMessageError || err instanceof MessageNotFoundError)) {
           throw new GatewayHttpError(422, "unusable_original", errMsg(err), true);
         }
-        if (err instanceof SessionNeedsLoginError) {
+        if (isCredentialDeniedError(err)) {
           throw new GatewayHttpError(503, "needs_login", errMsg(err), true);
         }
         throw new GatewayHttpError(502, "reply_failed", errMsg(err), false);

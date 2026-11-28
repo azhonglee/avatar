@@ -305,14 +305,12 @@ export class SettingsService {
       return !b.success || JSON.stringify(a.data) !== JSON.stringify(b.data);
     });
     if (forbidden.length) return fail(forbidden.map((k) => ({ path: k, message: `出于安全考虑，${k} 不能在控制台修改，请直接编辑 ${this.file}` })));
-    const trialParsed = ConfigSchema.safeParse(after);
+    const pwShape = ConfigSchema.shape.context.unwrap().shape.personal_web.unwrap().shape;
     const forbiddenNested = FORBIDDEN_NESTED.filter((p) => {
-      if (getIn(patch, p) === undefined) return false;
+      const leaf = p[p.length - 1] as keyof typeof pwShape;
       const beforeVal = getIn(cur.data, p);
-      if (trialParsed.success) {
-        return JSON.stringify(beforeVal) !== JSON.stringify(getIn(trialParsed.data, p));
-      }
-      return JSON.stringify(beforeVal) !== JSON.stringify(getIn(after, p));
+      const parsedAfter = pwShape[leaf].safeParse(getIn(after, p));
+      return !parsedAfter.success || JSON.stringify(beforeVal) !== JSON.stringify(parsedAfter.data);
     });
     if (forbiddenNested.length) {
       return fail(

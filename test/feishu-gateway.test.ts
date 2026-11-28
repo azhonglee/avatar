@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
@@ -251,10 +253,11 @@ describe("independent feishu-gateway daemon (Unix socket, scope isolation, SSE c
       fs.writeFileSync(badModeCfg, YAML.stringify({ data_dir: gwDir, listen: { socket: sockPath, socket_mode: "0666" } }));
       assert.throws(() => loadGatewayConfig(badModeCfg), /socket_mode/);
 
-      // 2) Wildcard / non-loopback TCP host rejected
+      // 2) Wildcard / non-loopback TCP host rejected & required missing config throws (fail-closed)
       const badHostCfg = path.join(dir, "bad-host.yaml");
       fs.writeFileSync(badHostCfg, YAML.stringify({ data_dir: gwDir, listen: { socket: "", host: "0.0.0.0", port: 7879 } }));
       assert.throws(() => loadGatewayConfig(badHostCfg), /回环地址/);
+      assert.throws(() => loadGatewayConfig(path.join(dir, "missing-gateway.yaml"), { required: true }), /找不到网关配置文件/);
 
       // 3) Start live gateway on Unix socket with 0660 mode
       const okCfgPath = path.join(dir, "gateway.yaml");
@@ -290,6 +293,22 @@ describe("independent feishu-gateway daemon (Unix socket, scope isolation, SSE c
       try {
         const mode = fs.statSync(sockPath).mode & 0o777;
         assert.equal(mode, 0o660);
+        assert.equal(fs.statSync(gwDir).mode & 0o777, 0o700, "gateway data_dir must be 0700");
+        assert.equal(fs.statSync(store.dbPath).mode & 0o777, 0o600, "gateway.db must be 0600");
+
+        // Malformed unauthenticated HTTP target must return 400 invalid_url and NOT crash the server
+        const rawResp = await new Promise<string>((resolve, reject) => {
+          const sock = net.connect(sockPath, () => {
+            sock.write("GET //[invalid HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+          });
+          let out = "";
+          sock.setEncoding("utf8");
+          sock.on("data", (d) => (out += d));
+          sock.on("end", () => resolve(out));
+          sock.on("error", reject);
+        });
+        assert.match(rawResp, /400 Bad Request/);
+        assert.match(rawResp, /invalid_url/);
 
         // Starting a second server on the SAME live Unix socket must fail without unlinking the live socket
         await assert.rejects(startGatewayServer(cfg, service, tokens), /已被另一个运行中的网关实例占用/);
@@ -321,11 +340,112 @@ describe("independent feishu-gateway daemon (Unix socket, scope isolation, SSE c
           replyAsReadClient.listEvents(0, 10),
           (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 403 && e.code === "insufficient_scope",
         );
+
+        // POST /v1/context rejects unsafe anchor.position (> MAX_SAFE_INTEGER / int32) and non-finite limit
+        await assert.rejects(
+          client.readContext({
+            anchor: { id: "1", conversationId: "chat-alpha", rootId: "", parentId: "", threadId: "", position: 1e17, createdAtMs: Date.now() },
+          }),
+          (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 400 && e.code === "invalid_request",
+        );
+        await assert.rejects(
+          client.readContext({
+            anchor: { id: "1", conversationId: "chat-alpha", rootId: "", parentId: "", threadId: "", position: 5, createdAtMs: Date.now() },
+            limit: Number.NaN,
+          }),
+          (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 400 && e.code === "invalid_request",
+        );
+
+        // Missing token rejects Promise asynchronously (does not throw synchronously)
+        const noTokClient = new FeishuGatewayClient({ socketPath: sockPath });
+        await assert.rejects(
+          () => noTokClient.health(),
+          (e: unknown) => e instanceof GatewayHttpError && e.code === "missing_read_token",
+        );
       } finally {
         await server.stop();
         store.close();
       }
       assert.equal(fs.existsSync(sockPath), false, "stopping server cleans up owned Unix socket");
+
+      // Stale Unix socket (left behind after SIGKILL -> ECONNREFUSED) is safely recovered on startup
+      const staleSock = path.join(dir, "run", "stale.sock");
+      spawnSync(process.execPath, [
+        "-e",
+        `const net = require("node:net"); const s = net.createServer(); s.listen(${JSON.stringify(staleSock)}, () => process.kill(process.pid, "SIGKILL"));`,
+      ]);
+      assert.equal(fs.lstatSync(staleSock).isSocket(), true, "SIGKILL 模拟的陈旧 socket 文件应存在");
+      const staleCfgPath = path.join(dir, "stale.yaml");
+      fs.writeFileSync(staleCfgPath, YAML.stringify({ data_dir: gwDir, listen: { socket: staleSock, socket_mode: "0600" } }));
+      const staleStore = new GatewayStore(gwDir);
+      const staleSvc = new FeishuGatewayService(loadGatewayConfig(staleCfgPath), staleStore);
+      const staleTokens = staleStore.resolveTokens();
+      const staleSrv = await startGatewayServer(loadGatewayConfig(staleCfgPath), staleSvc, staleTokens);
+      try {
+        const staleClient = new FeishuGatewayClient({ socketPath: staleSock, readToken: staleTokens.readToken });
+        assert.equal((await staleClient.health()).ok, true);
+      } finally {
+        await staleSrv.stop();
+        staleStore.close();
+      }
+
+      // IPv4 + IPv6 loopback TCP (`[::1]`) works end-to-end (including config host bracket normalization)
+      const ipv6CfgPath = path.join(dir, "tcp-ipv6.yaml");
+      fs.writeFileSync(ipv6CfgPath, YAML.stringify({ data_dir: gwDir, listen: { socket: "", host: "[::1]", port: 7879 } }));
+      assert.equal(loadGatewayConfig(ipv6CfgPath).listen.host, "::1");
+
+      for (const host of ["127.0.0.1", "[::1]"]) {
+        const tcpStore = new GatewayStore(gwDir);
+        const tcpTokens = tcpStore.resolveTokens();
+        const tcpCfg = { ...loadGatewayConfig(okCfgPath), socketPath: "", listen: { socket: "", socket_mode: "0600", host: host.replace(/^\[|\]$/g, ""), port: 0 } };
+        const tcpSvc = new FeishuGatewayService(tcpCfg, tcpStore);
+        let tcpSrv;
+        try {
+          tcpSrv = await startGatewayServer(tcpCfg, tcpSvc, tcpTokens);
+        } catch (e) {
+          tcpStore.close();
+          if (host === "[::1]" && ["EADDRNOTAVAIL", "EAFNOSUPPORT"].includes((e as NodeJS.ErrnoException).code ?? "")) continue;
+          throw e;
+        }
+        try {
+          const tcpClient = new FeishuGatewayClient({ baseUrl: tcpSrv.url!, readToken: tcpTokens.readToken });
+          const h = await tcpClient.health();
+          assert.equal(h.ok, true);
+        } finally {
+          await tcpSrv.stop();
+          tcpStore.close();
+        }
+      }
+
+      // SSE catch-up error after writeHead(200) must cleanly drop ONLY that stream without crashing server (no ERR_HTTP_HEADERS_SENT)
+      const errSock = path.join(dir, "run", "sse-err.sock");
+      const errCfgPath = path.join(dir, "sse-err.yaml");
+      fs.writeFileSync(errCfgPath, YAML.stringify({ data_dir: gwDir, listen: { socket: errSock, socket_mode: "0600" } }));
+      const errStore = new GatewayStore(gwDir);
+      const errSvc = new FeishuGatewayService(loadGatewayConfig(errCfgPath), errStore);
+      const origList = errSvc.listEvents.bind(errSvc);
+      let failOnce = true;
+      errSvc.listEvents = ((after?: number, limit?: number) => {
+        if (failOnce) {
+          failOnce = false;
+          throw new Error("simulated transient SQLITE_BUSY");
+        }
+        return origList(after, limit);
+      }) as typeof errSvc.listEvents;
+      const errTokens = errStore.resolveTokens();
+      const errSrv = await startGatewayServer(loadGatewayConfig(errCfgPath), errSvc, errTokens);
+      try {
+        const errClient = new FeishuGatewayClient({ socketPath: errSock, readToken: errTokens.readToken });
+        await assert.rejects(
+          errClient.streamEvents({ after: 0, signal: new AbortController().signal, onEvent: () => undefined }),
+          /stream_closed|socket hang up|ECONNRESET/i,
+        );
+        // Server must still be alive and healthy after the failed stream
+        assert.equal((await errClient.health()).ok, true);
+      } finally {
+        await errSrv.stop();
+        errStore.close();
+      }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -444,15 +564,74 @@ describe("independent feishu-gateway daemon (Unix socket, scope isolation, SSE c
         bridge2.stop();
       }
 
-      // 5) Retention gap triggers truncated flag and onReconnect fallback
+      // 5) Full prune (min_seq=0, latest_seq>0) sets truncated=true
       gwStore.db.prepare("DELETE FROM gw_events").run();
-      await gwService.handleMessage(makeWebMsg({ id: "m-after-gap", conversationId: "chat-alpha", text: "清理后的新消息" }));
-      app.store.set("ctx.pw_gateway.cursor", "1");
-      const gapPage = await gwClient.listEvents(1, 50);
-      assert.equal(gapPage.truncated, true);
+      const emptyGap = await gwClient.listEvents(1, 50);
+      assert.equal(emptyGap.truncated, true, "全量清空后 min_seq=0 且 after < latest_seq 仍必须报 truncated=true");
+
+      // 6) Newly added deny_chats scrubs already-cached history on gateway restart
+      await gwService.handleMessage(makeWebMsg({ id: "m-newly-denied", conversationId: "chat-to-ban", text: "旧敏感消息" }));
+      assert.ok(gwStore.listEvents(0, 50).events.some((e) => e.message_id === "m-newly-denied"));
+      const gwCfgWithBan = { ...gwCfg, deny_chats: [...gwCfg.deny_chats, "chat-to-ban"] };
+      const gwSvcAfterBan = new FeishuGatewayService(gwCfgWithBan, gwStore);
+      assert.equal(
+        gwSvcAfterBan.listEvents(0, 50).events.some((e) => e.message_id === "m-newly-denied"),
+        false,
+        "新增 deny_chats 重启后必须擦除已缓存的敏感消息",
+      );
+
+      // 7) Gateway DB reset (local cursor > latest_seq): SSE emits gap, bridge resets cursor, triggers onReconnect, and ingests new seq=1 message
+      const freshDir = path.join(dir, "gw-reset");
+      const resetSock = path.join(dir, "gw-reset.sock");
+      const resetCfgPath = path.join(dir, "gw-reset.yaml");
+      fs.writeFileSync(resetCfgPath, YAML.stringify({ data_dir: freshDir, listen: { socket: resetSock, socket_mode: "0600" } }));
+      const resetCfg = loadGatewayConfig(resetCfgPath);
+      const resetStore = new GatewayStore(resetCfg.dataDir);
+      const resetSvc = new FeishuGatewayService(resetCfg, resetStore);
+      const resetTokens = resetStore.resolveTokens();
+      const resetServer = await startGatewayServer(resetCfg, resetSvc, resetTokens, { heartbeatMs: 1_000 });
+      const resetClient = new FeishuGatewayClient({ socketPath: resetSock, readToken: resetTokens.readToken });
+      app.store.set("ctx.pw_gateway.cursor", "9999");
+      const resetReconnects: number[] = [];
+      const bridge3 = new PersonalWebBridge(app, svc.store, {
+        gatewayClient: resetClient,
+        watchIntervalMs: 50,
+        onFastTrigger: () => undefined,
+        onReconnect: () => resetReconnects.push(Date.now()),
+        onNeedsLogin: () => undefined,
+      });
+      try {
+        bridge3.start();
+        await waitUntil(() => resetReconnects.length >= 1 && bridge3.cursor() === 0);
+        await resetSvc.handleMessage(makeWebMsg({ id: "m-new-db-1", conversationId: "chat-alpha", text: "新库第一条消息" }));
+        await waitUntil(() => !!svc.store.obs("pw:m-new-db-1") && bridge3.cursor() === 1);
+        assert.equal(svc.store.obs("pw:m-new-db-1")?.text, "新库第一条消息");
+      } finally {
+        bridge3.stop();
+        await resetSvc.stop();
+        await resetServer.stop();
+        resetStore.close();
+      }
+
+      // 8) Slow onEvent consumer (> idleTimeoutMs) must NOT be killed by idleTimer while paused in pump()
+      const slowCtrl = new AbortController();
+      let slowSeen = 0;
+      const slowStream = gwClient.streamEvents({
+        after: 0,
+        signal: slowCtrl.signal,
+        idleTimeoutMs: 120,
+        onEvent: async () => {
+          slowSeen++;
+          await new Promise((r) => setTimeout(r, 200));
+          slowCtrl.abort();
+        },
+      });
+      await gwService.handleMessage(makeWebMsg({ id: "m-slow-1", conversationId: "chat-alpha", text: "慢消费测试" }));
+      await slowStream;
+      assert.ok(slowSeen >= 1, "慢消费回调超过 idleTimeoutMs 时不得误报 stream_idle_timeout");
     } finally {
       bridge.stop();
-      gwService.stop();
+      await gwService.stop();
       await gwServer.stop();
       gwStore.close();
       app.store.db.close();
@@ -512,10 +691,20 @@ describe("independent feishu-gateway daemon (Unix socket, scope isolation, SSE c
       assert.equal(r2.replyId, r1.replyId);
       assert.equal(mockFeishu.getSendCount(), 1, "同 cid 重试绝不二次发包");
 
-      // 3) Reusing same cid with different text -> permanent 409 cid_mismatch
+      // 3) Reusing same cid with different text or different message_id -> permanent 409 cid_mismatch
       await assert.rejects(
         client.sendReply({ chat_id: "chat-alpha", message_id: "orig-100", text: "改成周五上线", cid: "cid-reply-0001" }),
         (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 409 && e.code === "cid_mismatch" && e.permanent === true,
+      );
+      await assert.rejects(
+        client.sendReply({ chat_id: "chat-alpha", message_id: "orig-other", text: "收到，周四上线", cid: "cid-reply-0001" }),
+        (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 409 && e.code === "cid_mismatch" && e.permanent === true,
+      );
+
+      // 3b) expected_owner_id mismatch -> permanent 409 account_mismatch
+      await assert.rejects(
+        client.sendReply({ chat_id: "chat-alpha", message_id: "orig-100", text: "新回复", cid: "cid-owner-mismatch", expected_owner_id: "99999" }),
+        (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 409 && e.code === "account_mismatch" && e.permanent === true,
       );
 
       // 4) Gateway deny_chats blocks reply with permanent 403 chat_denied
@@ -524,7 +713,7 @@ describe("independent feishu-gateway daemon (Unix socket, scope isolation, SSE c
         (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 403 && e.code === "chat_denied" && e.permanent === true,
       );
 
-      // 5) Ambiguous sending record -> permanent 409 ambiguous_delivery without re-sending
+      // 5) Ambiguous sending record -> permanent 409 ambiguous_delivery; concurrent in-flight cid -> retryable 409 delivery_in_flight
       gwStore.saveDelivery({
         cid: "cid-ambiguous-01",
         status: "sending",
@@ -541,25 +730,20 @@ describe("independent feishu-gateway daemon (Unix socket, scope isolation, SSE c
         client.sendReply({ chat_id: "chat-alpha", message_id: "orig-100", text: "收到，周四上线", cid: "cid-ambiguous-01" }),
         (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 409 && e.code === "ambiguous_delivery" && e.permanent === true,
       );
+      (gwService as unknown as { inFlightCids: Set<string> }).inFlightCids.add("cid-ambiguous-01");
+      try {
+        await assert.rejects(
+          client.sendReply({ chat_id: "chat-alpha", message_id: "orig-100", text: "收到，周四上线", cid: "cid-ambiguous-01" }),
+          (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 409 && e.code === "delivery_in_flight" && e.permanent === false,
+        );
+      } finally {
+        (gwService as unknown as { inFlightCids: Set<string> }).inFlightCids.delete("cid-ambiguous-01");
+      }
       assert.equal(mockFeishu.getSendCount(), 1);
 
       // 6) Created (readback-only) completes verification even after allow_reply is turned back to false
-      gwStore.saveDelivery({
-        cid: "cid-readback-01",
-        status: "created",
-        reply_id: r1.replyId,
-        chat_id: "chat-alpha",
-        root_id: r1.rootId,
-        parent_id: r1.parentId,
-        threaded: false,
-        thread_id: "",
-        text_hash: gwStore.getDelivery("cid-reply-0001")!.text_hash,
-        updated_at: Date.now(),
-      });
-      // Inject matching cid on mock stored message so verifyReplyReadback matches cid
       const prevSendCount = mockFeishu.getSendCount();
       gwCfg.allow_reply = false;
-      // Note: mock message r1.replyId has cid="cid-reply-0001", so reuse cid="cid-reply-0001" after resetting its status to created
       gwStore.saveDelivery({
         cid: "cid-reply-0001",
         status: "created",
@@ -574,9 +758,29 @@ describe("independent feishu-gateway daemon (Unix socket, scope isolation, SSE c
       });
       const rRecovered = await client.sendReply({ chat_id: "chat-alpha", message_id: "orig-100", text: "收到，周四上线", cid: "cid-reply-0001" });
       assert.equal(rRecovered.verified, true);
+      assert.equal(gwStore.getDelivery("cid-reply-0001")?.status, "verified", "回读恢复后必须落库为 verified");
       assert.equal(mockFeishu.getSendCount(), prevSendCount, "created 状态回读恢复绝不二次发包，即使 allow_reply=false 也可完成核验");
+
+      // 7) Live start()/stop() graceful shutdown completes cleanly before store.close()
+      gwService.start();
+      const waitLive = Date.now() + 3_000;
+      while (gwService.status().state !== "listening" && Date.now() < waitLive) await new Promise((r) => setTimeout(r, 20));
+      assert.equal(gwService.status().state, "listening");
+      // Also test POST /v1/context on live connected gateway (allowed chat + denied chat)
+      const ctxResp = await client.readContext({
+        anchor: { id: "msg-trigger-11", conversationId: "chat-alpha", rootId: "", parentId: "", threadId: "", position: 11, createdAtMs: Date.now() },
+        limit: 5,
+      });
+      assert.equal(ctxResp.owner_id, "10001");
+      assert.ok(ctxResp.messages.some((m) => m.id === "orig-100"));
+      await assert.rejects(
+        client.readContext({
+          anchor: { id: "msg-trigger-11", conversationId: "chat-secret", rootId: "", parentId: "", threadId: "", position: 11, createdAtMs: Date.now() },
+        }),
+        (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 403 && e.code === "chat_denied",
+      );
     } finally {
-      gwService.stop();
+      await gwService.stop();
       await gwServer.stop();
       gwStore.close();
       await mockFeishu.close();

@@ -102,7 +102,7 @@ export class FeishuGatewayClient {
     const u = this.url!;
     return {
       protocol: u.protocol,
-      hostname: u.hostname,
+      hostname: u.hostname.replace(/^\[|\]$/g, ""),
       port: u.port || 80,
       path: reqPath,
       method,
@@ -117,23 +117,28 @@ export class FeishuGatewayClient {
     body?: unknown,
     opts: { signal?: AbortSignal; timeoutMs?: number } = {},
   ): Promise<T> {
-    const token = this.tokenFor(scope);
     const payload = body !== undefined ? Buffer.from(JSON.stringify(body), "utf8") : undefined;
-    const headers: http.OutgoingHttpHeaders = {
-      authorization: `Bearer ${token}`,
-      accept: "application/json",
-      ...(payload
-        ? {
-            "content-type": "application/json; charset=utf-8",
-            "content-length": payload.length,
-          }
-        : {}),
-    };
-    const reqOpts = this.buildRequestOptions(method, reqPath, headers);
     const timeoutMs = opts.timeoutMs ?? this.defaultTimeoutMs;
 
     return new Promise<T>((resolve, reject) => {
       if (opts.signal?.aborted) return reject(new Error("aborted"));
+      let token: string;
+      try {
+        token = this.tokenFor(scope);
+      } catch (err) {
+        return reject(err);
+      }
+      const headers: http.OutgoingHttpHeaders = {
+        authorization: `Bearer ${token}`,
+        accept: "application/json",
+        ...(payload
+          ? {
+              "content-type": "application/json; charset=utf-8",
+              "content-length": payload.length,
+            }
+          : {}),
+      };
+      const reqOpts = this.buildRequestOptions(method, reqPath, headers);
       let settled = false;
       const done = (fn: () => void) => {
         if (settled) return;
@@ -159,16 +164,24 @@ export class FeishuGatewayClient {
           const status = res.statusCode ?? 502;
           const text = Buffer.concat(chunks).toString("utf8");
           let parsed: unknown;
-          try {
-            parsed = text ? JSON.parse(text) : undefined;
-          } catch {
-            parsed = undefined;
+          let parseOk = false;
+          if (text) {
+            try {
+              parsed = JSON.parse(text);
+              parseOk = true;
+            } catch {
+              parseOk = false;
+            }
           }
           if (status >= 200 && status < 300) {
+            if (!parseOk) {
+              done(() => reject(new GatewayHttpError(502, "invalid_response", "网关返回了空或非合法 JSON 响应", false)));
+              return;
+            }
             done(() => resolve(parsed as T));
             return;
           }
-          const errBody = parsed as Partial<GatewayErrorBody> | undefined;
+          const errBody = (parseOk ? parsed : undefined) as Partial<GatewayErrorBody> | undefined;
           const code = typeof errBody?.code === "string" ? errBody.code : `http_${status}`;
           const message = typeof errBody?.error === "string" ? errBody.error : text.slice(0, 300) || `HTTP ${status}`;
           const permanent = typeof errBody?.permanent === "boolean" ? errBody.permanent : status === 400 || status === 401 || status === 403 || status === 404 || status === 422;
@@ -230,17 +243,22 @@ export class FeishuGatewayClient {
    * 严格按顺序逐条 `await onEvent(ev)`（背压暂停流读取），确保下游处理失败不会跳过后续游标。
    */
   streamEvents(opts: StreamEventsOptions): Promise<void> {
-    const token = this.tokenFor("read");
     const after = Math.max(0, Math.floor(opts.after));
     const idleMs = opts.idleTimeoutMs ?? DEFAULT_SSE_IDLE_MS;
-    const reqOpts = this.buildRequestOptions("GET", `/v1/stream?after=${after}`, {
-      authorization: `Bearer ${token}`,
-      accept: "text/event-stream",
-      "cache-control": "no-cache",
-    });
 
     return new Promise<void>((resolve, reject) => {
       if (opts.signal.aborted) return resolve();
+      let token: string;
+      try {
+        token = this.tokenFor("read");
+      } catch (err) {
+        return reject(err);
+      }
+      const reqOpts = this.buildRequestOptions("GET", `/v1/stream?after=${after}`, {
+        authorization: `Bearer ${token}`,
+        accept: "text/event-stream",
+        "cache-control": "no-cache",
+      });
       let settled = false;
       let idleTimer: NodeJS.Timeout | undefined;
       let activeRes: http.IncomingMessage | undefined;
@@ -256,8 +274,15 @@ export class FeishuGatewayClient {
         else resolve();
       };
 
+      const clearIdle = () => {
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+          idleTimer = undefined;
+        }
+      };
+
       const resetIdle = () => {
-        if (idleTimer) clearTimeout(idleTimer);
+        clearIdle();
         idleTimer = setTimeout(() => {
           finish(new GatewayHttpError(504, "stream_idle_timeout", `网关 SSE 连接超过 ${idleMs}ms 无心跳或数据`, false));
         }, idleMs);
@@ -272,7 +297,15 @@ export class FeishuGatewayClient {
         const status = res.statusCode ?? 502;
         if (status !== 200) {
           const chunks: Buffer[] = [];
-          res.on("data", (c: Buffer) => chunks.push(c));
+          let total = 0;
+          res.on("data", (c: Buffer) => {
+            total += c.length;
+            if (total > MAX_RESPONSE_BYTES) {
+              finish(new GatewayHttpError(502, "response_too_large", "网关错误响应体超过上限", false));
+              return;
+            }
+            chunks.push(c);
+          });
           res.on("end", () => {
             const text = Buffer.concat(chunks).toString("utf8");
             let errBody: Partial<GatewayErrorBody> | undefined;
@@ -302,6 +335,8 @@ export class FeishuGatewayClient {
         const pump = async () => {
           if (pumping) return;
           pumping = true;
+          // 暂停读取期间同时暂停空闲检测，防止大批量补拉或慢 onEvent 消费被误判为半开连接超时
+          clearIdle();
           res.pause();
           try {
             while (frames.length > 0 && !settled) {
@@ -324,7 +359,10 @@ export class FeishuGatewayClient {
           }
           if (!settled) {
             if (ended) finish(new GatewayHttpError(503, "stream_closed", "网关 SSE 连接已关闭", false));
-            else res.resume();
+            else {
+              resetIdle();
+              res.resume();
+            }
           }
         };
 
@@ -347,7 +385,7 @@ export class FeishuGatewayClient {
             } else if (line.startsWith("event:")) {
               eventName = line.slice(6).trim();
             } else if (line.startsWith("data:")) {
-              dataLines.push(line.slice(5).trimStart());
+              dataLines.push(line[5] === " " ? line.slice(6) : line.slice(5));
             }
             nl = buf.indexOf("\n");
           }

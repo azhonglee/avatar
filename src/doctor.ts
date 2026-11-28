@@ -360,7 +360,7 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
         `如需秒级响应任意群 @我 与私聊，请先以独立进程/用户部署 ${code("bin/feishu-gateway")}（${code("feishu-gateway login")} + ${code("feishu-gateway run")}），再在 ${code("config.yaml")} 中配置 ${code("context.personal_web.gateway_socket")}（或 ${code("gateway_url")}）并将 ${code("enabled")} 设为 true`,
       );
     }
-    const resolved = resolveGatewayClientConfig(pwCfg);
+    const resolved = resolveGatewayClientConfig(pwCfg, env);
     if (!resolved.socketPath && !resolved.baseUrl) {
       return fail(
         "已启用个人 Web 通道但未配置网关地址",
@@ -385,8 +385,13 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
         `在运行 Avatar 前导出 ${code(pwCfg.reply_token_env || "FEISHU_GW_REPLY_TOKEN")}，或关闭 ${code("context.personal_web.send_replies")}`,
       );
     }
+    let client;
     try {
-      const client = createGatewayClientForConfig(pwCfg);
+      client = createGatewayClientForConfig(pwCfg, env);
+    } catch (e) {
+      return fail(`个人 Web 网关配置无效：${errMsg(e)}`, `检查 ${code("config.yaml")} 中的 ${code("context.personal_web")} 地址与令牌配置`);
+    }
+    try {
       const st = await client.status({ timeoutMs: 3_000 });
       if (st.owner_id) {
         try {

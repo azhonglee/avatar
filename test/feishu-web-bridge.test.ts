@@ -630,8 +630,61 @@ describe("feishu-web gateway client bridge, store dedup, drafts, and env scrub",
 
       // Verify FeishuGatewayClient rejects non-loopback HTTP URLs
       assert.throws(() => new FeishuGatewayClient({ baseUrl: "http://192.168.1.10:7879", readToken: tokens.readToken }), /回环地址/);
+
+      // 7) sendVerifiedReply: pre-send ECONNREFUSED clears startedKey so toggling send_replies=false is NOT bypassed
+      const deadSockApp = makeApp(dir, {
+        context: {
+          personal_web: {
+            enabled: true,
+            gateway_socket: path.join(dir, "nonexistent.sock"),
+            read_token_env: "TEST_GW_READ_TOKEN",
+            reply_token_env: "TEST_GW_REPLY_TOKEN",
+            send_replies: true,
+          },
+        },
+      });
+      try {
+        process.env.TEST_GW_REPLY_TOKEN = tokens.replyToken;
+        const deadSvc = new ContextService(deadSockApp);
+        await assert.rejects(
+          deadSvc.personalWeb.sendVerifiedReply({ chat_id: "chat-1", message_id: "m1", text: "测试", cid: "cid-presend-001" }),
+        );
+        // Now toggle send_replies off: must fail permanently rather than bypassing via stale startedKey
+        deadSockApp.cfg.context.personal_web.send_replies = false;
+        await assert.rejects(
+          deadSvc.personalWeb.sendVerifiedReply({ chat_id: "chat-1", message_id: "m1", text: "测试", cid: "cid-presend-001" }),
+          /未开启个人 Web 回复/,
+        );
+
+        // 8) hydrateContext blocks denied chat before hitting gateway and rejects owner mismatch
+        deadSvc.app.store.set("ctx.personal_web.bound_owner_id", "owner-expected");
+        const deniedRes = await deadSvc.personalWeb.hydrateContext(
+          { id: "m1", conversationId: "chat-denied", rootId: "", parentId: "", threadId: "", position: 5, createdAtMs: Date.now() },
+          "pw_chat:chat-denied",
+          "敏感群",
+        );
+        assert.equal(deniedRes, 0);
+        // Inject a fake gatewayClient returning a different owner_id -> hydrateContext must reject & ingest 0 messages
+        (deadSvc.personalWeb as unknown as { hooks: { gatewayClient?: unknown } }).hooks.gatewayClient = {
+          readContext: async () => ({
+            owner_id: "owner-other",
+            owner_name: "Other",
+            chat_name: "正常群",
+            messages: [makeGatewayMsg({ id: "m-foreign-bg", conversationId: "chat-1", ownerId: "owner-other", text: "不该入库" })],
+          }),
+        };
+        const mismatchRes = await deadSvc.personalWeb.hydrateContext(
+          { id: "m2", conversationId: "chat-1", rootId: "", parentId: "", threadId: "", position: 5, createdAtMs: Date.now() },
+          "pw_chat:chat-1",
+          "正常群",
+        );
+        assert.equal(mismatchRes, 0);
+        assert.equal(deadSvc.store.obs("pw:m-foreign-bg"), undefined, "跨账号网关返回的背景消息绝不得写入 ctx_obs");
+      } finally {
+        deadSockApp.store.db.close();
+      }
     } finally {
-      gwService.stop();
+      await gwService.stop();
       await gwServer.stop();
       gwStore.close();
       app.store.db.close();

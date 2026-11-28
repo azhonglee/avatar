@@ -20,15 +20,20 @@ import type { ResolvedGatewayTokens } from "./store.ts";
  * 飞书个人 Web 独立网关 HTTP/1.1 + SSE 服务。
  *
  * 安全设计：
- *   - 默认监听 Unix Domain Socket（支持 chmod 0660 供同组客户端连接，禁止 world 权限）；
+ *   - 默认监听 Unix Domain Socket（bind 前临时收紧 umask(0177) 消除权限窗口，再按需放宽至 0660 供同组连接）；
  *   - 可选回环 TCP（仅 127.0.0.1 / localhost / ::1，拒绝通配地址）；
  *   - 严格读写分离鉴权：read_token 仅能访问只读接口，reply_token 仅能访问 POST /v1/replies；
- *   - 启动前先探测已有 Unix Socket 是否存活，绝不误删运行中实例的 socket 或非 socket 文件。
+ *   - 仅当明确收到 ECONNREFUSED 时才清理 stale Unix Socket，绝不误删存活实例或其他错误状态下的 socket；
+ *   - SSE 具备慢消费者背压上限保护（超限主动断开，事件保留在 SQLite 供重连按游标无损续传）。
  */
 
 const MAX_JSON_BODY = 64 * 1024;
 const MAX_SSE_CLIENTS = 32;
+const MAX_SSE_BUFFER_BYTES = 2 * 1024 * 1024;
+const MAX_SSE_PENDING = 2_000;
+const SSE_DRAIN_TIMEOUT_MS = 10_000;
 const DEFAULT_SSE_HEARTBEAT_MS = 15_000;
+const MIN_TOKEN_LEN = 16;
 
 function safeEqual(a: string, b: string): boolean {
   const ba = Buffer.from(a, "utf8");
@@ -43,13 +48,14 @@ function bearerToken(req: http.IncomingMessage): string {
   return m ? m[1] : "";
 }
 
-function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
-  if (res.writableEnded) return;
+function sendJson(res: http.ServerResponse, status: number, body: unknown, closeAfter = false): void {
+  if (res.writableEnded || res.destroyed || res.headersSent) return;
   const data = JSON.stringify(body);
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     "content-length": Buffer.byteLength(data),
+    ...(closeAfter ? { connection: "close" } : {}),
   });
   res.end(data);
 }
@@ -62,7 +68,7 @@ function sendError(res: http.ServerResponse, err: GatewayHttpError): void {
     permanent: err.permanent,
     ...(err.gatewayStatus ? { status: err.gatewayStatus } : {}),
   };
-  sendJson(res, err.statusCode, body);
+  sendJson(res, err.statusCode, body, err.statusCode === 413);
 }
 
 function readJsonBody<T>(req: http.IncomingMessage): Promise<T> {
@@ -79,7 +85,7 @@ function readJsonBody<T>(req: http.IncomingMessage): Promise<T> {
       total += chunk.length;
       if (total > MAX_JSON_BODY) {
         settled = true;
-        req.destroy();
+        req.pause();
         reject(new GatewayHttpError(413, "payload_too_large", `请求体超过上限（${MAX_JSON_BODY} 字节）`, true));
         return;
       }
@@ -103,21 +109,30 @@ function readJsonBody<T>(req: http.IncomingMessage): Promise<T> {
   });
 }
 
-function probeUnixSocketAlive(socketPath: string): Promise<boolean> {
+type SocketProbeResult = "alive" | "stale" | "missing" | { error: string };
+
+function probeUnixSocketStatus(socketPath: string): Promise<SocketProbeResult> {
   return new Promise((resolve) => {
     const sock = net.connect(socketPath);
-    const done = (alive: boolean) => {
+    let settled = false;
+    const done = (r: SocketProbeResult) => {
+      if (settled) return;
+      settled = true;
       sock.destroy();
-      resolve(alive);
+      resolve(r);
     };
-    sock.setTimeout(500, () => done(true));
-    sock.once("connect", () => done(true));
-    sock.once("error", () => done(false));
+    sock.setTimeout(500, () => done("alive"));
+    sock.once("connect", () => done("alive"));
+    sock.once("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "ECONNREFUSED") return done("stale");
+      if (err.code === "ENOENT") return done("missing");
+      return done({ error: `${err.code ?? "ERR"}: ${err.message}` });
+    });
   });
 }
 
 async function prepareUnixSocket(socketPath: string): Promise<void> {
-  fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+  fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o750 });
   let stat: fs.Stats | undefined;
   try {
     stat = fs.lstatSync(socketPath);
@@ -128,10 +143,36 @@ async function prepareUnixSocket(socketPath: string): Promise<void> {
   if (!stat.isSocket()) {
     throw new Error(`路径 ${socketPath} 已存在且不是 Unix Socket，拒绝覆盖`);
   }
-  if (await probeUnixSocketAlive(socketPath)) {
+  const probe = await probeUnixSocketStatus(socketPath);
+  if (probe === "alive") {
     throw new Error(`Unix Socket ${socketPath} 已被另一个运行中的网关实例占用`);
   }
+  if (probe === "missing") return;
+  if (probe !== "stale") {
+    throw new Error(`探测 Unix Socket ${socketPath} 失败，为避免误删拒绝覆盖：${probe.error}`);
+  }
   fs.unlinkSync(socketPath);
+}
+
+function waitDrain(res: http.ServerResponse, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (res.writableEnded || res.destroyed) return resolve(false);
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t);
+      res.off("drain", onDrain);
+      res.off("close", onClose);
+      resolve(ok);
+    };
+    const onDrain = () => done(true);
+    const onClose = () => done(false);
+    const t = setTimeout(() => done(false), timeoutMs);
+    t.unref?.();
+    res.once("drain", onDrain);
+    res.once("close", onClose);
+  });
 }
 
 export interface GatewayServerHandle {
@@ -151,6 +192,10 @@ export async function startGatewayServer(
   tokens: ResolvedGatewayTokens,
   opts: StartGatewayServerOptions = {},
 ): Promise<GatewayServerHandle> {
+  if (tokens.readToken.length < MIN_TOKEN_LEN || tokens.replyToken.length < MIN_TOKEN_LEN || tokens.readToken === tokens.replyToken) {
+    throw new Error("安全约束违规：启动网关服务必须提供两个不同且不少于 16 字符的 read_token 与 reply_token");
+  }
+
   const sseStreams = new Set<{ close(): void }>();
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_SSE_HEARTBEAT_MS;
 
@@ -173,11 +218,11 @@ export async function startGatewayServer(
     return undefined;
   };
 
-  const handleStream = (req: http.IncomingMessage, res: http.ServerResponse, afterRaw: string | null) => {
+  const handleStream = async (res: http.ServerResponse, afterRaw: string | null) => {
     if (sseStreams.size >= MAX_SSE_CLIENTS) {
       return sendError(res, new GatewayHttpError(503, "too_many_streams", "实时订阅连接数已达上限", false));
     }
-    const after = Math.max(0, Number.parseInt(afterRaw ?? "0", 10) || 0);
+    const requestedAfter = Math.max(0, Number.parseInt(afterRaw ?? "0", 10) || 0);
     res.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache, no-transform",
@@ -185,19 +230,46 @@ export async function startGatewayServer(
       "x-accel-buffering": "no",
     });
 
-    const writeSse = (event: string, data: unknown, id?: number) => {
-      if (res.writableEnded || res.destroyed) return;
-      if (id !== undefined) res.write(`id: ${id}\n`);
-      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-    };
-
-    let lastSent = after;
+    let closed = false;
+    let lastSent = requestedAfter;
     let catchingUp = true;
     const pending: GatewayEvent[] = [];
 
-    // 先挂订阅再补拉 DB，保证补拉期间到达的新事件零丢失、严格按 seq 递增
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      clearInterval(timer);
+      offEvent();
+      offStatus();
+      sseStreams.delete(handle);
+    };
+
+    const dropSlowClient = () => {
+      cleanup();
+      if (!res.destroyed) res.destroy();
+    };
+
+    const writeRaw = (chunk: string): boolean => {
+      if (closed || res.writableEnded || res.destroyed) return false;
+      if (res.writableLength > MAX_SSE_BUFFER_BYTES) {
+        dropSlowClient();
+        return false;
+      }
+      return res.write(chunk);
+    };
+
+    const writeSse = (event: string, data: unknown, id?: number): boolean => {
+      const prefix = id !== undefined ? `id: ${id}\n` : "";
+      return writeRaw(`${prefix}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
     const offEvent = service.onEvent((ev) => {
+      if (closed) return;
       if (catchingUp) {
+        if (pending.length >= MAX_SSE_PENDING) {
+          dropSlowClient();
+          return;
+        }
         pending.push(ev);
         return;
       }
@@ -206,19 +278,15 @@ export async function startGatewayServer(
       writeSse("event", ev, ev.seq);
     });
     const offStatus = service.onStatus((st: GatewayStatus) => {
+      if (closed) return;
       writeSse("status", st);
     });
     const timer = setInterval(() => {
-      if (!res.writableEnded && !res.destroyed) res.write(": ping\n\n");
+      if (closed || res.writableEnded || res.destroyed) return;
+      writeRaw(": ping\n\n");
     }, heartbeatMs);
     timer.unref?.();
 
-    const cleanup = () => {
-      clearInterval(timer);
-      offEvent();
-      offStatus();
-      sseStreams.delete(handle);
-    };
     const handle = {
       close: () => {
         cleanup();
@@ -226,44 +294,63 @@ export async function startGatewayServer(
       },
     };
     sseStreams.add(handle);
-    req.once("close", cleanup);
     res.once("close", cleanup);
 
-    // 初始状态
-    writeSse("status", service.status());
+    try {
+      // 1) 立即推送当前状态
+      const initialStatus = service.status();
+      writeSse("status", initialStatus);
 
-    // 同步补拉游标之后的增量事件
-    let cursor = after;
-    let gapEmitted = false;
-    while (!res.writableEnded && !res.destroyed) {
-      const page = service.store.listEvents(cursor, MAX_EVENTS_LIMIT);
-      if (page.truncated && !gapEmitted) {
+      // 2) 若客户端游标大于当前库 latest_seq（说明网关 DB 被重建/重置），发送 gap 并从 0 开始重放新库事件
+      let cursor = requestedAfter;
+      let gapEmitted = false;
+      if (requestedAfter > initialStatus.latest_seq) {
         gapEmitted = true;
-        writeSse("gap", { after, min_seq: page.min_seq, latest_seq: page.latest_seq });
+        writeSse("gap", { after: requestedAfter, min_seq: initialStatus.min_seq, latest_seq: initialStatus.latest_seq });
+        cursor = 0;
+        lastSent = 0;
       }
-      for (const ev of page.events) {
+
+      // 3) 分页异步补拉游标之后的增量事件，避免大积压阻塞事件循环
+      while (!closed && !res.writableEnded && !res.destroyed) {
+        const page = service.listEvents(cursor, MAX_EVENTS_LIMIT);
+        if (page.truncated && !gapEmitted) {
+          gapEmitted = true;
+          writeSse("gap", { after: requestedAfter, min_seq: page.min_seq, latest_seq: page.latest_seq });
+        }
+        for (const ev of page.events) {
+          if (closed) return;
+          if (ev.seq <= lastSent) continue;
+          lastSent = ev.seq;
+          const ok = writeSse("event", ev, ev.seq);
+          if (!ok && !closed) {
+            const drained = await waitDrain(res, SSE_DRAIN_TIMEOUT_MS);
+            if (!drained) {
+              dropSlowClient();
+              return;
+            }
+          }
+        }
+        if (!page.has_more || page.events.length === 0) break;
+        cursor = page.events[page.events.length - 1].seq;
+        await new Promise<void>((r) => setImmediate(r));
+      }
+
+      if (closed) return;
+      catchingUp = false;
+      for (const ev of pending) {
+        if (closed) return;
         if (ev.seq <= lastSent) continue;
         lastSent = ev.seq;
         writeSse("event", ev, ev.seq);
       }
-      if (!page.has_more || page.events.length === 0) break;
-      cursor = page.events[page.events.length - 1].seq;
+      pending.length = 0;
+    } catch {
+      dropSlowClient();
     }
-
-    catchingUp = false;
-    for (const ev of pending) {
-      if (ev.seq <= lastSent) continue;
-      lastSent = ev.seq;
-      writeSse("event", ev, ev.seq);
-    }
-    pending.length = 0;
   };
 
   const server = http.createServer(async (req, res) => {
-    const method = req.method ?? "GET";
-    const parsedUrl = new URL(req.url ?? "/", "http://localhost");
-    const pathname = parsedUrl.pathname;
-
     const reqCtrl = new AbortController();
     const onClose = () => {
       if (!res.writableEnded) reqCtrl.abort();
@@ -271,6 +358,15 @@ export async function startGatewayServer(
     res.once("close", onClose);
 
     try {
+      const method = req.method ?? "GET";
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(req.url ?? "/", "http://localhost");
+      } catch {
+        return sendError(res, new GatewayHttpError(400, "invalid_url", "请求路径格式非法", true));
+      }
+      const pathname = parsedUrl.pathname;
+
       if (method === "GET" && pathname === "/v1/health") {
         const authErr = authorize(req, "read");
         if (authErr) return sendError(res, authErr);
@@ -290,13 +386,13 @@ export async function startGatewayServer(
         if (authErr) return sendError(res, authErr);
         const after = Number.parseInt(parsedUrl.searchParams.get("after") ?? "0", 10) || 0;
         const limit = Number.parseInt(parsedUrl.searchParams.get("limit") ?? "200", 10) || 200;
-        return sendJson(res, 200, service.store.listEvents(after, limit));
+        return sendJson(res, 200, service.listEvents(after, limit));
       }
 
       if (method === "GET" && pathname === "/v1/stream") {
         const authErr = authorize(req, "read");
         if (authErr) return sendError(res, authErr);
-        handleStream(req, res, parsedUrl.searchParams.get("after"));
+        await handleStream(res, parsedUrl.searchParams.get("after"));
         return;
       }
 
@@ -334,14 +430,30 @@ export async function startGatewayServer(
 
   if (cfg.socketPath) {
     await prepareUnixSocket(cfg.socketPath);
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(cfg.socketPath, () => {
-        server.off("error", reject);
-        resolve();
+    // bind 前临时收紧 umask(0177) 确保 socket 初始权限严格 0600，再按需放宽到 socketMode（如 0660）
+    const prevUmask = process.umask(0o177);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(cfg.socketPath, () => {
+          server.off("error", reject);
+          resolve();
+        });
       });
-    });
-    fs.chmodSync(cfg.socketPath, cfg.socketMode);
+    } finally {
+      process.umask(prevUmask);
+    }
+    try {
+      fs.chmodSync(cfg.socketPath, cfg.socketMode);
+    } catch (e) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      try {
+        if (fs.lstatSync(cfg.socketPath).isSocket()) fs.unlinkSync(cfg.socketPath);
+      } catch {
+        // ignore
+      }
+      throw e;
+    }
     boundSocketPath = cfg.socketPath;
   } else {
     await new Promise<void>((resolve, reject) => {
@@ -356,7 +468,8 @@ export async function startGatewayServer(
       const h = addr.address.includes(":") ? `[${addr.address}]` : addr.address;
       boundUrl = `http://${h}:${addr.port}`;
     } else {
-      boundUrl = `http://${cfg.listen.host}:${cfg.listen.port}`;
+      const h = cfg.listen.host.includes(":") ? `[${cfg.listen.host}]` : cfg.listen.host;
+      boundUrl = `http://${h}:${cfg.listen.port}`;
     }
   }
 
