@@ -7,6 +7,7 @@ import { MAX_WIRE_BYTES, parseProto, ProtoFields, ProtoWriter, WIRE_BYTES, WIRE_
  */
 
 // Gateway / Frontier command identifiers
+export const CMD_RESPONSE = 1;
 export const CMD_HEARTBEAT = 4;
 export const CMD_SEND_MESSAGE = 5;
 export const CMD_PUSH_PACKET = 6;
@@ -200,7 +201,7 @@ export function encodeAckFrame(sid: string, nowMs = Date.now()): Buffer {
   const ack = new ProtoWriter()
     .str(1, sid)
     .uint(2, 1)
-    .uint(3, 1)
+    .uint(3, CMD_RESPONSE)
     .bytes(5, Buffer.from([8, 0]))
     .finish();
   return encodeFrame(ack, nowMs);
@@ -235,9 +236,12 @@ export function unwrapGatewayPayload(
   }
 
   const cmdField = packet.lastField(3);
-  if (opts.expectedCommand !== undefined && cmdField !== undefined && Number(cmdField.uint ?? 0n) !== opts.expectedCommand) {
+  const gotCmd = cmdField !== undefined ? Number(cmdField.uint ?? 0n) : undefined;
+  // 真实飞书网关 HTTP 响应信封的 field 3 (cmd) 固定为 CMD_RESPONSE (1)，而非回显请求命令号
+  const matchesExpectedCmd = (cmd: number, expected: number): boolean => cmd === CMD_RESPONSE || cmd === expected;
+  if (opts.expectedCommand !== undefined && gotCmd !== undefined && !matchesExpectedCmd(gotCmd, opts.expectedCommand)) {
     throw new GatewayError(
-      `个人 Web 网关响应命令号不匹配 (got=${Number(cmdField.uint ?? 0n)}, want=${opts.expectedCommand})`,
+      `个人 Web 网关响应命令号不匹配 (got=${gotCmd}, want=${CMD_RESPONSE} 或 ${opts.expectedCommand})`,
     );
   }
 
@@ -265,10 +269,8 @@ export function unwrapGatewayPayload(
     // 才把 0 字节载荷视作权威空结果；防止无关 protobuf 或畸形 HTTP 200 响应被误判为「消息已不存在」
     const hasValidPayloadType = payloadTypeField !== undefined && Number(payloadTypeField.uint ?? 0n) === 1;
     const hasValidCmd =
-      cmdField !== undefined &&
-      (opts.expectedCommand === undefined
-        ? Number(cmdField.uint ?? 0n) > 0
-        : Number(cmdField.uint ?? 0n) === opts.expectedCommand);
+      gotCmd !== undefined &&
+      (opts.expectedCommand === undefined ? gotCmd > 0 : matchesExpectedCmd(gotCmd, opts.expectedCommand));
     const hasMatchingCid =
       !!opts.expectedCid &&
       cidField !== undefined &&

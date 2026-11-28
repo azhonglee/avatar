@@ -10,6 +10,7 @@ import {
   CMD_HISTORY,
   CMD_PUSH_PACKET,
   CMD_READ_MESSAGE,
+  CMD_RESPONSE,
   CMD_SEND_MESSAGE,
   decodeFrame,
   decodeRichText,
@@ -164,7 +165,7 @@ async function startMockFeishu(): Promise<MockServer> {
         const found = messages.get(id);
         const respPayload = found ? new ProtoWriter().bytes(1, mapEntry(id, found)).finish() : Buffer.alloc(0);
         res.writeHead(200, { "Content-Type": "application/x-protobuf" });
-        res.end(encodePacket(cmd, respPayload, cid));
+        res.end(encodePacket(CMD_RESPONSE, respPayload, cid));
         return;
       }
 
@@ -173,7 +174,7 @@ async function startMockFeishu(): Promise<MockServer> {
         const found = chats.get(chatId);
         const respPayload = found ? new ProtoWriter().bytes(1, mapEntry(chatId, found)).finish() : Buffer.alloc(0);
         res.writeHead(200, { "Content-Type": "application/x-protobuf" });
-        res.end(encodePacket(cmd, respPayload, cid));
+        res.end(encodePacket(CMD_RESPONSE, respPayload, cid));
         return;
       }
 
@@ -190,7 +191,7 @@ async function startMockFeishu(): Promise<MockServer> {
         const respBuf = out.finish();
         if (respBuf.length === 0) emptyHistoryPages++;
         res.writeHead(200, { "Content-Type": "application/x-protobuf" });
-        res.end(encodePacket(cmd, respBuf, cid));
+        res.end(encodePacket(CMD_RESPONSE, respBuf, cid));
         return;
       }
 
@@ -218,7 +219,7 @@ async function startMockFeishu(): Promise<MockServer> {
         messages.set(replyId, replyBuf);
         const respPayload = new ProtoWriter().bytes(1, replyBuf).finish();
         res.writeHead(200, { "Content-Type": "application/x-protobuf" });
-        res.end(encodePacket(cmd, respPayload, cid));
+        res.end(encodePacket(CMD_RESPONSE, respPayload, cid));
         return;
       }
     }
