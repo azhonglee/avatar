@@ -984,20 +984,81 @@ describe("independent feishu-gateway daemon (Unix socket, scope isolation, SSE c
       assert.equal(gwStore.getDelivery("cid-old-1"), undefined);
       assert.equal(gwStore.loadState(), undefined);
 
-      // 4) 运行中的旧账号长连接若在断开前收到残留推送，必须丢弃不得污染新库
+      // 4) 运行中的旧账号长连接若在断开前收到残留推送（含跨 await readChat 的 TOCTOU 竞态），必须丢弃不得污染新库
       const stalePush = await gwService.handleMessage(
         makeWebMsg({ id: "stale-from-alice", conversationId: "chat-old", ownerId: "10001", text: "旧连接残留" }),
       );
       assert.equal(stalePush, null);
       assert.equal(gwStore.seqStats().cached_events, 0);
 
+      // 4b) 复现 handleMessage 在 await client.readChat 期间发生切号的 TOCTOU 竞态：事务内核对 bound_owner_id 必须回滚并丢弃
+      let releaseReadChat!: () => void;
+      const readChatStarted = new Promise<void>((resolve) => {
+        const fakeBobClient = {
+          owner: () => ({ id: "20002", name: "Bob" }),
+          readChat: async () => {
+            resolve();
+            await new Promise<void>((r) => {
+              releaseReadChat = r;
+            });
+            return { id: "chat-toctou", name: "Bob旧群", kind: 2, mode: 0 };
+          },
+          readContext: async () => [],
+        } as unknown as Parameters<FeishuGatewayService["handleMessage"]>[1];
+        (gwService as unknown as { client?: unknown }).client = fakeBobClient;
+      });
+      const inFlightMsg = gwService.handleMessage(
+        makeWebMsg({ id: "toctou-bob-1", conversationId: "chat-toctou", ownerId: "20002", text: "切号前发出的推送" }),
+        (gwService as unknown as { client?: Parameters<FeishuGatewayService["handleMessage"]>[1] }).client,
+      );
+      await readChatStarted;
+      // 在 readChat 挂起期间强制切换到第三个账号 30003
+      commitGatewayLogin(
+        gwStore,
+        loginStore,
+        {
+          owner_id: "30003",
+          owner_name: "Carol",
+          cookies: [{ name: "session", value: "s-carol", domain: "feishu.cn", path: "/" }],
+        },
+        { forceSwitch: true },
+      );
+      releaseReadChat();
+      const toctouEv = await inFlightMsg;
+      assert.equal(toctouEv, null, "跨 readChat 发生切号后事务内必须放弃写入旧账号消息");
+      assert.equal(gwStore.seqStats().cached_events, 0);
+      assert.equal(gwStore.getChatName("chat-toctou"), "");
+
+      // 4c) 切号后 watchTimer 未触发前 this.client 仍为旧账号 20002：readContext 与 sendReply 均不得复用旧 client
+      await assert.rejects(
+        gwService.readContext({
+          anchor: { id: "m1", conversationId: "chat-toctou", rootId: "", parentId: "", threadId: "", position: 1, createdAtMs: Date.now() },
+        }),
+        (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 503 && e.code === "offline",
+        "过期旧账号 client 不得响应 readContext",
+      );
+      gwCfg.allow_reply = true;
+      await assert.rejects(
+        gwService.sendReply({
+          chat_id: "chat-toctou",
+          message_id: "m1",
+          text: "旧账号期望回复",
+          cid: "cid-stale-owner-01",
+          expected_owner_id: "20002",
+        }),
+        (e: unknown) => e instanceof GatewayHttpError && e.statusCode === 409 && e.code === "account_mismatch",
+        "bound_owner_id 优先于过期 this.client，必须拒绝旧 expected_owner_id",
+      );
+      gwCfg.allow_reply = false;
+      (gwService as unknown as { client?: unknown }).client = undefined;
+
       // 新账号第一条消息 seq 从 1 开始
       const freshEv = await gwService.handleMessage(
-        makeWebMsg({ id: "bob-msg-1", conversationId: "chat-bob", ownerId: "20002", text: "新账号首条消息" }),
+        makeWebMsg({ id: "carol-msg-1", conversationId: "chat-carol", ownerId: "30003", text: "新账号首条消息" }),
       );
       assert.equal(freshEv?.seq, 1);
 
-      // 5) systemd LoadCredential 模式下记录 token_sources 后，无 CREDENTIALS_DIRECTORY 的 tokens 拒绝静默生成冲突 tokens.json
+      // 5) systemd LoadCredential / env / 混合模式下记录 token_sources 后，无对应外部令牌时拒绝静默生成冲突 tokens.json
       fs.mkdirSync(credDir, { recursive: true });
       fs.writeFileSync(path.join(credDir, "read-token"), "cred-read-token-0123456789abcdef\n", { mode: 0o600 });
       fs.writeFileSync(path.join(credDir, "reply-token"), "cred-reply-token-0123456789abcdef\n", { mode: 0o600 });
@@ -1008,13 +1069,21 @@ describe("independent feishu-gateway daemon (Unix socket, scope isolation, SSE c
       gwStore.recordTokenSources(fromCred);
       assert.equal(fs.existsSync(gwStore.tokensFile), false, "LoadCredential 模式不生成 tokens.json");
 
-      // 模拟用户在普通交互式 shell 运行 feishu-gateway tokens（无 CREDENTIALS_DIRECTORY）
+      // 模拟用户在普通交互式 shell 运行 feishu-gateway tokens / run（无 CREDENTIALS_DIRECTORY）
       delete process.env.CREDENTIALS_DIRECTORY;
       assert.throws(
         () => gwStore.resolveTokens({ rejectConflictingFileGeneration: true }),
         /secrets\/read-token.*--force-file/s,
       );
       assert.equal(fs.existsSync(gwStore.tokensFile), false, "被保护拦截后绝不能静默创建 tokens.json");
+
+      // env 模式与混合模式（read=env, reply=file）同样拒绝在缺环境变量时静默建文件
+      gwStore.recordTokenSources({ readSource: "env", replySource: "file" });
+      assert.throws(
+        () => gwStore.resolveTokens({ rejectConflictingFileGeneration: true }),
+        /FEISHU_GW_READ_TOKEN.*--force-file/s,
+      );
+      assert.equal(fs.existsSync(gwStore.tokensFile), false);
 
       // 显式 --force-file 允许切换回文件模式
       const forced = gwStore.resolveTokens({ rejectConflictingFileGeneration: false });

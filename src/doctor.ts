@@ -466,13 +466,20 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
     if (!cfg.context.enabled || !pwCfg.enabled) {
       return skip("个人 Web 通道未启用");
     }
+    const resolved = resolveGatewayClientConfig(pwCfg, env);
     if (pwCfg.send_replies) {
       return warn(
         "已开启 context.personal_web.send_replies：与 Avatar 同 OS 用户运行的 --approve-all worker 可从 /proc/<pid>/environ 或 $CREDENTIALS_DIRECTORY 读取 reply_token，在网关 allow_reply=true 时能以本人身份回复消息",
-        `如不需要经个人 Web 自动发送回复，将 ${code("context.personal_web.send_replies")} 设为 false；如需保留，请将派单 worker 隔离在独立 OS 用户或容器中运行`,
+        `如不需要经个人 Web 自动发送回复，将 ${code("context.personal_web.send_replies")} 设为 false 并从 Avatar 运行环境/凭据目录移除 ${code(pwCfg.reply_token_env || "FEISHU_GW_REPLY_TOKEN")}；如需保留，请将派单 worker 隔离在独立 OS 用户或容器中运行`,
       );
     }
-    return ok("个人 Web 回复已关闭（send_replies = false，仅暴露只读通道；如需对 read_token 做强隔离，仍建议以独立 OS 用户或容器运行 worker）");
+    if (resolved.replyToken) {
+      return warn(
+        `context.personal_web.send_replies 已关闭，但 Avatar 进程环境或 $CREDENTIALS_DIRECTORY 中仍存在 reply_token（${pwCfg.reply_token_env || "FEISHU_GW_REPLY_TOKEN"}）：同 OS 用户的 --approve-all worker 仍可读取该令牌并在网关 allow_reply=true 时直接调用回复接口`,
+        `从 Avatar 运行环境或 systemd LoadCredential 中移除 ${code(pwCfg.reply_token_env || "FEISHU_GW_REPLY_TOKEN")}（reply-token），仅保留只读令牌`,
+      );
+    }
+    return ok("个人 Web 回复已关闭且未向 Avatar 暴露 reply_token（仅使用只读通道；如需对 read_token 做强隔离，仍建议以独立 OS 用户或容器运行 worker）");
   });
 
   add("data_dir", "数据目录", async () => {

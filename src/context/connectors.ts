@@ -111,21 +111,34 @@ export class Connectors {
 
   /**
    * 显式单页翻页调用（不依赖 CLI --page-all / --page-limit 截断）：
+   *   - 响应必须是非空纯对象（兼容可能多包一层 data 的信封），把列表 / message_ids / has_more / page_token 对齐到同一容器；
    *   - has_more === true 时必须继续用 page_token 翻页；
-   *   - 缺失或重复 page_token、仅返回 message_ids（详情拉取失败）或超出保护页数上限时一律抛错，绝不静默丢页并推进游标。
+   *   - 非对象响应、无效 has_more、缺失或重复 page_token、仅返回 message_ids（详情拉取失败）或超出保护页数上限时一律抛错，绝不静默丢页并推进游标。
    */
   private async paginateLark(args: string[], listKey: string, timeoutMs = 180_000, maxPages = 200): Promise<Raw[]> {
     const out: Raw[] = [];
     const seenTokens = new Set<string>();
     let token: string | undefined;
     for (let page = 0; page < maxPages; page++) {
-      const data = await this.lark(token ? [...args, "--page-token", token] : args, timeoutMs);
-      if (listKey === "messages" && data && typeof data === "object" && "message_ids" in data) {
+      const raw = await this.lark(token ? [...args, "--page-token", token] : args, timeoutMs);
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new Error(`分页接口返回非对象结果（${args.slice(0, 2).join(" ")}）`);
+      }
+      const box =
+        listKey in raw || "has_more" in raw || "message_ids" in raw
+          ? (raw as Raw)
+          : raw.data && typeof raw.data === "object" && !Array.isArray(raw.data)
+            ? (raw.data as Raw)
+            : (raw as Raw);
+      if (listKey === "messages" && "message_ids" in box) {
         throw new Error("消息查询仅返回 ID，消息详情获取失败");
       }
-      out.push(...arr(data, listKey));
-      if (data?.has_more !== true) return out;
-      const next = typeof data?.page_token === "string" ? data.page_token.trim() : "";
+      if (box.has_more !== undefined && typeof box.has_more !== "boolean") {
+        throw new Error(`分页返回无效的 has_more 字段（${args.slice(0, 2).join(" ")}）`);
+      }
+      out.push(...arr(box, listKey));
+      if (box.has_more !== true) return out;
+      const next = typeof box.page_token === "string" ? box.page_token.trim() : "";
       if (!next || seenTokens.has(next)) {
         throw new Error(`分页返回缺失或重复的 page_token（${args.slice(0, 2).join(" ")}）`);
       }
@@ -377,8 +390,10 @@ export class Connectors {
       .sort((a, b) => b[1].at - a[1].at)
       .slice(0, this.cfg.context.max_groups);
     const succeededChats: string[] = [];
+    const failedInitialChats: string[] = [];
     for (const [chatId, v] of ranked) {
-      const cur = Number(this.kv(`cursor.chat.${chatId}`) ?? 0) || since;
+      const existingCur = Number(this.kv(`cursor.chat.${chatId}`) ?? 0);
+      const cur = existingCur || since;
       try {
         const msgs = await this.paginateLark(
           ["im", "+chat-messages-list", "--chat-id", chatId, "--start", isoLocal(cur - 60_000), "--end", end, "--order", "asc", "--page-size", "50", "--no-reactions"],
@@ -387,7 +402,9 @@ export class Connectors {
         for (const m of msgs) raws.push({ m: { ...m, chat_name: m.chat_name || v.name, chat_type: m.chat_type || "group" }, kind: "group" });
         succeededChats.push(chatId);
       } catch {
-        // 单个群翻页失败不推进该群游标，下轮重试
+        // 单个群翻页失败不推进该群游标，下轮重试；若该群尚无独立游标，需将其钉在本次 since，
+        // 避免全局 cursor.im 推进到 now 后下轮回退到新的 since 永久漏掉 [since, now - 60s)
+        if (!existingCur) failedInitialChats.push(chatId);
       }
     }
 
@@ -419,6 +436,7 @@ export class Connectors {
     this.store.tx(() => {
       n = this.store.addObs(obs);
       this.setKv("spoken_groups", JSON.stringify(spoken));
+      for (const chatId of failedInitialChats) this.setKv(`cursor.chat.${chatId}`, String(since));
       for (const chatId of succeededChats) this.setKv(`cursor.chat.${chatId}`, String(now));
       this.setKv("cursor.im", String(now));
     });
@@ -493,8 +511,11 @@ export class Connectors {
       url: r.link,
       meta: {},
     }));
-    const n = this.store.addObs(obs);
-    this.setKv("cursor.comments", String(Math.max(...rows.map((r) => r.at))));
+    let n = 0;
+    this.store.tx(() => {
+      n = this.store.addObs(obs);
+      this.setKv("cursor.comments", String(Math.max(...rows.map((r) => r.at))));
+    });
     return { count: n };
   }
 

@@ -262,8 +262,20 @@ export class GatewayStore {
     return !!row && row.deleted === 0;
   }
 
-  upsertChat(chatId: string, name: string, kind = ""): void {
+  upsertChat(chatId: string, name: string, kind = "", expectedOwnerId?: string): void {
     if (!chatId || !name) return;
+    const expected = expectedOwnerId?.trim() ?? "";
+    if (expected) {
+      this.db
+        .prepare(
+          `INSERT INTO gw_chats(chat_id, name, kind, updated_at)
+           SELECT ?, ?, ?, ?
+           WHERE NOT EXISTS (SELECT 1 FROM gw_kv WHERE k = 'bound_owner_id' AND v != '' AND v != ?)
+           ON CONFLICT(chat_id) DO UPDATE SET name = excluded.name, kind = CASE WHEN excluded.kind != '' THEN excluded.kind ELSE gw_chats.kind END, updated_at = excluded.updated_at`,
+        )
+        .run(chatId, name, kind, Date.now(), expected);
+      return;
+    }
     this.db
       .prepare(
         "INSERT INTO gw_chats(chat_id, name, kind, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET name = excluded.name, kind = CASE WHEN excluded.kind != '' THEN excluded.kind ELSE gw_chats.kind END, updated_at = excluded.updated_at",
@@ -287,10 +299,22 @@ export class GatewayStore {
   /**
    * 原子写入一条个人 Web 消息并分配单调递增 seq。
    * 只有此事务提交成功后，上层才会向飞书发送 WS ACK。
+   * 若传入 expectedOwnerId，会在 BEGIN IMMEDIATE 事务内核对 bound_owner_id，
+   * 与 resetForAccountSwitch 严格串行化，防止切号期间旧连接跨 await 写入新库。
    */
-  appendMessage(msg: GatewayMessagePayload, now = Date.now()): GatewayEvent {
+  appendMessage(msg: GatewayMessagePayload, now?: number): GatewayEvent;
+  appendMessage(msg: GatewayMessagePayload, now: number | undefined, expectedOwnerId: string): GatewayEvent | null;
+  appendMessage(msg: GatewayMessagePayload, now = Date.now(), expectedOwnerId?: string): GatewayEvent | null {
+    const expected = expectedOwnerId?.trim() ?? "";
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      if (expected) {
+        const bound = (this.getKv("bound_owner_id") ?? "").trim();
+        if (bound && bound !== expected) {
+          this.safeRollback();
+          return null;
+        }
+      }
       if (msg.chatName) {
         this.upsertChat(msg.conversationId, msg.chatName, msg.conversationKind);
       }
@@ -319,10 +343,21 @@ export class GatewayStore {
 
   /**
    * 消息撤回/清空：立刻擦除该消息所有历史事件载荷、标记为 deleted，并追加一条 delete 墓碑事件通知下游删除本地观测。
+   * 若传入 expectedOwnerId，会在 BEGIN IMMEDIATE 事务内校验 bound_owner_id。
    */
-  appendDelete(messageId: string, chatId: string, now = Date.now()): GatewayEvent {
+  appendDelete(messageId: string, chatId: string, now?: number): GatewayEvent;
+  appendDelete(messageId: string, chatId: string, now: number | undefined, expectedOwnerId: string): GatewayEvent | null;
+  appendDelete(messageId: string, chatId: string, now = Date.now(), expectedOwnerId?: string): GatewayEvent | null {
+    const expected = expectedOwnerId?.trim() ?? "";
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      if (expected) {
+        const bound = (this.getKv("bound_owner_id") ?? "").trim();
+        if (bound && bound !== expected) {
+          this.safeRollback();
+          return null;
+        }
+      }
       this.db.prepare("UPDATE gw_events SET payload = NULL WHERE message_id = ? AND kind = 'message'").run(messageId);
       this.db
         .prepare(

@@ -671,6 +671,7 @@ test("断线补采分页与游标原子性：has_more 翻完所有页；分页�
   });
 
   app.store.db.prepare("DELETE FROM kv WHERE k IN ('ctx.cursor.chat.oc_paged', 'ctx.cursor.chat.oc_bad_page')").run();
+  const prevImCursor = Number(app.store.get("ctx.cursor.im") ?? 0);
   const res = await svc.connectors.pullIm();
   assert.ok(res.count >= 4);
   assert.ok(svc.store.obs("im:om_pg_at1"), "at_me 第 1 页已入库");
@@ -678,13 +679,46 @@ test("断线补采分页与游标原子性：has_more 翻完所有页；分页�
   assert.ok(svc.store.obs("im:om_pg_g1"), "群列表第 1 页已入库");
   assert.ok(svc.store.obs("im:om_pg_g2"), "群列表第 2 页必须完整翻页入库");
   assert.ok(app.store.get("ctx.cursor.chat.oc_paged"), "完整翻页且落库成功的群应推进游标");
-  assert.equal(app.store.get("ctx.cursor.chat.oc_bad_page"), undefined, "has_more=true 缺 page_token 的群绝不能推进群游标");
+  const badPinned = Number(app.store.get("ctx.cursor.chat.oc_bad_page") ?? 0);
+  assert.equal(badPinned, prevImCursor, "首次拉取失败的新群应把群游标钉在本次 since，不能随 cursor.im 跳过历史区间");
   const recentLark = calls().slice(beforeCalls).filter((c) => c.role === "lark");
   assert.ok(recentLark.some((c) => c.argv.includes("--page-token") && c.argv.includes("tok_at_2")));
   assert.ok(recentLark.some((c) => c.argv.includes("--page-token") && c.argv.includes("tok_grp_2")));
   assert.ok(!recentLark.some((c) => c.argv.includes("--page-all")), "不再依赖会截断的 --page-all");
 
-  // 2) 搜索本身返回 has_more=true 且重复 page_token：必须抛错且不推进 cursor.im
+  // 1b) 故障群恢复后跑第二轮：必须沿用钉住的 since 补回历史消息（即使 cursor.im 已推进到 now），且兼容嵌套 data 容器
+  writeFx("lark.json", {
+    user_name: "张三",
+    at_me: [],
+    p2p: [],
+    mine: [],
+    chats: {
+      oc_paged: [],
+      oc_bad_page: {
+        pages: {
+          "": {
+            data: {
+              messages: [msg("om_pg_bad1", { chat_id: "oc_bad_page", chat_name: "断页故障群", content: "恢复后补回第1页", create_time: iso(tBase + 4000) })],
+              has_more: true,
+              page_token: "tok_bad_2",
+            },
+          },
+          tok_bad_2: {
+            data: {
+              messages: [msg("om_pg_bad2", { chat_id: "oc_bad_page", chat_name: "断页故障群", content: "恢复后补回第2页", create_time: iso(tBase + 5000) })],
+              has_more: false,
+            },
+          },
+        },
+      },
+    },
+  });
+  await svc.connectors.pullIm();
+  assert.ok(svc.store.obs("im:om_pg_bad1"), "第二轮恢复必须补回首轮失败群的第 1 页消息");
+  assert.ok(svc.store.obs("im:om_pg_bad2"), "第二轮恢复必须翻完嵌套 data 容器的第 2 页消息");
+  assert.ok(Number(app.store.get("ctx.cursor.chat.oc_bad_page") ?? 0) > badPinned, "恢复成功后才推进故障群游标");
+
+  // 2) 搜索返回重复 page_token / 仅 message_ids / 非 JSON 文本响应：一律抛错且不推进 cursor.im
   const imCursorBefore = app.store.get("ctx.cursor.im");
   writeFx("lark.json", {
     user_name: "张三",
@@ -700,6 +734,26 @@ test("断线补采分页与游标原子性：has_more 翻完所有页；分页�
   });
   await assert.rejects(svc.connectors.pullIm(), /缺失或重复的 page_token/);
   assert.equal(app.store.get("ctx.cursor.im"), imCursorBefore, "分页异常时全局游标不得推进");
+
+  writeFx("lark.json", {
+    user_name: "张三",
+    at_me: { pages: { "": { message_ids: ["om_only_id"] } } },
+    p2p: [],
+    mine: [],
+    chats: {},
+  });
+  await assert.rejects(svc.connectors.pullIm(), /仅返回 ID/);
+  assert.equal(app.store.get("ctx.cursor.im"), imCursorBefore, "仅返回 message_ids 时不得推进游标");
+
+  writeFx("lark.json", {
+    user_name: "张三",
+    at_me: { raw_stdout: "plain text error output without json\n" },
+    p2p: [],
+    mine: [],
+    chats: {},
+  });
+  await assert.rejects(svc.connectors.pullIm(), /非对象结果/);
+  assert.equal(app.store.get("ctx.cursor.im"), imCursorBefore, "非 JSON 文本输出不得推进游标");
 
   // 3) 模拟落库失败：cursor.chat.<chatId> 与 cursor.im 均不得提前推进
   writeFx("lark.json", {

@@ -242,6 +242,15 @@ export class FeishuGatewayService {
     return `${login.owner_id}:${login.session_id ?? ""}`;
   }
 
+  /** 返回当前仍与 bound_owner_id 一致的活跃长连接客户端（切号后 watchTimer 尚未触发前视为失效）。 */
+  private getActiveClient(): FeishuWebClient | undefined {
+    const client = this.client;
+    if (!client) return undefined;
+    const bound = (this.store.getKv(GATEWAY_BOUND_OWNER_KEY) ?? "").trim();
+    if (bound && client.owner().id !== bound) return undefined;
+    return client;
+  }
+
   hasDenyRules(): boolean {
     return this.cfg.deny_chats.some((r) => r.trim().length > 0);
   }
@@ -489,11 +498,15 @@ export class FeishuGatewayService {
 
       const watchTimer = setInterval(() => {
         if (sessionCtrl.signal.aborted) return;
-        const latest = this.loginStore.load();
-        const latestBound = (this.store.getKv(GATEWAY_BOUND_OWNER_KEY) ?? "").trim();
-        const latestEpoch = this.store.dbEpoch();
-        if (`${this.sessionKeyOf(latest)}:${latestBound}:${latestEpoch}` !== curKey) {
-          sessionCtrl.abort();
+        try {
+          const latest = this.loginStore.load();
+          const latestBound = (this.store.getKv(GATEWAY_BOUND_OWNER_KEY) ?? "").trim();
+          const latestEpoch = this.store.dbEpoch();
+          if (`${this.sessionKeyOf(latest)}:${latestBound}:${latestEpoch}` !== curKey) {
+            sessionCtrl.abort();
+          }
+        } catch (err) {
+          this.log("warn", "轮询网关凭据或绑定状态失败", { err: errMsg(err) });
         }
       }, watchMs);
       watchTimer.unref?.();
@@ -522,7 +535,9 @@ export class FeishuGatewayService {
             await this.handleMessage(msg, client, sessionCtrl.signal);
           },
           shouldDeliverInvalid: (msg) => !!msg.id && this.store.hasKnownMessage(msg.id),
-          onState: handleState,
+          onState: (next, detail) => {
+            if (!sessionCtrl.signal.aborted) handleState(next, detail);
+          },
           onWarn: (m) => this.log("warn", m),
         });
       } catch (err) {
@@ -577,7 +592,13 @@ export class FeishuGatewayService {
 
     if (msg.unsupported || (!msg.text.trim() && msg.resources.length === 0)) {
       if (!this.store.hasKnownMessage(msg.id)) return null;
-      const ev = this.store.appendDelete(msg.id, msg.conversationId);
+      const ev = currentOwner
+        ? this.store.appendDelete(msg.id, msg.conversationId, Date.now(), currentOwner)
+        : this.store.appendDelete(msg.id, msg.conversationId);
+      if (!ev) {
+        this.log("warn", "检测到网关已切换绑定账号，事务内放弃写入旧账号撤回事件", { msg_owner: currentOwner });
+        return null;
+      }
       this.emitter.emit("event", ev);
       return ev;
     }
@@ -631,7 +652,13 @@ export class FeishuGatewayService {
       ownerName,
     };
 
-    const ev = this.store.appendMessage(payload);
+    const ev = ownerId
+      ? this.store.appendMessage(payload, Date.now(), ownerId)
+      : this.store.appendMessage(payload);
+    if (!ev) {
+      this.log("warn", "检测到网关已切换绑定账号，事务内放弃写入旧账号消息", { msg_owner: ownerId });
+      return null;
+    }
     const now = Date.now();
     this.state = { ...this.state, last_message_at: now };
     if (now - this.lastMsgPersistedAt >= LAST_MSG_PERSIST_INTERVAL_MS) {
@@ -658,28 +685,36 @@ export class FeishuGatewayService {
     if (this.isDeniedChat(anchor.conversationId, "")) {
       throw new GatewayHttpError(403, "chat_denied", `会话 ${anchor.conversationId} 已被网关排除`, true);
     }
-    const client = this.client;
+    const client = this.getActiveClient();
     if (!client) {
       throw new GatewayHttpError(503, "offline", "网关当前未连接飞书个人 Web 长连接", false);
     }
+    const owner = client.owner();
     let chatName = this.store.getChatName(anchor.conversationId);
     try {
       const meta = await client.readChat(anchor.conversationId, { signal });
       if (meta.name.trim()) {
         chatName = meta.name.trim();
-        this.store.upsertChat(anchor.conversationId, chatName);
+        this.store.upsertChat(anchor.conversationId, chatName, "", owner.id);
       }
     } catch (err) {
       if (this.hasDenyRules()) {
         throw new GatewayHttpError(503, "chat_lookup_failed", `查询会话名称失败，无法核对网关排除规则：${errMsg(err)}`, false);
       }
     }
+    const boundBeforeRead = (this.store.getKv(GATEWAY_BOUND_OWNER_KEY) ?? "").trim();
+    if (boundBeforeRead && boundBeforeRead !== owner.id) {
+      throw new GatewayHttpError(409, "account_mismatch", "网关已切换绑定账号，拒绝返回旧账号上下文", true);
+    }
     if (this.isDeniedChat(anchor.conversationId, chatName)) {
       throw new GatewayHttpError(403, "chat_denied", `会话「${chatName || anchor.conversationId}」已被网关排除`, true);
     }
 
     const history = await client.readContext(anchor, { limit, signal });
-    const owner = client.owner();
+    const boundAfterRead = (this.store.getKv(GATEWAY_BOUND_OWNER_KEY) ?? "").trim();
+    if (boundAfterRead && boundAfterRead !== owner.id) {
+      throw new GatewayHttpError(409, "account_mismatch", "网关已切换绑定账号，拒绝返回旧账号上下文", true);
+    }
     const messages: GatewayMessagePayload[] = [];
     for (const m of history) {
       if (!(isUsableWebMessage(m) || (m.id && m.text.trim()))) continue;
@@ -781,7 +816,11 @@ export class FeishuGatewayService {
 
     try {
       if (expectedOwner) {
-        const currentOwner = this.client?.owner().id || this.store.getKv(GATEWAY_BOUND_OWNER_KEY) || this.loginStore.load()?.owner_id || "";
+        const currentOwner =
+          (this.store.getKv(GATEWAY_BOUND_OWNER_KEY) ?? "").trim() ||
+          this.getActiveClient()?.owner().id ||
+          this.loginStore.load()?.owner_id ||
+          "";
         if (currentOwner && currentOwner !== expectedOwner) {
           throw new GatewayHttpError(
             409,
@@ -827,7 +866,7 @@ export class FeishuGatewayService {
         throw new GatewayHttpError(403, "chat_denied", `目标会话 ${req.chat_id} 已被网关排除，拒绝发送个人 Web 回复`, true);
       }
 
-      let client = this.client;
+      let client = this.getActiveClient();
       if (!client) {
         const inspected = this.loginStore.inspect();
         if (inspected.status !== "ok") {
@@ -918,6 +957,10 @@ export class FeishuGatewayService {
           },
           {
             onBeforeSend: ({ chat, rootId, parentId, threaded }) => {
+              const boundNow = (this.store.getKv(GATEWAY_BOUND_OWNER_KEY) ?? "").trim();
+              if (boundNow && boundNow !== client.owner().id) {
+                throw new GatewayHttpError(409, "account_mismatch", `网关绑定账号已切换为 ${boundNow}，拒绝使用旧账号 ${client.owner().id} 发送回复`, true);
+              }
               if (
                 this.isDeniedChat(req.chat_id, chat.name) ||
                 this.matchesRules(clientDeny, req.chat_id, chat.name) ||

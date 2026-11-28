@@ -8,7 +8,7 @@ import { GatewayStore } from "./store.ts";
 
 const USAGE = `用法：feishu-gateway <命令> [选项]
 
-  run [--config <gateway.yaml>]                     常驻运行独立飞书个人 Web 网关服务
+  run [--config <gateway.yaml>] [--force-file]      常驻运行独立飞书个人 Web 网关服务
   login [--config <file>] [--out qr.svg] [--force-switch-account]
                                                     扫码登录并保存 AES-256-GCM 加密凭据（需配置 FEISHU_GW_KEY 或 PA_FEISHU_WEB_KEY）
   status [--config <file>] [--verify]               查看网关凭据、缓存与连接状态（--verify 在线核验飞书会话）
@@ -50,10 +50,12 @@ async function main(): Promise<void> {
   try {
     switch (cmd) {
       case "run": {
-        const tokens = store.resolveTokens();
-        store.recordTokenSources(tokens);
+        const tokens = store.resolveTokens({
+          rejectConflictingFileGeneration: !values["force-file"],
+        });
         const service = new FeishuGatewayService(cfg, store);
         const server = await startGatewayServer(cfg, service, tokens);
+        store.recordTokenSources(tokens);
         service.start();
         const st = service.status();
         console.log(`✅ 飞书个人 Web 网关已启动`);

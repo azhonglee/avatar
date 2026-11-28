@@ -184,7 +184,7 @@ export function verifyGatewayOwnerForWorkspace(app: App, ownerId: string): void 
   }
 }
 
-/** 解除当前 Avatar 工作区与个人 Web 账号的绑定，并清空本地网关游标、db_epoch、状态与发言群缓存（保留历史观测）。 */
+/** 解除当前 Avatar 工作区与个人 Web 账号的绑定，并清空本地网关游标、db_epoch、状态、发言群与跨通道别名缓存（保留历史观测）。 */
 export function unbindPersonalWebAccount(app: App): { previousOwnerId: string } {
   const previousOwnerId = (app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
   const keys = [BOUND_OWNER_KV_KEY, CURSOR_KV_KEY, EPOCH_KV_KEY, STATE_KV_KEY, SPOKEN_GROUPS_KV_KEY];
@@ -192,6 +192,8 @@ export function unbindPersonalWebAccount(app: App): { previousOwnerId: string } 
   try {
     const del = app.store.db.prepare("DELETE FROM kv WHERE k = ?");
     for (const k of keys) del.run(k);
+    const hasAliasTable = !!app.store.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ctx_pw_alias'").get();
+    if (hasAliasTable) app.store.db.exec("DELETE FROM ctx_pw_alias");
     app.store.db.exec("COMMIT");
   } catch (e) {
     try {
@@ -664,6 +666,10 @@ export class PersonalWebBridge {
       for (let i = recent.length - 1; i >= 0; i--) {
         const name = realConvName(recent[i].conv_name);
         if (name) return name;
+        if (!recent[i].is_me && recent[i].meta.chat_type === "p2p" && recent[i].actor_id) {
+          const peer = this.store.pwAlias("actor", recent[i].actor_id);
+          if (peer) return peer;
+        }
       }
     }
     return "";
@@ -822,38 +828,52 @@ export class PersonalWebBridge {
       if (!resp.messages.length) return 0;
       const ownerId = resp.owner_id || this.state.owner_id;
       const ownerName = this.app.store.get("ctx.owner_name") || resp.owner_name || this.state.owner_name || "我";
-      const bg: Obs[] = resp.messages
-        .filter((m) => m.id && m.text.trim() && !this.isDeniedChat(m.conversationId, m.chatName || effectiveConvName))
-        .map((m) => {
-          const isMe = !!ownerId && m.actorId === ownerId;
-          const displayConvName = m.chatName || effectiveConvName;
-          return {
-            id: `pw:${m.id}`,
-            source: "im",
-            kind: m.senderType !== GATEWAY_USER_SENDER_TYPE ? "bot" : isMe ? "mine" : m.conversationKind === "dm" ? "p2p" : "group",
-            conv,
-            conv_name: displayConvName,
-            actor_id: m.actorId,
-            actor_name: isMe ? ownerName : this.actorDisplayName(m.actorId, m.conversationKind, displayConvName),
-            is_me: isMe,
-            time: m.createdAtMs || Date.now(),
-            text: m.text.trim().slice(0, 2000),
-            url: "",
-            meta: {
-              transport: "personal_web",
-              native_message_id: m.id,
-              native_chat_id: m.conversationId,
-              native_root_id: m.rootId || m.id,
-              native_parent_id: m.parentId,
-              thread_id: m.threadId,
-              position: m.position,
-              chat_type: m.conversationKind === "dm" ? "p2p" : "group",
-              sender_type: m.senderType === GATEWAY_USER_SENDER_TYPE ? "user" : "app",
-              background: true,
-            },
-          };
+      let resolvedConvName = effectiveConvName;
+      for (const m of resp.messages) {
+        const isMe = !!ownerId && m.actorId === ownerId;
+        const candidate = this.knownChatName(m.conversationId, m.conversationKind, isMe ? "" : m.actorId, m.chatName);
+        const real = realConvName(candidate);
+        if (real) {
+          resolvedConvName = candidate;
+          this.store.setPwAlias("chat_name", m.conversationId, real);
+          break;
+        }
+      }
+      if (this.isDeniedChat(anchor.conversationId, resolvedConvName)) return 0;
+      const bg: Obs[] = [];
+      for (const m of resp.messages) {
+        if (!m.id || !m.text.trim()) continue;
+        const isMe = !!ownerId && m.actorId === ownerId;
+        const msgChatName = this.knownChatName(m.conversationId, m.conversationKind, isMe ? "" : m.actorId, m.chatName || resolvedConvName);
+        if (this.isDeniedChat(m.conversationId, msgChatName)) continue;
+        const displayConvName = msgChatName || resolvedConvName;
+        bg.push({
+          id: `pw:${m.id}`,
+          source: "im",
+          kind: m.senderType !== GATEWAY_USER_SENDER_TYPE ? "bot" : isMe ? "mine" : m.conversationKind === "dm" ? "p2p" : "group",
+          conv,
+          conv_name: displayConvName,
+          actor_id: m.actorId,
+          actor_name: isMe ? ownerName : this.actorDisplayName(m.actorId, m.conversationKind, displayConvName),
+          is_me: isMe,
+          time: m.createdAtMs || Date.now(),
+          text: m.text.trim().slice(0, 2000),
+          url: "",
+          meta: {
+            transport: "personal_web",
+            native_message_id: m.id,
+            native_chat_id: m.conversationId,
+            native_root_id: m.rootId || m.id,
+            native_parent_id: m.parentId,
+            thread_id: m.threadId,
+            position: m.position,
+            chat_type: m.conversationKind === "dm" ? "p2p" : "group",
+            sender_type: m.senderType === GATEWAY_USER_SENDER_TYPE ? "user" : "app",
+            background: true,
+          },
         });
-      return this.store.addBackgroundObs(bg);
+      }
+      return bg.length ? this.store.addBackgroundObs(bg) : 0;
     } catch (e) {
       log("warn", "快通道经网关补读会话背景失败（继续理解当前消息）", { conv, err: errMsg(e) });
       return 0;

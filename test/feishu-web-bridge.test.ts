@@ -685,7 +685,9 @@ describe("feishu-web gateway client bridge, store dedup, drafts, and env scrub",
       assert.equal(pwInvalid?.status, "fail");
       assert.match(pwInvalid?.detail ?? "", /invalid|解密失败/);
 
-      // 4) Valid key + valid read token -> doctor ok; boundary check ok when send_replies=false, warn when send_replies=true
+      // 4) Valid key + valid read token -> doctor ok; boundary check ok when send_replies=false & no reply_token,
+      //    warn when send_replies=true OR when send_replies=false yet reply_token is still present in env
+      delete process.env.TEST_GW_REPLY_TOKEN;
       process.env.FEISHU_GW_KEY = "key-original";
       const docOk = await runDoctor(app);
       const pwOk = docOk.checks.find((c) => c.id === "personal_web");
@@ -700,7 +702,13 @@ describe("feishu-web gateway client bridge, store dedup, drafts, and env scrub",
       const boundWarn = docSendWarn.checks.find((c) => c.id === "personal_web_boundary");
       assert.equal(boundWarn?.status, "warn");
       assert.match(boundWarn?.detail ?? "", /\/proc\/<pid>\/environ.*reply_token/s);
+
       app.cfg.context.personal_web.send_replies = false;
+      const docResidualWarn = await runDoctor(app);
+      const boundResidual = docResidualWarn.checks.find((c) => c.id === "personal_web_boundary");
+      assert.equal(boundResidual?.status, "warn");
+      assert.match(boundResidual?.detail ?? "", /仍存在 reply_token/);
+      delete process.env.TEST_GW_REPLY_TOKEN;
 
       // 5) Same conv concurrent fastCycle deferred with refunded attempt
       const svc = new ContextService(app);
@@ -1026,6 +1034,53 @@ describe("feishu-web gateway client bridge, store dedup, drafts, and env scrub",
         "即使最新观测是私聊：本人，sendVerifiedReply 也必须回溯历史真实私聊名并拦截",
       );
 
+      // 2b) 先有占位名私聊记录（私聊：90077，无 chat_name 别名），后经群聊学到 actor 别名“孙九”并静音：
+      //     sendVerifiedReply 与 hydrateContext 均必须回查历史私聊观测的 actor 别名并拦截
+      svc.store.addObs([
+        {
+          id: "pw:dm-late-1",
+          source: "im",
+          kind: "p2p",
+          conv: "pw_chat:dm-late-learn",
+          conv_name: "私聊：90077",
+          actor_id: "90077",
+          actor_name: "90077",
+          is_me: false,
+          time: t0,
+          text: "先发一条未学名的私聊",
+          url: "",
+          meta: { transport: "personal_web", native_chat_id: "dm-late-learn", native_message_id: "dm-late-1", chat_type: "p2p" },
+        },
+      ]);
+      svc.store.setPwAlias("actor", "90077", "孙九");
+      svc.store.muteConv("oc_dm_sj", "私聊：孙九", true);
+      await assert.rejects(
+        bridge.sendVerifiedReply({ chat_id: "dm-late-learn", message_id: "dm-late-1", text: "不应发出", cid: "cid-dm-late-01" }),
+        /已被排除或静音/,
+        "历史私聊仅存占位名时也必须回查对端 actor 别名并拦截回复",
+      );
+      // hydrateContext 补读背景里即使本人消息在前、静音对端消息在后，也必须整批拦截不入库
+      (bridge as unknown as { hooks: { gatewayClient?: unknown } }).hooks.gatewayClient = {
+        readContext: async () => ({
+          owner_id: "owner-1",
+          owner_name: "Owner",
+          chat_name: "",
+          messages: [
+            makeGatewayMsg({ id: "bg-owner-1", conversationId: "dm-late-bg", conversationKind: "dm", chatName: "", actorId: "owner-1", text: "本人背景消息" }),
+            makeGatewayMsg({ id: "bg-peer-1", conversationId: "dm-late-bg", conversationKind: "dm", chatName: "", actorId: "90077", text: "静音对端背景消息" }),
+          ],
+        }),
+      };
+      const bgLateCount = await bridge.hydrateContext(
+        { id: "dm-late-bg-trigger", conversationId: "dm-late-bg", rootId: "", parentId: "", threadId: "", position: 5, createdAtMs: t0 },
+        "pw_chat:dm-late-bg",
+        "私聊：90077",
+      );
+      assert.equal(bgLateCount, 0, "hydrateContext 发现背景中有已静音对端时应整批拦截");
+      assert.equal(svc.store.obs("pw:bg-owner-1"), undefined);
+      assert.equal(svc.store.obs("pw:bg-peer-1"), undefined);
+      (bridge as unknown as { hooks: { gatewayClient?: unknown } }).hooks.gatewayClient = undefined;
+
       // fail-closed 保留：网关明确查名失败（chatNameResolved=false）时，不得轻信旧缓存 chat_name 绕过排除核对
       svc.store.setPwAlias("chat_name", "grp-renamed", "普通群");
       bridge.handleGatewayMessage(
@@ -1041,7 +1096,7 @@ describe("feishu-web gateway client bridge, store dedup, drafts, and env scrub",
       );
       assert.equal(svc.store.obs("pw:grp-failclosed-1"), undefined, "chatNameResolved=false 且存在按名称排除规则时必须丢弃");
 
-      // 3) pa context web-unbind 解绑工作区账号并重置游标/epoch/状态，保留历史观测
+      // 3) pa context web-unbind 解绑工作区账号并重置游标/epoch/状态与派生别名，保留历史观测
       app.store.set("ctx.personal_web.bound_owner_id", "10001");
       app.store.set("ctx.pw_gateway.cursor", "42");
       app.store.set("ctx.pw_gateway.db_epoch", "epoch-old");
@@ -1055,6 +1110,7 @@ describe("feishu-web gateway client bridge, store dedup, drafts, and env scrub",
       assert.equal(app.store.get("ctx.pw_gateway.db_epoch"), undefined);
       assert.equal(app.store.get("ctx.personal_web.state"), undefined);
       assert.equal(app.store.get("ctx.personal_web.spoken_groups"), undefined);
+      assert.equal(svc.store.pwAlias("chat_name", "dm-chat-blocked"), "", "解绑应清空派生别名缓存");
       assert.ok(svc.store.obs("pw:dm-hist-1"), "解绑不删除历史观测");
       assert.doesNotThrow(() => verifyGatewayOwnerForWorkspace(app, "20002"));
 

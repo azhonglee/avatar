@@ -296,7 +296,11 @@ export class ContextStore {
       this.db.exec("COMMIT");
       return r;
     } catch (e) {
-      this.db.exec("ROLLBACK");
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // SQLite may already have rolled back automatically
+      }
       throw e;
     } finally {
       this.txDepth--;

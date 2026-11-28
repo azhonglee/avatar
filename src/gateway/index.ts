@@ -31,5 +31,12 @@ export {
   type GatewayStatus,
 } from "./protocol.ts";
 export { startGatewayServer, type GatewayServerHandle, type StartGatewayServerOptions } from "./server.ts";
-export { FeishuGatewayService, GATEWAY_BOUND_OWNER_KEY, verifyLoginForGateway, type GatewayServiceOptions } from "./service.ts";
-export { GatewayStore, type GatewayDeliveryRecord, type GatewayPersistedState, type ResolvedGatewayTokens } from "./store.ts";
+export { commitGatewayLogin, FeishuGatewayService, GATEWAY_BOUND_OWNER_KEY, verifyLoginForGateway, type GatewayServiceOptions } from "./service.ts";
+export {
+  GatewayStore,
+  type GatewayDeliveryRecord,
+  type GatewayPersistedState,
+  type RecordedTokenSources,
+  type ResolvedGatewayTokens,
+  type ResolveTokensOptions,
+} from "./store.ts";

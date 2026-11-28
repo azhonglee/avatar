@@ -48,6 +48,10 @@ if (role === "lark") {
     process.exit(0);
   }
   const paged = (val, listKey, fallback = {}) => {
+    if (val && typeof val === "object" && !Array.isArray(val) && typeof val.raw_stdout === "string") {
+      process.stdout.write(val.raw_stdout);
+      process.exit(0);
+    }
     if (val && typeof val === "object" && !Array.isArray(val) && val.pages) {
       const token = flag("--page-token") ?? "";
       return val.pages[token] ?? { [listKey]: [], has_more: false };

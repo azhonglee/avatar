@@ -232,6 +232,7 @@ export async function startGatewayServer(
 
     let closed = false;
     let lastSent = requestedAfter;
+    let streamEpoch = "";
     let catchingUp = true;
     const pending: GatewayEvent[] = [];
 
@@ -279,6 +280,12 @@ export async function startGatewayServer(
     });
     const offStatus = service.onStatus((st: GatewayStatus) => {
       if (closed) return;
+      if (st.db_epoch && streamEpoch && st.db_epoch !== streamEpoch) {
+        streamEpoch = st.db_epoch;
+        lastSent = 0;
+      } else if (st.db_epoch && !streamEpoch) {
+        streamEpoch = st.db_epoch;
+      }
       writeSse("status", st);
     });
     const timer = setInterval(() => {
@@ -299,6 +306,7 @@ export async function startGatewayServer(
     try {
       // 1) 立即推送当前状态
       const initialStatus = service.status();
+      if (initialStatus.db_epoch) streamEpoch = initialStatus.db_epoch;
       writeSse("status", initialStatus);
 
       // 2) 若客户端游标大于当前库 latest_seq（说明网关 DB 被重建/重置），发送 gap 并从 0 开始重放新库事件
