@@ -1,46 +1,46 @@
+import fs from "node:fs";
+import path from "node:path";
 import type { App } from "../app.ts";
 import type { CtxPersonalWebStatus } from "../api/types.ts";
+import type { Config } from "../config.ts";
 import { PermanentEffectError } from "../effects.ts";
-import { errMsg, log } from "../util.ts";
+import { FeishuGatewayClient } from "../gateway/client.ts";
 import {
-  FeishuWebClient,
-  GatewayError,
-  isUsableWebMessage,
-  MessageNotFoundError,
-  SessionNeedsLoginError,
-  UnusableOriginalMessageError,
-  USER_SENDER_TYPE,
-  WebHttpError,
-  WebLoginStore,
-  type FeishuWebClientOptions,
-  type ListenerState,
-  type VerifiedReplyResult,
-  type WebLogin,
-  type WebMessage,
-} from "./feishu-web/index.ts";
+  GATEWAY_USER_SENDER_TYPE,
+  GatewayHttpError,
+  MAX_CLIENT_DENY_RULE_LEN,
+  MAX_CLIENT_DENY_RULES,
+  type GatewayAnchor,
+  type GatewayEvent,
+  type GatewayListenerState,
+  type GatewayMessagePayload,
+  type GatewayReplyResult,
+  type GatewayStatus,
+} from "../gateway/protocol.ts";
+import { errMsg, expandHome, log } from "../util.ts";
 import { isRealConvName, realConvName, type ContextStore, type Obs } from "./store.ts";
 
 /**
- * 个人 Web 协议桥接层：把 FeishuWebClient 的实时推送接入 Working Context。
+ * 个人 Web 协议网关客户端桥接层（纯客户端，零密钥 / 零 Cookie / 零飞书协议依赖）。
  *
  * 职责：
- *   1. 管理 AES-256-GCM 加密的 0600 凭据文件（<dataDir>/feishu-web.json）与长连接生命周期；
- *   2. 收到推送后先持久化到 ctx_obs 再返回（保留背压 ACK：落库失败绝不 ACK）；
- *   3. 严格执行群排除（groups_deny / muted）与范围过滤，支持撤回/清空消息同步删除本地观测；
- *   4. 对「真实 @本人」与「对方私聊」按会话防抖后触发单会话快通道（不等 10 分钟定时周期）；
- *   5. 仅在用户显式确认草稿后，才按需经个人 Web 协议执行带发送前核验、幂等回执与独立回读确认的回复。
+ *   1. 通过独立部署的 feishu-gateway（Unix Socket 或回环 HTTP）订阅 SSE 事件流，按持久化游标零丢失消费；
+ *   2. 执行 Avatar 业务层过滤（groups_deny / mutedConvs / groups=spoken|allowlist / bot_allow）后写入 ctx_obs；
+ *   3. 收到 delete 墓碑事件时同步删除本地观测；
+ *   4. 对「真实 @本人」与「对方私聊」按会话防抖后触发单会话快通道，必要时经只读接口补读有界上下文；
+ *   5. 仅在用户显式确认草稿后，使用独立 reply_token 向网关提交带固定 cid 幂等键的受控回复请求。
  */
 
 export const BOUND_OWNER_KV_KEY = "ctx.personal_web.bound_owner_id";
+export const CURSOR_KV_KEY = "ctx.pw_gateway.cursor";
+/** 与游标配套保存的网关事件库实例标识：变化说明网关库被重建，游标必须重置 */
+const EPOCH_KV_KEY = "ctx.pw_gateway.db_epoch";
 const STATE_KV_KEY = "ctx.personal_web.state";
 const SPOKEN_GROUPS_KV_KEY = "ctx.personal_web.spoken_groups";
-const DELIVERY_KV_PREFIX = "ctx.pw_delivery.";
-const CRED_WATCH_INTERVAL_MS = 3_000;
+const REPLY_STARTED_PREFIX = "ctx.pw_reply_started.";
+const WATCH_INTERVAL_MS = 3_000;
 
-export type FastAnchor = Pick<
-  WebMessage,
-  "id" | "conversationId" | "rootId" | "parentId" | "threadId" | "position" | "createdAtMs"
->;
+export type FastAnchor = GatewayAnchor;
 
 export interface FastTrigger {
   conv: string;
@@ -50,7 +50,8 @@ export interface FastTrigger {
 }
 
 interface PersistedState {
-  state: ListenerState;
+  state: GatewayListenerState;
+  logged_in: boolean;
   owner_id: string;
   owner_name: string;
   since: number;
@@ -58,42 +59,128 @@ interface PersistedState {
   last_error: string;
 }
 
-interface DeliveryRecord {
-  /** sending：已开始发包但结果未知（可能已送达），不得自动重发 */
-  status: "sending" | "created" | "verified";
-  replyId: string;
-  chatId: string;
-  rootId: string;
-  parentId: string;
-  threaded: boolean;
-  threadId?: string;
-  updatedAt: number;
-}
-
 export interface PersonalWebBridgeHooks {
   onFastTrigger: (t: FastTrigger) => void;
   onReconnect: () => void;
   onNeedsLogin: (reason: string) => void;
-  clientOptions?: FeishuWebClientOptions;
-  /** 仅测试覆盖：控制凭据文件变更轮询周期 */
+  /** 仅测试注入：替换默认按 config 构造的网关客户端 */
+  gatewayClient?: FeishuGatewayClient;
   watchIntervalMs?: number;
+  streamIdleTimeoutMs?: number;
 }
 
-/** 核验个人 Web 登录账号与当前工作区的绑定关系（防误登他人账号覆盖工作区上下文）。 */
-export function verifyLoginForWorkspace(app: App, login: WebLogin, opts: { forceSwitch?: boolean } = {}): void {
-  const cfgOpenId = app.cfg.owner.open_id.trim();
-  // open_id 按应用区分：网页端拿到的 open_id 属于飞书网页应用，与 lark-cli 自建应用下的值天然不同，只能作提示，不能据此拒绝
-  if (cfgOpenId && login.owner_open_id && login.owner_open_id !== cfgOpenId) {
-    log("warn", "个人 Web 资料返回的 open_id 与 config.yaml 的 owner.open_id 不同（open_id 按应用区分，可能属正常）", {
-      web_open_id: login.owner_open_id,
-      owner_open_id: cfgOpenId,
-    });
+export interface ResolvedGatewayClientConfig {
+  socketPath?: string;
+  baseUrl?: string;
+  readToken: string;
+  replyToken: string;
+  endpointLabel: string;
+}
+
+function readSystemdCredential(names: string[], env: NodeJS.ProcessEnv = process.env): string {
+  const dir = env.CREDENTIALS_DIRECTORY?.trim();
+  if (!dir) return "";
+  for (const name of names) {
+    try {
+      const v = fs.readFileSync(path.join(dir, name), "utf8").trim();
+      if (v) return v;
+    } catch {
+      // absent
+    }
   }
+  return "";
+}
+
+/** 从配置指定的环境变量（或 systemd LoadCredential）解析网关地址与读写分离双令牌。 */
+export function resolveGatewayClientConfig(
+  pwCfg: Config["context"]["personal_web"],
+  env: NodeJS.ProcessEnv = process.env,
+): ResolvedGatewayClientConfig {
+  const socketRaw = pwCfg.gateway_socket.trim();
+  const urlRaw = pwCfg.gateway_url.trim();
+  const socketPath = socketRaw ? path.resolve(expandHome(socketRaw)) : undefined;
+  const baseUrl = urlRaw || undefined;
+  const readEnvName = pwCfg.read_token_env.trim();
+  const replyEnvName = pwCfg.reply_token_env.trim();
+
+  const readToken =
+    (readEnvName ? env[readEnvName]?.trim() : "") ||
+    readSystemdCredential(["feishu-gw-read-token", "read-token"], env);
+  const replyToken =
+    (replyEnvName ? env[replyEnvName]?.trim() : "") ||
+    readSystemdCredential(["feishu-gw-reply-token", "reply-token"], env);
+
+  const endpointLabel = socketPath ? `unix://${socketPath}` : (baseUrl ?? "(未配置)");
+  return { socketPath, baseUrl, readToken, replyToken, endpointLabel };
+}
+
+export function createGatewayClientForConfig(
+  pwCfg: Config["context"]["personal_web"],
+  env: NodeJS.ProcessEnv = process.env,
+): FeishuGatewayClient {
+  const resolved = resolveGatewayClientConfig(pwCfg, env);
+  if (resolved.readToken && resolved.replyToken && resolved.readToken === resolved.replyToken) {
+    throw new Error("安全约束违规：read_token 与 reply_token 的值不能相同，请为读写配置不同令牌");
+  }
+  return new FeishuGatewayClient({
+    socketPath: resolved.socketPath,
+    baseUrl: resolved.baseUrl,
+    readToken: resolved.readToken,
+    replyToken: resolved.replyToken,
+  });
+}
+
+function isRegularFile(filePath: string): boolean {
+  try {
+    return fs.lstatSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function isInsideDir(filePath: string, dir: string): boolean {
+  const rel = path.relative(path.resolve(dir), path.resolve(filePath));
+  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+/**
+ * 旧版（进程内个人 Web）遗留在 Avatar 侧的会话凭据：
+ *   - `files`：仅包含 `cfg.dataDir` 内的普通文件（`feishu-web.json` 及其锁文件），可由 `pa context web-logout` 安全自动清理；
+ *   - `externalFiles`：位于 `cfg.dataDir` 外的 `PA_FEISHU_WEB_CRED_FILE` 路径（可能同时被新网关回退读取，只提示不自动删）；
+ *   - `envKeys`：运行环境中仍设置的旧环境变量名。
+ */
+export function legacyPersonalWebArtifacts(
+  cfg: Pick<Config, "dataDir">,
+  env: NodeJS.ProcessEnv = process.env,
+): { files: string[]; externalFiles: string[]; envKeys: string[] } {
+  const suffixes = (f: string) => [f, `${f}.lock`, `${f}.lock.db`, `${f}.lock.db-journal`];
+  const localBase = path.join(cfg.dataDir, "feishu-web.json");
+  const files = new Set<string>();
+  const externalFiles = new Set<string>();
+
+  for (const f of suffixes(localBase)) {
+    if (isRegularFile(f)) files.add(f);
+  }
+  const extRaw = env.PA_FEISHU_WEB_CRED_FILE?.trim();
+  if (extRaw) {
+    const extResolved = path.resolve(extRaw);
+    for (const f of suffixes(extResolved)) {
+      if (!isRegularFile(f)) continue;
+      if (isInsideDir(f, cfg.dataDir)) files.add(f);
+      else externalFiles.add(f);
+    }
+  }
+  const envKeys = ["PA_FEISHU_WEB_KEY", "PA_FEISHU_WEB_CRED_FILE"].filter((k) => !!env[k]?.trim());
+  return { files: [...files], externalFiles: [...externalFiles], envKeys };
+}
+
+/** 核验网关上报的个人账号与当前 Avatar 工作区的绑定关系，防止指向错误网关实例导致跨账号混库。 */
+export function verifyGatewayOwnerForWorkspace(app: App, ownerId: string): void {
+  const id = ownerId.trim();
+  if (!id) return;
   const bound = (app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
-  if (bound && bound !== login.owner_id && !opts.forceSwitch) {
-    throw new Error(
-      `当前工作区已绑定个人 Web 账号 ${bound}，与本次登录账号 ${login.owner_id} 不一致；如确需切换请追加 --force-switch-account`,
-    );
+  if (bound && bound !== id) {
+    throw new Error(`当前工作区已绑定个人 Web 账号 ${bound}，与网关当前账号 ${id} 不一致，拒绝混入消息`);
   }
 }
 
@@ -101,8 +188,6 @@ export class PersonalWebBridge {
   private readonly app: App;
   private readonly store: ContextStore;
   private readonly hooks: PersonalWebBridgeHooks;
-  readonly loginStore: WebLoginStore;
-  private client: FeishuWebClient | undefined;
   private stopCtrl: AbortController | undefined;
   private readonly debounceTimers = new Map<string, NodeJS.Timeout>();
   private state: PersistedState;
@@ -111,13 +196,12 @@ export class PersonalWebBridge {
     this.app = app;
     this.store = store;
     this.hooks = hooks;
-    this.loginStore = new WebLoginStore(app.cfg.dataDir);
     const saved = this.loadSavedState();
-    const login = this.loginStore.load();
     this.state = saved ?? {
       state: "idle",
-      owner_id: login?.owner_id ?? "",
-      owner_name: login?.owner_name ?? "",
+      logged_in: false,
+      owner_id: "",
+      owner_name: "",
       since: 0,
       last_message_at: null,
       last_error: "",
@@ -126,6 +210,28 @@ export class PersonalWebBridge {
 
   private get cfg() {
     return this.app.cfg;
+  }
+
+  private getClient(): FeishuGatewayClient {
+    if (this.hooks.gatewayClient) return this.hooks.gatewayClient;
+    return createGatewayClientForConfig(this.cfg.context.personal_web);
+  }
+
+  cursor(): number {
+    const raw = this.app.store.get(CURSOR_KV_KEY);
+    const n = raw ? Number.parseInt(raw, 10) : 0;
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  }
+
+  private setCursor(seq: number): void {
+    if (!Number.isFinite(seq) || seq < 0) return;
+    if (seq > this.cursor()) {
+      this.app.store.set(CURSOR_KV_KEY, String(Math.floor(seq)));
+    }
+  }
+
+  private resetCursor(seq = 0): void {
+    this.app.store.set(CURSOR_KV_KEY, String(Math.max(0, Math.floor(seq))));
   }
 
   private loadSavedState(): PersistedState | undefined {
@@ -148,41 +254,31 @@ export class PersonalWebBridge {
   }
 
   status(): CtxPersonalWebStatus {
-    const inspected = this.loginStore.inspect();
-    const login = inspected.status === "ok" ? inspected.login : undefined;
     const saved = this.loadSavedState() ?? this.state;
     const enabled = this.cfg.context.personal_web.enabled;
-    const loggedIn = !!login;
-    let state = saved.state;
-    let lastError = saved.last_error;
     if (!enabled) {
-      state = "idle";
-    } else if (!loggedIn) {
-      if (inspected.status === "missing_key") {
-        state = "needs_login";
-        lastError = "缺少解密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）";
-      } else if (inspected.status === "plaintext_rejected") {
-        state = "needs_login";
-        lastError = "检测到未加密的旧凭据文件，请设置密钥后重新执行 pa context web-login";
-      } else if (inspected.status === "invalid") {
-        state = "needs_login";
-        lastError = "加密凭据解密失败或已损坏，请核对 PA_FEISHU_WEB_KEY 或重新执行 pa context web-login";
-      } else if (state === "idle") {
-        state = "needs_login";
-      }
+      return {
+        enabled: false,
+        logged_in: false,
+        state: "idle",
+        owner_id: saved.owner_id,
+        owner_name: saved.owner_name,
+        last_message_at: saved.last_message_at,
+        last_error: "",
+      };
     }
     return {
-      enabled,
-      logged_in: loggedIn,
-      state,
-      owner_id: login?.owner_id || saved.owner_id,
-      owner_name: login?.owner_name || saved.owner_name,
+      enabled: true,
+      logged_in: saved.logged_in,
+      state: saved.state,
+      owner_id: saved.owner_id,
+      owner_name: saved.owner_name,
       last_message_at: saved.last_message_at,
-      last_error: lastError,
+      last_error: saved.last_error,
     };
   }
 
-  /** 启动个人 Web 长连接监听（异步后台运行，不阻塞常驻进程启动）。 */
+  /** 启动网关 SSE 订阅循环（异步后台运行，不阻塞常驻进程启动）。 */
   start(): { stop(): void } {
     if (!this.cfg.context.personal_web.enabled) return { stop: () => undefined };
     this.stop();
@@ -195,27 +291,30 @@ export class PersonalWebBridge {
   stop(): void {
     this.stopCtrl?.abort();
     this.stopCtrl = undefined;
-    this.client = undefined;
     for (const timer of this.debounceTimers.values()) clearTimeout(timer);
     this.debounceTimers.clear();
   }
 
-  private sessionKeyOf(login: WebLogin | undefined): string {
-    if (!login) return "";
-    return `${login.owner_id}:${login.session_id ?? ""}`;
-  }
-
   private async runSupervisor(signal: AbortSignal): Promise<void> {
-    const watchMs = this.hooks.watchIntervalMs ?? CRED_WATCH_INTERVAL_MS;
-    let connectDelayMs = 2_000;
-    let connectDenials = 0;
+    const watchMs = this.hooks.watchIntervalMs ?? WATCH_INTERVAL_MS;
+    let reconnectDelayMs = 1_000;
     let wasDegraded = false;
     let everConnected = false;
-    let failedSessionKey = "";
+    let notifiedNeedsLogin = false;
 
-    const handleState = (next: ListenerState, detail = "") => {
-      if (next === "reconnecting" || next === "reverifying") wasDegraded = true;
-      if (next === "listening") {
+    const applyGatewayStatus = (st: GatewayStatus) => {
+      if (st.owner_id) {
+        verifyGatewayOwnerForWorkspace(this.app, st.owner_id);
+        if (!this.app.store.get(BOUND_OWNER_KV_KEY)) {
+          this.app.store.set(BOUND_OWNER_KV_KEY, st.owner_id);
+        }
+      }
+      if (st.owner_name && !this.app.store.get("ctx.owner_name")) {
+        this.app.store.set("ctx.owner_name", st.owner_name);
+      }
+      if (st.state === "reconnecting" || st.state === "reverifying") wasDegraded = true;
+      if (st.state === "listening") {
+        notifiedNeedsLogin = false;
         if (wasDegraded && everConnected) {
           wasDegraded = false;
           this.hooks.onReconnect();
@@ -223,136 +322,172 @@ export class PersonalWebBridge {
         everConnected = true;
       }
       this.persistState({
-        state: next,
-        owner_id: this.client?.owner().id ?? this.state.owner_id,
-        owner_name: this.client?.owner().name ?? this.state.owner_name,
-        since: Date.now(),
-        last_error: next === "listening" || next === "stopped" ? "" : detail,
+        state: st.state,
+        logged_in: st.logged_in,
+        owner_id: st.owner_id || this.state.owner_id,
+        owner_name: st.owner_name || this.state.owner_name,
+        since: st.since || Date.now(),
+        last_message_at: st.last_message_at ?? this.state.last_message_at,
+        last_error: st.state === "listening" || st.state === "stopped" ? "" : st.last_error,
       });
-      if (next === "needs_login") {
-        this.hooks.onNeedsLogin(detail || "个人 Web 会话已失效，请重新扫码登录");
+      if (st.state === "needs_login" && !notifiedNeedsLogin) {
+        notifiedNeedsLogin = true;
+        this.hooks.onNeedsLogin(st.last_error || "个人 Web 网关会话已失效，请在网关侧运行 `feishu-gateway login` 重新扫码");
       }
     };
 
     while (!signal.aborted) {
-      const inspected = this.loginStore.inspect();
-      const login = inspected.status === "ok" ? inspected.login : undefined;
-      const curKey = this.sessionKeyOf(login);
-
-      if (!login) {
-        const msg =
-          inspected.status === "missing_key"
-            ? "缺少个人 Web 凭据解密密钥（请配置 PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）"
-            : inspected.status === "plaintext_rejected"
-              ? "检测到明文凭据文件，请配置密钥并重新运行 `pa context web-login`"
-              : inspected.status === "invalid"
-                ? "加密凭据解密失败或已损坏，请核对 PA_FEISHU_WEB_KEY 或重新运行 `pa context web-login`"
-                : "尚未完成个人 Web 扫码登录，请运行 `pa context web-login`";
-        if (this.state.state !== "needs_login" || this.state.last_error !== msg) {
-          handleState("needs_login", msg);
-        }
-        await waitAbortable(watchMs, signal);
-        continue;
-      }
-
-      // 若同一失效会话尚未被重新扫码替换，静默等待磁盘出现新会话而不刷屏重连
-      if (failedSessionKey && curKey === failedSessionKey) {
-        await waitAbortable(watchMs, signal);
-        continue;
-      }
-      failedSessionKey = "";
-
+      let client: FeishuGatewayClient;
       try {
-        verifyLoginForWorkspace(this.app, login);
+        client = this.getClient();
       } catch (err) {
-        failedSessionKey = curKey;
-        handleState("needs_login", errMsg(err));
+        const msg = errMsg(err);
+        this.persistState({ state: "needs_login", logged_in: false, since: Date.now(), last_error: msg });
+        if (!notifiedNeedsLogin) {
+          notifiedNeedsLogin = true;
+          this.hooks.onNeedsLogin(msg);
+        }
         await waitAbortable(watchMs, signal);
         continue;
       }
 
-      const sessionCtrl = new AbortController();
-      const onOuterAbort = () => sessionCtrl.abort();
-      signal.addEventListener("abort", onOuterAbort, { once: true });
-
-      // 轻量监控凭据是否被 `web-logout` 删除或被新一次 `web-login` 替换
-      const watchTimer = setInterval(() => {
-        if (sessionCtrl.signal.aborted) return;
-        const latest = this.loginStore.load();
-        if (this.sessionKeyOf(latest) !== curKey) {
-          sessionCtrl.abort();
+      if (!this.hooks.gatewayClient) {
+        const resolved = resolveGatewayClientConfig(this.cfg.context.personal_web);
+        if (!resolved.readToken) {
+          const msg = `缺少网关只读令牌（请设置环境变量 ${this.cfg.context.personal_web.read_token_env || "FEISHU_GW_READ_TOKEN"} 或 systemd LoadCredential）`;
+          this.persistState({ state: "needs_login", logged_in: false, since: Date.now(), last_error: msg });
+          if (!notifiedNeedsLogin) {
+            notifiedNeedsLogin = true;
+            this.hooks.onNeedsLogin(msg);
+          }
+          await waitAbortable(watchMs, signal);
+          continue;
         }
-      }, watchMs);
-      watchTimer.unref?.();
+      }
+
+      const streamCtrl = new AbortController();
+      const onOuterAbort = () => streamCtrl.abort();
+      signal.addEventListener("abort", onOuterAbort, { once: true });
+      let accountMismatch = false;
+      let cursorResetReconnect = false;
 
       try {
-        handleState("connecting");
-        const client = await FeishuWebClient.connect(
-          login,
-          {
-            ...this.hooks.clientOptions,
-            onSessionConfirmed: (updated) => {
-              const saved = this.loginStore.saveIfSessionMatches(updated);
-              if (!saved) return false;
-              if (saved.owner_name && !this.app.store.get("ctx.owner_name")) {
-                this.app.store.set("ctx.owner_name", saved.owner_name);
+        if (!everConnected) {
+          this.persistState({ state: "connecting", since: Date.now(), last_error: "" });
+        }
+        await client.streamEvents({
+          after: this.cursor(),
+          signal: streamCtrl.signal,
+          idleTimeoutMs: this.hooks.streamIdleTimeoutMs,
+          onStatus: (st) => {
+            try {
+              applyGatewayStatus(st);
+              reconnectDelayMs = 1_000;
+              const savedEpoch = this.app.store.get(EPOCH_KV_KEY) ?? "";
+              if (st.db_epoch && savedEpoch && savedEpoch !== st.db_epoch) {
+                log("warn", "网关事件库实例已变化（网关数据库被重建），重置本地游标并重新订阅", {
+                  local_cursor: this.cursor(),
+                  saved_epoch: savedEpoch,
+                  gateway_epoch: st.db_epoch,
+                });
+                this.resetCursor(0);
+                this.app.store.set(EPOCH_KV_KEY, st.db_epoch);
+                this.hooks.onReconnect();
+                cursorResetReconnect = true;
+                streamCtrl.abort();
+                return;
               }
-              return saved;
-            },
+              if (st.db_epoch && !savedEpoch) this.app.store.set(EPOCH_KV_KEY, st.db_epoch);
+              if (this.cursor() > st.latest_seq) {
+                log("warn", "检测到网关事件游标回退（网关数据库可能已重建），重置本地游标并重新订阅", {
+                  local_cursor: this.cursor(),
+                  gateway_latest_seq: st.latest_seq,
+                });
+                this.resetCursor(0);
+                this.hooks.onReconnect();
+                cursorResetReconnect = true;
+                streamCtrl.abort();
+              }
+            } catch (err) {
+              accountMismatch = true;
+              const msg = errMsg(err);
+              this.persistState({ state: "needs_login", logged_in: false, since: Date.now(), last_error: msg });
+              if (!notifiedNeedsLogin) {
+                notifiedNeedsLogin = true;
+                this.hooks.onNeedsLogin(msg);
+              }
+              streamCtrl.abort();
+            }
           },
-          sessionCtrl.signal,
-        );
-        this.client = client;
-        if (!this.app.store.get(BOUND_OWNER_KV_KEY)) {
-          this.app.store.set(BOUND_OWNER_KV_KEY, client.owner().id);
-        }
-        connectDelayMs = 2_000;
-        connectDenials = 0;
-        if (client.owner().name && !this.app.store.get("ctx.owner_name")) {
-          this.app.store.set("ctx.owner_name", client.owner().name);
-        }
-        log("info", "个人 Web 通道已连接", { owner_id: client.owner().id, owner_name: client.owner().name });
-
-        await client.listen({
-          signal: sessionCtrl.signal,
-          onMessage: (msg) => this.handleMessage(msg, client, sessionCtrl.signal),
-          shouldDeliverInvalid: (msg) => !!msg.id && !!this.store.obs(`pw:${msg.id}`),
-          onState: handleState,
-          onWarn: (m) => log("warn", m),
+          onGap: (gap) => {
+            log("warn", "个人 Web 网关缓存已滚动淘汰或重置，将触发一次飞书常规采集补齐", {
+              after: gap.after,
+              min_seq: gap.min_seq,
+              latest_seq: gap.latest_seq,
+            });
+            if (gap.after > gap.latest_seq) {
+              this.resetCursor(0);
+            }
+            this.hooks.onReconnect();
+          },
+          onEvent: async (ev) => {
+            if (ev.kind === "message" && ev.message.ownerId) {
+              try {
+                verifyGatewayOwnerForWorkspace(this.app, ev.message.ownerId);
+              } catch (err) {
+                accountMismatch = true;
+                const msg = errMsg(err);
+                this.persistState({ state: "needs_login", logged_in: false, since: Date.now(), last_error: msg });
+                if (!notifiedNeedsLogin) {
+                  notifiedNeedsLogin = true;
+                  this.hooks.onNeedsLogin(msg);
+                }
+                streamCtrl.abort();
+                return;
+              }
+            }
+            await this.handleGatewayEvent(ev);
+            this.setCursor(ev.seq);
+            reconnectDelayMs = 1_000;
+          },
         });
       } catch (err) {
         if (signal.aborted) return;
-        this.client = undefined;
-        // 本地登出/重新登录触发的主动中断：直接进入下一轮加载新状态
-        if (sessionCtrl.signal.aborted) continue;
-
         const msg = errMsg(err);
-        if (err instanceof SessionNeedsLoginError) {
-          failedSessionKey = curKey;
-          handleState("needs_login", msg);
-          await waitAbortable(watchMs, signal);
-        } else if (err instanceof WebHttpError && err.code === "credential_denied") {
-          connectDenials++;
-          if (connectDenials >= 3) {
-            failedSessionKey = curKey;
-            handleState("needs_login", msg);
-            await waitAbortable(watchMs, signal);
-          } else {
-            handleState("reverifying", msg);
-            await waitAbortable(30_000, signal);
+        if (err instanceof GatewayHttpError && (err.statusCode === 401 || err.statusCode === 403)) {
+          this.persistState({
+            state: "needs_login",
+            logged_in: false,
+            since: Date.now(),
+            last_error: `网关鉴权失败（${err.code}）：${msg}`,
+          });
+          if (!notifiedNeedsLogin) {
+            notifiedNeedsLogin = true;
+            this.hooks.onNeedsLogin(`个人 Web 网关鉴权失败：${msg}`);
           }
+          await waitAbortable(Math.max(watchMs, 5_000), signal);
         } else {
-          handleState("reconnecting", msg);
-          await waitAbortable(connectDelayMs, signal);
-          connectDelayMs = Math.min(connectDelayMs * 2, 30_000);
+          wasDegraded = true;
+          this.persistState({
+            state: "reconnecting",
+            since: Date.now(),
+            last_error: `连接个人 Web 网关失败：${msg}`,
+          });
+          await waitAbortable(reconnectDelayMs, signal);
+          reconnectDelayMs = Math.min(reconnectDelayMs * 2, 15_000);
         }
       } finally {
-        clearInterval(watchTimer);
         signal.removeEventListener("abort", onOuterAbort);
-        this.client = undefined;
+      }
+
+      if (cursorResetReconnect && !signal.aborted) {
+        continue;
+      }
+      if (accountMismatch && !signal.aborted) {
+        await waitAbortable(Math.max(watchMs, 5_000), signal);
       }
     }
-    handleState("stopped");
+    this.persistState({ state: "stopped", since: Date.now(), last_error: "" });
   }
 
   private botAllowed(text: string): boolean {
@@ -406,9 +541,50 @@ export class PersonalWebBridge {
     );
   }
 
-  /** 是否存在要靠会话名才能判定的排除或静音规则（查不到会话名时据此决定是否放行） */
+  /** 是否存在要靠会话名才能判定的排除或静音规则（pw_chat:<id> / 纯数字原生 ID 只按 ID 匹配，不算） */
   private hasNameBasedExclusions(): boolean {
-    return this.cfg.context.groups_deny.some(Boolean) || this.store.mutedConvs().length > 0;
+    const idOnly = (r: string) => r.startsWith("pw_chat:") || /^\d+$/.test(r);
+    return (
+      this.cfg.context.groups_deny.some((d) => {
+        const r = d.trim();
+        if (!r || idOnly(r)) return false;
+        return r.startsWith("oc_") ? !!this.openGroupName(r) : true;
+      }) ||
+      this.store.mutedConvs().some((m) => {
+        if (m.conv.startsWith("pw_chat:")) return false;
+        return !!realConvName(m.name) || (m.conv.startsWith("oc_") && !!this.openGroupName(m.conv));
+      })
+    );
+  }
+
+  /**
+   * 交给网关在发送前用实时会话名核对的规则：
+   *   - `rules`（子串关键字 / ID）：groups_deny 非 oc_ 规则与静音会话的 pw_chat: ID；
+   *   - `exactNames`（精确匹配，不做子串）：oc_ 反查群名与静音会话真实名称（避免静音私聊“张三”误拦“张三的评审群”）。
+   */
+  private clientDenyRules(): { rules: string[]; exactNames: string[] } {
+    const rules = new Set<string>();
+    const exactNames = new Set<string>();
+    const addOcName = (oc: string) => {
+      const name = this.openGroupName(oc);
+      if (name) exactNames.add(name);
+    };
+    for (const raw of this.cfg.context.groups_deny) {
+      const r = raw.trim();
+      if (!r) continue;
+      if (r.startsWith("oc_")) addOcName(r);
+      else rules.add(r);
+    }
+    for (const m of this.store.mutedConvs()) {
+      if (m.conv.startsWith("pw_chat:")) rules.add(m.conv);
+      if (m.conv.startsWith("oc_")) addOcName(m.conv);
+      const name = realConvName(m.name);
+      if (name) exactNames.add(name);
+    }
+    return {
+      rules: [...rules].filter((r) => r.length <= MAX_CLIENT_DENY_RULE_LEN).slice(0, MAX_CLIENT_DENY_RULES),
+      exactNames: [...exactNames].filter((r) => r.length <= MAX_CLIENT_DENY_RULE_LEN).slice(0, MAX_CLIENT_DENY_RULES),
+    };
   }
 
   private loadSpokenGroups(): Set<string> {
@@ -438,42 +614,40 @@ export class PersonalWebBridge {
     return inAllow || this.loadSpokenGroups().has(chatId);
   }
 
-  /**
-   * 将单条个人 Web 推送消息落库，并对「@我」和「对方私聊」触发防抖快通道。
-   * 抛出异常时外层 `FeishuWebClient` 不会发送 ACK，确保背压不丢消息。
-   */
-  async handleMessage(msg: WebMessage, client?: FeishuWebClient, signal?: AbortSignal): Promise<void> {
+  /** 处理单条来自独立网关的事件（消息写入或撤回删除）。 */
+  async handleGatewayEvent(ev: GatewayEvent): Promise<void> {
+    if (ev.kind === "delete") {
+      this.store.deleteObs(`pw:${ev.message_id}`);
+      return;
+    }
+    this.handleGatewayMessage(ev.message);
+  }
+
+  /** 将来自独立网关的归一化消息按 Avatar 业务层规则过滤并落库 `ctx_obs`。 */
+  handleGatewayMessage(msg: GatewayMessagePayload): void {
     const obsId = `pw:${msg.id}`;
-    // 已知消息被撤回/编辑为空/转为不支持类型：删除本地旧观测
-    if (msg.unsupported || (!msg.text.trim() && msg.resources.length === 0)) {
+    const text = msg.text.trim();
+    if (!text && msg.resources.length === 0) {
       this.store.deleteObs(obsId);
       return;
     }
 
-    const ownerId = client?.owner().id || this.state.owner_id;
-    const ownerName = this.app.store.get("ctx.owner_name") || client?.owner().name || this.state.owner_name || "我";
+    const ownerId = msg.ownerId || this.state.owner_id;
+    const ownerName = this.app.store.get("ctx.owner_name") || msg.ownerName || this.state.owner_name || "我";
     const isMe = !!ownerId && msg.actorId === ownerId;
-    const isHuman = msg.senderType === USER_SENDER_TYPE;
-    const text = msg.text.trim();
+    const isHuman = msg.senderType === GATEWAY_USER_SENDER_TYPE;
 
     if (!isHuman && !this.botAllowed(text)) return;
 
-    // 已按 ID 命中排除/静音的会话直接丢弃，避免 readChat 失败时无谓阻塞 ACK
-    if (this.isDeniedChat(msg.conversationId, "")) return;
-
-    // 群和私聊都查会话名（私聊的会话名即对方姓名），排除/静音规则和姓名展示都要用
-    let chatName = "";
-    if (client && msg.conversationKind) {
-      try {
-        chatName = (await client.readChat(msg.conversationId, { signal })).name.trim();
-      } catch (err) {
-        // 查不到名称时无法判断是否命中按名称的排除/静音规则：抛出以不 ACK，等重投后再判断，绝不按“未命中”放行
-        if (this.hasNameBasedExclusions()) {
-          throw new Error(`查询会话名称失败，无法核对排除规则，暂不处理该消息：${errMsg(err)}`);
-        }
-      }
-    }
+    const rawChatName = msg.chatName.trim();
+    const chatName = rawChatName || (msg.conversationKind === "dm" ? this.store.pwAlias("actor", msg.actorId) : "");
     if (this.isDeniedChat(msg.conversationId, chatName)) return;
+    // 仅当网关明确未能核验会话名（chatNameResolved === false）且本地存在按名称排除规则时丢弃；
+    // 飞书私聊或未命名群在 readChat 成功返回空名（chatNameResolved === true）时正常放行，避免误丢真实私聊
+    if (!chatName && msg.chatNameResolved === false && this.hasNameBasedExclusions()) {
+      log("warn", "个人 Web 网关未能解析会话名，无法核对按名称的排除规则，已丢弃", { chat_id: msg.conversationId, message_id: msg.id });
+      return;
+    }
 
     const isAtMe = !isMe && !!ownerId && msg.mentions.some((m) => m.id === ownerId);
     if (msg.conversationKind === "group") {
@@ -547,7 +721,7 @@ export class PersonalWebBridge {
   }
 
   /** 对方姓名：跨通道匹配记下的姓名；私聊里对方发的消息用会话名（即对方姓名）；都没有才退回原生 ID */
-  private actorDisplayName(actorId: string, kind: WebMessage["conversationKind"], chatName: string): string {
+  private actorDisplayName(actorId: string, kind: GatewayMessagePayload["conversationKind"], chatName: string): string {
     return this.store.pwAlias("actor", actorId) || (kind === "dm" && isRealConvName(chatName) ? chatName : actorId);
   }
 
@@ -567,28 +741,38 @@ export class PersonalWebBridge {
     this.debounceTimers.set(trigger.conv, timer);
   }
 
-  /** 快通道理解前补读该会话的历史背景消息（最多 15 条，标记为已处理背景，不重复提取旧噪音）。 */
+  /** 快通道理解前经网关只读接口补读该会话的历史背景消息（最多 15 条，标记为已处理背景）。 */
   async hydrateContext(anchor: FastAnchor, conv: string, convName: string, signal?: AbortSignal): Promise<number> {
-    if (!this.client) return 0;
+    if (this.isDeniedChat(anchor.conversationId, convName)) return 0;
     const existing = this.store.convObs(conv, Date.now() - 24 * 3_600_000, 6);
     if (existing.length >= 5) return 0;
+    let client: FeishuGatewayClient;
     try {
-      const history = await this.client.readContext(anchor, { limit: 15, signal });
-      if (!history.length) return 0;
-      const ownerId = this.client.owner().id;
-      const ownerName = this.app.store.get("ctx.owner_name") || this.client.owner().name || "我";
-      const bg: Obs[] = history
-        .filter((m) => isUsableWebMessage(m) || (m.id && m.text.trim()))
+      client = this.getClient();
+    } catch {
+      return 0;
+    }
+    try {
+      const resp = await client.readContext({ anchor, limit: 15 }, signal);
+      if (resp.owner_id) {
+        verifyGatewayOwnerForWorkspace(this.app, resp.owner_id);
+      }
+      if (!resp.messages.length) return 0;
+      const ownerId = resp.owner_id || this.state.owner_id;
+      const ownerName = this.app.store.get("ctx.owner_name") || resp.owner_name || this.state.owner_name || "我";
+      const bg: Obs[] = resp.messages
+        .filter((m) => m.id && m.text.trim() && !this.isDeniedChat(m.conversationId, m.chatName || convName))
         .map((m) => {
-          const isMe = m.actorId === ownerId;
+          const isMe = !!ownerId && m.actorId === ownerId;
+          const displayConvName = m.chatName || convName;
           return {
             id: `pw:${m.id}`,
             source: "im",
-            kind: m.senderType !== USER_SENDER_TYPE ? "bot" : isMe ? "mine" : m.conversationKind === "dm" ? "p2p" : "group",
+            kind: m.senderType !== GATEWAY_USER_SENDER_TYPE ? "bot" : isMe ? "mine" : m.conversationKind === "dm" ? "p2p" : "group",
             conv,
-            conv_name: convName,
+            conv_name: displayConvName,
             actor_id: m.actorId,
-            actor_name: isMe ? ownerName : this.actorDisplayName(m.actorId, m.conversationKind, convName),
+            actor_name: isMe ? ownerName : this.actorDisplayName(m.actorId, m.conversationKind, displayConvName),
             is_me: isMe,
             time: m.createdAtMs || Date.now(),
             text: m.text.trim().slice(0, 2000),
@@ -602,37 +786,23 @@ export class PersonalWebBridge {
               thread_id: m.threadId,
               position: m.position,
               chat_type: m.conversationKind === "dm" ? "p2p" : "group",
-              sender_type: m.senderType === USER_SENDER_TYPE ? "user" : "app",
+              sender_type: m.senderType === GATEWAY_USER_SENDER_TYPE ? "user" : "app",
               background: true,
             },
           };
         });
       return this.store.addBackgroundObs(bg);
     } catch (e) {
-      log("warn", "快通道补读会话背景失败（继续理解当前消息）", { conv, err: errMsg(e) });
+      log("warn", "快通道经网关补读会话背景失败（继续理解当前消息）", { conv, err: errMsg(e) });
       return 0;
     }
   }
 
-  private loadDelivery(cid: string): DeliveryRecord | undefined {
-    const raw = this.app.store.get(`${DELIVERY_KV_PREFIX}${cid}`);
-    if (!raw) return undefined;
-    try {
-      return JSON.parse(raw) as DeliveryRecord;
-    } catch {
-      return undefined;
-    }
-  }
-
-  private saveDelivery(cid: string, rec: DeliveryRecord): void {
-    this.app.store.set(`${DELIVERY_KV_PREFIX}${cid}`, JSON.stringify(rec));
-  }
-
   /**
-   * 确认草稿后的个人 Web 回复：
-   *   - 校验 send_replies 开关、凭据与群排除策略；
-   *   - 基于固定 cid 做幂等回执（若上次已发出但未完成回读，重试时直接回读核验绝不重复发送）；
-   *   - 发送前核验原消息可用性，发送后独立回读核验。
+   * 确认草稿后经独立网关发送个人 Web 回复：
+   *   - 先在 Avatar 侧执行本地黑名单/静音与 send_replies 开关检查；
+   *   - 委托给网关 POST /v1/replies（必须持有独立 reply_token），由网关侧持久化 sending / created / verified 状态机防跨进程重发；
+   *   - 网关返回的永久性错误（permanent=true）直接映射为 PermanentEffectError，避免 10 次无谓重试。
    */
   async sendVerifiedReply(args: {
     chat_id: string;
@@ -640,129 +810,79 @@ export class PersonalWebBridge {
     root_id?: string;
     text: string;
     cid: string;
-  }): Promise<VerifiedReplyResult> {
-    const prev = this.loadDelivery(args.cid);
-    if (prev?.status === "verified") {
-      return {
-        replyId: prev.replyId,
-        rootId: prev.rootId,
-        parentId: prev.parentId,
-        threadId: prev.threadId ?? "",
-        verified: true,
-      };
+  }): Promise<GatewayReplyResult> {
+    const knownConvName = this.store.convObs(`pw_chat:${args.chat_id}`, 0, 1)[0]?.conv_name ?? "";
+    if (this.isDeniedChat(args.chat_id, knownConvName)) {
+      throw new PermanentEffectError(`目标会话「${knownConvName || args.chat_id}」已被排除或静音，拒绝发送个人 Web 回复`);
     }
 
-    if (prev?.status === "sending") {
-      throw new PermanentEffectError("上次个人 Web 发送结果不明确（对方可能已经收到），为避免重复发送已停止自动重试；请先在飞书核实");
-    }
-    // 已发出只差回读核验的回复不需要发送权限，关掉 send_replies 后仍可完成确认
-    const readbackOnly = prev?.status === "created" && !!prev.replyId;
-    if (!readbackOnly && !this.cfg.context.personal_web.send_replies) {
+    const startedKey = `${REPLY_STARTED_PREFIX}${args.cid}`;
+    const alreadyStarted = !!this.app.store.get(startedKey);
+    // 关闭 send_replies 后只允许“已发出、只差回读”的收尾：本地标记无法证明网关真的发过包，交给网关按投递记录判定，拒绝任何新发送
+    const readbackOnly = !this.cfg.context.personal_web.send_replies;
+    if (readbackOnly && !alreadyStarted) {
       throw new PermanentEffectError("未开启个人 Web 回复（需在配置中设置 context.personal_web.send_replies: true）");
     }
 
-    let client = this.client;
-    if (!client) {
-      const login = this.loginStore.load();
-      if (!login) throw new PermanentEffectError("个人 Web 未登录，请先运行 `pa context web-login`");
-      try {
-        verifyLoginForWorkspace(this.app, login);
-      } catch (e) {
-        throw new PermanentEffectError(errMsg(e), e);
-      }
-      client = await FeishuWebClient.connect(login, {
-        ...this.hooks.clientOptions,
-        onSessionConfirmed: (updated) => this.loginStore.saveIfSessionMatches(updated) ?? false,
-      });
-    }
-
-    // 上次已成功发包但回读中断：直接走回读核验，绝不二次发包
-    if (readbackOnly && prev) {
-      const res = await client.verifyReplyReadback({
-        replyId: prev.replyId,
-        chatId: prev.chatId,
-        rootId: prev.rootId,
-        parentId: prev.parentId,
-        cid: args.cid,
-        text: args.text,
-        threaded: prev.threaded,
-      });
-      this.saveDelivery(args.cid, { ...prev, status: "verified", threadId: res.threadId, updatedAt: Date.now() });
-      return res;
-    }
-
-    let entered = false;
-    let created = false;
-    let res: VerifiedReplyResult;
+    let client: FeishuGatewayClient;
     try {
-      res = await client.sendVerifiedReply(
-        {
-          chatId: args.chat_id,
-          messageId: args.message_id,
-          rootId: args.root_id,
-          text: args.text,
-          cid: args.cid,
-        },
-        {
-          onBeforeSend: ({ chat, rootId, parentId, threaded }) => {
-            if (this.isDeniedChat(args.chat_id, chat.name)) {
-              throw new PermanentEffectError(`目标会话「${chat.name || args.chat_id}」已被排除或静音，拒绝发送个人 Web 回复`);
-            }
-            // 发包前先记 sending：之后若结果不明（超时、断线、进程被杀），重试会停在这里而不是再发一次
-            this.saveDelivery(args.cid, { status: "sending", replyId: "", chatId: args.chat_id, rootId, parentId, threaded, updatedAt: Date.now() });
-            entered = true;
-          },
-          onCreated: ({ replyId, rootId, parentId, threaded }) => {
-            created = true;
-            this.saveDelivery(args.cid, {
-              status: "created",
-              replyId,
-              chatId: args.chat_id,
-              rootId,
-              parentId,
-              threaded,
-              updatedAt: Date.now(),
-            });
-          },
-        },
-      );
+      client = this.getClient();
     } catch (err) {
-      if (err instanceof PermanentEffectError) throw err;
-      if (entered && !created) {
-        // 只有服务端明确拒绝（未创建消息）才撤销 sending 允许重试；结果不明时保留 sending 并立刻落失败终态通知人工核实
-        if (isDefinitiveNonCreationError(err)) {
-          this.app.store.set(`${DELIVERY_KV_PREFIX}${args.cid}`, "");
-          throw err;
-        }
-        throw new PermanentEffectError(
-          `个人 Web 发送结果不明确（对方可能已经收到），为避免重复发送已停止自动重试；请先在飞书核实（原错误：${errMsg(err)}）`,
-          err,
-        );
+      throw new PermanentEffectError(`个人 Web 网关客户端未就绪：${errMsg(err)}`, err);
+    }
+
+    const expectedOwner = (this.app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim() || undefined;
+    const deny = this.clientDenyRules();
+    this.app.store.set(startedKey, String(Date.now()));
+    try {
+      const res = await client.sendReply({
+        chat_id: args.chat_id,
+        message_id: args.message_id,
+        root_id: args.root_id,
+        text: args.text,
+        cid: args.cid,
+        ...(expectedOwner ? { expected_owner_id: expectedOwner } : {}),
+        ...(readbackOnly ? { readback_only: true } : {}),
+        client_deny: deny.rules,
+        ...(deny.exactNames.length ? { client_deny_exact: deny.exactNames } : {}),
+      });
+      this.app.store.db.prepare("DELETE FROM kv WHERE k = ?").run(startedKey);
+      return res;
+    } catch (err) {
+      if (isDefinitePreSendGatewayError(err)) {
+        this.app.store.db.prepare("DELETE FROM kv WHERE k = ?").run(startedKey);
       }
-      if (!entered && (err instanceof UnusableOriginalMessageError || err instanceof MessageNotFoundError)) {
-        throw new PermanentEffectError(errMsg(err), err);
+      if (err instanceof GatewayHttpError && err.permanent) {
+        throw new PermanentEffectError(err.message, err);
       }
       throw err;
     }
-    this.saveDelivery(args.cid, {
-      status: "verified",
-      replyId: res.replyId,
-      chatId: args.chat_id,
-      rootId: res.rootId,
-      parentId: res.parentId,
-      threaded: res.threadId !== "",
-      threadId: res.threadId,
-      updatedAt: Date.now(),
-    });
-    return res;
   }
 }
 
-/** 请求被服务端明确拒绝（因此确定没有创建消息）的错误；超时、断线、5xx、空载荷都不算 */
-function isDefinitiveNonCreationError(err: unknown): boolean {
-  if (err instanceof WebHttpError && err.status !== undefined) return [400, 401, 403, 404].includes(err.status);
-  if (err instanceof GatewayError) return !err.emptyPayload && typeof err.status === "number" && err.status !== 0;
-  return false;
+const PRE_SEND_GATEWAY_ERROR_CODES = new Set([
+  "missing_reply_token",
+  "unauthorized",
+  "insufficient_scope",
+  "reply_disabled",
+  "chat_denied",
+  "invalid_request",
+  "text_too_large",
+  "invalid_cid",
+  "unusable_original",
+  "needs_login",
+  "account_mismatch",
+  "gateway_connect_failed",
+  "upstream_rejected",
+]);
+
+const PRE_SEND_NET_CODES = new Set(["ECONNREFUSED", "ENOENT", "EACCES", "ENOTFOUND"]);
+
+/** 确定未向飞书发出消息的客户端/网关前置错误：允许清理本地 started 标记，避免热关闭 send_replies 被绕过。 */
+function isDefinitePreSendGatewayError(err: unknown): boolean {
+  if (err instanceof GatewayHttpError) return PRE_SEND_GATEWAY_ERROR_CODES.has(err.code);
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" && PRE_SEND_NET_CODES.has(code);
 }
 
 function waitAbortable(ms: number, signal: AbortSignal): Promise<void> {

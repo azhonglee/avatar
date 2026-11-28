@@ -44,6 +44,11 @@ dispatch:
 
 schedules:
   capture: "*/15 * * * *"
+
+context:
+  personal_web:
+    enabled: false
+    gateway_socket: ${path.join(tmp, "gw.sock")}
 `;
 
 const settings = () => app.ext.settings!;
@@ -147,13 +152,29 @@ test("校验失败：返回点分路径和中文信息，文件和内存都不�
 
 test("禁止修改 data_dir / bins；回传原值可以", async () => {
   const before = read();
-  for (const patch of [{ data_dir: "/tmp/elsewhere" }, { bins: { lark: "/usr/bin/evil" } }]) {
+  for (const patch of [
+    { data_dir: "/tmp/elsewhere" },
+    { bins: { lark: "/usr/bin/evil" } },
+    { context: { personal_web: { gateway_socket: "/tmp/evil.sock" } } },
+    { context: { personal_web: { gateway_socket: null } } },
+    { context: { personal_web: null } },
+    { context: null },
+    { context: { personal_web: { gateway_url: "http://127.0.0.1:9999" } } },
+    { context: { personal_web: { read_token_env: "AWS_SECRET_ACCESS_KEY" } } },
+    { context: { personal_web: { reply_token_env: "OTHER_SECRET" } } },
+  ]) {
     const r = await settings().put(patch);
     assert.equal(r.ok, false);
-    assert.equal(r.errors[0].path, Object.keys(patch)[0]);
     assert.match(r.errors[0].message, /不能在控制台修改/);
     assert.equal(read(), before);
   }
+  // 整份回传仅改一个无关非法字段时，不得误报默认受保护字段“不能在控制台修改”
+  const badUnrelated = structuredClone(settings().get().config) as any;
+  badUnrelated.dispatch.fix_rounds = -1;
+  const rBad = await settings().put(badUnrelated);
+  assert.equal(rBad.ok, false);
+  assert.ok(rBad.errors.every((e) => !e.message.includes("不能在控制台修改")), `不应误报受保护字段：${JSON.stringify(rBad.errors)}`);
+  assert.equal(read(), before);
   // 前端回传整份配置（含打码的密钥、data_dir、bins 原值）：只落真正的改动
   const whole = structuredClone(settings().get().config) as any;
   whole.capture.lookback_hours = 48;

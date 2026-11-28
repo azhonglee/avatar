@@ -11,7 +11,7 @@ import { deepFind, errMsg, log, truncate } from "../util.ts";
 import { draftCard, eveningCard, itemCard, KIND_LABEL, morningCard, type CtxRenderCtx } from "./cards.ts";
 import { Connectors, relinkMeegoItems } from "./connectors.ts";
 import { defaultDraftKind, Drafter } from "./drafts.ts";
-import { PersonalWebBridge, type FastAnchor } from "./personal-web.ts";
+import { legacyPersonalWebArtifacts, PersonalWebBridge, type FastAnchor } from "./personal-web.ts";
 import { ContextStore, type ItemRow } from "./store.ts";
 import { splitProject, Understander, UnderstandParseError, type SplitResult } from "./understand.ts";
 import { ContextViews, startOfDay } from "./views.ts";
@@ -73,7 +73,7 @@ export class ContextService {
         const day = this.today();
         this.app.ledger.emit(
           "context:pw-needs-login",
-          [notify(`⚠️ 飞书个人 Web 实时通道登录已失效（${truncate(reason, 200)}）。请运行 \`pa context web-login\` 重新扫码；期间每 10 分钟的飞书定时采集仍继续兜底。`, "failure")],
+          [notify(`⚠️ 飞书个人 Web 独立网关不可用或登录已失效（${truncate(reason, 200)}）。请在网关侧运行 \`feishu-gateway login\` 或检查网关服务；期间每 10 分钟的飞书定时采集仍继续兜底。`, "failure")],
           `pw-needs-login-${day}`,
         );
         this.app.engine.kick();
@@ -468,6 +468,14 @@ export class ContextService {
   /** 常驻进程的定时任务 */
   start(): { stop(): void } {
     const c = this.cfg.context;
+    const legacy = legacyPersonalWebArtifacts(this.cfg);
+    if (legacy.files.length || legacy.externalFiles.length || legacy.envKeys.length) {
+      log("warn", `发现旧版遗留的个人 Web 会话凭据，同一系统用户下的 worker 仍可能读到；请清理残留文件并移除 ${legacy.envKeys.join(" / ") || "旧凭据变量"}`, {
+        files: legacy.files,
+        external_files: legacy.externalFiles,
+        env: legacy.envKeys,
+      });
+    }
     const opts = { timezone: this.cfg.owner.timezone, protect: true };
     const slot = (cr: Cron) => (cr.currentRun() ?? new Date()).toISOString().slice(0, 16);
     const guard = (name: string, fn: (cr: Cron) => void) => (cr: Cron) => {

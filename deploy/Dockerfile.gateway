@@ -1,0 +1,43 @@
+# 独立部署边界容器：仅包含 feishu-gateway 与其最小运行时依赖，不包含 Avatar 业务代码或 harness 工具。
+# 构建：docker build -f deploy/Dockerfile.gateway --build-arg GW_GID=$(getent group feishu-gw-client | cut -d: -f3) -t feishu-gateway .
+#   socket 以 0660 创建、属组为容器内的 GW_GID；宿主机上运行 Avatar 的用户必须属于同一个 gid 的组，否则连接会报 EACCES。
+#   默认 GW_UID/GW_GID 为 10001；宿主机建组建议指定显式非冲突 GID（如 sudo groupadd --system -g 10001 feishu-gw-client），
+#   避免宿主机自动分配到 999 与 Alpine 内置 ping(999) 组冲突导致构建报错。
+# 运行（通过共享卷挂载 Unix Socket 给 Avatar，密钥通过 env-file 或 Docker secrets 注入）：
+#   docker run -d --name feishu-gateway \
+#     --read-only --tmpfs /tmp:noexec,nosuid,size=16m \
+#     --cap-drop=ALL --security-opt=no-new-privileges \
+#     -v feishu-gw-data:/data \
+#     -v /run/feishu-gateway:/run/feishu-gateway \
+#     -v /etc/feishu-gateway/gateway.yaml:/etc/feishu-gateway/gateway.yaml:ro \
+#     -e FEISHU_GW_CONFIG=/etc/feishu-gateway/gateway.yaml \
+#     --env-file /etc/feishu-gateway/secrets.env \
+#     feishu-gateway
+FROM node:22-alpine
+
+# 固定 uid/gid：宿主机客户端组的 gid 必须与 GW_GID 一致，Avatar 才能连接挂载出来的 socket
+ARG GW_UID=10001
+ARG GW_GID=10001
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+# 只拷网关自身目录与入口脚本，物理隔离 Avatar 其他模块
+COPY bin/feishu-gateway ./bin/feishu-gateway
+COPY src/gateway ./src/gateway
+
+RUN chmod +x /app/bin/feishu-gateway \
+  && addgroup -S -g "$GW_GID" feishu-gw \
+  && adduser -S -u "$GW_UID" -G feishu-gw -h /data feishu-gw \
+  && mkdir -p /data /run/feishu-gateway \
+  && chown -R feishu-gw:feishu-gw /data /run/feishu-gateway \
+  && chmod 0700 /data \
+  && chmod 0750 /run/feishu-gateway
+
+USER feishu-gw
+ENV FEISHU_GW_CONFIG=/etc/feishu-gateway/gateway.yaml
+
+# 直接以 Node 作为 PID 1 启动，避免 Alpine 无 bash 且确保 SIGTERM 直达网关进程
+ENTRYPOINT ["node", "--experimental-strip-types", "--disable-warning=ExperimentalWarning", "/app/src/gateway/cli.ts"]
+CMD ["run"]
