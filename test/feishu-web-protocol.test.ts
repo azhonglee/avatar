@@ -8,7 +8,10 @@ import { describe, it } from "node:test";
 import { WebSocketServer } from "ws";
 import {
   BinaryWebSocket,
+  CMD_CHAT_MODE,
+  CMD_PUSH_PACKET,
   CMD_READ_MESSAGE,
+  CMD_RESPONSE,
   decodeFrame,
   decodeMessage,
   decodeRichText,
@@ -355,10 +358,25 @@ describe("feishu-web protobuf & wire codec", () => {
     const badVarint = Buffer.from([0x08, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]);
     assert.throws(() => parseProto(badVarint), ProtoWireError);
 
-    // Gateway envelope checks
+    // Gateway envelope checks (real Feishu gateway HTTP responses set field 3 to CMD_RESPONSE=1)
     const validEmpty = encodePacket(CMD_READ_MESSAGE, Buffer.alloc(0), "cid-1");
     assert.equal(unwrapGatewayPayload(validEmpty, { allowEmptyPayload: true, expectedCommand: CMD_READ_MESSAGE, expectedCid: "cid-1" }).length, 0);
     assert.throws(() => unwrapGatewayPayload(validEmpty, { allowEmptyPayload: false }), GatewayError);
+    const liveChatResp = encodePacket(CMD_RESPONSE, Buffer.from("chat-meta"), "cid-chat");
+    assert.equal(
+      unwrapGatewayPayload(liveChatResp, { expectedCommand: CMD_CHAT_MODE, expectedCid: "cid-chat" }).toString("utf8"),
+      "chat-meta",
+    );
+    const liveEmptyResp = new ProtoWriter().uint(3, CMD_RESPONSE).finish();
+    assert.equal(
+      unwrapGatewayPayload(liveEmptyResp, { allowEmptyPayload: true, expectedCommand: CMD_READ_MESSAGE }).length,
+      0,
+    );
+    const wrongCmdResp = encodePacket(CMD_PUSH_PACKET, Buffer.from("wrong"), "cid-bad");
+    assert.throws(
+      () => unwrapGatewayPayload(wrongCmdResp, { expectedCommand: CMD_CHAT_MODE, expectedCid: "cid-bad" }),
+      /响应命令号不匹配/,
+    );
     // Arbitrary protobuf lacking valid Packet header must be rejected even with allowEmptyPayload
     const bogusProto = new ProtoWriter().str(99, "not-a-packet").finish();
     assert.throws(() => unwrapGatewayPayload(bogusProto, { allowEmptyPayload: true }), GatewayError);

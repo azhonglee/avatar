@@ -53,6 +53,7 @@ export {
   CMD_HISTORY,
   CMD_PUSH_PACKET,
   CMD_READ_MESSAGE,
+  CMD_RESPONSE,
   CMD_SEND_MESSAGE,
   decodeChatRecord,
   decodeFrame,

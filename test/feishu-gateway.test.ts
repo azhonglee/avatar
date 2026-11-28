@@ -20,6 +20,7 @@ import {
   CMD_CHAT_MODE,
   CMD_HISTORY,
   CMD_READ_MESSAGE,
+  CMD_RESPONSE,
   CMD_SEND_MESSAGE,
   decodeRichText,
   encodePacket,
@@ -151,7 +152,7 @@ async function startMockFeishu() {
         const found = chats.get(chatId);
         const respPayload = found ? new ProtoWriter().bytes(1, mapEntry(chatId, found)).finish() : Buffer.alloc(0);
         res.writeHead(200, { "content-type": "application/x-protobuf" });
-        res.end(encodePacket(cmd, respPayload, cid));
+        res.end(encodePacket(CMD_RESPONSE, respPayload, cid));
         return;
       }
       if (cmd === CMD_READ_MESSAGE) {
@@ -159,7 +160,7 @@ async function startMockFeishu() {
         const found = messages.get(id);
         const respPayload = found ? new ProtoWriter().bytes(1, mapEntry(id, found)).finish() : Buffer.alloc(0);
         res.writeHead(200, { "content-type": "application/x-protobuf" });
-        res.end(encodePacket(cmd, respPayload, cid));
+        res.end(encodePacket(CMD_RESPONSE, respPayload, cid));
         return;
       }
       if (cmd === CMD_HISTORY) {
@@ -172,7 +173,7 @@ async function startMockFeishu() {
           out.bytes(1, mapEntry(id, buf));
         }
         res.writeHead(200, { "content-type": "application/x-protobuf" });
-        res.end(encodePacket(cmd, out.finish(), cid));
+        res.end(encodePacket(CMD_RESPONSE, out.finish(), cid));
         return;
       }
       if (cmd === CMD_SEND_MESSAGE) {
@@ -199,7 +200,7 @@ async function startMockFeishu() {
         messages.set(replyId, replyBuf);
         const respPayload = new ProtoWriter().bytes(1, replyBuf).finish();
         res.writeHead(200, { "content-type": "application/x-protobuf" });
-        res.end(encodePacket(cmd, respPayload, cid));
+        res.end(encodePacket(CMD_RESPONSE, respPayload, cid));
         return;
       }
     }
