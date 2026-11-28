@@ -32,7 +32,7 @@ import {
   unwrapGatewayPayload,
   WebHttpError,
   WebLoginStore,
-} from "../src/context/feishu-web/index.ts";
+} from "../src/gateway/feishu-web/index.ts";
 
 function makeTmp(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));

@@ -6,11 +6,16 @@ import { describe, it } from "node:test";
 import YAML from "yaml";
 import { createApp } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
-import { USER_SENDER_TYPE, WebLoginStore, type WebMessage } from "../src/context/feishu-web/index.ts";
 import { ContextService } from "../src/context/index.ts";
-import { verifyLoginForWorkspace } from "../src/context/personal-web.ts";
+import { verifyGatewayOwnerForWorkspace } from "../src/context/personal-web.ts";
 import { runDoctor } from "../src/doctor.ts";
 import { EventSupervisor } from "../src/events.ts";
+import { FeishuGatewayClient } from "../src/gateway/client.ts";
+import { loadGatewayConfig } from "../src/gateway/config.ts";
+import { GATEWAY_USER_SENDER_TYPE, type GatewayMessagePayload } from "../src/gateway/protocol.ts";
+import { startGatewayServer } from "../src/gateway/server.ts";
+import { FeishuGatewayService } from "../src/gateway/service.ts";
+import { GatewayStore } from "../src/gateway/store.ts";
 import { scrubPersonalWebEnv } from "../src/harness.ts";
 
 function makeTmp(prefix: string): string {
@@ -19,6 +24,7 @@ function makeTmp(prefix: string): string {
 
 function makeApp(dir: string, overrides: Record<string, unknown> = {}) {
   const cfgPath = path.join(dir, "config.yaml");
+  const defaultSock = path.join(dir, "gw.sock");
   fs.writeFileSync(
     cfgPath,
     YAML.stringify({
@@ -40,6 +46,9 @@ function makeApp(dir: string, overrides: Record<string, unknown> = {}) {
         groups_deny: ["敏感群", "chat-denied"],
         personal_web: {
           enabled: true,
+          gateway_socket: defaultSock,
+          read_token_env: "TEST_GW_READ_TOKEN",
+          reply_token_env: "TEST_GW_REPLY_TOKEN",
           fast_lane: true,
           debounce_ms: 0,
           pre_draft: false,
@@ -52,84 +61,105 @@ function makeApp(dir: string, overrides: Record<string, unknown> = {}) {
   return createApp(loadConfig(cfgPath));
 }
 
-function makeWebMsg(overrides: Partial<WebMessage> = {}): WebMessage {
+function makeGatewayMsg(overrides: Partial<GatewayMessagePayload> = {}): GatewayMessagePayload {
   return {
     id: "70001",
-    ownerId: "owner-1",
-    kind: 4,
-    messageType: "text",
     conversationId: "chat-1",
     conversationKind: "group",
+    chatName: "核心研发群",
     actorId: "actor-2",
-    senderType: USER_SENDER_TYPE,
+    senderType: GATEWAY_USER_SENDER_TYPE,
     text: "请帮我确认下发布时间",
     createdAtMs: Date.now(),
     rootId: "",
     parentId: "",
     threadId: "",
-    cid: "cid-msg",
     position: 10,
-    threadPosition: 0,
-    sendToChat: false,
     mentions: [{ id: "owner-1", name: "@我", start: 0, end: 2 }],
     resources: [],
-    partial: false,
-    unsupported: false,
+    ownerId: "owner-1",
+    ownerName: "Owner",
     ...overrides,
   };
 }
 
-describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
-  it("scrubPersonalWebEnv strips credential env vars without touching unrelated variables", () => {
-    const cleaned = scrubPersonalWebEnv({
-      PATH: "/usr/bin",
-      HOME: "/home/dev",
-      PA_FEISHU_WEB_KEY: "secret-key",
-      PA_FEISHU_WEB_CRED_FILE: "/tmp/cred.json",
+describe("feishu-web gateway client bridge, store dedup, drafts, and env scrub", () => {
+  it("scrubPersonalWebEnv strips gateway keys, tokens, and custom configured token envs", () => {
+    const dir = makeTmp("pa-pw-scrub-");
+    const app = makeApp(dir, {
+      context: {
+        personal_web: {
+          enabled: true,
+          gateway_socket: path.join(dir, "gw.sock"),
+          read_token_env: "CUSTOM_GW_READ_SECRET",
+          reply_token_env: "CUSTOM_GW_REPLY_SECRET",
+        },
+      },
     });
-    assert.equal(cleaned.PATH, "/usr/bin");
-    assert.equal(cleaned.HOME, "/home/dev");
-    assert.equal(cleaned.PA_FEISHU_WEB_KEY, undefined);
-    assert.equal(cleaned.PA_FEISHU_WEB_CRED_FILE, undefined);
+    try {
+      const cleaned = scrubPersonalWebEnv({
+        PATH: "/usr/bin",
+        HOME: "/home/dev",
+        PA_FEISHU_WEB_KEY: "secret-key",
+        PA_FEISHU_WEB_CRED_FILE: "/tmp/cred.json",
+        FEISHU_GW_KEY: "gw-key",
+        FEISHU_GW_READ_TOKEN: "rt-1",
+        FEISHU_GW_REPLY_TOKEN: "wt-1",
+        CUSTOM_GW_READ_SECRET: "custom-read",
+        CUSTOM_GW_REPLY_SECRET: "custom-reply",
+        CREDENTIALS_DIRECTORY: "/run/credentials",
+      });
+      assert.equal(cleaned.PATH, "/usr/bin");
+      assert.equal(cleaned.HOME, "/home/dev");
+      assert.equal(cleaned.PA_FEISHU_WEB_KEY, undefined);
+      assert.equal(cleaned.PA_FEISHU_WEB_CRED_FILE, undefined);
+      assert.equal(cleaned.FEISHU_GW_KEY, undefined);
+      assert.equal(cleaned.FEISHU_GW_READ_TOKEN, undefined);
+      assert.equal(cleaned.FEISHU_GW_REPLY_TOKEN, undefined);
+      assert.equal(cleaned.CUSTOM_GW_READ_SECRET, undefined);
+      assert.equal(cleaned.CUSTOM_GW_REPLY_SECRET, undefined);
+      assert.equal(cleaned.CREDENTIALS_DIRECTORY, undefined);
+    } finally {
+      app.store.db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
-  it("enforces groups_deny, mutedConvs, group scope, recall deletion, and Fast Lane triggers", async () => {
+  it("enforces groups_deny, mutedConvs, group scope, delete tombstone, and Fast Lane triggers", async () => {
     const dir = makeTmp("pa-pw-bridge-");
     const app = makeApp(dir);
     try {
       const svc = new ContextService(app);
       const triggers: string[] = [];
       const bridge = svc.personalWeb;
-      // Inject fake owner state & capture triggers
-      (bridge as unknown as { state: { owner_id: string; owner_name: string } }).state.owner_id = "owner-1";
       (bridge as unknown as { hooks: { onFastTrigger: (t: { trigger_obs_id: string }) => void } }).hooks.onFastTrigger = (t) =>
         triggers.push(t.trigger_obs_id);
 
       // 1) Denied chat ID dropped
-      await bridge.handleMessage(makeWebMsg({ id: "m-denied", conversationId: "chat-denied" }));
+      bridge.handleGatewayMessage(makeGatewayMsg({ id: "m-denied", conversationId: "chat-denied" }));
       assert.equal(svc.store.obs("pw:m-denied"), undefined);
 
       // 2) Muted conv dropped
       svc.store.muteConv("pw_chat:chat-muted", "静音群", true);
-      await bridge.handleMessage(makeWebMsg({ id: "m-muted", conversationId: "chat-muted" }));
+      bridge.handleGatewayMessage(makeGatewayMsg({ id: "m-muted", conversationId: "chat-muted", chatName: "静音群" }));
       assert.equal(svc.store.obs("pw:m-muted"), undefined);
 
       // 3) Unspoken group without @me ignored; after I speak, group is tracked
-      await bridge.handleMessage(makeWebMsg({ id: "m-unspoken", conversationId: "chat-2", mentions: [] }));
+      bridge.handleGatewayMessage(makeGatewayMsg({ id: "m-unspoken", conversationId: "chat-2", mentions: [] }));
       assert.equal(svc.store.obs("pw:m-unspoken"), undefined);
-      await bridge.handleMessage(makeWebMsg({ id: "m-mine", conversationId: "chat-2", actorId: "owner-1", mentions: [], text: "我来跟进" }));
+      bridge.handleGatewayMessage(makeGatewayMsg({ id: "m-mine", conversationId: "chat-2", actorId: "owner-1", mentions: [], text: "我来跟进" }));
       assert.ok(svc.store.obs("pw:m-mine"));
-      await bridge.handleMessage(makeWebMsg({ id: "m-after-spoken", conversationId: "chat-2", mentions: [], text: "好的谢谢" }));
+      bridge.handleGatewayMessage(makeGatewayMsg({ id: "m-after-spoken", conversationId: "chat-2", mentions: [], text: "好的谢谢" }));
       assert.ok(svc.store.obs("pw:m-after-spoken"));
       assert.equal(triggers.length, 0, "regular non-@me group message does not trigger fast lane");
 
       // 4) @me in group persists and triggers Fast Lane
-      await bridge.handleMessage(makeWebMsg({ id: "m-atme", conversationId: "chat-1" }));
+      bridge.handleGatewayMessage(makeGatewayMsg({ id: "m-atme", conversationId: "chat-1" }));
       assert.ok(svc.store.obs("pw:m-atme"));
       assert.deepEqual(triggers, ["pw:m-atme"]);
 
-      // 5) Recalled/empty push deletes existing local obs
-      await bridge.handleMessage(makeWebMsg({ id: "m-atme", conversationId: "chat-1", text: "", unsupported: true }));
+      // 5) Gateway delete tombstone event deletes existing local obs
+      await bridge.handleGatewayEvent({ seq: 99, kind: "delete", message_id: "m-atme", chat_id: "chat-1", created_at: Date.now() });
       assert.equal(svc.store.obs("pw:m-atme"), undefined, "recalled message must be deleted locally");
     } finally {
       app.store.db.close();
@@ -198,12 +228,11 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
         },
       ]);
       assert.equal(n2, 0, "matching lark-cli message is deduplicated against the existing pw:* obs");
-      // pw:9001 只有占位会话名（弱匹配）：只去重，不回填开放平台 ID 和名称
       const weak = svc.store.obs("pw:9001")!;
       assert.equal(weak.conv_name, "群聊(c1)");
       assert.equal(weak.meta.open_message_id, undefined);
 
-      // 双方都有真实群名且一致（强匹配）：回填开放平台 ID 与姓名，并记下原生 ID 的对应关系
+      // Strong match enriches open IDs and aliases
       svc.store.addObs([
         {
           id: "pw:9002",
@@ -244,7 +273,6 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
       assert.equal(svc.store.pwAlias("chat", "c2"), "oc_grp_1");
       assert.equal(svc.store.pwAlias("actor", "8888"), "张三");
 
-      // 另一个群里同一句短话：会话名不同，不得合并或回填
       const n4 = svc.store.addObs([
         {
           id: "im:om_other_grp",
@@ -264,7 +292,6 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
       assert.equal(n4, 1, "same short text from a different chat must be stored separately");
       assert.equal(svc.store.obs("pw:9002")!.meta.open_message_id, "om_grp_9002");
 
-      // 按 oc_ ID 配置的排除在个人 Web 通道同样生效（借助跨通道记下的对应关系）
       app.cfg.context.groups_deny = ["oc_grp_1"];
       assert.equal(svc.personalWeb.isDeniedChat("c2", ""), true);
       app.cfg.context.groups_deny = [];
@@ -308,7 +335,6 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
       const fx = svc.drafter.effectFor(draft, "周四前完成");
       assert.equal(fx.op, "pw.reply");
 
-      // After cross-transport enrichment adds open_message_id, Drafter prefers official lark-cli im.reply
       svc.store.addObs([
         {
           id: "im:om_5001",
@@ -334,75 +360,15 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
     }
   });
 
-  it("verifies workspace owner binding and enforces idempotent delivery recovery", async () => {
+  it("verifies workspace owner binding and fast-fails permanent pw.reply errors on attempt 1", async () => {
     const dir = makeTmp("pa-pw-bind-");
-    const prevKey = process.env.PA_FEISHU_WEB_KEY;
-    process.env.PA_FEISHU_WEB_KEY = "bridge-test-key";
     const app = makeApp(dir);
     try {
-      // open_id 按应用区分，网页端的 open_id 与 owner.open_id 不同不能据此拒绝（只告警）
-      assert.doesNotThrow(() =>
-        verifyLoginForWorkspace(app, {
-          owner_id: "1001",
-          owner_name: "Other",
-          owner_open_id: "ou_someone_else",
-          cookies: [],
-        }),
-      );
-
-      // Matching open_id accepted and bound
-      const loginStore = new WebLoginStore(dir);
-      const saved = loginStore.save({
-        owner_id: "1001",
-        owner_name: "Owner",
-        owner_open_id: "ou_owner",
-        cookies: [{ name: "session", value: "s1", domain: "feishu.cn", path: "/" }],
-      });
-      verifyLoginForWorkspace(app, saved);
       app.store.set("ctx.personal_web.bound_owner_id", "1001");
+      assert.doesNotThrow(() => verifyGatewayOwnerForWorkspace(app, "1001"));
+      assert.throws(() => verifyGatewayOwnerForWorkspace(app, "2002"), /不一致/);
 
-      // Different native owner rejected unless forceSwitch
-      assert.throws(
-        () => verifyLoginForWorkspace(app, { owner_id: "2002", owner_name: "Other", cookies: [] }),
-        /force-switch-account/,
-      );
-      verifyLoginForWorkspace(app, { owner_id: "2002", owner_name: "Other", cookies: [] }, { forceSwitch: true });
-
-      // Idempotent delivery: already-verified cid returns without touching network
       const svc = new ContextService(app);
-      app.store.set(
-        "ctx.pw_delivery.cid-already-done",
-        JSON.stringify({
-          status: "verified",
-          replyId: "rep-1",
-          chatId: "chat-1",
-          rootId: "root-1",
-          parentId: "root-1",
-          threaded: true,
-          threadId: "th-1",
-          updatedAt: Date.now(),
-        }),
-      );
-      const res = await svc.personalWeb.sendVerifiedReply({
-        chat_id: "chat-1",
-        message_id: "root-1",
-        text: "重复投递测试",
-        cid: "cid-already-done",
-      });
-      assert.equal(res.verified, true);
-      assert.equal(res.replyId, "rep-1");
-
-      // 上次发包结果不明（sending）：拒绝自动重发，也不触网，且经 effectHandler 立刻落 dead 终态而非退避重试 10 次
-      app.store.set(
-        "ctx.pw_delivery.cid-uncertain",
-        JSON.stringify({ status: "sending", replyId: "", chatId: "chat-1", rootId: "root-1", parentId: "root-1", threaded: true, updatedAt: Date.now() }),
-      );
-      await assert.rejects(
-        svc.personalWeb.sendVerifiedReply({ chat_id: "chat-1", message_id: "root-1", text: "重复投递测试", cid: "cid-uncertain" }),
-        /结果不明确/,
-      );
-
-      // 端到端验证：PermanentEffectError 经 engine.drain 仅尝试 1 次即落 dead，草稿立刻转为 failed
       const p = svc.store.upsertProject({ name: "失败速报项目" });
       const { item: it } = svc.store.upsertItem({ project_id: p.id, kind: "ask_me", title: "速报测试", priority: "high" });
       const d = svc.store.addDraft({
@@ -414,7 +380,6 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
         content: "确认方案",
       });
       app.cfg.context.personal_web.send_replies = false;
-      app.store.set("ctx.pw_delivery.force", "");
       await app.commands.exec("context.draft_approve", { id: d.id }, { source: "cli", actor: "owner" });
       await app.engine.drain(["effect"]);
       const fx = app.ledger.effectsOf(`ctx-draft:${d.id}`).at(-1)!;
@@ -424,8 +389,6 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
       assert.equal(svc.store.draft(d.id)?.status, "failed");
     } finally {
       app.store.db.close();
-      if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
-      else process.env.PA_FEISHU_WEB_KEY = prevKey;
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -437,7 +400,6 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
       const svc = new ContextService(app);
       const now = Date.now();
 
-      // 1) 短私聊（< 8 字）：pw 侧 conv_name="张三" vs lark-cli 侧 conv_name="私聊：张三" 应 strong 命中并回填开放平台 ID 与别名
       assert.equal(
         svc.store.addObs([
           {
@@ -482,7 +444,6 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
       assert.equal(enriched.meta.open_chat_id, "oc_dm_zs");
       assert.equal(svc.store.pwAlias("chat", "native_dm_zs"), "oc_dm_zs");
 
-      // 2) 本人给两个不同私聊 15 秒内发相同 >=8 字消息，不得误合并
       assert.equal(
         svc.store.addObs([
           {
@@ -523,11 +484,9 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
         "不同私聊的本人同文本消息绝不能误合并",
       );
 
-      // 3) lark-cli 侧静音的私聊（name="私聊：王五"）必须拦住个人 Web（chatName="王五"）
       svc.store.muteConv("oc_dm_ww", "私聊：王五", true);
       assert.equal(svc.personalWeb.isDeniedChat("native_dm_ww", "王五"), true);
 
-      // 4) addBackgroundObs 不得把同群 15 秒内两位不同成员的相同短消息误判为跨通道重复
       const bgAdded = svc.store.addBackgroundObs([
         {
           id: "pw:bg_1",
@@ -565,29 +524,76 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
     }
   });
 
-  it("defers concurrent fastCycle on the same conv, flags invalid encryption key in doctor/status, and scrubs EventSupervisor env", async () => {
+  it("probes live gateway in doctor, defers concurrent fastCycle on same conv, and scrubs EventSupervisor env", async () => {
     const dir = makeTmp("pa-pw-conc-");
-    const prevKey = process.env.PA_FEISHU_WEB_KEY;
+    const gwDir = path.join(dir, "gw");
+    const sockPath = path.join(dir, "gw.sock");
+    const gwCfgPath = path.join(dir, "gateway.yaml");
+    fs.writeFileSync(
+      gwCfgPath,
+      YAML.stringify({
+        data_dir: gwDir,
+        listen: { socket: sockPath, socket_mode: "0600" },
+        allow_reply: false,
+      }),
+    );
+
+    const prevRead = process.env.TEST_GW_READ_TOKEN;
+    const prevReply = process.env.TEST_GW_REPLY_TOKEN;
+    const prevKey = process.env.FEISHU_GW_KEY;
     const prevCredDir = process.env.CREDENTIALS_DIRECTORY;
-    const app = makeApp(dir);
+
+    const gwCfg = loadGatewayConfig(gwCfgPath);
+    const gwStore = new GatewayStore(gwCfg.dataDir);
+    const gwService = new FeishuGatewayService(gwCfg, gwStore);
+    const tokens = gwStore.resolveTokens();
+    const gwServer = await startGatewayServer(gwCfg, gwService, tokens);
+    const app = makeApp(dir, {
+      context: {
+        personal_web: {
+          enabled: true,
+          gateway_socket: sockPath,
+          read_token_env: "TEST_GW_READ_TOKEN",
+          reply_token_env: "TEST_GW_REPLY_TOKEN",
+          send_replies: false,
+        },
+      },
+    });
+
     try {
-      // 1) 密钥不匹配（invalid）时 doctor 报 fail(ready=false) 且 personalWeb.status() 报 needs_login + 解密失败原因
-      process.env.PA_FEISHU_WEB_KEY = "key-original";
-      const loginStore = new WebLoginStore(dir);
-      loginStore.save({ owner_id: "1001", owner_name: "Owner", cookies: [{ name: "session", value: "s1", domain: "feishu.cn", path: "/" }] });
-      process.env.PA_FEISHU_WEB_KEY = "key-wrong";
+      // 1) Missing read token -> doctor fails
+      delete process.env.TEST_GW_READ_TOKEN;
+      const docMissing = await runDoctor(app);
+      const pwMissing = docMissing.checks.find((c) => c.id === "personal_web");
+      assert.equal(pwMissing?.status, "fail");
+      assert.match(pwMissing?.detail ?? "", /缺少网关只读令牌/);
 
+      // 2) Wrong read token -> doctor fails with 401 auth error
+      process.env.TEST_GW_READ_TOKEN = "wrong-token-value-123456";
+      const docAuthFail = await runDoctor(app);
+      const pwAuthFail = docAuthFail.checks.find((c) => c.id === "personal_web");
+      assert.equal(pwAuthFail?.status, "fail");
+      assert.match(pwAuthFail?.detail ?? "", /鉴权失败/);
+
+      // 3) Valid read token, gateway has invalid encrypted cred -> doctor fails clearly
+      process.env.FEISHU_GW_KEY = "key-original";
+      gwService.loginStore.save({ owner_id: "1001", owner_name: "Owner", cookies: [{ name: "session", value: "s1", domain: "feishu.cn", path: "/" }] });
+      process.env.FEISHU_GW_KEY = "key-wrong";
+      process.env.TEST_GW_READ_TOKEN = tokens.readToken;
+      const docInvalid = await runDoctor(app);
+      const pwInvalid = docInvalid.checks.find((c) => c.id === "personal_web");
+      assert.equal(pwInvalid?.status, "fail");
+      assert.match(pwInvalid?.detail ?? "", /invalid|解密失败/);
+
+      // 4) Valid key + valid read token -> doctor ok
+      process.env.FEISHU_GW_KEY = "key-original";
+      const docOk = await runDoctor(app);
+      const pwOk = docOk.checks.find((c) => c.id === "personal_web");
+      assert.equal(pwOk?.status, "ok");
+      assert.match(pwOk?.detail ?? "", /Owner/);
+
+      // 5) Same conv concurrent fastCycle deferred with refunded attempt
       const svc = new ContextService(app);
-      const st = svc.personalWeb.status();
-      assert.equal(st.state, "needs_login");
-      assert.match(st.last_error, /解密失败|损坏/);
-
-      const doc = await runDoctor(app);
-      const pwCheck = doc.checks.find((c) => c.id === "personal_web");
-      assert.equal(pwCheck?.status, "fail");
-      assert.match(pwCheck?.detail ?? "", /解密失败|损坏/);
-
-      // 2) 同会话并发 fast 任务互斥：当 conv 已在 activeConvs 中时，第 2 个 fast 任务延后 release 且退回 attempts
       (svc as unknown as { activeConvs: Set<string> }).activeConvs.add("pw_chat:busy");
       app.ledger.enqueue({
         id: "context:fast:busy:2",
@@ -605,15 +611,14 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
       assert.ok(deferred.next_at >= before + 2500);
       (svc as unknown as { activeConvs: Set<string> }).activeConvs.delete("pw_chat:busy");
 
-      // 3) EventSupervisor 直接 spawn 时也必须剥离 PA_FEISHU_WEB_KEY 与 CREDENTIALS_DIRECTORY
+      // 6) EventSupervisor strips gateway tokens & CREDENTIALS_DIRECTORY
       const probeBin = path.join(dir, "fake-lark");
       const envDump = path.join(dir, "event-env.txt");
       fs.writeFileSync(
         probeBin,
-        `#!/bin/sh\necho "KEY=\${PA_FEISHU_WEB_KEY:-EMPTY} CRED=\${CREDENTIALS_DIRECTORY:-EMPTY}" > ${JSON.stringify(envDump)}\n`,
+        `#!/bin/sh\necho "READ=\${TEST_GW_READ_TOKEN:-EMPTY} KEY=\${FEISHU_GW_KEY:-EMPTY} CRED=\${CREDENTIALS_DIRECTORY:-EMPTY}" > ${JSON.stringify(envDump)}\n`,
         { mode: 0o755 },
       );
-      process.env.PA_FEISHU_WEB_KEY = "leak-check-key";
       process.env.CREDENTIALS_DIRECTORY = "/tmp/leak-cred-dir";
       app.cfg.bins.lark = probeBin;
       const sup = new EventSupervisor(app.cfg, () => undefined);
@@ -621,11 +626,21 @@ describe("feishu-web bridge, store dedup, drafts, and env scrub", () => {
       const deadline = Date.now() + 3000;
       while (!fs.existsSync(envDump) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
       await sup.stop();
-      assert.equal(fs.readFileSync(envDump, "utf8").trim(), "KEY=EMPTY CRED=EMPTY");
+      assert.equal(fs.readFileSync(envDump, "utf8").trim(), "READ=EMPTY KEY=EMPTY CRED=EMPTY");
+
+      // Verify FeishuGatewayClient rejects non-loopback HTTP URLs
+      assert.throws(() => new FeishuGatewayClient({ baseUrl: "http://192.168.1.10:7879", readToken: tokens.readToken }), /回环地址/);
     } finally {
+      gwService.stop();
+      await gwServer.stop();
+      gwStore.close();
       app.store.db.close();
-      if (prevKey === undefined) delete process.env.PA_FEISHU_WEB_KEY;
-      else process.env.PA_FEISHU_WEB_KEY = prevKey;
+      if (prevRead === undefined) delete process.env.TEST_GW_READ_TOKEN;
+      else process.env.TEST_GW_READ_TOKEN = prevRead;
+      if (prevReply === undefined) delete process.env.TEST_GW_REPLY_TOKEN;
+      else process.env.TEST_GW_REPLY_TOKEN = prevReply;
+      if (prevKey === undefined) delete process.env.FEISHU_GW_KEY;
+      else process.env.FEISHU_GW_KEY = prevKey;
       if (prevCredDir === undefined) delete process.env.CREDENTIALS_DIRECTORY;
       else process.env.CREDENTIALS_DIRECTORY = prevCredDir;
       fs.rmSync(dir, { recursive: true, force: true });

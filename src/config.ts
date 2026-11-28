@@ -3,7 +3,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 import { z } from "zod";
-import { expandHome } from "./util.ts";
+import { ENV_NAME_RE, validateLoopbackGatewayUrl } from "./gateway/protocol.ts";
+import { expandHome, registerScrubbedEnvKeys } from "./util.ts";
 
 /** 项目根目录（prompts/、bin/guard/ 都相对它）。 */
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -247,20 +248,28 @@ const Schema = z.object({
         })
         .prefault({}),
       /**
-       * 个人 Web 协议实时通道（基于飞书网页版长连接）：
-       * 无需拉机器人进群即可秒级收到本人所有群聊与私聊推送；对外回复永远需要你确认草稿。
+       * 个人 Web 协议实时通道（独立常驻网关客户端）：
+       * Avatar 主进程不再接触个人 Web 加密密钥与 Cookie，仅作为独立 feishu-gateway 的最小权限客户端消费事件流与提交经确认的回复。
        */
       personal_web: z
         .object({
-          /** 是否启用个人 Web 协议长连接（需先运行 `pa context web-login` 本人扫码登录） */
+          /** 是否启用独立个人 Web 网关客户端（需先独立运行 `feishu-gateway run` 并配置 gateway_socket 或 gateway_url） */
           enabled: z.boolean().default(false),
+          /** 网关 Unix Domain Socket 路径（推荐，如 /run/feishu-gateway/gateway.sock）；与 gateway_url 二选一 */
+          gateway_socket: z.string().default(""),
+          /** 网关回环 HTTP 地址（仅允许 127.0.0.1 / localhost / [::1]，如 http://127.0.0.1:7879）；与 gateway_socket 二选一 */
+          gateway_url: z.string().default(""),
+          /** 存放网关只读令牌（read_token）的环境变量名；勿把明文令牌写进 config.yaml */
+          read_token_env: z.string().default("FEISHU_GW_READ_TOKEN"),
+          /** 存放网关回复令牌（reply_token）的环境变量名；仅 send_replies: true 时使用 */
+          reply_token_env: z.string().default("FEISHU_GW_REPLY_TOKEN"),
           /** 收到真实 @我 或对方私聊时，不等 10 分钟定时周期，立刻走单会话快通道理解与提醒 */
           fast_lane: z.boolean().default(true),
           /** 同一会话短时间连发多条消息时合并等待的毫秒数 */
           debounce_ms: z.number().int().min(0).max(30_000).default(2500),
           /** 快通道识别出高优先级「别人在等你」时是否自动起草回复草稿（仅起草，仍需你确认才发） */
           pre_draft: z.boolean().default(false),
-          /** 当草稿目标来自个人 Web 原生数字 ID 且尚无开放平台 om_ ID 时，允许你确认后经个人 Web 协议回复（带发送前核验与独立回读确认） */
+          /** 当草稿目标来自个人 Web 原生数字 ID 且尚无开放平台 om_ ID 时，允许你确认后经独立网关发送回复（需网关同时开启 allow_reply 且配置独立 reply_token） */
           send_replies: z.boolean().default(false),
         })
         .prefault({}),
@@ -341,6 +350,53 @@ export function repoSpec(cfg: Config, ref: string): RepoSpec {
 /** 配置的 zod schema（设置服务用它校验写入）。 */
 export const ConfigSchema = Schema;
 
+/** 校验个人 Web 独立网关客户端配置，供 loadConfig 与 settings.crossCheck 共用。 */
+export function validatePersonalWebConfig(
+  pw: z.infer<typeof ConfigSchema>["context"]["personal_web"],
+): Array<{ path: string; message: string }> {
+  const issues: Array<{ path: string; message: string }> = [];
+  const sock = pw.gateway_socket.trim();
+  const url = pw.gateway_url.trim();
+  const readEnv = pw.read_token_env.trim();
+  const replyEnv = pw.reply_token_env.trim();
+
+  if (sock && url) {
+    issues.push({
+      path: "context.personal_web.gateway_url",
+      message: "gateway_socket 与 gateway_url 只能二选一",
+    });
+  }
+  if (url) {
+    try {
+      validateLoopbackGatewayUrl(url);
+    } catch (e) {
+      issues.push({
+        path: "context.personal_web.gateway_url",
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+  if (readEnv && !ENV_NAME_RE.test(readEnv)) {
+    issues.push({ path: "context.personal_web.read_token_env", message: `无效的环境变量名：${readEnv}` });
+  }
+  if (replyEnv && !ENV_NAME_RE.test(replyEnv)) {
+    issues.push({ path: "context.personal_web.reply_token_env", message: `无效的环境变量名：${replyEnv}` });
+  }
+  if (readEnv && replyEnv && readEnv === replyEnv) {
+    issues.push({
+      path: "context.personal_web.reply_token_env",
+      message: "read_token_env 与 reply_token_env 不能指向同一个环境变量（读写权限必须分离）",
+    });
+  }
+  if (pw.enabled && !sock && !url) {
+    issues.push({
+      path: "context.personal_web.gateway_socket",
+      message: "启用个人 Web 网关时必须配置 gateway_socket 或 gateway_url 之一",
+    });
+  }
+  return issues;
+}
+
 export function loadConfig(file = process.env.PA_CONFIG ?? path.join(ROOT, "config.yaml")): Config {
   if (!fs.existsSync(file)) {
     throw new Error(`找不到配置文件 ${file}。先执行：cp config.example.yaml config.yaml 并按需修改`);
@@ -354,6 +410,11 @@ export function loadConfig(file = process.env.PA_CONFIG ?? path.join(ROOT, "conf
   for (const h of Object.values(cfg.harnesses)) {
     if (h.type === "acpx" && !h.agent === !h.agentCommand) throw new Error("acpx 类型的 harness 必须且只能设置 agent 或 agentCommand 之一");
   }
+  const pwIssues = validatePersonalWebConfig(cfg.context.personal_web);
+  if (pwIssues.length) {
+    throw new Error(`配置文件 ${file} 有误：\n${pwIssues.map((i) => `- ${i.path}: ${i.message}`).join("\n")}`);
+  }
+  registerScrubbedEnvKeys([cfg.context.personal_web.read_token_env, cfg.context.personal_web.reply_token_env]);
   const dataDir = path.resolve(expandHome(cfg.data_dir));
   for (const sub of ["logs", "runs", "workspace", "worktrees"]) fs.mkdirSync(path.join(dataDir, sub), { recursive: true });
   return { ...cfg, dataDir, file };

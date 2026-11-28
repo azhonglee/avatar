@@ -5,7 +5,8 @@ import YAML from "yaml";
 import type { App } from "./app.ts";
 import type { DoctorCheck, DoctorReport } from "./api/types.ts";
 import { repoSpec } from "./config.ts";
-import { WebLoginStore } from "./context/feishu-web/index.ts";
+import { createGatewayClientForConfig, resolveGatewayClientConfig, verifyGatewayOwnerForWorkspace } from "./context/personal-web.ts";
+import { GatewayHttpError } from "./gateway/protocol.ts";
 import { resolveBin } from "./harness.ts";
 import { consoleBaseUrl, isLoopbackHost } from "./server/index.ts";
 import { validateConfig } from "./settings.ts";
@@ -351,51 +352,86 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
     return ok(detail, fix);
   });
 
-  add("personal_web", "个人 Web 实时通道", async () => {
-    if (!cfg.context.enabled || !cfg.context.personal_web.enabled) {
+  add("personal_web", "个人 Web 独立网关", async () => {
+    const pwCfg = cfg.context.personal_web;
+    if (!cfg.context.enabled || !pwCfg.enabled) {
       return skip(
         "未启用（当前仅走 lark-cli 定时采集）",
-        `如需秒级响应任意群 @我 与私聊，先配置加密密钥 ${code("PA_FEISHU_WEB_KEY")}，运行 ${code("bin/pa context web-login")} 扫码，再把 ${code("context.personal_web.enabled")} 设为 true`,
+        `如需秒级响应任意群 @我 与私聊，请先以独立进程/用户部署 ${code("bin/feishu-gateway")}（${code("feishu-gateway login")} + ${code("feishu-gateway run")}），再在 ${code("config.yaml")} 中配置 ${code("context.personal_web.gateway_socket")}（或 ${code("gateway_url")}）并将 ${code("enabled")} 设为 true`,
       );
     }
-    const inspected = new WebLoginStore(cfg.dataDir).inspect();
-    if (inspected.status === "missing_key") {
+    const resolved = resolveGatewayClientConfig(pwCfg);
+    if (!resolved.socketPath && !resolved.baseUrl) {
       return fail(
-        "检测到加密凭据文件，但当前环境缺少解密密钥",
-        `设置环境变量 ${code("PA_FEISHU_WEB_KEY")} 或通过 systemd ${code("LoadCredential=feishu-web-key:...")} 提供密钥`,
+        "已启用个人 Web 通道但未配置网关地址",
+        `在 ${code("config.yaml")} 中配置 ${code("context.personal_web.gateway_socket")} 或回环 ${code("gateway_url")}`,
       );
     }
-    if (inspected.status === "plaintext_rejected") {
+    if (!resolved.readToken) {
       return fail(
-        "检测到明文凭据文件（已拒绝加载）",
-        `配置 ${code("PA_FEISHU_WEB_KEY")} 后运行 ${code("bin/pa context web-login")} 重新生成加密凭据`,
+        `缺少网关只读令牌（环境变量 ${pwCfg.read_token_env || "FEISHU_GW_READ_TOKEN"} 未设置）`,
+        `在网关侧运行 ${code("bin/feishu-gateway tokens")} 获取 read_token，并在运行 Avatar 前导出环境变量 ${code(pwCfg.read_token_env || "FEISHU_GW_READ_TOKEN")}`,
       );
     }
-    if (inspected.status === "invalid") {
+    if (resolved.replyToken && resolved.readToken === resolved.replyToken) {
       return fail(
-        "加密凭据解密失败或已损坏（可能是密钥不匹配）",
-        `核对 ${code("PA_FEISHU_WEB_KEY")} / ${code("CREDENTIALS_DIRECTORY/feishu-web-key")}，或运行 ${code("bin/pa context web-login")} 重新扫码`,
+        "安全约束违规：read_token 与 reply_token 相同",
+        `为 ${code(pwCfg.read_token_env)} 与 ${code(pwCfg.reply_token_env)} 配置各自独立的令牌`,
       );
     }
-    if (inspected.status !== "ok") {
-      return warn(
-        "已启用但尚未扫码登录（期间仍由每 10 分钟的飞书轮询兜底）",
-        `配置 ${code("PA_FEISHU_WEB_KEY")} 后运行 ${code("bin/pa context web-login")} 使用本人飞书 App 扫码登录`,
+    if (pwCfg.send_replies && !resolved.replyToken) {
+      return fail(
+        `已开启 send_replies 但缺少回复令牌（环境变量 ${pwCfg.reply_token_env || "FEISHU_GW_REPLY_TOKEN"} 未设置）`,
+        `在运行 Avatar 前导出 ${code(pwCfg.reply_token_env || "FEISHU_GW_REPLY_TOKEN")}，或关闭 ${code("context.personal_web.send_replies")}`,
       );
     }
-    let state = "idle";
-    let lastError = "";
     try {
-      const saved = JSON.parse(store.get("ctx.personal_web.state") ?? "null") as { state?: string; last_error?: string } | null;
-      if (saved?.state) state = saved.state;
-      if (saved?.last_error) lastError = saved.last_error;
-    } catch {
-      // ignore malformed kv
+      const client = createGatewayClientForConfig(pwCfg);
+      const st = await client.status({ timeoutMs: 3_000 });
+      if (st.owner_id) {
+        try {
+          verifyGatewayOwnerForWorkspace(app, st.owner_id);
+        } catch (e) {
+          return fail(errMsg(e), `确认 ${resolved.endpointLabel} 指向正确的网关实例，或使用对应个人账号`);
+        }
+      }
+      if (st.credential_status === "missing_key") {
+        return fail(
+          `网关缺少凭据解密密钥（${resolved.endpointLabel}）`,
+          `在网关侧配置 ${code("FEISHU_GW_KEY")}（或 systemd ${code("LoadCredential=feishu-gw-key:...")}）并重启网关`,
+        );
+      }
+      if (st.credential_status === "plaintext_rejected" || st.credential_status === "invalid") {
+        return fail(
+          `网关凭据异常（${st.credential_status}）：${st.last_error || "解密失败"}`,
+          `在网关侧核对 ${code("FEISHU_GW_KEY")} 或重新运行 ${code("bin/feishu-gateway login")}`,
+        );
+      }
+      if (!st.logged_in || st.state === "needs_login") {
+        return warn(
+          `网关在线但尚未登录或会话已失效（${st.last_error || st.credential_status}）`,
+          `在网关侧运行 ${code("bin/feishu-gateway login")} 使用本人飞书 App 扫码登录`,
+        );
+      }
+      if (pwCfg.send_replies && !st.allow_reply) {
+        return warn(
+          `网关已连接（${st.owner_name || st.owner_id}，${st.state}），但网关侧 allow_reply 为 false，无法发送回复`,
+          `如需走个人 Web 发送回复，请在网关 ${code("gateway.yaml")} 中显式设置 ${code("allow_reply: true")} 并重启网关`,
+        );
+      }
+      return ok(`${st.owner_name || st.owner_id}（${resolved.endpointLabel}，状态：${st.state}，缓存 seq ${st.latest_seq}）`);
+    } catch (e) {
+      if (e instanceof GatewayHttpError && (e.statusCode === 401 || e.statusCode === 403)) {
+        return fail(
+          `网关鉴权失败（${e.code}）：${e.message}`,
+          `核对 ${code(pwCfg.read_token_env || "FEISHU_GW_READ_TOKEN")} 是否与网关 ${code("bin/feishu-gateway tokens")} 输出的 read_token 一致`,
+        );
+      }
+      return warn(
+        `无法连接到个人 Web 网关 ${resolved.endpointLabel}：${errMsg(e)}（期间由每 10 分钟的飞书轮询兜底）`,
+        `确认独立网关正在运行（${code("bin/feishu-gateway run")}）且当前用户对 socket 有访问权限`,
+      );
     }
-    if (state === "needs_login") {
-      return warn(`会话已失效（${lastError || "需要重新扫码"}）`, `运行 ${code("bin/pa context web-login")} 重新扫码登录`);
-    }
-    return ok(`${inspected.login.owner_name || inspected.login.owner_id}（已加密登录，当前状态：${state}）`);
   });
 
   add("data_dir", "数据目录", async () => {

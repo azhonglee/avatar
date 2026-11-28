@@ -249,15 +249,17 @@ interface EncryptedEnvelope {
 }
 
 function resolveEncryptionKey(): Buffer | undefined {
-  const envKey = process.env.PA_FEISHU_WEB_KEY?.trim();
+  const envKey = process.env.FEISHU_GW_KEY?.trim() || process.env.PA_FEISHU_WEB_KEY?.trim();
   if (envKey) return crypto.createHash("sha256").update(envKey, "utf8").digest();
   const credDir = process.env.CREDENTIALS_DIRECTORY?.trim();
   if (credDir) {
-    try {
-      const raw = fs.readFileSync(path.join(credDir, "feishu-web-key"), "utf8").trim();
-      if (raw) return crypto.createHash("sha256").update(raw, "utf8").digest();
-    } catch {
-      // key file absent
+    for (const name of ["feishu-gw-key", "feishu-web-key"]) {
+      try {
+        const raw = fs.readFileSync(path.join(credDir, name), "utf8").trim();
+        if (raw) return crypto.createHash("sha256").update(raw, "utf8").digest();
+      } catch {
+        // key file absent
+      }
     }
   }
   return undefined;
@@ -290,14 +292,14 @@ function decryptPayload(env: EncryptedEnvelope, key: Buffer): string {
 
 /**
  * Atomic 0600 AES-256-GCM encrypted store for the owner's personal Feishu Web session.
- * Requires `PA_FEISHU_WEB_KEY` or systemd `CREDENTIALS_DIRECTORY/feishu-web-key` so session cookies
- * are never written to disk in plaintext.
+ * Requires `FEISHU_GW_KEY` / `PA_FEISHU_WEB_KEY` or systemd `CREDENTIALS_DIRECTORY/feishu-gw-key`
+ * (`feishu-web-key`) so session cookies are never written to disk in plaintext.
  */
 export class WebLoginStore {
   readonly file: string;
 
   constructor(dataDir: string, filename = "feishu-web.json") {
-    const external = process.env.PA_FEISHU_WEB_CRED_FILE?.trim();
+    const external = process.env.FEISHU_GW_CRED_FILE?.trim() || process.env.PA_FEISHU_WEB_CRED_FILE?.trim();
     this.file = external ? path.resolve(external) : path.join(dataDir, filename);
   }
 
@@ -356,7 +358,7 @@ export class WebLoginStore {
     const key = resolveEncryptionKey();
     if (!key) {
       throw new Error(
-        "保存个人 Web 凭据必须配置加密密钥（设置环境变量 PA_FEISHU_WEB_KEY 或通过 systemd LoadCredential 提供 CREDENTIALS_DIRECTORY/feishu-web-key），拒绝明文写入磁盘",
+        "保存个人 Web 凭据必须配置加密密钥（设置环境变量 FEISHU_GW_KEY / PA_FEISHU_WEB_KEY，或通过 systemd LoadCredential 提供 feishu-gw-key / feishu-web-key），拒绝明文写入磁盘",
       );
     }
     const dir = path.dirname(this.file);

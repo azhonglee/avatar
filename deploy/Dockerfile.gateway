@@ -1,0 +1,34 @@
+# 独立部署边界容器：仅包含 feishu-gateway 与其最小运行时依赖，不包含 Avatar 业务代码或 harness 工具。
+# 构建：docker build -f deploy/Dockerfile.gateway -t feishu-gateway .
+# 运行（通过共享卷挂载 Unix Socket 给 Avatar，密钥通过 env-file 或 Docker secrets 注入）：
+#   docker run -d --name feishu-gateway \
+#     --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+#     -v feishu-gw-data:/data \
+#     -v /run/feishu-gateway:/run/feishu-gateway \
+#     -v /etc/feishu-gateway/gateway.yaml:/etc/feishu-gateway/gateway.yaml:ro \
+#     -e FEISHU_GW_CONFIG=/etc/feishu-gateway/gateway.yaml \
+#     --env-file /etc/feishu-gateway/secrets.env \
+#     feishu-gateway
+FROM node:22-alpine
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+# 只拷网关自身目录与入口脚本，物理隔离 Avatar 其他模块
+COPY bin/feishu-gateway ./bin/feishu-gateway
+COPY src/gateway ./src/gateway
+
+RUN chmod +x /app/bin/feishu-gateway \
+  && addgroup -S feishu-gw \
+  && adduser -S -G feishu-gw -h /data feishu-gw \
+  && mkdir -p /data /run/feishu-gateway \
+  && chown -R feishu-gw:feishu-gw /data /run/feishu-gateway \
+  && chmod 0700 /data \
+  && chmod 0750 /run/feishu-gateway
+
+USER feishu-gw
+ENV FEISHU_GW_CONFIG=/etc/feishu-gateway/gateway.yaml
+
+ENTRYPOINT ["/app/bin/feishu-gateway"]
+CMD ["run"]

@@ -26,7 +26,7 @@ import {
   type WebEndpoints,
   type WebLogin,
   type WebMessage,
-} from "../src/context/feishu-web/index.ts";
+} from "../src/gateway/feishu-web/index.ts";
 
 function buildMessageBytes(opts: {
   id: string;

@@ -1,0 +1,33 @@
+# feishu-gateway 独立常驻网关配置。复制为 gateway.yaml 后按需修改（gateway.yaml 不进 git）。
+# 强烈建议以独立 OS 用户或独立容器部署，与 Avatar 主进程和代码 worker 物理隔离。
+
+# 网关独占数据目录（建议 0700，仅网关 OS 用户可访问）：
+# 存放 AES-256-GCM 加密凭据（feishu-web.json）、事件缓存与幂等账本（gateway.db）、以及令牌文件（tokens.json）。
+data_dir: ~/.feishu-gateway
+
+listen:
+  # 方式 1（推荐）：Unix Domain Socket（配合独立 OS 用户 feishu-gw + 属组 feishu-gw-client + mode 0660 形成内核级边界）
+  socket: ~/.feishu-gateway/run/gateway.sock
+  socket_mode: "0660"         # 仅允许属主可读写且禁止 other 权限（如 0600 或 0660）
+
+  # 方式 2（可选，本机调试或端口转发）：回环 TCP（与 socket 二选一；启用时需将上面 socket 置为 ""）
+  # 安全边界：仅允许 127.0.0.1 / localhost / ::1，拒绝绑定 0.0.0.0
+  host: ""
+  port: 0
+
+# 网关侧回复总闸门（默认 false，安全闭锁）：
+# 设为 false 时，即使客户端持有 reply_token 也无法发送任何个人 Web 回复（仅已完成发包的回读核验例外）。
+allow_reply: false
+
+# 网关侧强制排除的会话（原生 chat_id、pw_chat:<id> 或群名/私聊名关键字）：
+# 命中会话的消息绝不落库缓存、绝不推给客户端、绝不允许回复，客户端无法通过接口覆盖。
+deny_chats: []
+
+# 网关本地 SQLite 事件缓存保留天数（撤回消息会立即擦除缓存正文并下发 delete 墓碑事件）
+retention_days: 7
+
+# 已完成（verified）的发送幂等记录保留天数
+delivery_retention_days: 30
+
+# 日志与命令行展示时区
+timezone: Asia/Shanghai

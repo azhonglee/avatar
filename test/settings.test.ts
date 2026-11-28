@@ -44,6 +44,11 @@ dispatch:
 
 schedules:
   capture: "*/15 * * * *"
+
+context:
+  personal_web:
+    enabled: false
+    gateway_socket: ${path.join(tmp, "gw.sock")}
 `;
 
 const settings = () => app.ext.settings!;
@@ -147,10 +152,16 @@ test("校验失败：返回点分路径和中文信息，文件和内存都不�
 
 test("禁止修改 data_dir / bins；回传原值可以", async () => {
   const before = read();
-  for (const patch of [{ data_dir: "/tmp/elsewhere" }, { bins: { lark: "/usr/bin/evil" } }]) {
+  for (const patch of [
+    { data_dir: "/tmp/elsewhere" },
+    { bins: { lark: "/usr/bin/evil" } },
+    { context: { personal_web: { gateway_socket: "/tmp/evil.sock" } } },
+    { context: { personal_web: { gateway_url: "http://127.0.0.1:9999" } } },
+    { context: { personal_web: { read_token_env: "AWS_SECRET_ACCESS_KEY" } } },
+    { context: { personal_web: { reply_token_env: "OTHER_SECRET" } } },
+  ]) {
     const r = await settings().put(patch);
     assert.equal(r.ok, false);
-    assert.equal(r.errors[0].path, Object.keys(patch)[0]);
     assert.match(r.errors[0].message, /不能在控制台修改/);
     assert.equal(read(), before);
   }

@@ -5,7 +5,7 @@ import YAML, { isMap, type Document } from "yaml";
 import { z } from "zod";
 import type { App } from "./app.ts";
 import type { SettingsUpdateResult, SettingsView } from "./api/types.ts";
-import { ConfigSchema } from "./config.ts";
+import { ConfigSchema, validatePersonalWebConfig } from "./config.ts";
 import { parseHHMM } from "./notify-prefs.ts";
 import { errMsg, log } from "./util.ts";
 
@@ -33,8 +33,19 @@ const COLD_PATHS = new Set([
   "context.evening",
   "context.weekly",
   "context.personal_web.enabled",
+  "context.personal_web.gateway_socket",
+  "context.personal_web.gateway_url",
+  "context.personal_web.read_token_env",
+  "context.personal_web.reply_token_env",
 ]);
 const FORBIDDEN = ["data_dir", "bins"];
+/** 禁止通过控制台 API 修改的嵌套敏感路径（防止 SSRF 或环境变量外泄，仅允许手工编辑 config.yaml） */
+const FORBIDDEN_NESTED: string[][] = [
+  ["context", "personal_web", "gateway_socket"],
+  ["context", "personal_web", "gateway_url"],
+  ["context", "personal_web", "read_token_env"],
+  ["context", "personal_web", "reply_token_env"],
+];
 
 type Obj = Record<string, unknown>;
 type Issue = { path: string; message: string };
@@ -139,6 +150,7 @@ export function crossCheck(cfg: z.infer<typeof ConfigSchema>): Issue[] {
   });
   if (cfg.capture.auto_inbox_confidence < cfg.capture.min_confidence)
     issues.push({ path: "capture.auto_inbox_confidence", message: "直接进 Inbox 的置信度不能低于进“待确认”的置信度" });
+  issues.push(...validatePersonalWebConfig(cfg.context.personal_web));
   return issues;
 }
 
@@ -167,6 +179,16 @@ function getIn(o: unknown, p: string[]): unknown {
     cur = cur[k];
   }
   return cur;
+}
+
+function deleteIn(o: Obj, p: string[]): void {
+  if (!p.length) return;
+  let cur: unknown = o;
+  for (let i = 0; i < p.length - 1; i++) {
+    if (!isObj(cur) || !Object.hasOwn(cur, p[i])) return;
+    cur = cur[p[i]];
+  }
+  if (isObj(cur)) delete cur[p[p.length - 1]];
 }
 
 /**
@@ -283,7 +305,25 @@ export class SettingsService {
       return !b.success || JSON.stringify(a.data) !== JSON.stringify(b.data);
     });
     if (forbidden.length) return fail(forbidden.map((k) => ({ path: k, message: `出于安全考虑，${k} 不能在控制台修改，请直接编辑 ${this.file}` })));
+    const trialParsed = ConfigSchema.safeParse(after);
+    const forbiddenNested = FORBIDDEN_NESTED.filter((p) => {
+      if (getIn(patch, p) === undefined) return false;
+      const beforeVal = getIn(cur.data, p);
+      if (trialParsed.success) {
+        return JSON.stringify(beforeVal) !== JSON.stringify(getIn(trialParsed.data, p));
+      }
+      return JSON.stringify(beforeVal) !== JSON.stringify(getIn(after, p));
+    });
+    if (forbiddenNested.length) {
+      return fail(
+        forbiddenNested.map((p) => ({
+          path: p.join("."),
+          message: `出于安全考虑，${p.join(".")} 不能在控制台修改，请直接编辑 ${this.file}`,
+        })),
+      );
+    }
     for (const k of FORBIDDEN) delete patch[k]; // 没有改动：不写进文件
+    for (const p of FORBIDDEN_NESTED) deleteIn(patch, p); // 没有改动：不写进文件
     applyPatch(doc, patch, cur.data);
     const v = validateConfig(doc.toJS());
     if (!v.ok) return fail(v.errors);

@@ -73,7 +73,7 @@ export class ContextService {
         const day = this.today();
         this.app.ledger.emit(
           "context:pw-needs-login",
-          [notify(`⚠️ 飞书个人 Web 实时通道登录已失效（${truncate(reason, 200)}）。请运行 \`pa context web-login\` 重新扫码；期间每 10 分钟的飞书定时采集仍继续兜底。`, "failure")],
+          [notify(`⚠️ 飞书个人 Web 独立网关不可用或登录已失效（${truncate(reason, 200)}）。请在网关侧运行 \`feishu-gateway login\` 或检查网关服务；期间每 10 分钟的飞书定时采集仍继续兜底。`, "failure")],
           `pw-needs-login-${day}`,
         );
         this.app.engine.kick();
