@@ -27,12 +27,13 @@ import {
   parseProto,
   ProtoWriter,
   USER_SENDER_TYPE,
+  WebLoginStore,
   type WebEndpoints,
   type WebMessage,
 } from "../src/gateway/feishu-web/index.ts";
 import { GatewayHttpError, type GatewayEvent } from "../src/gateway/protocol.ts";
 import { startGatewayServer } from "../src/gateway/server.ts";
-import { FeishuGatewayService } from "../src/gateway/service.ts";
+import { commitGatewayLogin, FeishuGatewayService, GATEWAY_BOUND_OWNER_KEY } from "../src/gateway/service.ts";
 import { GatewayStore } from "../src/gateway/store.ts";
 
 function makeTmp(prefix: string): string {
@@ -866,6 +867,169 @@ describe("independent feishu-gateway daemon (Unix socket, scope isolation, SSE c
       await mockFeishu.close();
       if (prevKey === undefined) delete process.env.FEISHU_GW_KEY;
       else process.env.FEISHU_GW_KEY = prevKey;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resets event cache/chats/deliveries and rotates db_epoch on --force-switch-account, drops stale-owner pushes, and guards tokens against conflicting file generation", async () => {
+    const dir = makeTmp("pa-gw-switch-");
+    const gwDir = path.join(dir, "gw");
+    const credDir = path.join(dir, "creds");
+    const gwCfgPath = path.join(dir, "gateway.yaml");
+    const prevKey = process.env.FEISHU_GW_KEY;
+    const prevCredDir = process.env.CREDENTIALS_DIRECTORY;
+    const prevRead = process.env.FEISHU_GW_READ_TOKEN;
+    const prevReply = process.env.FEISHU_GW_REPLY_TOKEN;
+    process.env.FEISHU_GW_KEY = "switch-account-test-key-01234567";
+    delete process.env.CREDENTIALS_DIRECTORY;
+    delete process.env.FEISHU_GW_READ_TOKEN;
+    delete process.env.FEISHU_GW_REPLY_TOKEN;
+
+    fs.writeFileSync(
+      gwCfgPath,
+      YAML.stringify({
+        data_dir: gwDir,
+        listen: { socket: path.join(dir, "gateway.sock"), socket_mode: "0600" },
+        allow_reply: false,
+      }),
+    );
+
+    const gwCfg = loadGatewayConfig(gwCfgPath);
+    const gwStore = new GatewayStore(gwCfg.dataDir);
+    const loginStore = new WebLoginStore(gwCfg.dataDir);
+    const gwService = new FeishuGatewayService(gwCfg, gwStore);
+
+    try {
+      // 1) 首次登录账号 10001 并写入事件、会话名、投递记录与运行状态
+      const first = commitGatewayLogin(gwStore, loginStore, {
+        owner_id: "10001",
+        owner_name: "Alice",
+        cookies: [{ name: "session", value: "s-alice", domain: "feishu.cn", path: "/" }],
+      });
+      assert.equal(first.switched, false);
+      const epochBefore = gwStore.dbEpoch();
+      const ev1 = gwStore.appendMessage({
+        id: "old-msg-1",
+        conversationId: "chat-old",
+        conversationKind: "group",
+        chatName: "旧账号群",
+        chatNameResolved: true,
+        actorId: "u1",
+        senderType: 1,
+        text: "旧账号消息",
+        rootId: "",
+        parentId: "",
+        threadId: "",
+        position: 1,
+        createdAtMs: Date.now(),
+        mentions: [],
+        resources: [],
+        ownerId: "10001",
+        ownerName: "Alice",
+      });
+      assert.equal(ev1.seq, 1);
+      gwStore.saveDelivery({
+        cid: "cid-old-1",
+        status: "verified",
+        reply_id: "r1",
+        chat_id: "chat-old",
+        root_id: "old-msg-1",
+        parent_id: "old-msg-1",
+        threaded: false,
+        thread_id: "",
+        text_hash: "abc",
+        updated_at: Date.now(),
+      });
+      gwStore.saveState({
+        state: "listening",
+        owner_id: "10001",
+        owner_name: "Alice",
+        since: Date.now(),
+        last_message_at: Date.now(),
+        last_error: "",
+      });
+
+      // 2) 未传 forceSwitch 切换账号 -> 拒绝且保留旧库
+      assert.throws(
+        () =>
+          commitGatewayLogin(gwStore, loginStore, {
+            owner_id: "20002",
+            owner_name: "Bob",
+            cookies: [{ name: "session", value: "s-bob", domain: "feishu.cn", path: "/" }],
+          }),
+        /不一致/,
+      );
+      assert.equal(gwStore.seqStats().cached_events, 1);
+      assert.equal(gwStore.dbEpoch(), epochBefore);
+
+      // 3) --force-switch-account -> 原子清空旧事件/消息/会话/投递与 state，轮换 db_epoch，重置 seq 从 1 开始
+      const switched = commitGatewayLogin(
+        gwStore,
+        loginStore,
+        {
+          owner_id: "20002",
+          owner_name: "Bob",
+          cookies: [{ name: "session", value: "s-bob", domain: "feishu.cn", path: "/" }],
+        },
+        { forceSwitch: true },
+      );
+      assert.equal(switched.switched, true);
+      assert.equal(switched.previousOwnerId, "10001");
+      assert.ok(switched.dbEpoch && switched.dbEpoch !== epochBefore);
+      assert.equal(gwStore.dbEpoch(), switched.dbEpoch);
+      assert.equal(gwStore.getKv(GATEWAY_BOUND_OWNER_KEY), "20002");
+      assert.deepEqual(gwStore.seqStats(), { min_seq: 0, latest_seq: 0, cached_events: 0 });
+      assert.equal(gwStore.getChatName("chat-old"), "");
+      assert.equal(gwStore.hasKnownMessage("old-msg-1"), false);
+      assert.equal(gwStore.getDelivery("cid-old-1"), undefined);
+      assert.equal(gwStore.loadState(), undefined);
+
+      // 4) 运行中的旧账号长连接若在断开前收到残留推送，必须丢弃不得污染新库
+      const stalePush = await gwService.handleMessage(
+        makeWebMsg({ id: "stale-from-alice", conversationId: "chat-old", ownerId: "10001", text: "旧连接残留" }),
+      );
+      assert.equal(stalePush, null);
+      assert.equal(gwStore.seqStats().cached_events, 0);
+
+      // 新账号第一条消息 seq 从 1 开始
+      const freshEv = await gwService.handleMessage(
+        makeWebMsg({ id: "bob-msg-1", conversationId: "chat-bob", ownerId: "20002", text: "新账号首条消息" }),
+      );
+      assert.equal(freshEv?.seq, 1);
+
+      // 5) systemd LoadCredential 模式下记录 token_sources 后，无 CREDENTIALS_DIRECTORY 的 tokens 拒绝静默生成冲突 tokens.json
+      fs.mkdirSync(credDir, { recursive: true });
+      fs.writeFileSync(path.join(credDir, "read-token"), "cred-read-token-0123456789abcdef\n", { mode: 0o600 });
+      fs.writeFileSync(path.join(credDir, "reply-token"), "cred-reply-token-0123456789abcdef\n", { mode: 0o600 });
+      process.env.CREDENTIALS_DIRECTORY = credDir;
+      const fromCred = gwStore.resolveTokens({ rejectConflictingFileGeneration: true });
+      assert.equal(fromCred.readSource, "credential");
+      assert.equal(fromCred.replySource, "credential");
+      gwStore.recordTokenSources(fromCred);
+      assert.equal(fs.existsSync(gwStore.tokensFile), false, "LoadCredential 模式不生成 tokens.json");
+
+      // 模拟用户在普通交互式 shell 运行 feishu-gateway tokens（无 CREDENTIALS_DIRECTORY）
+      delete process.env.CREDENTIALS_DIRECTORY;
+      assert.throws(
+        () => gwStore.resolveTokens({ rejectConflictingFileGeneration: true }),
+        /secrets\/read-token.*--force-file/s,
+      );
+      assert.equal(fs.existsSync(gwStore.tokensFile), false, "被保护拦截后绝不能静默创建 tokens.json");
+
+      // 显式 --force-file 允许切换回文件模式
+      const forced = gwStore.resolveTokens({ rejectConflictingFileGeneration: false });
+      assert.equal(forced.readSource, "file");
+      assert.equal(fs.existsSync(gwStore.tokensFile), true);
+    } finally {
+      gwStore.close();
+      if (prevKey === undefined) delete process.env.FEISHU_GW_KEY;
+      else process.env.FEISHU_GW_KEY = prevKey;
+      if (prevCredDir === undefined) delete process.env.CREDENTIALS_DIRECTORY;
+      else process.env.CREDENTIALS_DIRECTORY = prevCredDir;
+      if (prevRead === undefined) delete process.env.FEISHU_GW_READ_TOKEN;
+      else process.env.FEISHU_GW_READ_TOKEN = prevRead;
+      if (prevReply === undefined) delete process.env.FEISHU_GW_REPLY_TOKEN;
+      else process.env.FEISHU_GW_REPLY_TOKEN = prevReply;
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });

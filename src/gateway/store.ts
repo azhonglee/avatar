@@ -45,6 +45,19 @@ export interface ResolvedGatewayTokens {
   file: string;
 }
 
+export interface RecordedTokenSources {
+  read: ResolvedGatewayTokens["readSource"];
+  reply: ResolvedGatewayTokens["replySource"];
+  updated_at?: string;
+}
+
+export interface ResolveTokensOptions {
+  rotateRead?: boolean;
+  rotateReply?: boolean;
+  /** 当运行中的网关最近是通过 systemd LoadCredential / 环境变量加载令牌、而当前 shell 未提供它们时，拒绝静默生成冲突的 tokens.json */
+  rejectConflictingFileGeneration?: boolean;
+}
+
 interface TokenFileData {
   read_token: string;
   reply_token: string;
@@ -200,6 +213,34 @@ export class GatewayStore {
 
   deleteKv(k: string): void {
     this.db.prepare("DELETE FROM gw_kv WHERE k = ?").run(k);
+  }
+
+  /**
+   * 强制切换绑定账号时原子清空旧账号的事件日志、消息索引、会话名缓存、投递账本与运行状态，
+   * 重置 seq 序列并轮换 db_epoch、写入新 bound_owner_id，防止旧账号事件混入并让客户端立即识别新事件库实例。
+   */
+  resetForAccountSwitch(newOwnerId: string): { db_epoch: string } {
+    const owner = newOwnerId.trim();
+    if (!owner) throw new Error("新绑定账号 owner_id 不能为空");
+    const nextEpoch = crypto.randomUUID();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        DELETE FROM gw_events;
+        DELETE FROM gw_messages;
+        DELETE FROM gw_chats;
+        DELETE FROM gw_deliveries;
+      `);
+      this.db.prepare("DELETE FROM sqlite_sequence WHERE name = 'gw_events'").run();
+      this.deleteKv("state");
+      this.setKv("db_epoch", nextEpoch);
+      this.setKv("bound_owner_id", owner);
+      this.db.exec("COMMIT");
+      return { db_epoch: nextEpoch };
+    } catch (e) {
+      this.safeRollback();
+      throw e;
+    }
   }
 
   loadState(): GatewayPersistedState | undefined {
@@ -480,12 +521,62 @@ export class GatewayStore {
     }
   }
 
+  /** 记录网关最近一次 run 实际生效的令牌来源，防止交互式 shell 误执行 tokens 生成冲突的 tokens.json。 */
+  recordTokenSources(tokens: Pick<ResolvedGatewayTokens, "readSource" | "replySource">): void {
+    const rec: RecordedTokenSources = {
+      read: tokens.readSource,
+      reply: tokens.replySource,
+      updated_at: new Date().toISOString(),
+    };
+    this.setKv("token_sources", JSON.stringify(rec));
+  }
+
+  getTokenSources(): RecordedTokenSources | undefined {
+    const raw = this.getKv("token_sources");
+    if (!raw) return undefined;
+    try {
+      const parsed = JSON.parse(raw) as Partial<RecordedTokenSources>;
+      const valid = (v: unknown): v is ResolvedGatewayTokens["readSource"] => v === "env" || v === "credential" || v === "file";
+      if (valid(parsed.read) && valid(parsed.reply)) {
+        return { read: parsed.read, reply: parsed.reply, updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : undefined };
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** 解析或自动生成读写分离双令牌（read_token != reply_token）。 */
-  resolveTokens(opts: { rotateRead?: boolean; rotateReply?: boolean } = {}): ResolvedGatewayTokens {
+  resolveTokens(opts: ResolveTokensOptions = {}): ResolvedGatewayTokens {
     const envRead = process.env.FEISHU_GW_READ_TOKEN?.trim();
     const envReply = process.env.FEISHU_GW_REPLY_TOKEN?.trim();
     const credRead = envRead ? undefined : readCredentialFile(["read-token", "feishu-gw-read-token"]);
     const credReply = envReply ? undefined : readCredentialFile(["reply-token", "feishu-gw-reply-token"]);
+
+    if (opts.rejectConflictingFileGeneration) {
+      const prev = this.getTokenSources();
+      if (prev) {
+        const missingCred: string[] = [];
+        const missingEnv: string[] = [];
+        if (!envRead && !credRead) {
+          if (prev.read === "credential") missingCred.push("read_token（/etc/feishu-gateway/secrets/read-token）");
+          else if (prev.read === "env") missingEnv.push("read_token（FEISHU_GW_READ_TOKEN）");
+        }
+        if (!envReply && !credReply) {
+          if (prev.reply === "credential") missingCred.push("reply_token（/etc/feishu-gateway/secrets/reply-token）");
+          else if (prev.reply === "env") missingEnv.push("reply_token（FEISHU_GW_REPLY_TOKEN）");
+        }
+        if (missingCred.length || missingEnv.length) {
+          const parts = [
+            ...(missingCred.length ? [`systemd LoadCredential：${missingCred.join("、")}`] : []),
+            ...(missingEnv.length ? [`环境变量：${missingEnv.join("、")}`] : []),
+          ];
+          throw new Error(
+            `网关最近一次启动使用的是外部令牌（${parts.join("；")}），当前 shell 未提供它们；为避免生成与常驻进程冲突的 tokens.json 已拒绝执行。请直接查看对应凭据文件或服务环境配置；若确需改回本地 tokens.json 文件模式，请追加 --force-file 并同步修改服务配置。`,
+          );
+        }
+      }
+    }
 
     if (opts.rotateRead && (envRead || credRead)) {
       throw new Error("read_token 当前由环境变量或 systemd LoadCredential 提供，请直接在外部密钥管理中轮换");

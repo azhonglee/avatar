@@ -389,7 +389,7 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
     if (!resolved.readToken) {
       return fail(
         `缺少网关只读令牌（环境变量 ${pwCfg.read_token_env || "FEISHU_GW_READ_TOKEN"} 未设置）`,
-        `在网关侧运行 ${code("bin/feishu-gateway tokens")} 获取 read_token，并在运行 Avatar 前导出环境变量 ${code(pwCfg.read_token_env || "FEISHU_GW_READ_TOKEN")}`,
+        `非 systemd 部署请在网关侧运行 ${code("bin/feishu-gateway tokens")} 获取 read_token；systemd ${code("LoadCredential")} 部署请查看 ${code("/etc/feishu-gateway/secrets/read-token")}，并在运行 Avatar 前导出环境变量 ${code(pwCfg.read_token_env || "FEISHU_GW_READ_TOKEN")}`,
       );
     }
     if (resolved.replyToken && resolved.readToken === resolved.replyToken) {
@@ -401,7 +401,7 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
     if (pwCfg.send_replies && !resolved.replyToken) {
       return fail(
         `已开启 send_replies 但缺少回复令牌（环境变量 ${pwCfg.reply_token_env || "FEISHU_GW_REPLY_TOKEN"} 未设置）`,
-        `在运行 Avatar 前导出 ${code(pwCfg.reply_token_env || "FEISHU_GW_REPLY_TOKEN")}，或关闭 ${code("context.personal_web.send_replies")}`,
+        `在运行 Avatar 前导出 ${code(pwCfg.reply_token_env || "FEISHU_GW_REPLY_TOKEN")}（文件模式来自 ${code("bin/feishu-gateway tokens")}，systemd 部署见 ${code("/etc/feishu-gateway/secrets/reply-token")}），或关闭 ${code("context.personal_web.send_replies")}`,
       );
     }
     let client;
@@ -416,7 +416,10 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
         try {
           verifyGatewayOwnerForWorkspace(app, st.owner_id);
         } catch (e) {
-          return fail(errMsg(e), `确认 ${resolved.endpointLabel} 指向正确的网关实例，或使用对应个人账号`);
+          return fail(
+            errMsg(e),
+            `确认 ${resolved.endpointLabel} 指向正确的网关实例；如网关已通过 ${code("--force-switch-account")} 切换账号，请运行 ${code("pa context web-unbind")} 解除当前工作区旧绑定`,
+          );
         }
       }
       if (st.credential_status === "missing_key") {
@@ -448,7 +451,7 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
       if (e instanceof GatewayHttpError && (e.statusCode === 401 || e.statusCode === 403)) {
         return fail(
           `网关鉴权失败（${e.code}）：${e.message}`,
-          `核对 ${code(pwCfg.read_token_env || "FEISHU_GW_READ_TOKEN")} 是否与网关 ${code("bin/feishu-gateway tokens")} 输出的 read_token 一致`,
+          `核对 ${code(pwCfg.read_token_env || "FEISHU_GW_READ_TOKEN")} 是否与网关当前生效的 read_token 一致（文件模式运行 ${code("bin/feishu-gateway tokens")}，systemd ${code("LoadCredential")} 部署请核对 ${code("/etc/feishu-gateway/secrets/read-token")}）`,
         );
       }
       return warn(
@@ -456,6 +459,20 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
         `确认独立网关正在运行（${code("bin/feishu-gateway run")}）且当前用户对 socket 有访问权限`,
       );
     }
+  });
+
+  add("personal_web_boundary", "个人 Web 令牌隔离边界", async () => {
+    const pwCfg = cfg.context.personal_web;
+    if (!cfg.context.enabled || !pwCfg.enabled) {
+      return skip("个人 Web 通道未启用");
+    }
+    if (pwCfg.send_replies) {
+      return warn(
+        "已开启 context.personal_web.send_replies：与 Avatar 同 OS 用户运行的 --approve-all worker 可从 /proc/<pid>/environ 或 $CREDENTIALS_DIRECTORY 读取 reply_token，在网关 allow_reply=true 时能以本人身份回复消息",
+        `如不需要经个人 Web 自动发送回复，将 ${code("context.personal_web.send_replies")} 设为 false；如需保留，请将派单 worker 隔离在独立 OS 用户或容器中运行`,
+      );
+    }
+    return ok("个人 Web 回复已关闭（send_replies = false，仅暴露只读通道；如需对 read_token 做强隔离，仍建议以独立 OS 用户或容器运行 worker）");
   });
 
   add("data_dir", "数据目录", async () => {

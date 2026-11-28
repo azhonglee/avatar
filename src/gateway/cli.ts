@@ -3,7 +3,7 @@ import { parseArgs } from "node:util";
 import { defaultGatewayConfigPath, loadGatewayConfig } from "./config.ts";
 import { beginLogin, pollLogin, renderQrSvg, renderQrTerminal, WebLoginStore } from "./feishu-web/index.ts";
 import { startGatewayServer } from "./server.ts";
-import { FeishuGatewayService, GATEWAY_BOUND_OWNER_KEY, verifyLoginForGateway } from "./service.ts";
+import { commitGatewayLogin, FeishuGatewayService } from "./service.ts";
 import { GatewayStore } from "./store.ts";
 
 const USAGE = `用法：feishu-gateway <命令> [选项]
@@ -13,7 +13,7 @@ const USAGE = `用法：feishu-gateway <命令> [选项]
                                                     扫码登录并保存 AES-256-GCM 加密凭据（需配置 FEISHU_GW_KEY 或 PA_FEISHU_WEB_KEY）
   status [--config <file>] [--verify]               查看网关凭据、缓存与连接状态（--verify 在线核验飞书会话）
   logout [--config <file>]                          清除网关本地加密凭据（运行中的网关将在数秒内自动断开）
-  tokens [--config <file>] [--rotate-read] [--rotate-reply]
+  tokens [--config <file>] [--rotate-read] [--rotate-reply] [--force-file]
                                                     查看或轮换读写分离双令牌（read_token / reply_token）
 `;
 
@@ -37,6 +37,7 @@ async function main(): Promise<void> {
       "force-switch-account": { type: "boolean" },
       "rotate-read": { type: "boolean" },
       "rotate-reply": { type: "boolean" },
+      "force-file": { type: "boolean" },
     },
     allowPositionals: true,
   });
@@ -50,6 +51,7 @@ async function main(): Promise<void> {
     switch (cmd) {
       case "run": {
         const tokens = store.resolveTokens();
+        store.recordTokenSources(tokens);
         const service = new FeishuGatewayService(cfg, store);
         const server = await startGatewayServer(cfg, service, tokens);
         service.start();
@@ -100,11 +102,15 @@ async function main(): Promise<void> {
               if (st === "approved") console.log("✅ 已确认，正在验证账号并保存加密凭据…");
             },
           });
-          verifyLoginForGateway(store, login, { forceSwitch: !!values["force-switch-account"] });
           const loginStore = new WebLoginStore(cfg.dataDir);
-          const saved = loginStore.save(login);
-          store.setKv(GATEWAY_BOUND_OWNER_KEY, saved.owner_id);
+          const { saved, switched, previousOwnerId, dbEpoch } = commitGatewayLogin(store, loginStore, login, {
+            forceSwitch: !!values["force-switch-account"],
+          });
           console.log(`✅ 网关个人 Web 登录成功：${saved.owner_name || "(无昵称)"}（ID: ${saved.owner_id}）`);
+          if (switched) {
+            console.log(`⚠️ 已强制切换绑定账号（${previousOwnerId} -> ${saved.owner_id}）：已清空旧账号的事件日志、会话缓存与投递账本，并轮换 db_epoch=${dbEpoch}。`);
+            console.log("提示：如 Avatar 工作区此前绑定了旧账号，请在 Avatar 侧执行 `pa context web-unbind` 解除绑定后再重新同步。");
+          }
           console.log(`加密凭据（AES-256-GCM, 0600）已保存到：${loginStore.file}`);
           console.log("提示：若 `feishu-gateway run` 正在运行，将在数秒内自动加载新凭据并建立长连接。");
         } finally {
@@ -147,8 +153,13 @@ async function main(): Promise<void> {
         const tokens = store.resolveTokens({
           rotateRead: !!values["rotate-read"],
           rotateReply: !!values["rotate-reply"],
+          rejectConflictingFileGeneration: !values["force-file"],
         });
-        console.log(`令牌文件：${tokens.file}`);
+        if (tokens.readSource === "file" || tokens.replySource === "file") {
+          console.log(`令牌文件：${tokens.file}`);
+        } else {
+          console.log("令牌来源：外部注入（环境变量 / systemd LoadCredential，未使用本地 tokens.json）");
+        }
         console.log(`read_token  (${tokens.readSource}): ${tokens.readToken}`);
         console.log(`reply_token (${tokens.replySource}): ${tokens.replyToken}`);
         console.log("\nAvatar 客户端环境变量示例（仅只读消费时无需提供 REPLY 令牌）：");

@@ -609,3 +609,132 @@ test("环境故障不误跳会话：harness 启动失败（ENOENT）连续 4 轮
   assert.equal(okRun.errors.filter((e) => !/meego/.test(e)).length, 0);
   assert.ok(!s4.store.pendingConvs(50).some((c) => c.conv === "oc_env_fail"), "环境恢复后正常理解完");
 });
+
+test("断线补采分页与游标原子性：has_more 翻完所有页；分页异常或落库失败绝不推进群游标与全局游标", async () => {
+  const beforeCalls = calls().length;
+  const tBase = Date.now() - 10 * 60_000;
+  // 1) 多页 search（at_me 两页）+ 多页群消息列表（oc_paged 两页）+ 单群分页异常（oc_bad_page 缺 page_token）
+  writeFx("lark.json", {
+    user_name: "张三",
+    at_me: {
+      pages: {
+        "": {
+          messages: [msg("om_pg_at1", { chat_id: "oc_paged", chat_name: "分页测试群", content: "@张三 第1页", create_time: iso(tBase) })],
+          has_more: true,
+          page_token: "tok_at_2",
+        },
+        tok_at_2: {
+          messages: [msg("om_pg_at2", { chat_id: "oc_paged", chat_name: "分页测试群", content: "@张三 第2页", create_time: iso(tBase + 1000) })],
+          has_more: false,
+        },
+      },
+    },
+    p2p: [],
+    mine: [
+      msg("om_pg_m1", { chat_id: "oc_paged", chat_name: "分页测试群", content: "我在分页群说过话", sender: { id: "ou_owner", name: "张三", sender_type: "user" }, create_time: iso(tBase) }),
+      msg("om_pg_m2", { chat_id: "oc_bad_page", chat_name: "断页故障群", content: "我在故障群说过话", sender: { id: "ou_owner", name: "张三", sender_type: "user" }, create_time: iso(tBase) }),
+    ],
+    chats: {
+      oc_paged: {
+        pages: {
+          "": {
+            messages: [msg("om_pg_g1", { chat_id: "oc_paged", chat_name: "分页测试群", content: "群消息第1页", create_time: iso(tBase + 2000) })],
+            has_more: true,
+            page_token: "tok_grp_2",
+          },
+          tok_grp_2: {
+            messages: [msg("om_pg_g2", { chat_id: "oc_paged", chat_name: "分页测试群", content: "群消息第2页", create_time: iso(tBase + 3000) })],
+            has_more: false,
+          },
+        },
+      },
+      oc_bad_page: {
+        pages: {
+          "": {
+            messages: [msg("om_pg_bad1", { chat_id: "oc_bad_page", chat_name: "断页故障群", content: "缺token的半页", create_time: iso(tBase + 4000) })],
+            has_more: true,
+            // 故意缺失 page_token：单群拉取应报错，不推进该群游标
+          },
+        },
+      },
+    },
+    minutes: {
+      pages: {
+        "": { items: [{ token: "min_pg_1", title: "分页妙记1" }], has_more: true, page_token: "tok_min_2" },
+        tok_min_2: { items: [{ token: "min_pg_2", title: "分页妙记2" }], has_more: false },
+      },
+    },
+    minute_details: [
+      { minute_token: "min_pg_1", title: "分页妙记1", artifacts: { summary: "第1页妙记纪要", todos: [] } },
+      { minute_token: "min_pg_2", title: "分页妙记2", artifacts: { summary: "第2页妙记纪要", todos: [] } },
+    ],
+  });
+
+  app.store.db.prepare("DELETE FROM kv WHERE k IN ('ctx.cursor.chat.oc_paged', 'ctx.cursor.chat.oc_bad_page')").run();
+  const res = await svc.connectors.pullIm();
+  assert.ok(res.count >= 4);
+  assert.ok(svc.store.obs("im:om_pg_at1"), "at_me 第 1 页已入库");
+  assert.ok(svc.store.obs("im:om_pg_at2"), "at_me 第 2 页必须完整翻页入库");
+  assert.ok(svc.store.obs("im:om_pg_g1"), "群列表第 1 页已入库");
+  assert.ok(svc.store.obs("im:om_pg_g2"), "群列表第 2 页必须完整翻页入库");
+  assert.ok(app.store.get("ctx.cursor.chat.oc_paged"), "完整翻页且落库成功的群应推进游标");
+  assert.equal(app.store.get("ctx.cursor.chat.oc_bad_page"), undefined, "has_more=true 缺 page_token 的群绝不能推进群游标");
+  const recentLark = calls().slice(beforeCalls).filter((c) => c.role === "lark");
+  assert.ok(recentLark.some((c) => c.argv.includes("--page-token") && c.argv.includes("tok_at_2")));
+  assert.ok(recentLark.some((c) => c.argv.includes("--page-token") && c.argv.includes("tok_grp_2")));
+  assert.ok(!recentLark.some((c) => c.argv.includes("--page-all")), "不再依赖会截断的 --page-all");
+
+  // 2) 搜索本身返回 has_more=true 且重复 page_token：必须抛错且不推进 cursor.im
+  const imCursorBefore = app.store.get("ctx.cursor.im");
+  writeFx("lark.json", {
+    user_name: "张三",
+    at_me: {
+      pages: {
+        "": { messages: [msg("om_loop_1", { content: "@张三 循环token" })], has_more: true, page_token: "loop_tok" },
+        loop_tok: { messages: [msg("om_loop_2", { content: "@张三 循环token2" })], has_more: true, page_token: "loop_tok" },
+      },
+    },
+    p2p: [],
+    mine: [],
+    chats: {},
+  });
+  await assert.rejects(svc.connectors.pullIm(), /缺失或重复的 page_token/);
+  assert.equal(app.store.get("ctx.cursor.im"), imCursorBefore, "分页异常时全局游标不得推进");
+
+  // 3) 模拟落库失败：cursor.chat.<chatId> 与 cursor.im 均不得提前推进
+  writeFx("lark.json", {
+    user_name: "张三",
+    at_me: [],
+    p2p: [],
+    mine: [msg("om_faildb_m", { chat_id: "oc_faildb", chat_name: "落库失败群", content: "测试原子性", sender: { id: "ou_owner", name: "张三", sender_type: "user" }, create_time: iso(Date.now()) })],
+    chats: {
+      oc_faildb: [msg("om_faildb_g1", { chat_id: "oc_faildb", chat_name: "落库失败群", content: "不应推进游标", create_time: iso(Date.now()) })],
+    },
+    minutes: {
+      pages: {
+        "": { items: [{ token: "min_pg_1", title: "分页妙记1" }], has_more: true, page_token: "tok_min_2" },
+        tok_min_2: { items: [{ token: "min_pg_2", title: "分页妙记2" }], has_more: false },
+      },
+    },
+    minute_details: [
+      { minute_token: "min_pg_1", title: "分页妙记1", artifacts: { summary: "第1页妙记纪要", todos: [] } },
+      { minute_token: "min_pg_2", title: "分页妙记2", artifacts: { summary: "第2页妙记纪要", todos: [] } },
+    ],
+  });
+  const minRes = await svc.connectors.pullMinutes();
+  assert.equal(minRes.count, 2, "minutes +search 多页应全部翻完");
+  const minCursorBefore = app.store.get("ctx.cursor.minutes");
+  const origAddObs = svc.store.addObs.bind(svc.store);
+  svc.store.addObs = () => {
+    throw new Error("simulated sqlite write failure");
+  };
+  try {
+    await assert.rejects(svc.connectors.pullIm(), /simulated sqlite write failure/);
+    assert.equal(app.store.get("ctx.cursor.chat.oc_faildb"), undefined, "落库失败时群游标不得推进");
+    assert.equal(app.store.get("ctx.cursor.im"), imCursorBefore, "落库失败时全局 im 游标不得推进");
+    await assert.rejects(svc.connectors.pullMinutes(), /simulated sqlite write failure/);
+    assert.equal(app.store.get("ctx.cursor.minutes"), minCursorBefore, "落库失败时 minutes 游标不得推进");
+  } finally {
+    svc.store.addObs = origAddObs;
+  }
+});

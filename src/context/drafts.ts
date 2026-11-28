@@ -94,7 +94,7 @@ export class Drafter {
             native_root_id: String(any.meta.native_root_id ?? any.meta.native_message_id),
             url: any.url,
           },
-          label: `${kind === "followup" ? "跟进" : "发到"} ${any.conv_name}（个人 Web）`,
+          label: `${kind === "followup" ? "跟进回复" : "回复"} ${any.conv_name}（引用原消息 · 个人 Web）`,
           conv: any,
         };
       }

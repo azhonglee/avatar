@@ -7,7 +7,7 @@ import YAML from "yaml";
 import { createApp } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { ContextService } from "../src/context/index.ts";
-import { legacyPersonalWebArtifacts, verifyGatewayOwnerForWorkspace } from "../src/context/personal-web.ts";
+import { legacyPersonalWebArtifacts, unbindPersonalWebAccount, verifyGatewayOwnerForWorkspace } from "../src/context/personal-web.ts";
 import { runDoctor } from "../src/doctor.ts";
 import { EventSupervisor } from "../src/events.ts";
 import { FeishuGatewayClient } from "../src/gateway/client.ts";
@@ -659,19 +659,21 @@ describe("feishu-web gateway client bridge, store dedup, drafts, and env scrub",
     });
 
     try {
-      // 1) Missing read token -> doctor fails
+      // 1) Missing read token -> doctor fails (fix mentions both tokens CLI and systemd secret path)
       delete process.env.TEST_GW_READ_TOKEN;
       const docMissing = await runDoctor(app);
       const pwMissing = docMissing.checks.find((c) => c.id === "personal_web");
       assert.equal(pwMissing?.status, "fail");
       assert.match(pwMissing?.detail ?? "", /缺少网关只读令牌/);
+      assert.match(pwMissing?.fix ?? "", /\/etc\/feishu-gateway\/secrets\/read-token/);
 
-      // 2) Wrong read token -> doctor fails with 401 auth error
+      // 2) Wrong read token -> doctor fails with 401 auth error (fix mentions systemd secret path)
       process.env.TEST_GW_READ_TOKEN = "wrong-token-value-123456";
       const docAuthFail = await runDoctor(app);
       const pwAuthFail = docAuthFail.checks.find((c) => c.id === "personal_web");
       assert.equal(pwAuthFail?.status, "fail");
       assert.match(pwAuthFail?.detail ?? "", /鉴权失败/);
+      assert.match(pwAuthFail?.fix ?? "", /\/etc\/feishu-gateway\/secrets\/read-token/);
 
       // 3) Valid read token, gateway has invalid encrypted cred -> doctor fails clearly
       process.env.FEISHU_GW_KEY = "key-original";
@@ -683,12 +685,22 @@ describe("feishu-web gateway client bridge, store dedup, drafts, and env scrub",
       assert.equal(pwInvalid?.status, "fail");
       assert.match(pwInvalid?.detail ?? "", /invalid|解密失败/);
 
-      // 4) Valid key + valid read token -> doctor ok
+      // 4) Valid key + valid read token -> doctor ok; boundary check ok when send_replies=false, warn when send_replies=true
       process.env.FEISHU_GW_KEY = "key-original";
       const docOk = await runDoctor(app);
       const pwOk = docOk.checks.find((c) => c.id === "personal_web");
       assert.equal(pwOk?.status, "ok");
       assert.match(pwOk?.detail ?? "", /Owner/);
+      const boundOk = docOk.checks.find((c) => c.id === "personal_web_boundary");
+      assert.equal(boundOk?.status, "ok");
+
+      app.cfg.context.personal_web.send_replies = true;
+      process.env.TEST_GW_REPLY_TOKEN = tokens.replyToken;
+      const docSendWarn = await runDoctor(app);
+      const boundWarn = docSendWarn.checks.find((c) => c.id === "personal_web_boundary");
+      assert.equal(boundWarn?.status, "warn");
+      assert.match(boundWarn?.detail ?? "", /\/proc\/<pid>\/environ.*reply_token/s);
+      app.cfg.context.personal_web.send_replies = false;
 
       // 5) Same conv concurrent fastCycle deferred with refunded attempt
       const svc = new ContextService(app);
@@ -794,6 +806,288 @@ describe("feishu-web gateway client bridge, store dedup, drafts, and env scrub",
       else process.env.FEISHU_GW_KEY = prevKey;
       if (prevCredDir === undefined) delete process.env.CREDENTIALS_DIRECTORY;
       else process.env.CREDENTIALS_DIRECTORY = prevCredDir;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("deletes merged im:* observations on gateway recall across strong/weak/background dedup, persists DM chat_name across owner turns, supports web-unbind, and labels followup drafts as quoted replies", async () => {
+    const dir = makeTmp("pa-pw-regressions-");
+    const app = makeApp(dir, {
+      context: {
+        groups_deny: ["高管私聊屏蔽"],
+        personal_web: { enabled: true, gateway_socket: path.join(dir, "gw.sock"), send_replies: true, fast_lane: false, debounce_ms: 0 },
+      },
+    });
+    try {
+      const svc = new ContextService(app);
+      const bridge = svc.personalWeb;
+      const t0 = Date.now();
+
+      // 1) 跨通道撤回联动删除：覆盖强匹配、弱匹配、背景去重、以及旧库仅存 meta.native_message_id 四种路径
+      // 1a) 强匹配：im:* 先入库，pw:* 合并后收到 delete 墓碑
+      svc.store.addObs([
+        {
+          id: "im:om_strong_1",
+          source: "im",
+          kind: "group",
+          conv: "oc_grp_recall",
+          conv_name: "撤回联测群",
+          actor_id: "ou_peer",
+          actor_name: "张三",
+          is_me: false,
+          time: t0,
+          text: "这条强匹配消息待会儿撤回",
+          url: "",
+          meta: { message_id: "om_strong_1", chat_type: "group" },
+        },
+      ]);
+      svc.store.addObs([
+        {
+          id: "pw:7001",
+          source: "im",
+          kind: "group",
+          conv: "pw_chat:c_recall",
+          conv_name: "撤回联测群",
+          actor_id: "90001",
+          actor_name: "90001",
+          is_me: false,
+          time: t0 + 1000,
+          text: "这条强匹配消息待会儿撤回",
+          url: "",
+          meta: { transport: "personal_web", native_message_id: "7001", native_chat_id: "c_recall", chat_type: "group" },
+        },
+      ]);
+      assert.ok(svc.store.obs("im:om_strong_1"));
+      assert.equal(svc.store.obs("pw:7001"), undefined, "pw:7001 应强匹配合并到 im:om_strong_1");
+      assert.equal(svc.store.pwAlias("chat_name", "c_recall"), "撤回联测群");
+      await bridge.handleGatewayEvent({ seq: 1, kind: "delete", message_id: "7001", chat_id: "c_recall", created_at: t0 + 2000 });
+      assert.equal(svc.store.obs("im:om_strong_1"), undefined, "强匹配合并的 im:* 观测在撤回后必须一并删除");
+
+      // 1b) 弱匹配：会话名未知（占位名）且长文本 >= 8 字，pw:* 被弱匹配丢弃但仍记住 msg 映射
+      svc.store.addObs([
+        {
+          id: "im:om_weak_1",
+          source: "im",
+          kind: "p2p",
+          conv: "oc_dm_weak",
+          conv_name: "私聊：李四",
+          actor_id: "ou_ls",
+          actor_name: "李四",
+          is_me: false,
+          time: t0,
+          text: "这是一条足够长的弱匹配私聊撤回测试消息",
+          url: "",
+          meta: { message_id: "om_weak_1", chat_type: "p2p" },
+        },
+      ]);
+      svc.store.addObs([
+        {
+          id: "pw:7002",
+          source: "im",
+          kind: "p2p",
+          conv: "pw_chat:c_dm_weak",
+          conv_name: "私聊：90002",
+          actor_id: "90002",
+          actor_name: "90002",
+          is_me: false,
+          time: t0 + 1000,
+          text: "这是一条足够长的弱匹配私聊撤回测试消息",
+          url: "",
+          meta: { transport: "personal_web", native_message_id: "7002", native_chat_id: "c_dm_weak", chat_type: "p2p" },
+        },
+      ]);
+      assert.ok(svc.store.obs("im:om_weak_1"));
+      assert.equal(svc.store.obs("pw:7002"), undefined);
+      assert.equal(svc.store.pwAlias("chat", "c_dm_weak"), "", "弱匹配仍不得回填 chat 别名");
+      await bridge.handleGatewayEvent({ seq: 2, kind: "delete", message_id: "7002", chat_id: "c_dm_weak", created_at: t0 + 2000 });
+      assert.equal(svc.store.obs("im:om_weak_1"), undefined, "弱匹配吸收的 im:* 观测在撤回后必须一并删除");
+
+      // 1c) addBackgroundObs 去重吸收：pw:* 背景消息命中 im:*，撤回后同样删除 im:*
+      svc.store.addObs([
+        {
+          id: "im:om_bg_1",
+          source: "im",
+          kind: "group",
+          conv: "oc_grp_bg",
+          conv_name: "背景去重群",
+          actor_id: "ou_bg",
+          actor_name: "王五",
+          is_me: false,
+          time: t0,
+          text: "背景补读去重后也要能联动撤回",
+          url: "",
+          meta: { message_id: "om_bg_1", chat_type: "group" },
+        },
+      ]);
+      const bgInserted = svc.store.addBackgroundObs([
+        {
+          id: "pw:7003",
+          source: "im",
+          kind: "group",
+          conv: "pw_chat:c_bg",
+          conv_name: "背景去重群",
+          actor_id: "90003",
+          actor_name: "90003",
+          is_me: false,
+          time: t0 + 500,
+          text: "背景补读去重后也要能联动撤回",
+          url: "",
+          meta: { transport: "personal_web", native_message_id: "7003", native_chat_id: "c_bg", chat_type: "group" },
+        },
+      ]);
+      assert.equal(bgInserted, 0);
+      await bridge.handleGatewayEvent({ seq: 3, kind: "delete", message_id: "7003", chat_id: "c_bg", created_at: t0 + 2000 });
+      assert.equal(svc.store.obs("im:om_bg_1"), undefined, "背景去重吸收的 im:* 观测在撤回后必须一并删除");
+
+      // 1d) 升级前旧数据（无 ctx_pw_alias('msg')，仅 meta.native_message_id）也能联动删除
+      svc.store.addObs([
+        {
+          id: "im:om_legacy_meta",
+          source: "im",
+          kind: "group",
+          conv: "oc_legacy",
+          conv_name: "历史群",
+          actor_id: "ou_x",
+          actor_name: "赵六",
+          is_me: false,
+          time: t0,
+          text: "旧库强匹配留下的记录",
+          url: "",
+          meta: { native_message_id: "7004", chat_type: "group" },
+        },
+      ]);
+      await bridge.handleGatewayEvent({ seq: 4, kind: "delete", message_id: "7004", chat_id: "c_legacy", created_at: t0 + 2000 });
+      assert.equal(svc.store.obs("im:om_legacy_meta"), undefined, "仅含 meta.native_message_id 的历史 im:* 观测也必须删除");
+
+      // 2) 方案 A 私聊名持久化与 sendVerifiedReply 回溯（覆盖本人最后发言变成“私聊：本人”的场景）
+      svc.store.setPwAlias("actor", "actor-blocked-dm", "高管私聊屏蔽");
+      bridge.handleGatewayMessage(
+        makeGatewayMsg({
+          id: "dm-blocked-peer",
+          conversationId: "dm-chat-blocked",
+          conversationKind: "dm",
+          chatName: "",
+          chatNameResolved: true,
+          actorId: "actor-blocked-dm",
+          text: "对方私聊",
+        }),
+      );
+      assert.equal(svc.store.obs("pw:dm-blocked-peer"), undefined, "按名称屏蔽的私聊对端消息应被拦截");
+      assert.equal(svc.store.pwAlias("chat_name", "dm-chat-blocked"), "高管私聊屏蔽", "应持久化私聊对端会话名");
+      // 本人随后在该被屏蔽私聊发消息（chatName 为空且 actorId 是本人）-> 必须继续被拦截
+      bridge.handleGatewayMessage(
+        makeGatewayMsg({
+          id: "dm-blocked-owner",
+          conversationId: "dm-chat-blocked",
+          conversationKind: "dm",
+          chatName: "",
+          chatNameResolved: true,
+          actorId: "owner-1",
+          text: "本人回复被屏蔽私聊",
+        }),
+      );
+      assert.equal(svc.store.obs("pw:dm-blocked-owner"), undefined, "本人在已屏蔽私聊的发言也必须被拦截");
+
+      // 模拟旧库中私聊最后一条观测是“私聊：本人”（无 chat_name 别名），静音对端后 sendVerifiedReply 仍必须拦截
+      svc.store.addObs([
+        {
+          id: "pw:dm-hist-1",
+          source: "im",
+          kind: "p2p",
+          conv: "pw_chat:dm-chat-muted",
+          conv_name: "私聊：钱七",
+          actor_id: "actor-qq",
+          actor_name: "钱七",
+          is_me: false,
+          time: t0,
+          text: "帮我看下",
+          url: "",
+          meta: { transport: "personal_web", native_chat_id: "dm-chat-muted", native_message_id: "dm-hist-1", chat_type: "p2p" },
+        },
+        {
+          id: "pw:dm-hist-2",
+          source: "im",
+          kind: "mine",
+          conv: "pw_chat:dm-chat-muted",
+          conv_name: "私聊：本人",
+          actor_id: "owner-1",
+          actor_name: "Owner",
+          is_me: true,
+          time: t0 + 1000,
+          text: "好的",
+          url: "",
+          meta: { transport: "personal_web", native_chat_id: "dm-chat-muted", native_message_id: "dm-hist-2", chat_type: "p2p" },
+        },
+      ]);
+      svc.store.muteConv("oc_dm_qq", "私聊：钱七", true);
+      await assert.rejects(
+        bridge.sendVerifiedReply({ chat_id: "dm-chat-muted", message_id: "dm-hist-1", text: "再补一句", cid: "cid-dm-muted-01" }),
+        /已被排除或静音/,
+        "即使最新观测是私聊：本人，sendVerifiedReply 也必须回溯历史真实私聊名并拦截",
+      );
+
+      // fail-closed 保留：网关明确查名失败（chatNameResolved=false）时，不得轻信旧缓存 chat_name 绕过排除核对
+      svc.store.setPwAlias("chat_name", "grp-renamed", "普通群");
+      bridge.handleGatewayMessage(
+        makeGatewayMsg({
+          id: "grp-failclosed-1",
+          conversationId: "grp-renamed",
+          conversationKind: "group",
+          chatName: "",
+          chatNameResolved: false,
+          actorId: "u-peer",
+          text: "@Owner 紧急看下",
+        }),
+      );
+      assert.equal(svc.store.obs("pw:grp-failclosed-1"), undefined, "chatNameResolved=false 且存在按名称排除规则时必须丢弃");
+
+      // 3) pa context web-unbind 解绑工作区账号并重置游标/epoch/状态，保留历史观测
+      app.store.set("ctx.personal_web.bound_owner_id", "10001");
+      app.store.set("ctx.pw_gateway.cursor", "42");
+      app.store.set("ctx.pw_gateway.db_epoch", "epoch-old");
+      app.store.set("ctx.personal_web.state", JSON.stringify({ state: "listening", owner_id: "10001" }));
+      app.store.set("ctx.personal_web.spoken_groups", JSON.stringify(["c1"]));
+      assert.throws(() => verifyGatewayOwnerForWorkspace(app, "20002"), /web-unbind/);
+      const unbindRes = unbindPersonalWebAccount(app);
+      assert.equal(unbindRes.previousOwnerId, "10001");
+      assert.equal(app.store.get("ctx.personal_web.bound_owner_id"), undefined);
+      assert.equal(app.store.get("ctx.pw_gateway.cursor"), undefined);
+      assert.equal(app.store.get("ctx.pw_gateway.db_epoch"), undefined);
+      assert.equal(app.store.get("ctx.personal_web.state"), undefined);
+      assert.equal(app.store.get("ctx.personal_web.spoken_groups"), undefined);
+      assert.ok(svc.store.obs("pw:dm-hist-1"), "解绑不删除历史观测");
+      assert.doesNotThrow(() => verifyGatewayOwnerForWorkspace(app, "20002"));
+
+      // 4) 个人 Web followup 草稿 target_label 明确提示为引用原消息回复
+      const proj = svc.store.upsertProject({ name: "跟进标签测试" });
+      svc.store.addObs([
+        {
+          id: "pw:8801",
+          source: "im",
+          kind: "group",
+          conv: "pw_chat:c_followup",
+          conv_name: "项目跟进群",
+          actor_id: "u_other",
+          actor_name: "周八",
+          is_me: false,
+          time: t0,
+          text: "我明天把接口文档发出来",
+          url: "",
+          meta: { transport: "personal_web", native_chat_id: "c_followup", native_message_id: "8801", native_root_id: "8801", chat_type: "group" },
+        },
+      ]);
+      const { item } = svc.store.upsertItem({
+        title: "等周八发接口文档",
+        kind: "waiting_on",
+        project_id: proj.id,
+        source: "im",
+      });
+      svc.store.addEvidence("item", item.id, "pw:8801", "我明天把接口文档发出来", t0);
+      const followupTarget = svc.drafter.target(item, "followup");
+      assert.equal(followupTarget.target.transport, "personal_web");
+      assert.match(followupTarget.label, /跟进回复 项目跟进群（引用原消息 · 个人 Web）/);
+    } finally {
+      app.store.db.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });

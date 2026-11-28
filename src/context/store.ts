@@ -353,17 +353,28 @@ export class ContextStore {
                 strong = m === "strong";
                 return true;
               });
-              // 弱匹配（会话名未知）只丢弃重复观测，不回填任何 ID 或名称，防止把另一个会话的开放平台 ID 写到这条消息上
-              if (hit && !strong) continue;
+              // 弱匹配（会话名未知）只丢弃重复观测、记录原生消息 ID → 既有观测 ID 以支持撤回联动删除；
+              // 不回填 chat/actor 别名或修改 hit.meta/conv_name，防止把另一个会话的开放平台 ID 写到这条消息上
+              if (hit && !strong) {
+                const nativeMsg = o.id.startsWith("pw:") ? String(o.meta.native_message_id ?? o.id.slice(3)) : "";
+                if (nativeMsg) this.setPwAlias("msg", nativeMsg, String(hit.id));
+                continue;
+              }
               if (hit) {
                 const hitMeta = j<Record<string, unknown>>(hit.meta, {});
                 const isIncomingLark = o.id.startsWith("im:");
                 const nativeChat = String(isIncomingLark ? (hitMeta.native_chat_id ?? "") : (o.meta.native_chat_id ?? ""));
                 const openChat = isIncomingLark ? o.conv : String(hit.conv ?? "");
                 if (nativeChat && openChat.startsWith("oc_")) this.setPwAlias("chat", nativeChat, openChat);
+                const learnedChatName =
+                  realConvName(isIncomingLark ? o.conv_name : String(hit.conv_name ?? "")) ||
+                  realConvName(isIncomingLark ? String(hit.conv_name ?? "") : o.conv_name);
+                if (nativeChat && learnedChatName) this.setPwAlias("chat_name", nativeChat, learnedChatName);
                 const nativeActor = isIncomingLark ? String(hit.actor_id ?? "") : o.actor_id;
                 const larkActorName = isIncomingLark ? o.actor_name : String(hit.actor_name ?? "");
                 if (!o.is_me && nativeActor && isRealActorName(larkActorName)) this.setPwAlias("actor", nativeActor, larkActorName);
+                const nativeMsg = isIncomingLark ? "" : String(o.meta.native_message_id ?? o.id.slice(3));
+                if (nativeMsg) this.setPwAlias("msg", nativeMsg, String(hit.id));
                 const mergedMeta = isIncomingLark
                   ? {
                       ...hitMeta,
@@ -373,7 +384,7 @@ export class ContextStore {
                     }
                   : {
                       ...hitMeta,
-                      native_message_id: String(o.meta.native_message_id ?? o.id.slice(3)),
+                      native_message_id: nativeMsg,
                       native_chat_id: String(o.meta.native_chat_id ?? ""),
                       native_root_id: String(o.meta.native_root_id ?? ""),
                     };
@@ -421,7 +432,7 @@ export class ContextStore {
           const otherPrefix = o.id.startsWith("im:") ? "pw:%" : "im:%";
           const inChatType = String(o.meta.chat_type ?? "");
           const cands = nearIm.all(o.is_me ? 1 : 0, o.time - 15_000, o.time + 15_000, otherPrefix) as Row[];
-          const dup = cands.some((c) => {
+          const dup = cands.find((c) => {
             if (norm(String(c.text ?? "")) !== nt) return false;
             const cMeta = j<Record<string, unknown>>(c.meta, {});
             const cChatType = String(cMeta.chat_type ?? "");
@@ -435,7 +446,11 @@ export class ContextStore {
             const m = crossMatch(c, o, sameChatAlias);
             return m === "strong" || (m === "weak" && nt.length >= WEAK_MERGE_MIN_CHARS);
           });
-          if (dup) continue;
+          if (dup) {
+            const nativeMsg = o.id.startsWith("pw:") ? String(o.meta.native_message_id ?? o.id.slice(3)) : "";
+            if (nativeMsg) this.setPwAlias("msg", nativeMsg, String(dup.id));
+            continue;
+          }
         }
         ins.run(o.id, o.source, o.kind, o.conv, o.conv_name, o.actor_id, o.actor_name, o.is_me ? 1 : 0, o.time, o.text, o.url, JSON.stringify(o.meta ?? {}), now);
         n++;
@@ -448,6 +463,32 @@ export class ContextStore {
   deleteObs(id: string): boolean {
     const r = this.db.prepare("DELETE FROM ctx_obs WHERE id = ?").run(id);
     return Number(r.changes ?? 0) > 0;
+  }
+
+  /**
+   * 按个人 Web 原生消息 ID 删掉所有对应本地观测（用于撤回/编辑清空联动删除）：
+   * 同时覆盖直接入库的 `pw:<id>`、跨通道强匹配回填 `meta.native_message_id` 的 `im:*`，
+   * 以及弱匹配/背景去重时记在 `ctx_pw_alias('msg', id)` 的 `im:*`。
+   */
+  deleteByNativeMessageId(nativeId: string): number {
+    const id = nativeId.trim();
+    if (!id) return 0;
+    let deleted = 0;
+    this.tx(() => {
+      const r1 = this.db.prepare("DELETE FROM ctx_obs WHERE id = ?").run(`pw:${id}`);
+      deleted += Number(r1.changes ?? 0);
+      const mapped = this.pwAlias("msg", id);
+      if (mapped && mapped !== `pw:${id}`) {
+        const r2 = this.db.prepare("DELETE FROM ctx_obs WHERE id = ?").run(mapped);
+        deleted += Number(r2.changes ?? 0);
+      }
+      const r3 = this.db
+        .prepare("DELETE FROM ctx_obs WHERE source = 'im' AND json_extract(meta, '$.native_message_id') = ?")
+        .run(id);
+      deleted += Number(r3.changes ?? 0);
+      this.db.prepare("DELETE FROM ctx_pw_alias WHERE kind = 'msg' AND native_id = ?").run(id);
+    });
+    return deleted;
   }
 
   obs(id: string): Obs | undefined {
@@ -504,12 +545,18 @@ export class ContextStore {
     return this.db.prepare("SELECT conv, name FROM ctx_mute_conv").all() as { conv: string; name: string }[];
   }
 
-  /** 个人 Web 原生 ID 与开放平台的对应（chat：原生会话 ID → oc_；actor：原生用户 ID → 姓名），来自跨通道强匹配 */
-  setPwAlias(kind: "chat" | "actor", nativeId: string, value: string): void {
+  /**
+   * 个人 Web 原生 ID 与本地/开放平台的对应：
+   *   - `chat`：原生会话 ID → 开放平台 `oc_` ID（跨通道强匹配）
+   *   - `actor`：原生用户 ID → 真实姓名（跨通道强匹配）
+   *   - `chat_name`：原生会话 ID → 已学到的真实会话/私聊对端名（供私聊本人发言与发送前排除核对）
+   *   - `msg`：原生消息 ID → 已合并的 `ctx_obs.id`（供撤回墓碑联动删除 `im:*` 观测）
+   */
+  setPwAlias(kind: "chat" | "actor" | "chat_name" | "msg", nativeId: string, value: string): void {
     this.db.prepare("INSERT OR REPLACE INTO ctx_pw_alias (kind, native_id, value, at) VALUES (?, ?, ?, ?)").run(kind, nativeId, value, Date.now());
   }
 
-  pwAlias(kind: "chat" | "actor", nativeId: string): string {
+  pwAlias(kind: "chat" | "actor" | "chat_name" | "msg", nativeId: string): string {
     const r = this.db.prepare("SELECT value FROM ctx_pw_alias WHERE kind = ? AND native_id = ?").get(kind, nativeId) as { value: string } | undefined;
     return r?.value ?? "";
   }

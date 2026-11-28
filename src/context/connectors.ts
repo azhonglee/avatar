@@ -109,6 +109,32 @@ export class Connectors {
     return this.app.lark.run(args, { as: "user", timeoutMs });
   }
 
+  /**
+   * 显式单页翻页调用（不依赖 CLI --page-all / --page-limit 截断）：
+   *   - has_more === true 时必须继续用 page_token 翻页；
+   *   - 缺失或重复 page_token、仅返回 message_ids（详情拉取失败）或超出保护页数上限时一律抛错，绝不静默丢页并推进游标。
+   */
+  private async paginateLark(args: string[], listKey: string, timeoutMs = 180_000, maxPages = 200): Promise<Raw[]> {
+    const out: Raw[] = [];
+    const seenTokens = new Set<string>();
+    let token: string | undefined;
+    for (let page = 0; page < maxPages; page++) {
+      const data = await this.lark(token ? [...args, "--page-token", token] : args, timeoutMs);
+      if (listKey === "messages" && data && typeof data === "object" && "message_ids" in data) {
+        throw new Error("消息查询仅返回 ID，消息详情获取失败");
+      }
+      out.push(...arr(data, listKey));
+      if (data?.has_more !== true) return out;
+      const next = typeof data?.page_token === "string" ? data.page_token.trim() : "";
+      if (!next || seenTokens.has(next)) {
+        throw new Error(`分页返回缺失或重复的 page_token（${args.slice(0, 2).join(" ")}）`);
+      }
+      seenTokens.add(next);
+      token = next;
+    }
+    throw new Error(`分页超过 ${maxPages} 页上限仍未结束（${args.slice(0, 2).join(" ")}），暂不推进游标`);
+  }
+
   private async meego(args: string[]): Promise<any> {
     const r = await runProcess(this.cfg.bins.bytedcli, ["meego", ...args, "--json"], { timeoutMs: 120_000 });
     const t = r.stdout.trim();
@@ -324,8 +350,8 @@ export class Connectors {
     const since = Number(this.kv("cursor.im") ?? 0) || now - lookback;
     const start = isoLocal(since - 5 * 60_000); // 留 5 分钟重叠，靠 ID 去重
     const end = isoLocal(now);
-    const search = async (extra: string[]) =>
-      arr(await this.lark(["im", "+messages-search", "--start", start, "--end", end, "--page-all", "--page-limit", "40", "--page-size", "50", "--no-reactions", ...extra], 300_000), "messages");
+    const search = (extra: string[]) =>
+      this.paginateLark(["im", "+messages-search", "--start", start, "--end", end, "--page-size", "50", "--no-reactions", ...extra], "messages", 300_000);
     const raws: { m: Raw; kind: string }[] = [];
     for (const m of await search(["--is-at-me"])) raws.push({ m, kind: "at_me" });
     for (const m of await search(["--chat-type", "p2p"])) raws.push({ m, kind: "p2p" });
@@ -342,7 +368,6 @@ export class Connectors {
       }
     }
     for (const [id, v] of Object.entries(spoken)) if (v.at < now - lookback) delete spoken[id];
-    this.setKv("spoken_groups", JSON.stringify(spoken));
     const groups =
       this.cfg.context.groups === "allowlist"
         ? Object.fromEntries(this.cfg.context.groups_allow.map((id) => [id, { name: spoken[id]?.name ?? "", at: now }]))
@@ -351,14 +376,18 @@ export class Connectors {
       .filter(([id, v]) => !this.denied(id, v.name))
       .sort((a, b) => b[1].at - a[1].at)
       .slice(0, this.cfg.context.max_groups);
+    const succeededChats: string[] = [];
     for (const [chatId, v] of ranked) {
       const cur = Number(this.kv(`cursor.chat.${chatId}`) ?? 0) || since;
       try {
-        const data = await this.lark(["im", "+chat-messages-list", "--chat-id", chatId, "--start", isoLocal(cur - 60_000), "--end", end, "--order", "asc", "--page-all", "--page-limit", "4", "--no-reactions"]);
-        for (const m of arr(data, "messages")) raws.push({ m: { ...m, chat_name: m.chat_name || v.name, chat_type: m.chat_type || "group" }, kind: "group" });
-        this.setKv(`cursor.chat.${chatId}`, String(now));
+        const msgs = await this.paginateLark(
+          ["im", "+chat-messages-list", "--chat-id", chatId, "--start", isoLocal(cur - 60_000), "--end", end, "--order", "asc", "--page-size", "50", "--no-reactions"],
+          "messages",
+        );
+        for (const m of msgs) raws.push({ m: { ...m, chat_name: m.chat_name || v.name, chat_type: m.chat_type || "group" }, kind: "group" });
+        succeededChats.push(chatId);
       } catch {
-        // 单个群失败下轮重试
+        // 单个群翻页失败不推进该群游标，下轮重试
       }
     }
 
@@ -385,8 +414,14 @@ export class Connectors {
     const p2pName = new Map<string, string>();
     for (const o of obs) if (o.meta.chat_type === "p2p" && !o.is_me && o.actor_name) p2pName.set(o.conv, o.actor_name);
     for (const o of obs) if (o.meta.chat_type === "p2p") o.conv_name = `私聊：${p2pName.get(o.conv) ?? o.conv_name}`;
-    const n = this.store.addObs(obs);
-    this.setKv("cursor.im", String(now));
+    // 观测落库与所有游标推进同事务提交：落库失败时绝不提前推进任何群游标或全局游标
+    let n = 0;
+    this.store.tx(() => {
+      n = this.store.addObs(obs);
+      this.setKv("spoken_groups", JSON.stringify(spoken));
+      for (const chatId of succeededChats) this.setKv(`cursor.chat.${chatId}`, String(now));
+      this.setKv("cursor.im", String(now));
+    });
     return { count: n, dropped };
   }
 
@@ -395,14 +430,10 @@ export class Connectors {
   async pullMinutes(): Promise<{ count: number }> {
     const now = Date.now();
     const since = Number(this.kv("cursor.minutes") ?? 0) || now - this.cfg.context.lookback_days * DAY;
-    const list: Raw[] = [];
-    let token: string | undefined;
-    for (let i = 0; i < 5; i++) {
-      const data = await this.lark(["minutes", "+search", "--participant-ids", "me", "--start", isoLocal(since), "--end", isoLocal(now), "--page-size", "30", ...(token ? ["--page-token", token] : [])]);
-      list.push(...arr(data, "items"));
-      token = data?.page_token;
-      if (!data?.has_more || !token) break;
-    }
+    const list = await this.paginateLark(
+      ["minutes", "+search", "--participant-ids", "me", "--start", isoLocal(since), "--end", isoLocal(now), "--page-size", "30"],
+      "items",
+    );
     const tokens = list.map((x) => String(x.token ?? x.minute_token ?? "")).filter(Boolean);
     const obs: Obs[] = [];
     for (let i = 0; i < tokens.length; i += 10) {
@@ -432,8 +463,11 @@ export class Connectors {
         });
       }
     }
-    const n = this.store.addObs(obs);
-    this.setKv("cursor.minutes", String(now));
+    let n = 0;
+    this.store.tx(() => {
+      n = this.store.addObs(obs);
+      this.setKv("cursor.minutes", String(now));
+    });
     return { count: n };
   }
 

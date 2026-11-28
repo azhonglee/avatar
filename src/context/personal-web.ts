@@ -180,8 +180,28 @@ export function verifyGatewayOwnerForWorkspace(app: App, ownerId: string): void 
   if (!id) return;
   const bound = (app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
   if (bound && bound !== id) {
-    throw new Error(`当前工作区已绑定个人 Web 账号 ${bound}，与网关当前账号 ${id} 不一致，拒绝混入消息`);
+    throw new Error(`当前工作区已绑定个人 Web 账号 ${bound}，与网关当前账号 ${id} 不一致，拒绝混入消息（如确需切换账号，请先执行 pa context web-unbind）`);
   }
+}
+
+/** 解除当前 Avatar 工作区与个人 Web 账号的绑定，并清空本地网关游标、db_epoch、状态与发言群缓存（保留历史观测）。 */
+export function unbindPersonalWebAccount(app: App): { previousOwnerId: string } {
+  const previousOwnerId = (app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
+  const keys = [BOUND_OWNER_KV_KEY, CURSOR_KV_KEY, EPOCH_KV_KEY, STATE_KV_KEY, SPOKEN_GROUPS_KV_KEY];
+  app.store.db.exec("BEGIN IMMEDIATE");
+  try {
+    const del = app.store.db.prepare("DELETE FROM kv WHERE k = ?");
+    for (const k of keys) del.run(k);
+    app.store.db.exec("COMMIT");
+  } catch (e) {
+    try {
+      app.store.db.exec("ROLLBACK");
+    } catch {
+      // ignore
+    }
+    throw e;
+  }
+  return { previousOwnerId };
 }
 
 export class PersonalWebBridge {
@@ -321,13 +341,14 @@ export class PersonalWebBridge {
         }
         everConnected = true;
       }
+      const ownerChanged = !!st.owner_id && !!this.state.owner_id && st.owner_id !== this.state.owner_id;
       this.persistState({
         state: st.state,
         logged_in: st.logged_in,
         owner_id: st.owner_id || this.state.owner_id,
-        owner_name: st.owner_name || this.state.owner_name,
+        owner_name: ownerChanged ? st.owner_name : st.owner_name || this.state.owner_name,
         since: st.since || Date.now(),
-        last_message_at: st.last_message_at ?? this.state.last_message_at,
+        last_message_at: ownerChanged ? st.last_message_at : (st.last_message_at ?? this.state.last_message_at),
         last_error: st.state === "listening" || st.state === "stopped" ? "" : st.last_error,
       });
       if (st.state === "needs_login" && !notifiedNeedsLogin) {
@@ -614,10 +635,44 @@ export class PersonalWebBridge {
     return inAllow || this.loadSpokenGroups().has(chatId);
   }
 
+  /**
+   * 解析个人 Web 会话的已知真实名称（按优先级）：
+   *   1. 网关本次返回的实时会话名（群改名时以最新名称为准）；
+   *   2. `ctx_pw_alias('chat_name', chatId)` 已持久化的真实会话/私聊对端名；
+   *   3. 私聊对端发言时查 `ctx_pw_alias('actor', peerActorId)`；
+   *   4. 回扫 `pw_chat:<chatId>`（及已映射 `oc_` 会话）最近 20 条观测中第一条真实会话名（跳过“私聊：本人”等占位名）。
+   */
+  private knownChatName(
+    chatId: string,
+    kind: GatewayMessagePayload["conversationKind"] = "",
+    peerActorId = "",
+    liveName = "",
+  ): string {
+    const live = liveName.trim();
+    if (live) return live;
+    const aliased = this.store.pwAlias("chat_name", chatId);
+    if (aliased) return aliased;
+    if (kind === "dm" && peerActorId) {
+      const peer = this.store.pwAlias("actor", peerActorId);
+      if (peer) return peer;
+    }
+    const convs = [`pw_chat:${chatId}`];
+    const openChat = this.store.pwAlias("chat", chatId);
+    if (openChat) convs.push(openChat);
+    for (const conv of convs) {
+      const recent = this.store.convObs(conv, 0, 20);
+      for (let i = recent.length - 1; i >= 0; i--) {
+        const name = realConvName(recent[i].conv_name);
+        if (name) return name;
+      }
+    }
+    return "";
+  }
+
   /** 处理单条来自独立网关的事件（消息写入或撤回删除）。 */
   async handleGatewayEvent(ev: GatewayEvent): Promise<void> {
     if (ev.kind === "delete") {
-      this.store.deleteObs(`pw:${ev.message_id}`);
+      this.store.deleteByNativeMessageId(ev.message_id);
       return;
     }
     this.handleGatewayMessage(ev.message);
@@ -628,7 +683,7 @@ export class PersonalWebBridge {
     const obsId = `pw:${msg.id}`;
     const text = msg.text.trim();
     if (!text && msg.resources.length === 0) {
-      this.store.deleteObs(obsId);
+      this.store.deleteByNativeMessageId(msg.id);
       return;
     }
 
@@ -639,8 +694,14 @@ export class PersonalWebBridge {
 
     if (!isHuman && !this.botAllowed(text)) return;
 
-    const rawChatName = msg.chatName.trim();
-    const chatName = rawChatName || (msg.conversationKind === "dm" ? this.store.pwAlias("actor", msg.actorId) : "");
+    const chatName =
+      msg.chatNameResolved === false && !msg.chatName.trim()
+        ? ""
+        : this.knownChatName(msg.conversationId, msg.conversationKind, isMe ? "" : msg.actorId, msg.chatName);
+    const normalizedChatName = realConvName(chatName);
+    if (normalizedChatName) {
+      this.store.setPwAlias("chat_name", msg.conversationId, normalizedChatName);
+    }
     if (this.isDeniedChat(msg.conversationId, chatName)) return;
     // 仅当网关明确未能核验会话名（chatNameResolved === false）且本地存在按名称排除规则时丢弃；
     // 飞书私聊或未命名群在 readChat 成功返回空名（chatNameResolved === true）时正常放行，避免误丢真实私聊
@@ -743,7 +804,8 @@ export class PersonalWebBridge {
 
   /** 快通道理解前经网关只读接口补读该会话的历史背景消息（最多 15 条，标记为已处理背景）。 */
   async hydrateContext(anchor: FastAnchor, conv: string, convName: string, signal?: AbortSignal): Promise<number> {
-    if (this.isDeniedChat(anchor.conversationId, convName)) return 0;
+    const effectiveConvName = isRealConvName(convName) ? convName : this.knownChatName(anchor.conversationId) || convName;
+    if (this.isDeniedChat(anchor.conversationId, effectiveConvName)) return 0;
     const existing = this.store.convObs(conv, Date.now() - 24 * 3_600_000, 6);
     if (existing.length >= 5) return 0;
     let client: FeishuGatewayClient;
@@ -761,10 +823,10 @@ export class PersonalWebBridge {
       const ownerId = resp.owner_id || this.state.owner_id;
       const ownerName = this.app.store.get("ctx.owner_name") || resp.owner_name || this.state.owner_name || "我";
       const bg: Obs[] = resp.messages
-        .filter((m) => m.id && m.text.trim() && !this.isDeniedChat(m.conversationId, m.chatName || convName))
+        .filter((m) => m.id && m.text.trim() && !this.isDeniedChat(m.conversationId, m.chatName || effectiveConvName))
         .map((m) => {
           const isMe = !!ownerId && m.actorId === ownerId;
-          const displayConvName = m.chatName || convName;
+          const displayConvName = m.chatName || effectiveConvName;
           return {
             id: `pw:${m.id}`,
             source: "im",
@@ -811,7 +873,7 @@ export class PersonalWebBridge {
     text: string;
     cid: string;
   }): Promise<GatewayReplyResult> {
-    const knownConvName = this.store.convObs(`pw_chat:${args.chat_id}`, 0, 1)[0]?.conv_name ?? "";
+    const knownConvName = this.knownChatName(args.chat_id);
     if (this.isDeniedChat(args.chat_id, knownConvName)) {
       throw new PermanentEffectError(`目标会话「${knownConvName || args.chat_id}」已被排除或静音，拒绝发送个人 Web 回复`);
     }

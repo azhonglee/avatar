@@ -141,6 +141,29 @@ export function verifyLoginForGateway(store: GatewayStore, login: WebLogin, opts
   }
 }
 
+/**
+ * 核验并提交一次新的网关登录凭据：
+ *   - 若未切换账号，保存加密凭据并记录 bound_owner_id；
+ *   - 若通过 --force-switch-account 切换到新账号，先落盘新凭据，再原子清空旧账号事件/消息/会话/投递库并轮换 db_epoch。
+ */
+export function commitGatewayLogin(
+  store: GatewayStore,
+  loginStore: WebLoginStore,
+  login: WebLogin,
+  opts: { forceSwitch?: boolean } = {},
+): { saved: WebLogin; switched: boolean; previousOwnerId: string; dbEpoch?: string } {
+  verifyLoginForGateway(store, login, opts);
+  const previousOwnerId = (store.getKv(GATEWAY_BOUND_OWNER_KEY) ?? "").trim();
+  const switched = !!previousOwnerId && previousOwnerId !== login.owner_id;
+  const saved = loginStore.save(login);
+  if (switched) {
+    const { db_epoch } = store.resetForAccountSwitch(saved.owner_id);
+    return { saved, switched: true, previousOwnerId, dbEpoch: db_epoch };
+  }
+  store.setKv(GATEWAY_BOUND_OWNER_KEY, saved.owner_id);
+  return { saved, switched: false, previousOwnerId };
+}
+
 export class FeishuGatewayService {
   readonly cfg: GatewayConfig;
   readonly store: GatewayStore;
@@ -414,7 +437,9 @@ export class FeishuGatewayService {
     while (!signal.aborted) {
       const inspected = this.loginStore.inspect();
       const login = inspected.status === "ok" ? inspected.login : undefined;
-      const curKey = this.sessionKeyOf(login);
+      const boundOwner = (this.store.getKv(GATEWAY_BOUND_OWNER_KEY) ?? "").trim();
+      const curEpoch = this.store.dbEpoch();
+      const curKey = `${this.sessionKeyOf(login)}:${boundOwner}:${curEpoch}`;
 
       if (!login) {
         const msg =
@@ -447,6 +472,17 @@ export class FeishuGatewayService {
         continue;
       }
 
+      if (this.state.owner_id && this.state.owner_id !== login.owner_id) {
+        this.state = {
+          state: "idle",
+          owner_id: login.owner_id,
+          owner_name: login.owner_name,
+          since: 0,
+          last_message_at: null,
+          last_error: "",
+        };
+      }
+
       const sessionCtrl = new AbortController();
       const onOuterAbort = () => sessionCtrl.abort();
       signal.addEventListener("abort", onOuterAbort, { once: true });
@@ -454,7 +490,9 @@ export class FeishuGatewayService {
       const watchTimer = setInterval(() => {
         if (sessionCtrl.signal.aborted) return;
         const latest = this.loginStore.load();
-        if (this.sessionKeyOf(latest) !== curKey) {
+        const latestBound = (this.store.getKv(GATEWAY_BOUND_OWNER_KEY) ?? "").trim();
+        const latestEpoch = this.store.dbEpoch();
+        if (`${this.sessionKeyOf(latest)}:${latestBound}:${latestEpoch}` !== curKey) {
           sessionCtrl.abort();
         }
       }, watchMs);
@@ -529,6 +567,13 @@ export class FeishuGatewayService {
    */
   async handleMessage(msg: WebMessage, client?: FeishuWebClient, signal?: AbortSignal): Promise<GatewayEvent | null> {
     if (!msg.id) return null;
+
+    const currentOwner = client?.owner().id || this.state.owner_id || msg.ownerId;
+    const boundOwner = (this.store.getKv(GATEWAY_BOUND_OWNER_KEY) ?? "").trim();
+    if (boundOwner && currentOwner && boundOwner !== currentOwner) {
+      this.log("warn", "检测到网关已切换绑定账号，丢弃旧账号残留推送", { msg_owner: currentOwner, bound_owner: boundOwner });
+      return null;
+    }
 
     if (msg.unsupported || (!msg.text.trim() && msg.resources.length === 0)) {
       if (!this.store.hasKnownMessage(msg.id)) return null;

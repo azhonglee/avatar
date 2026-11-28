@@ -47,18 +47,25 @@ if (role === "lark") {
     process.stdout.write(JSON.stringify({ identities: { user: { openId: "ou_owner", userName: fx.user_name ?? "张三" } } }) + "\n");
     process.exit(0);
   }
+  const paged = (val, listKey, fallback = {}) => {
+    if (val && typeof val === "object" && !Array.isArray(val) && val.pages) {
+      const token = flag("--page-token") ?? "";
+      return val.pages[token] ?? { [listKey]: [], has_more: false };
+    }
+    return { [listKey]: val ?? [], ...fallback };
+  };
   switch (key) {
     case "im +messages-search":
-      if (argv.includes("--is-at-me")) ok({ messages: fx.at_me ?? [] });
-      if (flag("--chat-type") === "p2p") ok({ messages: fx.p2p ?? [] });
-      if (flag("--sender")) ok({ messages: fx.mine ?? [] });
+      if (argv.includes("--is-at-me")) ok(paged(fx.at_me, "messages"));
+      if (flag("--chat-type") === "p2p") ok(paged(fx.p2p, "messages"));
+      if (flag("--sender")) ok(paged(fx.mine, "messages"));
       ok({ messages: [] });
     case "im +chat-messages-list":
-      ok({ messages: (fx.chats ?? {})[flag("--chat-id")] ?? [] });
+      ok(paged((fx.chats ?? {})[flag("--chat-id")], "messages"));
     case "task +get-my-tasks":
       ok({ items: fx.tasks ?? [] });
     case "minutes +search":
-      ok({ items: fx.minutes ?? [], has_more: false });
+      ok(paged(fx.minutes, "items", { has_more: false }));
     case "minutes +detail":
       ok({ minutes: fx.minute_details ?? [] });
     case "calendar +agenda":
