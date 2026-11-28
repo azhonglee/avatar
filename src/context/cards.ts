@@ -77,17 +77,8 @@ function conflictBlock(c: CtxConflictView, cardKey: string, ctx: CtxRenderCtx): 
   const lines = c.claims
     .slice(0, 5)
     .map((cl, i) => `${nums[i]} ${esc(truncate(cl.claim, 80))} ${grey(`${fmtWhen(cl.time, ctx.timezone)}「${esc(truncate(cl.quote, 40))}」`)}${isUrl(cl.url) ? ` [原文](${cl.url})` : ""}`);
-  const buttons = c.claims.slice(0, 3).map((cl, i) =>
-    button(`以${nums[i]}为准`, {
-      cmd: "context.conflict_resolve",
-      args: { id: c.id, choice: cl.index ?? i, ...(cl.obs_rev ? { obs_rev: cl.obs_rev } : {}) },
-      card: cardKey,
-    }),
-  );
-  return [
-    md(`⚖️ **${esc(c.topic)}**${c.project_name ? ` ${grey(esc(c.project_name))}` : ""}\n${lines.join("\n")}`),
-    ...(buttons.length ? [buttonRow(buttons.map((b) => ({ ...b, size: "small" })))] : []),
-  ];
+  const buttons = c.claims.slice(0, 3).map((_, i) => button(`以${nums[i]}为准`, { cmd: "context.conflict_resolve", args: { id: c.id, choice: i }, card: cardKey }));
+  return [md(`⚖️ **${esc(c.topic)}**${c.project_name ? ` ${grey(esc(c.project_name))}` : ""}\n${lines.join("\n")}`), buttonRow(buttons.map((b) => ({ ...b, size: "small" })))];
 }
 
 function meetingsMd(ms: CtxMeeting[], tz: string): string {

@@ -663,12 +663,12 @@ export function SettingsForm({ view, onSaved }: { view: SettingsView; onSaved: (
               <Toggle path="context.autonomy.mute_legacy" label="自动静音历史遗留项目" />
               <Toggle path="context.autonomy.create_own_todo" label="把你的承诺建成飞书任务" hint="只建给你自己" />
             </div>
-            <h3 className="group-title">个人 Web 实时通道（秒级接收任意群 @我 与私聊）</h3>
+            <h3 className="group-title">个人 Web 独立网关（秒级接收任意群 @我 与私聊）</h3>
             <div className="toggles">
-              <Toggle path="context.personal_web.enabled" label="启用个人 Web 长连接" hint="需先在终端运行 pa context web-login 本人扫码；改后需重启常驻进程" />
+              <Toggle path="context.personal_web.enabled" label="启用独立个人 Web 网关客户端" hint="需先独立部署并启动 feishu-gateway，并在 config.yaml 配置 gateway_socket 或回环 gateway_url 与令牌环境变量；改后需重启常驻进程" />
               <Toggle path="context.personal_web.fast_lane" label="@我 与私聊秒级快通道" hint="不等 10 分钟定时周期，立刻做单会话理解并推送提醒卡片" />
               <Toggle path="context.personal_web.pre_draft" label="高优先级请求自动预起草" hint="只生成待确认草稿，永远不会自动在群里发言" />
-              <Toggle path="context.personal_web.send_replies" label="确认草稿后允许走个人 Web 回复" hint="仅对尚未拿到开放平台 ID 的实时消息生效，发送后独立回读核验" />
+              <Toggle path="context.personal_web.send_replies" label="确认草稿后允许经网关发送回复" hint="仅对尚未拿到开放平台 ID 的实时消息生效，同时需网关侧开启 allow_reply 并提供独立 reply_token" />
             </div>
             <div className="form-grid">
               <Num path="context.personal_web.debounce_ms" label="连续消息合并等待" min={0} step={500} suffix="毫秒" hint="同一会话短时间连发多条消息时合并成一次理解" />

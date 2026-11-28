@@ -1,13 +1,14 @@
 import http from "node:http";
 import https from "node:https";
 import zlib from "node:zlib";
-import { isAllowedFeishuHost, RecordingCookieJar, type CookieSnapshot } from "./cookies.ts";
+import { isAllowedFeishuHost, RecordingCookieJar } from "./cookies.ts";
 import { MAX_WIRE_BYTES } from "./proto.ts";
 
 /**
  * Bounded HTTPS/HTTP transport with manual redirect boundary enforcement and recording cookie jar.
- * Every hop (including 3xx redirects) validates host allowlist, records rotated Set-Cookie headers,
- * and strips sensitive auth-flow headers across host changes.
+ * Every hop (including 3xx redirects) validates host allowlist, stages Set-Cookie headers
+ * (discarding them on 401/403), strips sensitive auth headers across host changes,
+ * and re-derives `x-csrf-token` on redirect targets.
  */
 
 export const WEB_USER_AGENT =
@@ -23,7 +24,7 @@ export interface HttpResponse {
   headers: Record<string, string | string[] | undefined>;
   body: Buffer;
   url: string;
-  /** 本次请求（含重定向跳）是否收到过 Set-Cookie 响应头 */
+  /** 本次请求（含重定向跳）是否收到过 Set-Cookie 响应头并成功提交 */
   cookiesUpdated?: boolean;
 }
 
@@ -44,12 +45,7 @@ export class WebHttpError extends Error {
   readonly code: "credential_denied" | "http_error" | "transport" | "redirect_rejected" | "aborted";
   readonly status?: number;
 
-  constructor(
-    code: WebHttpError["code"],
-    message: string,
-    status?: number,
-    cause?: unknown,
-  ) {
+  constructor(code: WebHttpError["code"], message: string, status?: number, cause?: unknown) {
     super(message, cause !== undefined ? { cause } : undefined);
     this.name = "WebHttpError";
     this.code = code;
@@ -88,9 +84,7 @@ function singleRequest(
     let settled = false;
     let activeDecoder: zlib.Gunzip | zlib.Inflate | undefined;
     const destroyDecoder = (err?: Error) => {
-      if (activeDecoder && !activeDecoder.destroyed) {
-        activeDecoder.destroy(err);
-      }
+      if (activeDecoder && !activeDecoder.destroyed) activeDecoder.destroy(err);
     };
     const done = (fn: () => void) => {
       if (settled) return;
@@ -114,44 +108,27 @@ function singleRequest(
         const emptyBody = res.statusCode === 204 || res.statusCode === 304 || res.headers["content-length"] === "0";
         let stream: NodeJS.ReadableStream = res;
         if (!emptyBody && encoding === "gzip") {
-          const gz = zlib.createGunzip();
-          activeDecoder = gz;
-          res.pipe(gz);
-          stream = gz;
+          activeDecoder = zlib.createGunzip();
+          res.pipe(activeDecoder);
+          stream = activeDecoder;
         } else if (!emptyBody && encoding === "deflate") {
-          const inf = zlib.createInflate();
-          activeDecoder = inf;
-          res.pipe(inf);
-          stream = inf;
+          activeDecoder = zlib.createInflate();
+          res.pipe(activeDecoder);
+          stream = activeDecoder;
         }
-        // res.pipe(decoder) 不会将源响应流的中断/错误透传给解压器；显式转发中断与早关并销毁解压器，避免挂起到超时
+
+        const failStream = (msg: string, err?: Error) => {
+          destroyDecoder(err);
+          done(() => reject(new WebHttpError("transport", msg, undefined, err)));
+        };
         if (activeDecoder) {
-          res.on("error", (err) => {
-            destroyDecoder(err);
-            done(() => reject(new WebHttpError("transport", `读取响应失败：${err.message}`, undefined, err)));
-          });
-          res.on("aborted", () => {
-            const err = new Error("响应连接意外中断");
-            destroyDecoder(err);
-            done(() => reject(new WebHttpError("transport", "读取响应失败：连接意外中断", undefined, err)));
-          });
-          res.on("close", () => {
-            if (!res.complete && !settled) {
-              const err = new Error("响应连接未完成即关闭");
-              destroyDecoder(err);
-              done(() => reject(new WebHttpError("transport", "读取响应失败：连接未完成即关闭", undefined, err)));
-            }
-          });
-        } else {
-          res.on("aborted", () => {
-            done(() => reject(new WebHttpError("transport", "读取响应失败：连接意外中断")));
-          });
-          res.on("close", () => {
-            if (!res.complete && !settled) {
-              done(() => reject(new WebHttpError("transport", "读取响应失败：连接未完成即关闭")));
-            }
-          });
+          res.on("error", (err) => failStream(`读取响应失败：${err.message}`, err));
         }
+        res.on("aborted", () => failStream("读取响应失败：连接意外中断"));
+        res.on("close", () => {
+          if (!res.complete && !settled) failStream("读取响应失败：连接未完成即关闭");
+        });
+
         const chunks: Buffer[] = [];
         let total = 0;
         stream.on("data", (chunk: Buffer | string) => {
@@ -165,10 +142,7 @@ function singleRequest(
           }
           chunks.push(buf);
         });
-        stream.on("error", (err) => {
-          destroyDecoder();
-          done(() => reject(new WebHttpError("transport", `读取响应失败：${err.message}`, undefined, err)));
-        });
+        stream.on("error", (err) => failStream(`读取响应失败：${err.message}`, err));
         stream.on("end", () => {
           done(() =>
             resolve({
@@ -205,7 +179,7 @@ function singleRequest(
   });
 }
 
-/** Execute a bounded HTTP request following Feishu-only redirects while recording rotated cookies. */
+/** Execute a bounded HTTP request following Feishu-only redirects while staging rotated cookies. */
 export async function fetchWithJar(jar: RecordingCookieJar, opts: HttpRequestOptions): Promise<HttpResponse> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
   const maxBytes = opts.maxBytes ?? MAX_WIRE_BYTES;
@@ -215,23 +189,20 @@ export async function fetchWithJar(jar: RecordingCookieJar, opts: HttpRequestOpt
   let method: "GET" | "POST" = opts.method;
   let body = opts.body === undefined ? undefined : Buffer.isBuffer(opts.body) ? opts.body : Buffer.from(opts.body, "utf8");
   let headers: Record<string, string> = { ...(opts.headers ?? {}) };
-  // 按请求暂存每一跳的 Set-Cookie，仅在最终非 401/403 响应时提交回共享活罐；
-  // 鉴权拒绝响应（401/403）或异常重定向的 Cookie 变更一律丢弃，且绝不影响并发请求的无关 Cookie 轮换。
-  const stagedCookies: { url: URL; headers: string[] | string; nowMs: number; snapshot: CookieSnapshot }[] = [];
+  const stagedCookies: { url: URL; headers: string[] | string; nowMs: number }[] = [];
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     validateTarget(currentUrl, allowInsecureHttp, opts.extraAllowedHosts);
     const reqHeaders: Record<string, string> = { ...headers };
-    let viewJar: RecordingCookieJar = jar;
+    let viewJar = jar;
     if (stagedCookies.length > 0) {
       viewJar = jar.clone();
-      // 复用快照冲突校验叠算各重定向跳 Set-Cookie，确保在途期间 syncFromRecords() 写入的更新轮换值不被陈旧重定向覆写
       viewJar.applyStaged(stagedCookies);
     }
     const cookie = viewJar.cookieHeader(currentUrl);
     if (cookie) reqHeaders["Cookie"] = cookie;
     else delete reqHeaders["Cookie"];
-    // 每次重定向跳（无论首跳是否已携带 x-csrf-token，含 307 首次下发 swp_csrf_token 或切路径生效）均按目标 URL 重新派生 x-csrf-token
+
     if (hop > 0) {
       for (const k of Object.keys(reqHeaders)) {
         if (k.toLowerCase() === "x-csrf-token") delete reqHeaders[k];
@@ -240,12 +211,10 @@ export async function fetchWithJar(jar: RecordingCookieJar, opts: HttpRequestOpt
       if (destCsrf) reqHeaders["x-csrf-token"] = destCsrf;
     }
 
-    // 记录本跳实际发出的 Cookie 视图基准（含同步代际），避免重定向跳以未发送的新轮换值作为基线而误覆盖并发刷新
-    const reqSnap = viewJar.snapshot();
     const res = await singleRequest(currentUrl, method, reqHeaders, body, timeoutMs, maxBytes, opts.signal);
     const rawSetCookie = res.headers["set-cookie"];
     if (rawSetCookie) {
-      stagedCookies.push({ url: new URL(currentUrl.toString()), headers: rawSetCookie, nowMs: Date.now(), snapshot: reqSnap });
+      stagedCookies.push({ url: new URL(currentUrl.toString()), headers: rawSetCookie, nowMs: Date.now() });
     }
 
     const isRedirect = res.status === 301 || res.status === 302 || res.status === 303 || res.status === 307 || res.status === 308;

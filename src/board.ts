@@ -1,5 +1,5 @@
 import type { Config } from "./config.ts";
-import { verifyActiveLarkUser, type Lark } from "./lark.ts";
+import type { Lark } from "./lark.ts";
 import type { Store } from "./store.ts";
 import { deepFind, errMsg, findItems, log } from "./util.ts";
 
@@ -37,13 +37,9 @@ export class Board {
   }
 
   /** 幂等：找到同名清单/分组就复用，找不到才创建。 */
-  async init(opts?: { prevOwner?: string }): Promise<void> {
+  async init(): Promise<void> {
     let tasklist = this.store.get("board.tasklist");
-    const cfgOwner = this.cfg.owner.open_id.trim();
     if (!tasklist) {
-      // 全新初始化前必须先实时核验当前 lark-cli 登录用户与配置 owner.open_id 一致，
-      // 防止将其他账号的同名清单或新清单错误绑定并标成当前配置的 owner.open_id
-      const { openId: authedOwner } = await verifyActiveLarkUser(this.lark, cfgOwner, "初始化任务看板");
       const found = await this.lark.run(["task", "+tasklist-search", "--query", this.cfg.board.name], { as: "user" });
       tasklist = findItems(found, "guid").find((t) => t.name === this.cfg.board.name)?.guid as string | undefined;
       if (!tasklist) {
@@ -52,52 +48,7 @@ export class Board {
         if (!tasklist) throw new Error(`创建任务清单失败：${JSON.stringify(created)}`);
         log("info", "已创建任务清单", { name: this.cfg.board.name, guid: tasklist });
       }
-      // 搜索/创建清单后、原子落盘前再次核验活跃 lark-cli 用户与配置主人一致，
-      // 防止调用期间切号导致把他人账号的任务清单 GUID 绑定成当前主人
-      const { openId: postOwner } = await verifyActiveLarkUser(this.lark, authedOwner, "绑定任务看板");
-      if (postOwner !== authedOwner || postOwner !== this.cfg.owner.open_id.trim()) {
-        throw new Error(
-          `初始化任务看板期间活跃 lark-cli 用户发生变更 (${authedOwner} -> ${postOwner})，拒绝持久化看板绑定以防跨账号混用`,
-        );
-      }
-      // 将看板 ID 与已核验主人原子落盘，防止初始化中途崩溃导致遗留无主 board.tasklist
-      this.store.db.exec("BEGIN IMMEDIATE");
-      try {
-        this.store.set("board.tasklist", tasklist);
-        this.store.set("board.owner_open_id", postOwner);
-        this.store.db.exec("COMMIT");
-      } catch (err) {
-        try {
-          this.store.db.exec("ROLLBACK");
-        } catch {
-          // ignore
-        }
-        throw err;
-      }
-    } else {
-      const existingBoardOwner = (this.store.get("board.owner_open_id") ?? "").trim();
-      if (existingBoardOwner) {
-        if (!cfgOwner || existingBoardOwner !== cfgOwner) {
-          throw new Error(
-            `本地持久化看板归属账号 (${existingBoardOwner}) 与当前配置 owner.open_id (${cfgOwner || "未配置"}) 不一致，拒绝复用或改标；请切回原主人或使用全新的 data_dir 重新运行 pa init`,
-          );
-        }
-        await verifyActiveLarkUser(this.lark, existingBoardOwner, "同步任务看板分组");
-      } else {
-        const priorOwner = (opts?.prevOwner !== undefined ? opts.prevOwner : (this.store.get("owner.open_id") ?? "")).trim();
-        if (!priorOwner) {
-          throw new Error(
-            "本地已有遗留看板 (board.tasklist)，但缺少原始主人记录 (owner.open_id)，无法确立归属；为防跨账号混用，拒绝自动接管，请使用全新的 data_dir 重新运行 pa init",
-          );
-        }
-        if (!cfgOwner || priorOwner !== cfgOwner) {
-          throw new Error(
-            `本地遗留看板归属原主人 (${priorOwner})，与当前配置 owner.open_id (${cfgOwner || "未配置"}) 不一致，拒绝改标为新主人；请切回原主人或使用全新的 data_dir 重新运行 pa init`,
-          );
-        }
-        const { openId: authedOwner } = await verifyActiveLarkUser(this.lark, priorOwner, "迁移遗留任务看板");
-        this.store.set("board.owner_open_id", authedOwner);
-      }
+      this.store.set("board.tasklist", tasklist);
     }
     const listed = await this.lark.run(
       ["task", "sections", "list", "--params", JSON.stringify({ resource_type: "tasklist", resource_id: tasklist, page_size: 50 })],
@@ -171,14 +122,7 @@ export class Board {
     return { completed: false, sectionGuid: mine.section_guid };
   }
 
-  async createTask(t: {
-    summary: string;
-    description: string;
-    due?: string;
-    section: SectionKey;
-    opKey?: string;
-    onCreated?: (guid: string) => void;
-  }): Promise<string> {
+  async createTask(t: { summary: string; description: string; due?: string; section: SectionKey; opKey?: string }): Promise<string> {
     const create = async () => {
       const args = ["task", "+create", "--summary", t.summary, "--description", t.description, "--tasklist-id", this.tasklistGuid];
       if (t.due) args.push("--due", t.due);
@@ -186,11 +130,9 @@ export class Board {
       const created = await this.lark.run(args, { as: "user" });
       const guid = String(deepFind(created, "guid") ?? "");
       if (!guid) throw new Error(`创建任务失败：${JSON.stringify(created)}`);
-      t.onCreated?.(guid);
       return guid;
     };
     const guid = t.opKey ? await this.store.once(`task.create.${t.opKey}`, create) : await create();
-    t.onCreated?.(guid);
     await this.move(guid, t.section);
     return guid;
   }

@@ -56,8 +56,10 @@ bin/pa console                         # 打印带令牌的控制台登录链接
 
 ```
 pa doctor | init | run | brief [morning|evening] [--print] | capture | dispatch | status
-pa context run | today | split <项目> | digest [morning|evening] [--print]   工作上下文：采集理解 / 看今天 / 拆子项目 / 发早晚卡
-pa context web-login [--out qr.svg] | web-status [--verify] | web-logout     个人 Web 协议扫码登录与实时通道状态
+pa context run | today | digest [morning|evening] [--print]   工作上下文：采集理解一轮 / 看今天 / 发晨间卡
+pa context web-status [--verify]       查询独立飞书个人 Web 网关状态（网关部署见下）
+pa context web-unbind                  解除当前工作区与个人 Web 账号的绑定并重置本地网关游标（切换网关账号时使用）
+feishu-gateway login | run | status [--verify] | logout | tokens   独立飞书个人 Web 常驻网关（单独进程/OS 用户/容器部署）
 pa console [--rotate]                  打印控制台登录链接（--rotate 作废旧令牌）
 pa command <名称> [JSON 参数]          通过统一命令层执行操作（与卡片/控制台按钮一致）
 pa job <名称> | ask <文字> | publish-doc <file.md> [--title] [--parent 节点名]
@@ -85,9 +87,11 @@ src/
   notify-prefs.ts   通知偏好（免打扰时段、按类型开关、失败告警不拦截）
   usage.ts          acpx 用量解析、按天/执行者/任务统计、每日与单任务预算守卫
   candidates.ts     候选任务反馈、准确率统计、分诊校准闭环
-  context/          工作上下文：connectors（采集）· feishu-web/ + personal-web（独立 TS 个人 Web 长连接与秒级快通道）·
-                    understand（带证据的理解）· store（ctx_* 图谱与跨通道去重）· views（排序与视图）·
-                    drafts（起草）· cards（晨间卡 / 收尾卡 / 提醒 / 草稿）· index（周期、命令、自主等级）
+  gateway/          独立部署边界的飞书个人 Web 常驻网关（0 处依赖 Avatar 业务模块）：
+                    config / store（独立 SQLite 游标缓存 + 幂等发送账本 + 读写双令牌）/ service / server（Unix Socket 或回环 HTTP + SSE）/
+                    client / cli（bin/feishu-gateway）/ feishu-web（基于 ws/qrcode/tough-cookie 的协议层）
+  context/          工作上下文：connectors（采集）· personal-web（纯网关客户端桥接层）· understand（带证据的理解）·
+                    store（ctx_* 图谱）· views（排序与视图）· drafts（起草）· cards（晨间卡 / 收尾卡 / 提醒 / 草稿）· index（周期、命令、自主等级）
   config.ts / lark.ts / guard.ts / harness.ts / events.ts / board.ts / store.ts
   workflows/        triage.ts / capture.ts / dispatch.ts / brief.ts / agent.ts
 web/                React + Vite + TypeScript 本机控制台 SPA + scripts/demo-server.ts
@@ -104,6 +108,13 @@ test/               后端单元/引擎/集成/端到端测试（桩程序，不
 - **飞书权限守卫**：分诊和 worker 不能调用 `lark-cli`；superagent 作业只放行读和白名单写操作，审计记入 `<data_dir>/logs/guard.log`。机器人和卡片按钮只响应主人本人。
 - **控制台鉴权与边界**：默认监听 `0.0.0.0`（可设为 `127.0.0.1` 仅限本机），访问需令牌（HttpOnly + SameSite=Strict Cookie），写请求校验同源与 JSON，禁止经 API 修改 `data_dir` / `bins`，日志读取限定在 `data_dir` 内。
 - 守卫不是操作系统级沙箱：`--approve-all` 的 worker 仍可在开发机上执行命令，请只在你信任的仓库上派单。
+- **个人 Web 独立常驻网关边界（可选功能，默认关闭）**：个人 Web 协议、AES-256-GCM 静态加密会话 Cookie（`FEISHU_GW_KEY` / `PA_FEISHU_WEB_KEY` / systemd `LoadCredential`）与长连接已完整拆出到独立进程 `bin/feishu-gateway`（见 [gateway.example.yaml](gateway.example.yaml)、[deploy/feishu-gateway.service](deploy/feishu-gateway.service)、[deploy/Dockerfile.gateway](deploy/Dockerfile.gateway)）。推荐以独立 OS 用户或独立容器部署，通过 `0660` Unix Domain Socket + 读写分离双令牌（`read_token` 只读流与游标补拉，`reply_token` 且网关侧默认 `allow_reply: false` 才允许受控回复）与 Avatar 主进程隔离开，Avatar 及其 `--approve-all` worker 不再接触飞书 Cookie 与加密密钥。边界与运维注意：
+  - 与 Avatar 同一 OS 用户的 worker 仍能从 `/proc/<pid>/environ` 或 `$CREDENTIALS_DIRECTORY` 读到网关令牌（`read_token` 可读任意会话历史，`reply_token` 在 `allow_reply: true` 时可发消息；开启 `send_replies` 时 `pa doctor` 会显式告警），需要真正隔离时请让 worker 以独立 OS 用户或容器运行。
+  - **私聊排除**：飞书个人 Web 会话元信息接口对单聊（P2P DM）不返回对方姓名，因此在网关边界 `gateway.yaml` 的 `deny_chats` 中排除私聊必须使用原生数字 `chat_id` 或 `pw_chat:<id>`；按联系人姓名排除/静音私聊在 Avatar 侧跨通道学到对方姓名后生效。
+  - **切换账号**：在网关侧执行 `feishu-gateway login --force-switch-account` 会原子清空旧账号的事件日志/缓存/投递账本并轮换 `db_epoch`，随后在 Avatar 侧执行 `pa context web-unbind` 解绑旧账号即可重新同步。
+  - **systemd 令牌**：`deploy/feishu-gateway.service` 通过 `LoadCredential` 从 `/etc/feishu-gateway/secrets/{read-token,reply-token}` 加载令牌；此模式下直接查看凭据文件即可，在无 `CREDENTIALS_DIRECTORY` 的 shell 中运行 `feishu-gateway tokens` 会拒绝静默生成冲突的 `tokens.json`。
+  - 仍存在上游私有协议变更风险，请按需开启并遵守组织合规要求。
+- **从进程内个人 Web 升级**：旧版 `pa context web-login` 把加密会话保存在 `<data_dir>/feishu-web.json`。改用网关后请运行 `pa context web-logout` 删除它，从 Avatar 的运行环境中移除 `PA_FEISHU_WEB_KEY`，并在飞书 App 的登录设备管理里移除旧的网页登录；`pa doctor` 会提示残留。
 
 ## 开发与本地演示
 

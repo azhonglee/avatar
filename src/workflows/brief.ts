@@ -1,49 +1,10 @@
-import { isContextDerivedDispatchBlocked, isContextOwnedTaskBlocked } from "../api/queries.ts";
 import type { Board, BoardTask } from "../board.ts";
 import { toBoardTask } from "../board.ts";
 import type { Config } from "../config.ts";
-import { extractOwnerOpenId, type Lark } from "../lark.ts";
+import type { Lark } from "../lark.ts";
 import type { Ledger } from "../ledger.ts";
 import type { Store } from "../store.ts";
-import { errMsg, findItems } from "../util.ts";
-
-/**
- * 核验当前晨报/晚报的数据来源归属与配置中的目标接收者（owner.open_id）完全一致：
- *   1. 若本地持久化看板（board.tasklist）已绑定其他主人，拒绝复用旧主人看板生成新主人概览；
- *   2. 实时核验 lark-cli 当前登录用户 open_id 与 cfg.owner.open_id 一致，防止仅改配置换主人但 lark-cli 仍登录旧账号，
- *      从而把旧账号的个人逾期任务打上新主人标签发给新主人。
- */
-export async function assertBriefDataOwner(cfg: Config, lark: Lark, store: Store): Promise<string> {
-  const expectedOwner = cfg.owner.open_id.trim();
-  if (!expectedOwner) {
-    throw new Error("未配置 owner.open_id，无法确认晨报/晚报数据归属，请先运行 pa init");
-  }
-  const hasBoard = !!store.get("board.tasklist");
-  if (hasBoard) {
-    const boardOwner = (store.get("board.owner_open_id") || store.get("owner.open_id") || "").trim();
-    if (!boardOwner || boardOwner !== expectedOwner) {
-      throw new Error(
-        `本地持久化看板归属账号 (${boardOwner || "未知"}) 与当前配置 owner.open_id (${expectedOwner}) 不一致，拒绝生成概览以防跨账号泄漏；请切回原主人或使用全新的 data_dir 并重新运行 pa init`,
-      );
-    }
-  }
-  let status: Record<string, unknown>;
-  try {
-    status = await lark.authStatus();
-  } catch (err) {
-    throw new Error(`无法核验当前 lark-cli 登录用户身份，已按安全策略中止生成概览：${errMsg(err)}`);
-  }
-  const authedOpenId = extractOwnerOpenId(status).trim();
-  if (!authedOpenId || !authedOpenId.startsWith("ou_")) {
-    throw new Error("无法从 lark-cli auth status 解析当前登录用户的 open_id，已按安全策略中止生成概览");
-  }
-  if (authedOpenId !== expectedOwner) {
-    throw new Error(
-      `当前 lark-cli 登录用户 (${authedOpenId}) 与配置 owner.open_id (${expectedOwner}) 不一致，拒绝生成概览以防将他人任务发送给错误主人`,
-    );
-  }
-  return expectedOwner;
-}
+import { findItems } from "../util.ts";
 
 /**
  * 晨报 / 晚报：纯数据汇总，不调用模型——便宜、稳定、可预期。
@@ -57,37 +18,23 @@ export async function buildBrief(
   board: Board,
   mode: "morning" | "evening",
 ): Promise<string> {
-  const preOwner = await assertBriefDataOwner(cfg, lark, store);
   const now = Date.now();
   const tz = cfg.owner.timezone;
   const dayEnd = endOfLocalDay(now, tz);
-  const isTaskVisible = (t: BoardTask) => !isContextOwnedTaskBlocked({ cfg, store, ledger }, t.guid);
   const mine = findItems(
     await lark.run(["task", "+get-my-tasks", "--complete=false", "--page-all"], { as: "user" }),
     "guid",
-  )
-    .map(toBoardTask)
-    .filter(isTaskVisible);
+  ).map(toBoardTask);
 
   const overdue = mine.filter((t) => t.dueMs !== null && t.dueMs < now);
   const today = mine.filter((t) => t.dueMs !== null && t.dueMs >= now && t.dueMs <= dayEnd);
   const tomorrow = mine.filter((t) => t.dueMs !== null && t.dueMs > dayEnd && t.dueMs <= dayEnd + 86_400_000);
-  const pending = (await board.listSection("pending")).filter(isTaskVisible);
-  const review = (await board.listSection("review")).filter(isTaskVisible);
-  const attention = (await board.listSection("attention")).filter(isTaskVisible);
-  // 所有 --as user 读取完成后再次核验活跃 lark-cli 登录身份与配置主人一致，
-  // 防止拉取期间 CLI 切号导致把他人任务打包发给当前主人
-  const postOwner = await assertBriefDataOwner(cfg, lark, store);
-  if (postOwner !== preOwner) {
-    throw new Error(
-      `生成概览期间工作区主人发生变更 (${preOwner} -> ${postOwner})，已丢弃本轮数据以防跨账号泄漏`,
-    );
-  }
+  const pending = await board.listSection("pending");
+  const review = await board.listSection("review");
+  const attention = await board.listSection("attention");
   const since = now - 86_400_000;
-  // 派单统计按验收结果（outcome）算，而不是按执行者退出码；按主人隔离过滤旧主人上下文委派的派单
-  const dispatches = ledger
-    .recent(["dispatch"], since)
-    .filter((w) => !isContextDerivedDispatchBlocked({ cfg, store, ledger }, w.id));
+  // 派单统计按验收结果（outcome）算，而不是按执行者退出码
+  const dispatches = ledger.recent(["dispatch"], since);
   const count = (s: string) => dispatches.filter((w) => w.state === s).length;
   const inFlight = dispatches.filter((w) => !w.terminal).length;
   const failures = ledger.failuresSince(since);

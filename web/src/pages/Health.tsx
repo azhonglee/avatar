@@ -5,19 +5,12 @@ import { useCommand } from "../lib/command.ts";
 import { absTime, useNow } from "../lib/format.ts";
 import { useQuery } from "../lib/query.ts";
 
-const KIND_LABEL: Record<HealthItem["kind"], string> = {
-  event: "飞书事件",
-  effect: "飞书写入",
-  job: "作业",
-  delivery: "交付",
-  context: "工作上下文",
-};
+const KIND_LABEL: Record<HealthItem["kind"], string> = { event: "飞书事件", effect: "飞书写入", job: "作业", delivery: "交付" };
 const KIND_HINT: Record<HealthItem["kind"], string> = {
   event: "收到的飞书事件处理失败，相关的消息/评论可能没有被识别。",
   effect: "要写回飞书的评论、移动卡片或私信没有成功。",
   job: "定时作业没有跑完。",
   delivery: "推送分支 / 创建 PR / 合并没有成功。",
-  context: "工作上下文采集、快通道理解或起草失败。",
 };
 
 function refLink(it: HealthItem) {
@@ -49,9 +42,7 @@ function FailedItem({ it }: { it: HealthItem }) {
             {refLink(it)}
           </div>
         </div>
-        {it.isolated ? (
-          <Pill tone="muted">已隔离</Pill>
-        ) : !it.acknowledged ? (
+        {!it.acknowledged ? (
           <div className="row-gap">
             <button className="btn btn-sm btn-primary" disabled={cmd.isPending(kr)} onClick={() => void cmd.run("work.retry", { id: it.id }, { key: kr, navigate: false })}>
               {cmd.isPending(kr) && <Spinner />}重试
@@ -100,9 +91,8 @@ export function HealthPage() {
       <PageHeader title="健康" subtitle="失败与重试中的工作、常驻进程状态、命令守卫的拦截记录" />
       <QueryView q={q}>
         {(h) => {
-          const open = h.failed.filter((f) => !f.acknowledged && !f.isolated);
-          const acked = h.failed.filter((f) => f.acknowledged && !f.isolated);
-          const isolated = h.failed.filter((f) => !!f.isolated);
+          const open = h.failed.filter((f) => !f.acknowledged);
+          const acked = h.failed.filter((f) => f.acknowledged);
           return (
             <div className="grid-overview">
               <div className="col-main">
@@ -120,15 +110,6 @@ export function HealthPage() {
                     <Collapsible summary={`已忽略 ${acked.length} 项`}>
                       <ul className="hlist">
                         {acked.map((it) => (
-                          <FailedItem key={it.id} it={it} />
-                        ))}
-                      </ul>
-                    </Collapsible>
-                  )}
-                  {isolated.length > 0 && (
-                    <Collapsible summary={`已按旧主人隔离 ${isolated.length} 项`}>
-                      <ul className="hlist">
-                        {isolated.map((it) => (
                           <FailedItem key={it.id} it={it} />
                         ))}
                       </ul>

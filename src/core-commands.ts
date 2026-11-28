@@ -1,16 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
-import { isContextDerivedDispatchBlocked, isWorkBlockedByOwner } from "./api/queries.ts";
 import type { CommandName, DeliveryStatus } from "./api/types.ts";
 import { CommandError, S, type Commands } from "./commands.ts";
 import type { Config } from "./config.ts";
 import type { Board } from "./board.ts";
 import { loadPrompt } from "./harness.ts";
-import { verifyActiveLarkUser } from "./lark.ts";
 import type { Ledger, WorkItem } from "./ledger.ts";
-import type { Store } from "./store.ts";
-import { errMsg, expandHome } from "./util.ts";
+import { expandHome } from "./util.ts";
 import { enqueueJob } from "./workflows/agent.ts";
 import type { Dispatcher, DispatchPayload } from "./workflows/dispatch.ts";
 
@@ -36,31 +33,23 @@ export function availableActions(
 
 export interface CoreDeps {
   cfg: Config;
-  store: Store;
   ledger: Ledger;
   board: Board;
   dispatcher: Dispatcher;
 }
 
-function assertDispatchOwnerAllowed(d: Pick<CoreDeps, "cfg" | "store" | "ledger">, id: string): void {
-  if (isContextDerivedDispatchBlocked(d, id)) {
-    throw new CommandError("conflict", "该派单源自旧工作区主人的工作上下文，已按主人隔离阻断操作");
-  }
-}
-
-function terminalDispatch(d: Pick<CoreDeps, "cfg" | "store" | "ledger">, id: string): WorkItem<DispatchPayload> {
-  assertDispatchOwnerAllowed(d, id);
-  const w = d.ledger.get<DispatchPayload>(id);
+function terminalDispatch(ledger: Ledger, id: string): WorkItem<DispatchPayload> {
+  const w = ledger.get<DispatchPayload>(id);
   if (!w || w.kind !== "dispatch") throw new CommandError("not_found", `没有这项派单：${id}`);
   if (!w.terminal) throw new CommandError("conflict", "派单还在进行中，请先取消");
-  const latest = d.ledger.latest("dispatch", w.ref);
+  const latest = ledger.latest("dispatch", w.ref);
   if (latest && latest.id !== w.id) throw new CommandError("conflict", "这张卡片已经有更新的派单，请操作最新的一次");
   return w;
 }
 
 /** 注册不依赖可选模块的核心命令。 */
 export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
-  const { cfg, store, ledger, board, dispatcher } = d;
+  const { cfg, ledger, board, dispatcher } = d;
   const harnessName = z.string().refine((h) => !!cfg.harnesses[h], { message: "未定义的执行者" });
 
   commands.register({
@@ -76,45 +65,12 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
         .optional(),
     }),
     target: (a) => a.summary,
-    run: async (a, ctx) => {
+    run: async (a) => {
       const summary = `${a.harness ? `[${a.harness}] ` : ""}${a.summary}`;
       const description = [a.description ?? "", a.repo ? `repo: ${a.repo}` : ""].filter(Boolean).join("\n");
-      // 在远端创建返回 GUID 的第一时间（先于独立的 move 与 reconcile）即持久化主人归属，防止 move/reconcile 超时导致无主委派任务；
-      // 而在发起任何远端创建前，先核验本地看板归属与当前活跃 lark-cli 登录用户均与 contextOwner 一致，防止切换 CLI 账号后私密摘要被错发给他人看板
-      const contextOwner = ctx.contextOwner?.trim();
-      if (contextOwner) {
-        const hasBoard = !!store.get("board.tasklist");
-        const boardOwner = (store.get("board.owner_open_id") || store.get("owner.open_id") || "").trim();
-        if ((boardOwner && boardOwner !== contextOwner) || (hasBoard && !boardOwner)) {
-          throw new CommandError(
-            "conflict",
-            `本地持久化看板归属账号 (${boardOwner || "未知"}) 与上下文主人 (${contextOwner}) 不一致，拒绝创建工作上下文委派派单以防跨账号泄漏`,
-          );
-        }
-        try {
-          await verifyActiveLarkUser(board.lark, contextOwner, "创建工作上下文委派派单");
-        } catch (err) {
-          throw new CommandError("conflict", errMsg(err));
-        }
-      }
-      const guid = await board.createTask({
-        summary,
-        description,
-        section: "dispatch",
-        onCreated: (createdGuid) => {
-          if (contextOwner) {
-            store.set(`ctx.dispatch_ref_owner.${createdGuid}`, contextOwner);
-          }
-        },
-      });
-      if (contextOwner) {
-        store.set(`ctx.dispatch_ref_owner.${guid}`, contextOwner);
-      }
+      const guid = await board.createTask({ summary, description, section: "dispatch" });
       await dispatcher.reconcile();
       const w = ledger.latest("dispatch", guid);
-      if (contextOwner && w?.id) {
-        store.set(`ctx.dispatch_owner.${w.id}`, contextOwner);
-      }
       return { ok: true, message: "已创建派单，进度会实时更新", target: w?.id ?? guid };
     },
   });
@@ -125,7 +81,6 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
     schema: S.id,
     target: (a) => a.id,
     run: async (a) => {
-      assertDispatchOwnerAllowed(d, a.id);
       const w = ledger.get(a.id);
       if (!w || w.kind !== "dispatch") throw new CommandError("not_found", `没有这项派单：${a.id}`);
       if (w.terminal) throw new CommandError("conflict", "派单已经结束");
@@ -140,7 +95,7 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
     schema: S.id,
     target: (a) => a.id,
     run: async (a) => {
-      const w = terminalDispatch(d, a.id);
+      const w = terminalDispatch(ledger, a.id);
       const id = dispatcher.redispatch(w.ref, { reason: "手动重试", harness: w.payload.harness || undefined, from: w.id });
       return { ok: true, message: "已重新派单", target: id };
     },
@@ -152,7 +107,7 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
     schema: z.object({ id: z.string().min(1), feedback: z.string().trim().min(1, "请写下返工意见").max(5000) }),
     target: (a) => a.id,
     run: async (a) => {
-      const w = terminalDispatch(d, a.id);
+      const w = terminalDispatch(ledger, a.id);
       const id = dispatcher.redispatch(w.ref, { reason: "带意见返工", feedback: a.feedback, harness: w.payload.harness || undefined, from: w.id });
       return { ok: true, message: "已带着你的意见重新派单", target: id };
     },
@@ -164,7 +119,7 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
     schema: z.object({ id: z.string().min(1), harness: harnessName }),
     target: (a) => a.id,
     run: async (a) => {
-      const w = terminalDispatch(d, a.id);
+      const w = terminalDispatch(ledger, a.id);
       const id = dispatcher.redispatch(w.ref, { reason: `换执行者为 ${a.harness}`, harness: a.harness, from: w.id });
       return { ok: true, message: `已改由 ${a.harness} 重新执行`, target: id };
     },
@@ -178,7 +133,6 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
     run: async (a) => {
       const w = ledger.get(a.id);
       if (!w) throw new CommandError("not_found", `没有这项工作：${a.id}`);
-      if (isWorkBlockedByOwner(d, w)) throw new CommandError("conflict", "该工作项源自旧工作区主人的工作上下文，已按主人隔离阻断操作");
       if (w.kind === "dispatch") throw new CommandError("invalid", "派单请用“重试”或“返工”");
       if (!ledger.revive(a.id)) throw new CommandError("conflict", "只有失败落定的工作可以重试");
       return { ok: true, message: "已重新排队", target: a.id };
@@ -191,10 +145,6 @@ export function registerCoreCommands(commands: Commands, d: CoreDeps): void {
     schema: S.id,
     target: (a) => a.id,
     run: async (a) => {
-      const w = ledger.get(a.id);
-      if (isWorkBlockedByOwner(d, w ?? a.id)) {
-        throw new CommandError("conflict", "该工作项源自旧工作区主人的工作上下文，已按主人隔离阻断操作");
-      }
       if (!ledger.acknowledge(a.id)) throw new CommandError("conflict", "只有失败落定的工作可以忽略");
       return { ok: true, message: "已忽略", target: a.id };
     },

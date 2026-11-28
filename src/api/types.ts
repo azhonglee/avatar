@@ -170,7 +170,7 @@ export interface JobView {
 
 export interface HealthItem {
   id: string;
-  kind: "event" | "effect" | "job" | "delivery" | "context";
+  kind: "event" | "effect" | "job" | "delivery";
   ref: string;
   state: string;
   terminal: boolean;
@@ -180,16 +180,12 @@ export interface HealthItem {
   summary: string;
   updated: number;
   acknowledged: boolean;
-  /** true 表示该条工作因归属旧工作区主人而被脱敏隔离，前端隐藏重试/忽略按钮 */
-  isolated?: boolean;
 }
 
 export interface Health {
   daemon: { owner: string | null; last_heartbeat: number | null };
   retrying: HealthItem[];
   failed: HealthItem[];
-  /** 14 天报告窗口内归属当前主人且未确认的待处理失败总数（独立于 failed 列表展示上限） */
-  actionable_failures: number;
   guard: { at: string; profile: string; allow: boolean; reason: string; argv: string[] }[];
 }
 
@@ -306,7 +302,7 @@ export interface CommandArgs {
   "context.feedback": { entity: "item" | "project" | "knowledge" | "update" | "person"; id: string; verdict: "right" | "wrong" | "unimportant"; note?: string };
   "context.project_mute": { id: string; muted: boolean };
   "context.conv_mute": { conv: string; muted: boolean; name?: string };
-  "context.conflict_resolve": { id: string; choice?: number; obs_rev?: string; resolution?: string };
+  "context.conflict_resolve": { id: string; choice?: number; resolution?: string };
   "context.draft_create": { item_id: string; kind?: CtxDraftKind };
   "context.draft_approve": { id: string; content?: string };
   "context.draft_discard": { id: string };
@@ -442,7 +438,7 @@ export interface CtxConflictView {
   project_id: string;
   project_name: string;
   topic: string;
-  claims: { index?: number; obs_rev?: string; claim: string; quote: string; time: number; url: string }[];
+  claims: { claim: string; quote: string; time: number; url: string }[];
   status: "open" | "resolved";
   resolution: string;
   created: number;

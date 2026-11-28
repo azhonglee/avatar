@@ -16,8 +16,7 @@ import type {
   CtxUpdateView,
 } from "../api/types.ts";
 import { defaultDraftKind } from "./drafts.ts";
-import { hasWorkspaceOwnerMismatch } from "./personal-web.ts";
-import { obsRevisionToken, type ContextStore, type DraftRow, type ItemRow, type ProjectRow } from "./store.ts";
+import type { ContextStore, DraftRow, ItemRow, ProjectRow } from "./store.ts";
 
 /**
  * 排序与视图：确定性规则给事项打分（并说明原因），组装今天页、项目页等视图。
@@ -166,27 +165,12 @@ export class ContextViews {
   }
 
   conflictView(c: ReturnType<ContextStore["conflicts"]>[number]): CtxConflictView {
-    const claims: CtxConflictView["claims"] = [];
-    for (let i = 0; i < c.claims.length; i++) {
-      const cl = c.claims[i];
-      const obs = cl.obs_id ? this.store.obs(cl.obs_id) : undefined;
-      if (obs?.meta.withdrawn === true) continue;
-      if (obs && cl.obs_rev && obsRevisionToken(obs) !== cl.obs_rev) continue;
-      claims.push({
-        index: i,
-        ...(cl.obs_rev ? { obs_rev: cl.obs_rev } : {}),
-        claim: cl.claim,
-        quote: cl.quote,
-        time: cl.time,
-        url: obs?.url ?? "",
-      });
-    }
     return {
       id: c.id,
       project_id: c.project_id,
       project_name: this.proj(c.project_id)?.name ?? "",
       topic: c.topic,
-      claims,
+      claims: c.claims.map((cl) => ({ claim: cl.claim, quote: cl.quote, time: cl.time, url: this.store.obs(cl.obs_id)?.url ?? "" })),
       status: c.status,
       resolution: c.resolution,
       created: c.created,
@@ -274,11 +258,7 @@ export class ContextViews {
         .sort((a, b) => b.time - a.time)
         .map((u) => this.updateView(u)),
       people,
-      conflicts: this.store
-        .conflicts()
-        .filter((c) => ids.includes(c.project_id))
-        .map((c) => this.conflictView(c))
-        .filter((c) => c.status === "resolved" || c.claims.length > 0),
+      conflicts: this.store.conflicts().filter((c) => ids.includes(c.project_id)).map((c) => this.conflictView(c)),
     };
   }
 
@@ -288,37 +268,21 @@ export class ContextViews {
     return { ...this.itemView(it), evidence: this.evidence("item", id, 20), drafts: this.store.drafts({ item_id: id }).map((d) => this.draftView(d)), actions };
   }
 
-  status(running: boolean, personalWeb?: CtxPersonalWebStatus, ownerMismatchOverride?: boolean): CtxStatus {
+  status(running: boolean, personalWeb?: CtxPersonalWebStatus): CtxStatus {
     const kv = this.app.store;
-    const ownerMismatch = ownerMismatchOverride ?? hasWorkspaceOwnerMismatch(kv, this.app.cfg.owner.open_id);
     const sources = ["meego", "tasks", "im", "minutes", "calendar", "docs"].map((s) => {
-      if (ownerMismatch) return { source: s, last_pull: null, last_count: 0, error: "" };
       const r = JSON.parse(kv.get(`ctx.source.${s}`) ?? "null") as { at?: number; count?: number; error?: string } | null;
       return { source: s, last_pull: r?.at ?? null, last_count: r?.count ?? 0, error: r?.error ?? "" };
     });
-    const safePersonalWeb =
-      personalWeb && ownerMismatch
-        ? {
-            enabled: personalWeb.enabled,
-            logged_in: false,
-            state: "needs_login",
-            owner_id: "",
-            owner_name: "",
-            last_message_at: null,
-            last_error: "当前工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已隔离上下文",
-          }
-        : personalWeb;
     return {
-      last_cycle: ownerMismatch ? null : Number(kv.get("ctx.last_cycle") ?? 0) || null,
-      last_error: ownerMismatch ? "当前工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已隔离上下文" : kv.get("ctx.last_error") ?? "",
-      running: ownerMismatch ? false : running,
+      last_cycle: Number(kv.get("ctx.last_cycle") ?? 0) || null,
+      last_error: kv.get("ctx.last_error") ?? "",
+      running,
       sources,
-      pending_obs: ownerMismatch ? 0 : this.store.pendingCount(),
-      totals: ownerMismatch
-        ? { projects: 0, open_items: 0, knowledge: 0, people: 0 }
-        : this.store.totals(),
+      pending_obs: this.store.pendingCount(),
+      totals: this.store.totals(),
       understand_enabled: this.app.cfg.context.understand,
-      ...(safePersonalWeb ? { personal_web: safePersonalWeb } : {}),
+      ...(personalWeb ? { personal_web: personalWeb } : {}),
     };
   }
 
@@ -344,10 +308,7 @@ export class ContextViews {
       risks: by("risk"),
       due_soon: dueSoon,
       needs_review: open.filter((i) => i.needs_review).slice(0, 20),
-      conflicts: this.store
-        .conflicts("open")
-        .map((c) => this.conflictView(c))
-        .filter((c) => c.claims.length > 0),
+      conflicts: this.store.conflicts("open").map((c) => this.conflictView(c)),
       drafts: this.store.drafts({ status: ["proposed", "failed"] }).map((d) => this.draftView(d)),
       meetings: this.meetings(),
       changes: this.store.updates({ since: now - DAY, limit: 30 }).map((u) => this.updateView(u)),

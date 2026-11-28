@@ -100,7 +100,7 @@ export function isAlive(pid: number): boolean {
 export interface RunOpts {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
-  input?: string | Buffer;
+  input?: string;
   /** 用已打开的文件描述符作为 stdin（普通文件 FD，避免部分程序拒绝 Node spawn 的 Unix socketpair） */
   stdinFd?: number;
   timeoutMs?: number;
@@ -112,12 +112,46 @@ export interface RunOpts {
   signal?: AbortSignal;
 }
 
-/** 运行子进程并收集输出；超时或中止时先 SIGTERM，10 秒后 SIGKILL。 */
+const extraScrubEnvKeys = new Set<string>();
+
+/** 登记当前配置使用的网关令牌等敏感环境变量名，确保所有子进程一律剥离。 */
+export function registerScrubbedEnvKeys(keys: Iterable<string>): void {
+  for (const k of keys) {
+    const trimmed = k.trim();
+    if (trimmed) extraScrubEnvKeys.add(trimmed);
+  }
+}
+
+/**
+ * 去掉个人 Web 凭据与网关令牌相关变量（密钥、密文路径、网关读写令牌、systemd 凭据目录），
+ * 子进程一律默认不继承：校验命令、git hooks、harness 等都会执行仓库里的代码。
+ */
+export function scrubPersonalWebEnv(base: NodeJS.ProcessEnv, extraKeys?: Iterable<string>): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...base };
+  delete out.PA_FEISHU_WEB_KEY;
+  delete out.PA_FEISHU_WEB_CRED_FILE;
+  delete out.FEISHU_GW_KEY;
+  delete out.FEISHU_GW_CRED_FILE;
+  delete out.FEISHU_GW_CONFIG;
+  delete out.FEISHU_GW_READ_TOKEN;
+  delete out.FEISHU_GW_REPLY_TOKEN;
+  delete out.CREDENTIALS_DIRECTORY;
+  for (const k of extraScrubEnvKeys) delete out[k];
+  if (extraKeys) {
+    for (const k of extraKeys) {
+      const trimmed = k.trim();
+      if (trimmed) delete out[trimmed];
+    }
+  }
+  return out;
+}
+
+/** 运行子进程并收集输出；超时或中止时先 SIGTERM，10 秒后 SIGKILL。默认环境已去掉个人 Web 凭据变量。 */
 export function runProcess(cmd: string, args: string[], opts: RunOpts = {}): Promise<ProcResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, {
       cwd: opts.cwd,
-      env: opts.env ?? process.env,
+      env: opts.env ?? scrubPersonalWebEnv(process.env),
       stdio: [opts.stdinFd ?? "pipe", "pipe", "pipe"],
       detached: !!opts.group,
     });

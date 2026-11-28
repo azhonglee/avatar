@@ -1,5 +1,4 @@
 import path from "node:path";
-import { isWorkBlockedByOwner } from "../api/queries.ts";
 import type { Board } from "../board.ts";
 import type { Config } from "../config.ts";
 import { notify } from "../effects.ts";
@@ -209,7 +208,7 @@ export class BotHandler {
         return `已创建派单任务（${guid.slice(0, 8)}），进度会写在卡片评论里；通过验收后移到“待验收”，否则移到“需人工介入”。`;
       }
       case "/status":
-        return statusText(this.ledger, { cfg: this.cfg, store: this.store });
+        return statusText(this.ledger);
       default: {
         if (ctx.attempt > 1) {
           return "⚠️ 上次处理这条消息时进程中断了。为避免重复操作，没有自动重跑；需要的话请重新发送。";
@@ -237,11 +236,10 @@ const ICON: Record<string, string> = {
 };
 
 /** 最近 24 小时的工作（派单、作业、失败的事件和飞书写入）。 */
-export function statusText(ledger: Ledger, ownerCheck?: { cfg: Config; store: Store }): string {
+export function statusText(ledger: Ledger): string {
   const items = ledger
     .recent(["dispatch", "job", "event", "effect"], Date.now() - 86_400_000)
-    .filter((w) => w.kind === "dispatch" || w.kind === "job" || !w.terminal || w.state === "dead")
-    .filter((w) => !ownerCheck || !isWorkBlockedByOwner({ ...ownerCheck, ledger }, w));
+    .filter((w) => w.kind === "dispatch" || w.kind === "job" || !w.terminal || w.state === "dead");
   if (!items.length) return "最近 24 小时没有运行记录。";
   return items
     .slice(-15)

@@ -15,8 +15,6 @@ export interface CommandCtx {
   source: CommandSource;
   /** 操作者（飞书 open_id；控制台/命令行为 "owner"） */
   actor: string;
-  /** 可选：来自工作上下文委派的内部调用归属主人，用于即使内部命令失败也保留审计主人隔离 */
-  contextOwner?: string;
 }
 
 export class CommandError extends Error {
@@ -68,21 +66,15 @@ export class Commands {
     if (!parsed.success) throw new CommandError("invalid", `参数有误：${z.prettifyError(parsed.error)}`);
     const args = parsed.data;
     const target = def.target(args as never);
-    const auditArgs =
-      ctx.contextOwner !== undefined
-        ? typeof args === "object" && args !== null && !Array.isArray(args)
-          ? { ...(args as Record<string, unknown>), __context_owner: ctx.contextOwner }
-          : { value: args, __context_owner: ctx.contextOwner }
-        : args;
     try {
       const r = await def.run(args as never, ctx);
-      this.ledger.audit({ source: ctx.source, actor: ctx.actor, command: name, target: r.target ?? target, args: auditArgs, ok: r.ok, message: r.message });
+      this.ledger.audit({ source: ctx.source, actor: ctx.actor, command: name, target: r.target ?? target, args, ok: r.ok, message: r.message });
       this.bus?.emit("command.executed", { name, source: ctx.source, ok: r.ok, target: r.target ?? target });
       this.kick();
       return r;
     } catch (e) {
       const msg = errMsg(e);
-      this.ledger.audit({ source: ctx.source, actor: ctx.actor, command: name, target, args: auditArgs, ok: false, message: msg });
+      this.ledger.audit({ source: ctx.source, actor: ctx.actor, command: name, target, args, ok: false, message: msg });
       this.bus?.emit("command.executed", { name, source: ctx.source, ok: false, target });
       log("warn", "命令失败", { command: name, source: ctx.source, err: msg });
       throw e instanceof CommandError ? e : new CommandError("internal", msg);

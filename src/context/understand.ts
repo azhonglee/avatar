@@ -4,7 +4,7 @@ import type { App } from "../app.ts";
 import type { CtxItemKind, CtxPriority } from "../api/types.ts";
 import { loadPrompt, runHarness } from "../harness.ts";
 import { errMsg, log, render, truncate } from "../util.ts";
-import { obsRevision, obsRevisionToken, type ContextStore, type ItemRow, type KnowledgeRow, type Obs, type ProjectRow } from "./store.ts";
+import type { ContextStore, ItemRow, KnowledgeRow, Obs, ProjectRow } from "./store.ts";
 
 /**
  * 理解层：把待处理的会话观测交给模型，得到结构化的图谱更新（项目 / 事项 / 知识 / 动态 / 人 / 冲突），
@@ -73,18 +73,11 @@ export const UnderstandOut = z.object({
 });
 export type UnderstandOut = z.infer<typeof UnderstandOut>;
 
-export interface SubmittedBatchObs {
-  conv: string;
-  entries: { id: string; rev: string }[];
-}
-
 /** 模型有输出但不是合法 JSON / 校验不通过：属于会话内容或格式问题，多次失败可跳过；与进程启动失败 / 超时等环境故障区分。 */
 export class UnderstandParseError extends Error {
-  submittedByConv?: SubmittedBatchObs[];
-  constructor(message: string, submittedByConv?: SubmittedBatchObs[]) {
+  constructor(message: string) {
     super(message);
     this.name = "UnderstandParseError";
-    this.submittedByConv = submittedByConv;
   }
 }
 
@@ -111,10 +104,6 @@ export function parseUnderstand(text: string): UnderstandOut {
 export interface ApplyResult {
   projects: number;
   created: ItemRow[];
-  /** 本批新建或被新证据更新的仍处于 open 状态的事项（供自动预起草覆盖「先轮询建项、后收到原生 DM/@我 证据补充」场景） */
-  touched: ItemRow[];
-  /** 本批实际绑定到各 open 事项的新鲜观测 ID（按 item.id 分组），用于严格限定只有本批新证据才能触发自动预起草 */
-  touchedFreshObsByItem: Record<string, string[]>;
   closed: ItemRow[];
   updated: number;
   knowledge: number;
@@ -122,10 +111,6 @@ export interface ApplyResult {
   people: number;
   conflicts: number;
   rejected: number;
-  /** 本次事务实际标记为已处理的新观测数量（整批被拒绝或丢租约时为 0） */
-  processed: number;
-  /** 整批推理结果因租约失效、策略漂移或批次观测在推理期间被编辑/撤回而被整体丢弃 */
-  discarded?: boolean;
 }
 
 const fmt = (ms: number, tz: string) =>
@@ -134,26 +119,17 @@ const fmt = (ms: number, tz: string) =>
 export class Understander {
   app: App;
   store: ContextStore;
-  runner: typeof runHarness;
-  constructor(app: App, store: ContextStore, runner: typeof runHarness = runHarness) {
+  constructor(app: App, store: ContextStore) {
     this.app = app;
     this.store = store;
-    this.runner = runner;
   }
 
   private get cfg() {
     return this.app.cfg;
   }
 
-  /** 组装一批会话（控制总长度），返回提示词和这批涉及的观测；支持按 target_obs_id 定位快通道窗口与按当前绑定 Web 账号隔离 */
-  buildBatch(
-    convs: { conv: string; conv_name: string; target_obs_id?: string }[],
-    maxChars = 24_000,
-    activeNativeOwner?: string | null,
-    filterObs?: (conv: string, obs: Obs[]) => Obs[],
-    isMentionsOnly?: (conv: string) => boolean,
-    excludeCliIm?: boolean,
-  ): { prompt: string; obs: Obs[]; fresh: string[]; convs: string[] } {
+  /** 组装一批会话（控制总长度），返回提示词和这批涉及的观测 */
+  buildBatch(convs: { conv: string; conv_name: string }[], maxChars = 24_000): { prompt: string; obs: Obs[]; fresh: string[]; convs: string[] } {
     const tz = this.cfg.owner.timezone;
     const sections: string[] = [];
     const all: Obs[] = [];
@@ -161,13 +137,8 @@ export class Understander {
     const used: string[] = [];
     let size = 0;
     for (const c of convs) {
-      const onlyMentions = isMentionsOnly ? isMentionsOnly(c.conv) : false;
-      const rawList = c.target_obs_id
-        ? this.store.convWindowAround(c.conv, c.target_obs_id, 60, 12, activeNativeOwner, { onlyMentions })
-        : this.store.convWindow(c.conv, 60, 12, activeNativeOwner, { onlyMentions, excludeCliIm });
-      const list = filterObs ? filterObs(c.conv, rawList) : rawList;
+      const list = this.store.convWindow(c.conv);
       if (!list.length) continue;
-      if (!list.some((o) => !this.isProcessed(o.id))) continue;
       const lines = list.map((o) => {
         const isNew = !this.isProcessed(o.id);
         return `[${o.id}] ${fmt(o.time, tz)} ${o.is_me ? "【我】" : o.actor_name || o.actor_id}: ${truncate(o.text, 500)}${isNew ? " (新)" : ""}`;
@@ -246,37 +217,20 @@ export class Understander {
       .join("\n");
   }
 
-  /** 跑一批：调用模型 → 解析 → 应用前二次策略复核 → 写事务内校验租约与整批新鲜度后原子写入 */
-  async runBatch(
-    workId: string,
-    convs: { conv: string; conv_name: string; target_obs_id?: string }[],
-    signal?: AbortSignal,
-    activeNativeOwner?: string | null,
-    validateBeforeApply?: (batchConvs: { conv: string; conv_name: string }[], batchObs: Obs[]) => Promise<Set<string>>,
-    opts?: {
-      filterObs?: (conv: string, obs: Obs[]) => Obs[];
-      isMentionsOnly?: (conv: string) => boolean;
-      excludeCliIm?: boolean;
-      claimCheck?: { convs: string[]; holder: string; procOwner: string };
-      /** 提交事务内执行的同步策略版本守卫：返回 false 时整体丢弃本批模型结果且不消费观测 */
-      commitGuard?: () => boolean;
-    },
-  ): Promise<ApplyResult & { convs: string[]; fresh: number }> {
-    if (signal?.aborted) throw new Error("aborted");
+  /** 跑一批：调用模型 → 解析 → 写入 */
+  async runBatch(workId: string, convs: { conv: string; conv_name: string }[], signal?: AbortSignal): Promise<ApplyResult & { convs: string[]; fresh: number }> {
     this.processedCache.clear();
-    const batch = this.buildBatch(convs, 24_000, activeNativeOwner, opts?.filterObs, opts?.isMentionsOnly, opts?.excludeCliIm);
+    const batch = this.buildBatch(convs);
     if (!batch.fresh.length) {
-      // 若因当前白名单/范围过滤导致该会话无合格待处理行，不调用 skipConv，留待后续范围恢复或 @我 触发
-      if (!opts?.filterObs) {
-        for (const c of batch.convs) this.store.skipConv(c);
-      }
+      // 没有可处理的新观测（理论上不会发生）：把这些会话的待处理标掉，避免周期里反复空转
+      for (const c of batch.convs) this.store.skipConv(c);
       return { ...emptyResult(), convs: batch.convs, fresh: 0 };
     }
     const harness = this.cfg.context.harness || this.cfg.roles.brain;
     const logFile = path.join(this.cfg.dataDir, "runs", `context-${Date.now()}.log`);
     const step = this.app.ledger.startStep({ work_id: workId, name: "understand", harness, log: logFile });
     try {
-      const r = await this.runner(this.cfg, {
+      const r = await runHarness(this.cfg, {
         harness,
         prompt: batch.prompt,
         cwd: path.join(this.cfg.dataDir, "workspace", "context"),
@@ -288,58 +242,24 @@ export class Understander {
         onSpawn: (pid) => this.app.ledger.setStepPid(step, pid),
         stepId: step,
       });
-      if (signal?.aborted) throw new Error("aborted");
       if (!r.text) throw new Error(`理解 harness 无输出（exit ${r.exitCode}${r.timedOut ? "，超时" : ""}）`);
-      let out: UnderstandOut;
-      try {
-        out = parseUnderstand(r.text);
-      } catch (err) {
-        if (err instanceof UnderstandParseError) {
-          const freshSet = new Set(batch.fresh);
-          err.submittedByConv = batch.convs.map((convId) => ({
-            conv: convId,
-            entries: batch.obs
-              .filter((o) => o.conv === convId && freshSet.has(o.id))
-              .map((o) => ({ id: o.id, rev: obsRevision(o) })),
-          }));
-        }
-        throw err;
-      }
-      const usedMeta = batch.convs.map((id) => ({ conv: id, conv_name: convs.find((c) => c.conv === id)?.conv_name ?? "" }));
-      const disallowedConvs = validateBeforeApply ? await validateBeforeApply(usedMeta, batch.obs) : undefined;
-      if (signal?.aborted) throw new Error("aborted");
-      const claimCheck = opts?.claimCheck
-        ? { ...opts.claimCheck, convs: batch.convs.filter((id) => opts.claimCheck!.convs.includes(id)) }
-        : undefined;
-      const res = this.apply(out, batch.obs, batch.fresh, disallowedConvs, claimCheck, opts?.commitGuard);
+      const out = parseUnderstand(r.text);
+      const res = this.apply(out, batch.obs, batch.fresh);
       this.app.ledger.endStep(step, "ok", `新事项 ${res.created.length}，关闭 ${res.closed.length}，知识 ${res.knowledge}`);
-      return { ...res, convs: batch.convs, fresh: res.processed };
+      return { ...res, convs: batch.convs, fresh: batch.fresh.length };
     } catch (e) {
       this.app.ledger.endStep(step, "failed", errMsg(e));
       throw e;
     }
   }
 
-  /**
-   * 写入模型结果（原子事务内校验）：
-   *   - 若传入 `claimCheck`，先在同一 BEGIN IMMEDIATE 写事务内校验所有会话认领租约仍归当前执行者有效持有，失去租约则整体放弃，避免陈旧执行者覆盖继任者结果；
-   *   - 若传入 `commitGuard`，在写事务内同步复核策略签名与开关版本未发生二次漂移，漂移则整体丢弃且不消费观测；
-   *   - 证据必须指向这批里真实存在的观测，且在提交时刻未被编辑、撤回、静音或因策略变更而被禁止（disallowedConvs）；
-   *   - 若本批中任一观测在推理期间失效/撤回/被静音（`batchPartiallyStale`），因为 `out.projects` 与 `out.people` 无逐条证据归属，
-   *     整体放弃该批模型输出且不消费其余仍有效的待处理观测，留待下轮基于干净批次重跑，杜绝被排除会话的信息渗入项目或人物图谱。
-   */
-  apply(
-    out: UnderstandOut,
-    obs: Obs[],
-    fresh: string[],
-    disallowedConvs?: Set<string>,
-    claimCheck?: { convs: string[]; holder: string; procOwner: string },
-    commitGuard?: () => boolean,
-  ): ApplyResult {
+  /** 写入模型结果。证据必须指向这批里真实存在的观测，否则丢弃（防幻觉）。 */
+  apply(out: UnderstandOut, obs: Obs[], fresh: string[]): ApplyResult {
     const res = emptyResult();
     const byId = new Map(obs.map((o) => [o.id, o]));
     const auto = this.cfg.context.autonomy;
     const minConf = this.cfg.context.min_confidence;
+    const validEv = (evs: { obs_id: string; quote: string }[]) => evs.filter((e) => byId.has(e.obs_id));
     const latestTime = (evs: { obs_id: string }[]) => Math.max(0, ...evs.map((e) => byId.get(e.obs_id)?.time ?? 0)) || Date.now();
     const batchProjects = new Map<string, ProjectRow>();
 
@@ -349,77 +269,6 @@ export class Understander {
     };
 
     this.store.tx(() => {
-      // 1) 在写事务内强校验会话租约所有权：被暂停超时或被他进程接管后绝不覆写图谱
-      if (claimCheck && claimCheck.convs.length > 0) {
-        const nowCheck = Date.now();
-        const stillOwned = claimCheck.convs.every((c) =>
-          this.store.isConvClaimedBy(c, claimCheck.holder, claimCheck.procOwner, nowCheck),
-        );
-        if (!stillOwned) {
-          res.discarded = true;
-          res.rejected += out.items.length + out.knowledge.length + out.updates.length + out.projects.length + out.people.length;
-          return;
-        }
-      }
-
-      // 1b) 在写事务内强校验策略版本守卫：防止 validateBeforeApply 异步复核期间发生第二次策略变更而将过期批次写入图谱
-      if (commitGuard && !commitGuard()) {
-        res.discarded = true;
-        res.rejected += out.items.length + out.knowledge.length + out.updates.length + out.projects.length + out.people.length;
-        return;
-      }
-
-      // 2) 在同一 BEGIN IMMEDIATE 事务内核对本批观测当前修订、撤回状态、会话静音状态及策略复核结果
-      const stillValidIds = new Set<string>();
-      const curStmt = this.store.db.prepare("SELECT conv, text, meta FROM ctx_obs WHERE id = ?");
-      const mutedCache = new Map<string, boolean>();
-      const isConvMuted = (conv: string): boolean => {
-        let v = mutedCache.get(conv);
-        if (v === undefined) {
-          v = this.store.isConvMutedById(conv);
-          mutedCache.set(conv, v);
-        }
-        return v;
-      };
-      for (const o of obs) {
-        if (disallowedConvs?.has(o.conv)) continue;
-        const cur = curStmt.get(o.id) as { conv: string; text: string; meta: string } | undefined;
-        if (!cur || disallowedConvs?.has(cur.conv) || isConvMuted(cur.conv)) continue;
-        let curMeta: Record<string, unknown> = {};
-        try {
-          curMeta = cur.meta ? (JSON.parse(cur.meta) as Record<string, unknown>) : {};
-        } catch {
-          curMeta = {};
-        }
-        if (curMeta.withdrawn === true) continue;
-        if (obsRevision({ text: cur.text, meta: curMeta }) !== obsRevision(o)) continue;
-        stillValidIds.add(o.id);
-      }
-
-      const batchPartiallyStale = (!!disallowedConvs && disallowedConvs.size > 0) || stillValidIds.size < obs.length;
-      const validFreshIds = fresh.filter((id) => stillValidIds.has(id));
-      if (batchPartiallyStale || (fresh.length > 0 && validFreshIds.length === 0)) {
-        // 只要本批中任一会话/观测在推理期间被静音、撤回、编辑或策略失效，整体丢弃本批全部模型产出
-        // （含无逐条 evidence 归属的 projects / people），同时不标记其余仍有效观测为已处理，供下轮干净批次重跑。
-        res.discarded = true;
-        res.rejected += out.items.length + out.knowledge.length + out.updates.length + out.projects.length + out.people.length;
-        return;
-      }
-
-      // 记录因部分引用证据失效而被拒的结论中所包含的“仍有效观测”，令其保留 pending 供下轮按最新上下文重试
-      const keepPendingIds = new Set<string>();
-      const validEv = (evs: { obs_id: string; quote: string }[]) => {
-        const inBatch = evs.filter((e) => byId.has(e.obs_id));
-        if (!inBatch.length) return [];
-        if (inBatch.some((e) => !stillValidIds.has(e.obs_id))) {
-          for (const e of inBatch) {
-            if (stillValidIds.has(e.obs_id)) keepPendingIds.add(e.obs_id);
-          }
-          return [];
-        }
-        return inBatch;
-      };
-
       // 先建顶层（被别人引用为上级的），再建子项目
       const parentNames = new Set(out.projects.map((p) => p.parent.trim()).filter(Boolean));
       const ordered = [...out.projects].sort((a, b) => Number(!!a.parent.trim()) - Number(!!b.parent.trim()) || Number(parentNames.has(b.name)) - Number(parentNames.has(a.name)));
@@ -453,8 +302,6 @@ export class Understander {
         res.projects++;
       }
 
-      const validFreshSet = new Set(validFreshIds);
-      const touchedItemIds = new Set<string>();
       for (const it of out.items) {
         const evs = validEv(it.evidence);
         if (!evs.length) {
@@ -490,19 +337,6 @@ export class Understander {
           at,
         );
         for (const e of evs) this.store.addEvidence("item", item.id, e.obs_id, e.quote, byId.get(e.obs_id)!.time);
-        const freshItemObsIds = evs.map((e) => e.obs_id).filter((id) => validFreshSet.has(id));
-        if (item.status === "open" && (created || freshItemObsIds.length > 0)) {
-          if (!touchedItemIds.has(item.id)) {
-            touchedItemIds.add(item.id);
-            res.touched.push(item);
-          }
-          if (freshItemObsIds.length > 0) {
-            const list = res.touchedFreshObsByItem[item.id] ?? (res.touchedFreshObsByItem[item.id] = []);
-            for (const oid of freshItemObsIds) {
-              if (!list.includes(oid)) list.push(oid);
-            }
-          }
-        }
         if (created && item.status === "open") res.created.push(item);
         else if (wantDone && item.status === "done" && existing?.status !== "done") res.closed.push(item);
         else res.updated++;
@@ -539,38 +373,20 @@ export class Understander {
       for (const p of out.people) {
         if (!p.name.trim() || p.name.includes("【我】")) continue;
         const projects = p.projects.map((n) => resolveProject(n, Date.now())?.id).filter((x): x is string => !!x);
-        const fromObs = obs.find((o) => stillValidIds.has(o.id) && o.actor_name === p.name && o.actor_id.startsWith("ou_"));
+        const fromObs = obs.find((o) => o.actor_name === p.name && o.actor_id.startsWith("ou_"));
         this.store.upsertPerson({ id: p.open_id || fromObs?.actor_id || undefined, name: p.name.trim(), relation: p.relation, projects });
         res.people++;
       }
 
       for (const c of out.conflicts) {
-        const inBatchClaims = c.claims.filter((cl) => byId.has(cl.obs_id));
-        if (inBatchClaims.some((cl) => !stillValidIds.has(cl.obs_id))) {
-          for (const cl of inBatchClaims) {
-            if (stillValidIds.has(cl.obs_id)) keepPendingIds.add(cl.obs_id);
-          }
-          continue;
-        }
-        const claims = inBatchClaims.map((cl) => {
-          const srcObs = byId.get(cl.obs_id)!;
-          return { claim: cl.claim, obs_id: cl.obs_id, quote: cl.quote, time: srcObs.time, obs_rev: obsRevisionToken(srcObs) };
-        });
+        const claims = c.claims.filter((cl) => byId.has(cl.obs_id)).map((cl) => ({ claim: cl.claim, obs_id: cl.obs_id, quote: cl.quote, time: byId.get(cl.obs_id)!.time }));
         if (claims.length < 2) continue;
         const project = resolveProject(c.project, Date.now());
         this.store.addConflict({ project_id: project?.id ?? "", topic: c.topic, claims, ref: c.ref || undefined });
         res.conflicts++;
       }
-
-      const toMark = validFreshIds
-        .filter((id) => !keepPendingIds.has(id))
-        .flatMap((id) => {
-          const o = byId.get(id);
-          return o ? [{ id, rev: obsRevision(o) }] : [];
-        });
-      this.store.markProcessed(toMark);
-      res.processed = toMark.length;
     });
+    this.store.markProcessed(fresh);
     // 把 Meego 待办挂到具体项目
     return res;
   }
@@ -661,20 +477,7 @@ export async function splitProject(u: Understander, workId: string, projectId: s
 }
 
 function emptyResult(): ApplyResult {
-  return {
-    projects: 0,
-    created: [],
-    touched: [],
-    touchedFreshObsByItem: {},
-    closed: [],
-    updated: 0,
-    knowledge: 0,
-    updates: 0,
-    people: 0,
-    conflicts: 0,
-    rejected: 0,
-    processed: 0,
-  };
+  return { projects: 0, created: [], closed: [], updated: 0, knowledge: 0, updates: 0, people: 0, conflicts: 0, rejected: 0 };
 }
 
 /** 已知项目按两层树列出：顶层在前，子项目缩进在下 */

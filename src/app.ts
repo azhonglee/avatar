@@ -1,10 +1,8 @@
 import fs from "node:fs";
 import { Cron } from "croner";
-import { briefOwnerTag, isContextDerivedDispatchBlocked } from "./api/queries.ts";
 import { Board, KnowledgeBase } from "./board.ts";
 import { Bus } from "./bus.ts";
 import { Commands } from "./commands.ts";
-import { WebLoginStore } from "./context/feishu-web/index.ts";
 import { registerCoreCommands } from "./core-commands.ts";
 import type { EffectHooks } from "./effects.ts";
 import type { Extensions } from "./ext.ts";
@@ -59,15 +57,13 @@ export function createApp(cfg: Config) {
   // 账本每次变更（含 transition/enqueue 附带的 outbox 副作用）都立刻唤醒引擎，不必等下一个 tick_ms
   bus.on("work.changed", () => engine.kick());
   const ext: Extensions = {};
-  const effectHooks: EffectHooks = {
-    isDaemonRunning: () => engine.isDaemonRunning(),
-  };
+  const effectHooks: EffectHooks = {};
   const app = { cfg, store, ledger, lark, board, kb, capture, dispatcher, engine, bot, hooks, bus, commands, ext, effectHooks };
   engine.register(effectHandler(cfg, ledger, board, lark, store, effectHooks));
   engine.register(dispatcher.handler());
   engine.register(jobHandler(cfg, store, ledger));
   engine.register(eventHandler(app));
-  registerCoreCommands(commands, { cfg, store, ledger, board, dispatcher });
+  registerCoreCommands(commands, { cfg, ledger, board, dispatcher });
   registerModules(app);
   return app;
 }
@@ -132,25 +128,18 @@ export async function initApp(app: App): Promise<void> {
     }
     app.cfg.owner.open_id = id;
   }
-  const prevOwner = (app.store.get("owner.open_id") ?? "").trim();
-  // 先核验既有看板归属再写入 owner.open_id，避免用新配置覆盖旧主人记录后把遗留看板永久改标为新主人
-  await app.board.init({ prevOwner });
   app.store.set("owner.open_id", app.cfg.owner.open_id);
+  await app.board.init();
   await app.kb.init();
 }
 
-/** 生成概览并经 outbox 私信（同一天同一种对同一主人只发一次）。卡片与去重键均按目标主人隔离，防换主人后错投或误更新旧主人卡片。 */
+/** 生成概览并经 outbox 私信（同一天同一种只发一次）。启用卡片时以卡片发送。 */
 export async function sendBrief(app: App, mode: "morning" | "evening"): Promise<void> {
-  const ownerOpenId = app.cfg.owner.open_id.trim();
   const text = await buildBrief(app.cfg, app.lark, app.store, app.ledger, app.board, mode);
   const date = new Date().toISOString().slice(0, 10);
-  const ownerTag = briefOwnerTag(ownerOpenId);
-  const suffix = ownerTag ? `-${ownerTag}` : "";
-  const cardKey = `brief:${date}-${mode}${suffix}`;
-  const dedupeKey = `brief-${mode}-${date}${suffix}`;
   const c = app.cfg.cards.enabled ? app.ext.cards?.brief?.(mode, text) : undefined;
-  if (c) app.ledger.emit(`card:${cardKey}`, [card(cardKey, c, "brief", ownerOpenId)], dedupeKey);
-  else app.ledger.emit("brief", [notify(text, "brief", ownerOpenId)], dedupeKey);
+  if (c) app.ledger.emit(`card:brief:${date}-${mode}`, [card(`brief:${date}-${mode}`, c, "brief")], `brief-${mode}-${date}`);
+  else app.ledger.emit("brief", [notify(text)], `brief-${mode}-${date}`);
 }
 
 /** 立即执行一个配置的作业并等待结果（命令行用）。 */
@@ -164,15 +153,12 @@ export async function runConfiguredJob(app: App, name: string): Promise<string> 
   return w?.payload.result ?? `作业状态：${w?.state ?? "未知"}${w?.error ? `（${w.error}）` : ""}`;
 }
 
-/** 命令行单次派单：对账后把能做的派单做完，返回本次涉及的派单（按主人隔离过滤旧主人上下文派单）。 */
+/** 命令行单次派单：对账后把能做的派单做完，返回本次涉及的派单。 */
 export async function runDispatchOnce(app: App): Promise<{ enqueued: number; items: (WorkItem<DispatchPayload> | undefined)[] }> {
   const r = await app.dispatcher.reconcile();
   const before = new Set(app.ledger.active("dispatch").map((w) => w.id));
   await app.engine.drain(["dispatch", "effect"]);
-  const items = [...before]
-    .map((id) => app.ledger.get<DispatchPayload>(id))
-    .filter((w) => !w || !isContextDerivedDispatchBlocked(app, w.id));
-  return { enqueued: r.enqueued, items };
+  return { enqueued: r.enqueued, items: [...before].map((id) => app.ledger.get<DispatchPayload>(id)) };
 }
 
 /** 常驻运行：事件长连接 + 定时任务 + 工作引擎。 */
@@ -257,8 +243,7 @@ export async function runDaemon(app: App): Promise<void> {
     ),
   ];
   const contextSchedule = app.ext.context?.start();
-  // 心跳与持钥标记：控制台据此判断常驻进程在线，同工作区交互式子命令据此强制启用 PID+挂载隔离
-  store.set("daemon.holds_web_key", WebLoginStore.hasEncryptionKey() ? "1" : "");
+  // 心跳：控制台据此判断常驻进程是否在线
   const beat = () => store.set("daemon.heartbeat", `${ledger.owner}|${Date.now()}`);
   beat();
   const heartbeat = setInterval(beat, 15_000);
@@ -282,7 +267,6 @@ export async function runDaemon(app: App): Promise<void> {
       triageSoon.cancel();
       ctxSoon?.cancel();
       clearInterval(heartbeat);
-      store.set("daemon.holds_web_key", "");
       await server?.close();
       await events.stop();
       await engine.stop(); // 中止进行中的 harness；租约释放，下次启动从检查点继续

@@ -427,7 +427,6 @@ export async function pollLogin(
       owner_name: profile.name,
       ...(profile.openId ? { owner_open_id: profile.openId } : {}),
       session_id: crypto.randomUUID(),
-      cookie_version: 1,
       updated_at: new Date().toISOString(),
     };
   };

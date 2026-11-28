@@ -10,7 +10,6 @@ import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { createApp, initApp, sendBrief, type App } from "../src/app.ts";
-import { briefOwnerTag } from "../src/api/queries.ts";
 import { parseAction } from "../src/cards/actions.ts";
 import { CardService, failureWorthy, registerCards } from "../src/cards/index.ts";
 import {
@@ -525,18 +524,17 @@ test("失败告警：事件重试耗尽 → 告警卡片；卡片和私信自身
   assert.equal(lastCard(app, `failure:${did}`), undefined);
 });
 
-test("早晚报：启用卡片时以卡片发送（按主人作用域 brief:<日期>-<mode>-<tag>），同一天只发一次", async () => {
+test("早晚报：启用卡片时以卡片发送（brief:<日期>-<mode>），同一天只发一次", async () => {
   const a = createApp(loadConfig(writeConfig(path.join(tmp, "brief"), { cards: { enabled: true } })));
   try {
     await initApp(a);
     await sendBrief(a, "evening");
     await sendBrief(a, "evening");
     const date = new Date().toISOString().slice(0, 10);
-    const expectedKey = `brief:${date}-evening-${briefOwnerTag(a.cfg.owner.open_id)}`;
-    const fx = cardFx(a, expectedKey);
+    const fx = cardFx(a, `brief:${date}-evening`);
     assert.equal(fx.length, 1);
     const p = fx[0].payload;
-    assert.ok(p.op === "card.upsert" && p.args.kind === "brief" && p.args.key === expectedKey);
+    assert.ok(p.op === "card.upsert" && p.args.kind === "brief" && p.args.key === `brief:${date}-evening`);
     assert.match(text(p.args.card), /今日收尾/);
   } finally {
     a.store.db.close();

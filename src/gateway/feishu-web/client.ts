@@ -6,7 +6,7 @@ import {
   resolveEndpoints,
   type WebEndpoints,
 } from "./auth.ts";
-import { RecordingCookieJar, type CookieDelta, type WebLogin } from "./cookies.ts";
+import { RecordingCookieJar, type WebLogin } from "./cookies.ts";
 import { fetchWithJar, WEB_USER_AGENT, WebHttpError } from "./http.ts";
 import { MAX_WIRE_BYTES, parseProto, ProtoWriter, WIRE_BYTES } from "./proto.ts";
 import {
@@ -41,20 +41,30 @@ import {
 import { BinaryWebSocket } from "./ws.ts";
 
 /**
- * Feishu personal Web session client:
- *   - Gateway protobuf RPCs: readMessage, readChat, readContext, sendReply, sendVerifiedReply
- *   - Frontier WSS push supervisor: heartbeat (25s), idle timeout (75s), profile keepalive (30m),
- *     cookie rotation observer, exponential backoff (1s..30s), 3-denial threshold before needs_login,
- *     and backpressure ACK (ACK sent ONLY after durable onMessage succeeds).
+ * Feishu personal Web client:
+ *   - Session verification & cookie rotation persistence
+ *   - Gateway RPCs (read message, read chat metadata/mode, read bounded history, send verified reply)
+ *   - Frontier WSS long-connection push listener with backpressure ACK, heartbeat, keepalive,
+ *     and 3-consecutive-denial session expiry policy.
  */
+
+const DEFAULT_HEARTBEAT_MS = 25_000;
+const DEFAULT_KEEPALIVE_MS = 30 * 60_000;
+const DEFAULT_RECONNECT_BASE_MS = 2_000;
+const DEFAULT_RECONNECT_CEILING_MS = 30_000;
+const DEFAULT_DENIAL_THRESHOLD = 3;
+const DEFAULT_DENIAL_RETRY_MS = 30_000;
+const DEFAULT_HEALTHY_AFTER_MS = 60_000;
+const DEFAULT_CHAT_CACHE_TTL_MS = 10 * 60_000;
+const MAX_HISTORY_WINDOWS = 4;
 
 export type ListenerState =
   | "idle"
   | "connecting"
   | "listening"
-  | "publication_blocked"
-  | "reverifying"
   | "reconnecting"
+  | "reverifying"
+  | "publication_blocked"
   | "needs_login"
   | "stopped";
 
@@ -75,14 +85,20 @@ export class MessageNotFoundError extends Error {
   }
 }
 
+export class UnusableOriginalMessageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnusableOriginalMessageError";
+  }
+}
+
 export interface FeishuWebClientOptions {
   endpoints?: Partial<WebEndpoints>;
   /**
-   * 收到可信会话确认 / Cookie 轮换时回调：
-   *   - 返回 false / null 表示本地凭据已被登出或替换为新会话，客户端应停止继续使用当前会话；
-   *   - 返回合并后的 WebLogin 对象时，客户端据此同步最新 cookie_version 与磁盘快照（防止多进程互相回滚 Cookie）。
+   * 收到可信会话确认或 Cookie 轮换时回调：
+   * 返回 `false` / `null` 表示本地凭据已被登出或替换为新会话，客户端应立即中止当前会话。
    */
-  onSessionConfirmed?: (login: WebLogin, delta: CookieDelta) => WebLogin | boolean | null | void;
+  onSessionConfirmed?: (login: WebLogin) => WebLogin | boolean | null | void;
   heartbeatIntervalMs?: number;
   socketIdleTimeoutMs?: number;
   keepaliveIntervalMs?: number;
@@ -102,8 +118,8 @@ export interface VerifiedReplyInput {
   messageId: string;
   rootId?: string;
   text: string;
-  /** Deterministic idempotency key (32 hex chars). Reusing the same CID prevents duplicate sends. */
   cid: string;
+  requireMentionOwnerId?: string;
   signal?: AbortSignal;
 }
 
@@ -115,35 +131,8 @@ export interface VerifiedReplyResult {
   verified: boolean;
 }
 
-const DEFAULT_HEARTBEAT_MS = 25_000;
-const DEFAULT_KEEPALIVE_MS = 30 * 60_000;
-const DEFAULT_RECONNECT_BASE_MS = 1_000;
-const DEFAULT_RECONNECT_CEILING_MS = 30_000;
-const DEFAULT_DENIAL_THRESHOLD = 3;
-const DEFAULT_DENIAL_RETRY_MS = 30_000;
-const DEFAULT_CHAT_CACHE_TTL_MS = 10 * 60_000;
-const MAX_HISTORY_WINDOWS = 10;
-
 function randomRequestId(): string {
   return crypto.randomBytes(16).toString("hex");
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new WebHttpError("aborted", "已中止"));
-      return;
-    }
-    const onAbort = () => {
-      clearTimeout(t);
-      reject(new WebHttpError("aborted", "已中止"));
-    };
-    const t = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
 }
 
 function isCredentialDenied(err: unknown): boolean {
@@ -154,25 +143,57 @@ function isAborted(err: unknown): boolean {
   return err instanceof WebHttpError && err.code === "aborted";
 }
 
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new WebHttpError("aborted", "操作已取消"));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(new WebHttpError("aborted", "操作已取消"));
+    };
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    t.unref?.();
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** 统一判定一条个人 Web 消息是否满足可入库/可回复的基本正文与发送者条件 */
+export function isUsableWebMessage(m: WebMessage): boolean {
+  return (
+    !!m.id &&
+    !!m.conversationId &&
+    !m.unsupported &&
+    (m.conversationKind === "group" || m.conversationKind === "dm") &&
+    m.senderType === USER_SENDER_TYPE &&
+    !!m.text.trim()
+  );
+}
+
+/** Reconnect policy: requires N consecutive explicit auth denials before declaring `needs_login`. */
 class SessionRetryPolicy {
-  private delayMs: number;
-  private denials = 0;
   private readonly baseMs: number;
   private readonly ceilingMs: number;
   private readonly denialThreshold: number;
   private readonly denialRetryMs: number;
+  private delayMs: number;
+  private denials = 0;
 
   constructor(baseMs: number, ceilingMs: number, denialThreshold: number, denialRetryMs: number) {
     this.baseMs = baseMs;
-    this.delayMs = baseMs;
     this.ceilingMs = ceilingMs;
     this.denialThreshold = denialThreshold;
     this.denialRetryMs = denialRetryMs;
+    this.delayMs = baseMs;
   }
 
   markHealthy(): void {
-    this.denials = 0;
     this.delayMs = this.baseMs;
+    this.denials = 0;
   }
 
   next(err: unknown): { state: ListenerState; waitMs: number; giveUp: boolean } {
@@ -183,31 +204,11 @@ class SessionRetryPolicy {
       }
       return { state: "reverifying", waitMs: this.denialRetryMs, giveUp: false };
     }
-    // 非鉴权类错误中断「连续」鉴权拒绝计数，避免偶发 401 + 多次网络抖动误判为登出
     this.denials = 0;
     const waitMs = this.delayMs;
     this.delayMs = Math.min(this.delayMs * 2, this.ceilingMs);
     return { state: "reconnecting", waitMs, giveUp: false };
   }
-}
-
-export class UnusableOriginalMessageError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "UnusableOriginalMessageError";
-  }
-}
-
-/** 统一判定一条个人 Web 消息是否满足可入库/可回复的基本正文与发送者条件（用户消息、有效会话类型、未标记 unsupported、非空正文） */
-export function isUsableWebMessage(m: WebMessage): boolean {
-  return (
-    !!m.id &&
-    !!m.conversationId &&
-    !m.unsupported &&
-    (m.conversationKind === "group" || m.conversationKind === "dm") &&
-    m.senderType === USER_SENDER_TYPE &&
-    !!m.text.trim()
-  );
 }
 
 export class FeishuWebClient {
@@ -228,24 +229,22 @@ export class FeishuWebClient {
     >
   >;
   private readonly maxQueueBytes?: number;
-  private onSessionConfirmed?: (login: WebLogin, delta: CookieDelta) => WebLogin | boolean | null | void;
+  private onSessionConfirmed?: (login: WebLogin) => WebLogin | boolean | null | void;
   private ownerId: string;
   private ownerName: string;
   private ownerOpenId?: string;
   private readonly sessionId?: string;
-  private cookieVersion: number;
   private deviceId = "";
   private appKey = "";
   private readonly chatCache = new Map<string, { meta: ChatMeta; expiresAt: number }>();
 
-  private constructor(jar: RecordingCookieJar, login: WebLogin, options: FeishuWebClientOptions = {}) {
+  private constructor(jar: RecordingCookieJar, login: WebLogin, options: FeishuWebClientOptions) {
     this.endpoints = resolveEndpoints(options.endpoints);
     this.jar = jar;
     this.ownerId = login.owner_id;
     this.ownerName = login.owner_name;
     this.ownerOpenId = login.owner_open_id;
     this.sessionId = login.session_id;
-    this.cookieVersion = login.cookie_version ?? 1;
     this.onSessionConfirmed = options.onSessionConfirmed;
     this.maxQueueBytes = options.maxQueueBytes;
     const heartbeat = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_MS;
@@ -257,12 +256,12 @@ export class FeishuWebClient {
       reconnectCeilingMs: options.reconnectCeilingMs ?? DEFAULT_RECONNECT_CEILING_MS,
       sessionDenialThreshold: options.sessionDenialThreshold ?? DEFAULT_DENIAL_THRESHOLD,
       sessionDenialRetryMs: options.sessionDenialRetryMs ?? DEFAULT_DENIAL_RETRY_MS,
-      sessionHealthyAfterMs: options.sessionHealthyAfterMs ?? heartbeat,
+      sessionHealthyAfterMs: options.sessionHealthyAfterMs ?? DEFAULT_HEALTHY_AFTER_MS,
       chatCacheTtlMs: options.chatCacheTtlMs ?? DEFAULT_CHAT_CACHE_TTL_MS,
     };
   }
 
-  /** Connect an approved login, verify owner identity (persisting any rotated cookies immediately), and load Web SDK metadata. */
+  /** Connect an approved login, verify owner identity, and load Web SDK metadata. */
   static async connect(
     login: WebLogin,
     options: FeishuWebClientOptions = {},
@@ -271,8 +270,6 @@ export class FeishuWebClient {
     const ep = resolveEndpoints(options.endpoints);
     const jar = RecordingCookieJar.fromRecords(login.cookies, ep.extraAllowedHosts);
     const client = new FeishuWebClient(jar, login, options);
-    // 首次建连的 verifyOwner 若在返回瞬时 5xx / 不可解析响应 / 传输抖动前已轮换 Set-Cookie，
-    // 保留同一本地 jar 进行有界重试（但仍不落盘直至 owner 身份核验成功），避免丢弃新 Cookie 后下次重连触发 needs_login。
     const maxAttempts = Math.max(1, options.verifyOwnerMaxAttempts ?? 3);
     const retryBaseMs = Math.max(0, options.verifyOwnerRetryMs ?? 250);
     await client.verifyOwnerWithTransientRetry(maxAttempts, retryBaseMs, signal);
@@ -283,10 +280,8 @@ export class FeishuWebClient {
     try {
       meta = await loadWebMetadata(jar, ep, { signal });
     } catch (err) {
-      // verifyOwner 已确认会话归属；若 loadWebMetadata 遭遇 5xx/缺 appKey 前收到了 Set-Cookie 轮换，
-      // 须立即落盘已验证会话的新增 Cookie，避免重连回退到已失效的旧磁盘 Cookie
       if (!(err instanceof WebHttpError && err.code === "credential_denied")) {
-        client.flushVerifiedCookieDeltaBestEffort();
+        client.flushVerifiedCookiesBestEffort();
       }
       throw err;
     }
@@ -298,16 +293,12 @@ export class FeishuWebClient {
     return client;
   }
 
-  owner(): { id: string; name: string } {
-    return { id: this.ownerId, name: this.ownerName };
+  owner(): { id: string; name: string; openId?: string } {
+    return { id: this.ownerId, name: this.ownerName, ...(this.ownerOpenId ? { openId: this.ownerOpenId } : {}) };
   }
 
   currentSessionId(): string | undefined {
     return this.sessionId;
-  }
-
-  currentCookieVersion(): number {
-    return this.cookieVersion;
   }
 
   private refreshDeviceIdFromJar(): void {
@@ -319,19 +310,6 @@ export class FeishuWebClient {
     if (latest) this.deviceId = latest;
   }
 
-  /** 同步磁盘上更新版本的同会话 Cookie（保留本客户端在途未落盘且不冲突的轮换 Cookie，防止被无关更新回滚） */
-  syncFromDisk(login: WebLogin): void {
-    if (login.owner_id !== this.ownerId) return;
-    if (this.sessionId && login.session_id && login.session_id !== this.sessionId) return;
-    const nextVer = login.cookie_version ?? 1;
-    if (nextVer <= this.cookieVersion) return;
-    this.jar.syncFromRecords(login.cookies, Date.now(), { preservePendingDelta: true });
-    this.cookieVersion = nextVer;
-    this.refreshDeviceIdFromJar();
-    if (login.owner_name) this.ownerName = login.owner_name;
-    if (login.owner_open_id) this.ownerOpenId = login.owner_open_id;
-  }
-
   /** Live snapshot including any cookies rotated by Feishu since login. */
   session(): WebLogin {
     return {
@@ -339,63 +317,45 @@ export class FeishuWebClient {
       owner_name: this.ownerName,
       ...(this.ownerOpenId ? { owner_open_id: this.ownerOpenId } : {}),
       ...(this.sessionId ? { session_id: this.sessionId } : {}),
-      cookie_version: this.cookieVersion,
       cookies: this.jar.records(),
       updated_at: new Date().toISOString(),
     };
   }
 
-  setSessionObserver(cb: ((login: WebLogin, delta: CookieDelta) => WebLogin | boolean | null | void) | undefined): void {
-    this.onSessionConfirmed = cb;
-  }
-
-  private hasPendingCookieDelta(): boolean {
-    const d = this.jar.peekDelta();
-    return d.upserts.length > 0 || d.deletes.length > 0;
-  }
-
-  /** 对已验证会话在遭遇瞬时非鉴权错误（如 5xx、网关解码异常、票据异常）前落盘已收到的 Set-Cookie 轮换，避免短生命周期客户端丢失新 Cookie */
-  private flushVerifiedCookieDeltaBestEffort(): void {
-    if (!this.hasPendingCookieDelta()) return;
+  private flushVerifiedCookiesBestEffort(): void {
+    if (!this.jar.hasDirtyUpdates()) return;
     try {
       this.notifySessionConfirmed();
     } catch {
-      // 保留原始非鉴权错误，不吞掉上游失败信息
+      // preserve original upstream error
     }
   }
 
   private notifySessionConfirmed(): boolean {
     if (!this.onSessionConfirmed) {
-      this.jar.clearDelta();
+      this.jar.clearDirty();
       return true;
     }
-    const delta = this.jar.peekDelta();
     let res: WebLogin | boolean | null | void;
     try {
-      res = this.onSessionConfirmed(this.session(), delta);
+      res = this.onSessionConfirmed(this.session());
     } catch (err) {
-      // 保留未落盘增量以便重试，并对外显式暴露持久化失败（绝不把 Cookie 原文写入错误信息）
       throw new WebHttpError(
         "transport",
-        "持久化个人 Web 轮换后的会话凭据失败（凭据文件被锁定、缺少密钥或不可写）",
+        "持久化个人 Web 轮换后的会话凭据失败（缺少密钥或文件不可写）",
         undefined,
         err instanceof Error ? err.name : undefined,
       );
     }
     if (res === false || res === null) return false;
-    if (res && typeof res === "object") {
-      this.cookieVersion = res.cookie_version ?? this.cookieVersion;
-      this.jar.syncFromRecords(res.cookies);
-      this.refreshDeviceIdFromJar();
-    } else {
-      this.jar.clearDelta();
-    }
+    this.jar.clearDirty();
+    this.refreshDeviceIdFromJar();
     return true;
   }
 
   async verifyOwner(signal?: AbortSignal): Promise<void> {
     await this.verifyOwnerOnce(signal);
-    if (this.hasPendingCookieDelta()) {
+    if (this.jar.hasDirtyUpdates()) {
       if (!this.notifySessionConfirmed()) {
         throw new WebHttpError("aborted", "本地凭据已被登出或更新");
       }
@@ -422,15 +382,9 @@ export class FeishuWebClient {
         return;
       } catch (err) {
         if (signal?.aborted) throw err;
-        const isTransient =
-          !(err instanceof WebHttpError) ||
-          (err.code !== "credential_denied" && err.code !== "aborted");
-        if (!isTransient || attempt >= maxAttempts) {
-          throw err;
-        }
-        if (retryBaseMs > 0) {
-          await sleep(retryBaseMs * attempt, signal);
-        }
+        const isTransient = !(err instanceof WebHttpError) || (err.code !== "credential_denied" && err.code !== "aborted");
+        if (!isTransient || attempt >= maxAttempts) throw err;
+        if (retryBaseMs > 0) await sleep(retryBaseMs * attempt, signal);
       }
     }
   }
@@ -476,7 +430,7 @@ export class FeishuWebClient {
       throw new WebHttpError("credential_denied", `个人 Web 网关鉴权失败 (HTTP ${res.status})`, res.status);
     }
     if (res.status !== 200) {
-      this.flushVerifiedCookieDeltaBestEffort();
+      this.flushVerifiedCookiesBestEffort();
       throw new WebHttpError("http_error", `个人 Web 网关请求被拒绝 (HTTP ${res.status})`, res.status);
     }
     let unpacked: Buffer;
@@ -487,10 +441,10 @@ export class FeishuWebClient {
         expectedCid: cid,
       });
     } catch (err) {
-      this.flushVerifiedCookieDeltaBestEffort();
+      this.flushVerifiedCookiesBestEffort();
       throw err;
     }
-    if (!opts.deferCookiePersist && (res.cookiesUpdated || this.hasPendingCookieDelta())) {
+    if (!opts.deferCookiePersist && (res.cookiesUpdated || this.jar.hasDirtyUpdates())) {
       if (!this.notifySessionConfirmed()) {
         throw new WebHttpError("aborted", "本地凭据已被登出或更新");
       }
@@ -498,9 +452,8 @@ export class FeishuWebClient {
     return unpacked;
   }
 
-  /** 将此前延迟（如发回复先落库回执）的待持久化轮换 Cookie 立即刷盘；若会话已被吊销/取代则立即中止后续请求 */
   flushPendingCookies(): void {
-    if (this.hasPendingCookieDelta()) {
+    if (this.jar.hasDirtyUpdates()) {
       if (!this.notifySessionConfirmed()) {
         throw new WebHttpError("aborted", "本地凭据已被登出或更新");
       }
@@ -510,7 +463,6 @@ export class FeishuWebClient {
   /** Fetch one native message by its numeric message ID (command 8). */
   async readMessage(id: string, signal?: AbortSignal): Promise<WebMessage> {
     const req = new ProtoWriter().str(1, id).finish();
-    // Protobuf 中空的 GetMessagesByIdsResponse 载荷合法编码为 0 字节（位于非空、含有效信封头且 status=0 的网关包内），表示确认未查到该消息
     const data = await this.gateway(CMD_READ_MESSAGE, req, { signal, allowEmptyPayload: true });
     const fields = parseProto(data, MAX_WIRE_BYTES);
     for (const v of fields.allFields(1)) {
@@ -521,9 +473,7 @@ export class FeishuWebClient {
       if (pair.str(1) === id) {
         const decoded = decodeMessage(pair.bytes(2), this.ownerId);
         if (!decoded.id || decoded.id !== id) {
-          throw new GatewayError(
-            `个人 Web 消息查询返回不匹配的消息 ID (got=${decoded.id || "empty"}, want=${id})`,
-          );
+          throw new GatewayError(`个人 Web 消息查询返回不匹配的消息 ID (got=${decoded.id || "empty"}, want=${id})`);
         }
         return decoded;
       }
@@ -552,10 +502,7 @@ export class FeishuWebClient {
     throw new Error(`无法读取个人会话信息：${chatId}`);
   }
 
-  /**
-   * Read bounded conversation history strictly before an anchor message (command 43 / 8).
-   * For topic/reply messages, resolves root & quoted parent; for top-level messages, fetches recent positions.
-   */
+  /** Read bounded conversation history strictly before an anchor message (command 43 / 8). */
   async readContext(
     anchor: Pick<WebMessage, "id" | "conversationId" | "rootId" | "parentId" | "threadId" | "position" | "createdAtMs">,
     opts: { limit?: number; signal?: AbortSignal } = {},
@@ -577,7 +524,7 @@ export class FeishuWebClient {
       for (let page = 0; page < MAX_HISTORY_WINDOWS && pos > 0 && collected.length < maxCount; page++) {
         const next = Math.max(0, pos - maxCount);
         const payload = encodeHistoryWindowPayload(anchor.conversationId, pos, next);
-        const raw = await this.gateway(CMD_HISTORY, payload, { signal: opts.signal });
+        const raw = await this.gateway(CMD_HISTORY, payload, { signal: opts.signal, allowEmptyPayload: true });
         const resp = parseProto(raw, MAX_WIRE_BYTES);
         for (const entry of resp.allBytes(1)) {
           try {
@@ -607,13 +554,12 @@ export class FeishuWebClient {
             wanted.delete(id);
           }
         } catch {
-          // fall back to window scan if direct read fails
+          // fall back to window scan
         }
       }
       if (wanted.size > 0 && anchor.position > 0) {
         try {
-          const win = await readWindow(anchor.position, limit);
-          for (const m of win) {
+          for (const m of await readWindow(anchor.position, limit)) {
             if (wanted.has(m.id)) {
               msgs.push(m);
               wanted.delete(m.id);
@@ -696,13 +642,13 @@ export class FeishuWebClient {
 
   /**
    * Verified personal reply (used only after explicit human confirmation of a draft):
-   *   1. Pre-send check: reads the original message to confirm it still exists in the expected chat.
-   *   2. Reads chat kind & mode to determine explicit thread reply flag.
-   *   3. Sends ONCE with fixed CID, preserving both rootId and selected parentId.
+   *   1. Pre-send check: reads the original message to confirm it still exists and is usable.
+   *   2. Reads live chat kind & mode to determine explicit thread reply flag.
+   *   3. Sends ONCE with fixed CID, preserving both rootId and parentId.
    *   4. Independent readback check verifying owner, chat, root, parent, CID, and text.
    */
   async sendVerifiedReply(
-    input: VerifiedReplyInput & { requireMentionOwnerId?: string },
+    input: VerifiedReplyInput,
     hooks?: {
       onBeforeSend?: (meta: { rootId: string; parentId: string; threaded: boolean; original: WebMessage; chat: ChatMeta }) => Promise<void> | void;
       onCreated?: (meta: { replyId: string; rootId: string; parentId: string; threaded: boolean }) => void;
@@ -711,6 +657,7 @@ export class FeishuWebClient {
     const normalizeText = (s: string) => s.replace(/\r\n/g, "\n").trim();
     const text = normalizeText(input.text);
     if (!text) throw new Error("回复内容不能为空");
+
     const original = await this.readMessage(input.messageId, input.signal);
     if (original.conversationId !== input.chatId) {
       throw new Error("原消息所属会话与草稿目标不一致，拒绝发送");
@@ -731,7 +678,7 @@ export class FeishuWebClient {
     if (input.rootId && input.rootId !== actualRoot) {
       throw new Error("原消息根话题与草稿记录不一致，拒绝发送");
     }
-    // 发包前强制实时查询群模式（不走 10 分钟缓存），防止群模式变更后错用 thread 标志
+
     const chat = await this.readChat(input.chatId, { signal: input.signal, force: true });
     const group = isGroupChat(chat.kind);
     if (!group && chat.kind !== CHAT_KIND_P2P) {
@@ -739,9 +686,8 @@ export class FeishuWebClient {
     }
     const inThread = replyInThread(chat.kind, chat.mode);
     const threaded = group || inThread;
+
     await hooks?.onBeforeSend?.({ rootId: actualRoot, parentId: actualParent, threaded, original, chat });
-    // 发包响应可能同时携带新消息 ID 与 Cookie 轮换：先让 onCreated 把 replyId 持久化为 created，
-    // 再尝试刷盘轮换后的 Cookie，确保即使 Cookie 落盘报错也不会让已发送消息滞留在 sending 态而无法回读恢复。
     const created = await this.sendReply(input.chatId, actualRoot, input.cid, [{ text }], inThread, input.signal, actualParent, {
       deferCookiePersist: true,
     });
@@ -779,32 +725,30 @@ export class FeishuWebClient {
         throw new WebHttpError("credential_denied", `获取长连接票据鉴权失败 (HTTP ${res.status})`, res.status);
       }
       if (res.status !== 200) {
-        this.flushVerifiedCookieDeltaBestEffort();
+        this.flushVerifiedCookiesBestEffort();
         throw new WebHttpError("http_error", `获取长连接票据失败 (HTTP ${res.status})`, res.status);
       }
       let parsed: { code?: number; ticket?: string };
       try {
         parsed = JSON.parse(res.body.toString("utf8")) as typeof parsed;
       } catch {
-        this.flushVerifiedCookieDeltaBestEffort();
+        this.flushVerifiedCookiesBestEffort();
         throw new WebHttpError("http_error", "长连接票据响应不可解析");
       }
       if (typeof parsed.code === "number" && parsed.code !== 0) {
-        this.flushVerifiedCookieDeltaBestEffort();
+        this.flushVerifiedCookiesBestEffort();
         throw new WebHttpError("http_error", `长连接票据服务返回异常 (code=${parsed.code})`);
       }
       if (!parsed.ticket) {
-        this.flushVerifiedCookieDeltaBestEffort();
+        this.flushVerifiedCookiesBestEffort();
         throw new WebHttpError("http_error", "长连接票据暂不可用");
       }
-      if (res.cookiesUpdated || this.hasPendingCookieDelta()) {
+      if (res.cookiesUpdated || this.jar.hasDirtyUpdates()) {
         if (!this.notifySessionConfirmed()) {
           throw new WebHttpError("aborted", "本地凭据已被登出或更新");
         }
       }
       this.refreshDeviceIdFromJar();
-      // 若票据响应或并发磁盘同步轮换了 passport_web_did，用最新 deviceId 重新申请一次匹配票据；
-      // 最终 access_key 与 WebSocket URL 始终使用与该票据严格对应的同一个 deviceId
       if (this.deviceId && this.deviceId !== requestedDeviceId && attempt === 0) {
         continue;
       }
@@ -932,9 +876,7 @@ export class FeishuWebClient {
     }, this.opts.heartbeatIntervalMs);
     hbTimer.unref?.();
 
-    // Session keepalive loop (30m): touches profile so rotated cookies are persisted,
-    // recovers cookie rotations on transient non-auth errors (e.g. HTTP 503), and escalates
-    // definitive credential denials or owner mismatches out of the socket loop.
+    // Session keepalive loop (30m): touches profile so rotated cookies are persisted
     let keepaliveFatal: Error | null = null;
     let keepaliveInFlight = false;
     const kaTimer = setInterval(() => {
@@ -949,40 +891,16 @@ export class FeishuWebClient {
             return;
           }
           if (p.name) this.ownerName = p.name;
-          try {
-            if (!this.notifySessionConfirmed()) {
-              keepaliveFatal = new WebHttpError("aborted", "本地凭据已被登出或更新");
-              ws.close();
-            }
-          } catch (persistErr) {
-            onWarn?.(persistErr instanceof Error ? persistErr.message : "保活持久化个人 Web 会话凭据失败");
-            keepaliveFatal = persistErr instanceof Error ? persistErr : new WebHttpError("transport", "保活持久化个人 Web 会话凭据失败");
+          if (!this.notifySessionConfirmed()) {
+            keepaliveFatal = new WebHttpError("aborted", "本地凭据已被登出或更新");
             ws.close();
           }
         } catch (err: unknown) {
           if (isCredentialDenied(err)) {
             keepaliveFatal = err as Error;
             ws.close();
-            return;
-          }
-          // 非认证失败（如 503）前若已收到 Set-Cookie 轮换，在同一内存 jar 上有界重试身份核验，核验通过后立即落盘避免重启丢 Cookie
-          if (!loopCtrl.signal.aborted && this.hasPendingCookieDelta()) {
-            try {
-              await this.verifyOwnerWithTransientRetry(2, Math.min(this.opts.reconnectBaseMs, 250), loopCtrl.signal);
-              if (!this.notifySessionConfirmed()) {
-                keepaliveFatal = new WebHttpError("aborted", "本地凭据已被登出或更新");
-                ws.close();
-              }
-            } catch (retryErr: unknown) {
-              if (isCredentialDenied(retryErr)) {
-                keepaliveFatal = retryErr as Error;
-                ws.close();
-              } else if (!loopCtrl.signal.aborted) {
-                onWarn?.(
-                  `保活遇到瞬态故障，轮换 Cookie 暂留内存等待下次核验落盘：${retryErr instanceof Error ? retryErr.message : String(retryErr)}`,
-                );
-              }
-            }
+          } else if (!loopCtrl.signal.aborted && this.jar.hasDirtyUpdates()) {
+            this.flushVerifiedCookiesBestEffort();
           }
         } finally {
           keepaliveInFlight = false;
@@ -1009,7 +927,6 @@ export class FeishuWebClient {
             malformedReported = true;
             onWarn?.(`忽略畸形个人 Web 推送帧：${err instanceof Error ? err.message : String(err)}`);
           }
-          // Malformed frames remain unacknowledged without tearing down the healthy socket
           continue;
         }
         malformedReported = false;
@@ -1023,11 +940,11 @@ export class FeishuWebClient {
             shouldDeliverInvalid,
           );
           if (!delivered) {
+            if (loopCtrl.signal.aborted) break;
             if (!publicationBlocked) {
               publicationBlocked = true;
               onState("publication_blocked", "消息写入本地存储失败，暂缓 ACK 等待重试");
             }
-            // Backpressure: do NOT acknowledge when persistence failed!
             continue;
           }
           if (publicationBlocked) {
@@ -1065,8 +982,9 @@ export class FeishuWebClient {
     try {
       push = parseProto(payload, MAX_WIRE_BYTES);
     } catch (err) {
-      onWarn?.(`推送载荷解析失败：${err instanceof Error ? err.message : String(err)}`);
-      return false;
+      // 整包解析失败重试也不会成功，记录后照常 ACK；不 ACK 只留给真正的落库失败
+      onWarn?.(`推送载荷解析失败（已跳过并 ACK）：${err instanceof Error ? err.message : String(err)}`);
+      return true;
     }
 
     let rejected = false;
@@ -1077,12 +995,10 @@ export class FeishuWebClient {
         const pair = parseProto(entry, MAX_WIRE_BYTES);
         msg = decodeMessage(pair.bytes(2), this.ownerId);
       } catch (err) {
-        // One undecodable message entry must neither starve siblings nor stall ACK forever
         onWarn?.(`跳过无法解码的个人消息：${err instanceof Error ? err.message : String(err)}`);
         continue;
       }
       if (msg.unsupported || (!msg.text.trim() && msg.resources.length === 0)) {
-        // 允许已知活跃消息的空正文/不支持类型编辑推送透传给上层以撤回本地旧正文，同时继续过滤全新无效推送
         if (!shouldDeliverInvalid?.(msg)) continue;
       }
       try {

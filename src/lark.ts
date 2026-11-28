@@ -86,37 +86,6 @@ export function extractOwnerOpenId(status: Record<string, unknown>): string {
   return String(id);
 }
 
-/**
- * 实时核验当前 lark-cli 登录用户的 open_id 与预期主人一致，防止切换 CLI 账号后跨账号读写飞书数据。
- */
-export async function verifyActiveLarkUser(
-  lark: Pick<Lark, "authStatus">,
-  expectedOwnerOpenId: string,
-  actionLabel: string,
-): Promise<{ openId: string; status: Record<string, unknown> }> {
-  const expected = expectedOwnerOpenId.trim();
-  if (!expected) {
-    throw new Error(`未配置 owner.open_id，无法确认${actionLabel}的 lark-cli 账号归属，已按安全策略中止`);
-  }
-  let status: Record<string, unknown>;
-  try {
-    status = await lark.authStatus();
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`无法核验当前 lark-cli 登录用户身份，已中止${actionLabel}：${msg}`);
-  }
-  const openId = extractOwnerOpenId(status).trim();
-  if (!openId || !openId.startsWith("ou_")) {
-    throw new Error(`无法从 lark-cli auth status 解析当前登录用户的 open_id，已中止${actionLabel}`);
-  }
-  if (openId !== expected) {
-    throw new Error(
-      `当前 lark-cli 登录用户 (${openId}) 与配置 owner.open_id (${expected}) 不一致，已阻断${actionLabel}以防跨账号读写`,
-    );
-  }
-  return { openId, status };
-}
-
 function parseEnvelope(text: string): { ok?: boolean; data?: unknown; error?: unknown } | undefined {
   const t = text.trim();
   if (!t.startsWith("{")) return undefined;

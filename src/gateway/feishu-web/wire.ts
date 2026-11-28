@@ -370,6 +370,17 @@ export function encodeReplyPacket(
 
 /** Encode a command 43 history-window request for positions [next .. position - 1]. */
 export function encodeHistoryWindowPayload(chatId: string, position: number, next: number): Buffer {
+  if (
+    !Number.isSafeInteger(position) ||
+    !Number.isSafeInteger(next) ||
+    position < 0 ||
+    next < 0 ||
+    position > 0x7fffffff ||
+    next > position ||
+    position - next > 100
+  ) {
+    throw new Error(`非法的历史消息窗口区间：[${next}, ${position})`);
+  }
   const w = new ProtoWriter().str(1, chatId);
   for (let cur = position - 1; cur >= next; cur--) {
     w.uint(2, cur);

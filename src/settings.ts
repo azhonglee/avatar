@@ -5,7 +5,7 @@ import YAML, { isMap, type Document } from "yaml";
 import { z } from "zod";
 import type { App } from "./app.ts";
 import type { SettingsUpdateResult, SettingsView } from "./api/types.ts";
-import { ConfigSchema, markConfigMutated } from "./config.ts";
+import { ConfigSchema, validatePersonalWebConfig } from "./config.ts";
 import { parseHHMM } from "./notify-prefs.ts";
 import { errMsg, log } from "./util.ts";
 
@@ -33,8 +33,19 @@ const COLD_PATHS = new Set([
   "context.evening",
   "context.weekly",
   "context.personal_web.enabled",
+  "context.personal_web.gateway_socket",
+  "context.personal_web.gateway_url",
+  "context.personal_web.read_token_env",
+  "context.personal_web.reply_token_env",
 ]);
 const FORBIDDEN = ["data_dir", "bins"];
+/** 禁止通过控制台 API 修改的嵌套敏感路径（防止 SSRF 或环境变量外泄，仅允许手工编辑 config.yaml） */
+const FORBIDDEN_NESTED: string[][] = [
+  ["context", "personal_web", "gateway_socket"],
+  ["context", "personal_web", "gateway_url"],
+  ["context", "personal_web", "read_token_env"],
+  ["context", "personal_web", "reply_token_env"],
+];
 
 type Obj = Record<string, unknown>;
 type Issue = { path: string; message: string };
@@ -58,20 +69,14 @@ export function diffPaths(a: unknown, b: unknown, prefix: string[] = []): string
   return JSON.stringify(a) === JSON.stringify(b) ? [] : [prefix];
 }
 
-/** 把 target 原地同步成 source（按完整点分路径递归跳过冷配置项），保留 target 对象本身的引用。 */
-function syncInPlace(target: Obj, source: Obj, prefix: string[]): void {
-  for (const k of Object.keys(target)) {
-    if (!(k in source) && isHotPath([...prefix, k])) delete target[k];
-  }
+/** 把 target 原地同步成 source（对象递归，其他值替换），保留 target 对象本身的引用。 */
+function syncInPlace(target: Obj, source: Obj, prefix: string[] = [], skip: (path: string[]) => boolean = () => false): void {
+  for (const k of Object.keys(target)) if (!(k in source) && !skip([...prefix, k])) delete target[k];
   for (const [k, v] of Object.entries(source)) {
-    const p = [...prefix, k];
-    if (!isHotPath(p)) continue;
-    if (isObj(v)) {
-      if (!isObj(target[k])) target[k] = {};
-      syncInPlace(target[k] as Obj, v, p);
-    } else {
-      target[k] = structuredClone(v);
-    }
+    const nextPath = [...prefix, k];
+    if (skip(nextPath)) continue;
+    if (isObj(v) && isObj(target[k])) syncInPlace(target[k] as Obj, v, nextPath, skip);
+    else target[k] = structuredClone(v);
   }
 }
 
@@ -145,6 +150,7 @@ export function crossCheck(cfg: z.infer<typeof ConfigSchema>): Issue[] {
   });
   if (cfg.capture.auto_inbox_confidence < cfg.capture.min_confidence)
     issues.push({ path: "capture.auto_inbox_confidence", message: "直接进 Inbox 的置信度不能低于进“待确认”的置信度" });
+  issues.push(...validatePersonalWebConfig(cfg.context.personal_web));
   return issues;
 }
 
@@ -173,6 +179,16 @@ function getIn(o: unknown, p: string[]): unknown {
     cur = cur[k];
   }
   return cur;
+}
+
+function deleteIn(o: Obj, p: string[]): void {
+  if (!p.length) return;
+  let cur: unknown = o;
+  for (let i = 0; i < p.length - 1; i++) {
+    if (!isObj(cur) || !Object.hasOwn(cur, p[i])) return;
+    cur = cur[p[i]];
+  }
+  if (isObj(cur)) delete cur[p[p.length - 1]];
 }
 
 /**
@@ -289,7 +305,23 @@ export class SettingsService {
       return !b.success || JSON.stringify(a.data) !== JSON.stringify(b.data);
     });
     if (forbidden.length) return fail(forbidden.map((k) => ({ path: k, message: `出于安全考虑，${k} 不能在控制台修改，请直接编辑 ${this.file}` })));
+    const pwShape = ConfigSchema.shape.context.unwrap().shape.personal_web.unwrap().shape;
+    const forbiddenNested = FORBIDDEN_NESTED.filter((p) => {
+      const leaf = p[p.length - 1] as keyof typeof pwShape;
+      const beforeVal = getIn(cur.data, p);
+      const parsedAfter = pwShape[leaf].safeParse(getIn(after, p));
+      return !parsedAfter.success || JSON.stringify(beforeVal) !== JSON.stringify(parsedAfter.data);
+    });
+    if (forbiddenNested.length) {
+      return fail(
+        forbiddenNested.map((p) => ({
+          path: p.join("."),
+          message: `出于安全考虑，${p.join(".")} 不能在控制台修改，请直接编辑 ${this.file}`,
+        })),
+      );
+    }
     for (const k of FORBIDDEN) delete patch[k]; // 没有改动：不写进文件
+    for (const p of FORBIDDEN_NESTED) deleteIn(patch, p); // 没有改动：不写进文件
     applyPatch(doc, patch, cur.data);
     const v = validateConfig(doc.toJS());
     if (!v.ok) return fail(v.errors);
@@ -342,15 +374,14 @@ export class SettingsService {
     }
   }
 
-  /** 可热加载的分组原地同步到 app.cfg（深层嵌套冷字段保持启动时的原值，直到重启） */
+  /** 可热加载的分组原地同步到 app.cfg */
   private applyHot(data: Obj): void {
     const cfg = this.app.cfg as unknown as Obj;
     for (const k of HOT) {
       const src = data[k];
-      if (isObj(src) && isObj(cfg[k])) syncInPlace(cfg[k] as Obj, src, [k]);
-      else if (src !== undefined && isHotPath([k])) cfg[k] = structuredClone(src);
+      if (isObj(src) && isObj(cfg[k])) syncInPlace(cfg[k] as Obj, src, [k], (p) => !isHotPath(p));
+      else if (src !== undefined) cfg[k] = structuredClone(src);
     }
-    markConfigMutated(this.app.cfg);
   }
 
   private audit(args: Record<string, unknown>, ok: boolean, message: string): void {

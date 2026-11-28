@@ -2,15 +2,12 @@ import fs from "node:fs";
 import { parseArgs } from "node:util";
 import { createApp, initApp, runConfiguredJob, runDaemon, runDispatchOnce, sendBrief } from "./app.ts";
 import { loadConfig } from "./config.ts";
-import { beginLogin, FeishuWebClient, pollLogin, renderQrSvg, renderQrTerminal, WebLoginStore } from "./context/feishu-web/index.ts";
 import {
-  assertLoginAuthorizedForWorkspace,
-  BOUND_OWNER_KV_KEY,
-  BOUND_WORKSPACE_OWNER_KV_KEY,
-  commitWorkspaceLogin,
-  PENDING_CRED_COMMIT_KV_KEY,
-  revokeWorkspacePersonalWebSession,
-  verifyWorkspaceOwnerBinding,
+  createGatewayClientForConfig,
+  legacyPersonalWebArtifacts,
+  resolveGatewayClientConfig,
+  unbindPersonalWebAccount,
+  verifyGatewayOwnerForWorkspace,
 } from "./context/personal-web.ts";
 import { decide, type Profile } from "./guard.ts";
 import { consoleBaseUrl, isLoopbackHost, resolveConsoleHost, serverToken } from "./server/index.ts";
@@ -31,9 +28,9 @@ const USAGE = `用法：pa <命令>
   context today               打印「今天」：最该处理的事、冲突、草稿、今天的会
   context digest [morning|evening]   发送晨间卡 / 收尾卡（--print 只打印不发送）
   context split <项目>        把一个大项目拆成子项目（模型归类，可重复执行）
-  context web-login [--out qr.svg]   飞书个人 Web 协议扫码登录（用于秒级实时接收任意群 @我 与私聊）
-  context web-status [--verify]      查看个人 Web 协议登录与长连接状态（--verify 实时向飞书核验凭据）
-  context web-logout          清除本地保存的个人 Web 协议登录凭据
+  context web-status [--verify]      查询独立飞书个人 Web 网关的连接与缓存状态（登录/登出请使用 feishu-gateway）
+  context web-unbind          解除当前工作区与个人 Web 账号的绑定并重置本地网关游标（切换网关账号时使用）
+  context web-logout          删除旧版残留在本机数据目录的个人 Web 会话凭据（feishu-web.json）
   status                      最近 24 小时的派单、作业，以及重试中/失败的事件和飞书写入
   console [--rotate]          打印控制台登录链接（--rotate 作废旧链接）；常驻进程运行时可用
   command <名称> [JSON 参数]   执行一条命令（与控制台/卡片按钮相同），如 pa command dispatch.cancel '{"id":"…"}'
@@ -92,7 +89,7 @@ async function main(): Promise<void> {
     case "context":
       return context(app, rest);
     case "status":
-      return void console.log(statusText(app.ledger, { cfg: app.cfg, store: app.store }));
+      return void console.log(statusText(app.ledger));
     case "console": {
       const token = serverToken(app, rest.includes("--rotate"));
       const displayHost = resolveConsoleHost(cfg.server.host);
@@ -148,151 +145,71 @@ async function main(): Promise<void> {
 
 async function context(app: ReturnType<typeof createApp>, rest: string[]): Promise<void> {
   const [sub, ...more] = rest;
-  // 个人 Web 凭据管理不依赖 context.enabled（关闭模块后仍必须能 web-logout / 查看状态 / 重新登录）
+
+  // 清理旧版（进程内个人 Web）遗留在 Avatar 数据目录内的会话凭据；外部 PA_FEISHU_WEB_CRED_FILE 仅提示不自动删（避免误删新网关凭据）
   if (sub === "web-logout") {
-    const { fileRemoved, fileRetained, credFile, fileError } = revokeWorkspacePersonalWebSession(app);
-    if (fileError) {
-      console.log("已写入工作区个人 Web 会话吊销标记，正在运行的常驻监听与回复发送将立即中止。");
-      console.error(`⚠️ 清理本地凭据文件失败（${credFile}）：${fileError}；请手动删除该文件。`);
-      process.exitCode = 1;
-    } else if (fileRemoved) {
-      console.log(`已清除个人 Web 登录凭据（${credFile}）并写入工作区吊销标记。若 pa run 正在运行，将在数秒内自动断开会话且不会回写旧凭据。`);
-    } else if (fileRetained) {
+    const legacy = legacyPersonalWebArtifacts(app.cfg);
+    const removed: string[] = [];
+    const failed: string[] = [];
+    for (const f of legacy.files) {
+      try {
+        fs.rmSync(f, { force: true });
+        removed.push(f);
+      } catch (e) {
+        failed.push(`${f}（${errMsg(e)}）`);
+      }
+    }
+    console.log(removed.length ? `已删除数据目录内的旧版个人 Web 凭据：\n${removed.map((f) => `  ${f}`).join("\n")}` : "数据目录内未发现旧版个人 Web 凭据文件。");
+    if (failed.length) {
+      console.log(`⚠️ 以下文件删除失败，请检查权限后手动删除：\n${failed.map((f) => `  ${f}`).join("\n")}`);
+    }
+    if (legacy.externalFiles.length) {
       console.log(
-        `已写入本工作区个人 Web 会话吊销标记，正在运行的常驻监听与回复发送将立即中止；检测到共享/未核验归属的凭据文件（${credFile}），为避免影响其他工作区已原样保留未删除。`,
-      );
-    } else {
-      console.log(
-        `已写入工作区个人 Web 会话吊销标记，正在运行的常驻监听与回复发送将立即中止（当前默认路径 ${credFile} 无本地文件；如常驻进程使用了自定义 PA_FEISHU_WEB_CRED_FILE，请核实归属后按需处理）。`,
+        `⚠️ 检测到数据目录外的 PA_FEISHU_WEB_CRED_FILE 文件（为避免误删独立网关凭据未自动删除，请核实后再手动处理）：\n${legacy.externalFiles.map((f) => `  ${f}`).join("\n")}`,
       );
     }
+    if (legacy.envKeys.length) {
+      console.log(`请从 Avatar 的运行环境（shell / systemd 单元）中移除：${legacy.envKeys.join("、")}，然后重启 pa run。`);
+    }
+    console.log("旧会话在飞书侧仍可能有效：请在飞书 App 的登录设备管理中移除对应的网页登录；网关的登录/登出请使用 feishu-gateway login / logout。");
     return;
   }
+  // 解除当前工作区绑定的个人 Web 账号并清空网关游标/db_epoch/状态缓存（供切换网关账号时使用）
+  if (sub === "web-unbind") {
+    const { previousOwnerId } = unbindPersonalWebAccount(app);
+    console.log(
+      previousOwnerId
+        ? `已解除当前工作区与个人 Web 账号 ${previousOwnerId} 的绑定，并重置网关游标与状态缓存。`
+        : "当前工作区尚未绑定个人 Web 账号，已重置网关游标与状态缓存。",
+    );
+    console.log("下次连接个人 Web 网关时将自动绑定网关当前账号并从新事件库重新同步（历史观测不会被删除）。");
+    return;
+  }
+  // 查询独立个人 Web 网关状态（只读，不依赖 context.enabled）
   if (sub === "web-status") {
     const verify = more.includes("--verify");
-    const store = new WebLoginStore(app.cfg.dataDir);
-    store.reconcilePendingCommit(app.store, PENDING_CRED_COMMIT_KV_KEY);
-    const inspected = store.inspect();
-    const login = inspected.status === "ok" ? inspected.login : undefined;
-    let loginAuthErr: Error | undefined;
-    if (login) {
-      try {
-        assertLoginAuthorizedForWorkspace(app, login);
-      } catch (err) {
-        loginAuthErr = err instanceof Error ? err : new Error(errMsg(err));
-      }
-    }
-    const ctx = app.ext.context;
-    const st = ctx?.status().personal_web;
     const pwCfg = app.cfg.context.personal_web;
-    console.log(`启用状态：${app.cfg.context.enabled && pwCfg.enabled ? "已启用" : "未启用"}（context.enabled=${app.cfg.context.enabled}，fast_lane=${pwCfg.fast_lane}，debounce_ms=${pwCfg.debounce_ms}，pre_draft=${pwCfg.pre_draft}，send_replies=${pwCfg.send_replies}）`);
-    const fileNote = login
-      ? loginAuthErr
-        ? `本地凭据不可用于当前工作区（${loginAuthErr.message}）`
-        : `已登录 ${login.owner_name || login.owner_id}，更新于 ${login.updated_at ?? "未知"}`
-      : inspected.status === "missing_key"
-        ? "凭据已加密但当前环境缺少密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）"
-        : inspected.status === "plaintext_rejected"
-          ? "检测到未加密明文凭据（已拒绝加载，请配置密钥后重新 web-login）"
-          : st?.logged_in
-            ? `当前路径无本地文件（常驻进程正以其他凭据路径运行，状态：${st.state}）`
-            : "未登录";
-    console.log(`凭据文件：${store.file}（${fileNote}）`);
-    if (st) {
-      console.log(`常驻状态：${st.state}${st.last_message_at ? `，最近消息 ${new Date(st.last_message_at).toLocaleString("zh-CN", { timeZone: app.cfg.owner.timezone, hour12: false })}` : ""}`);
-      if (st.last_error) console.log(`最近错误：${st.last_error}`);
+    const resolved = resolveGatewayClientConfig(pwCfg);
+    console.log(
+      `启用状态：${pwCfg.enabled ? "已启用" : "未启用"}（fast_lane=${pwCfg.fast_lane}，debounce_ms=${pwCfg.debounce_ms}，pre_draft=${pwCfg.pre_draft}，send_replies=${pwCfg.send_replies}）`,
+    );
+    console.log(`网关地址：${resolved.endpointLabel}（只读令牌：${resolved.readToken ? "已配置" : "未配置"}，回复令牌：${resolved.replyToken ? "已配置" : "未配置"}）`);
+    if (!resolved.socketPath && !resolved.baseUrl) {
+      if (verify) throw new Error("未配置 context.personal_web.gateway_socket 或 gateway_url");
+      return;
     }
+    const client = createGatewayClientForConfig(pwCfg);
+    const st = await client.status({ verify });
+    if (st.owner_id) verifyGatewayOwnerForWorkspace(app, st.owner_id);
+    console.log(`网关账号：${st.logged_in ? `${st.owner_name || st.owner_id}（ID: ${st.owner_id}）` : `未登录（${st.credential_status}）`}`);
+    console.log(`运行状态：${st.state}，网关回复开关 allow_reply=${st.allow_reply}，缓存事件 ${st.cached_events} 条（seq ${st.min_seq}..${st.latest_seq}）`);
+    console.log(`本地游标：seq=${app.store.get("ctx.pw_gateway.cursor") ?? "0"}`);
+    if (st.last_message_at) {
+      console.log(`最近消息：${new Date(st.last_message_at).toLocaleString("zh-CN", { timeZone: app.cfg.owner.timezone, hour12: false })}`);
+    }
+    if (st.last_error) console.log(`最近错误：${st.last_error}`);
     if (verify) {
-      if (!login) {
-        if (inspected.status === "missing_key") {
-          throw new Error("凭据已加密但当前环境缺少解密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）");
-        }
-        throw new Error("尚未登录，请先运行 `pa context web-login`");
-      }
-      if (loginAuthErr) throw loginAuthErr;
-      const client = await FeishuWebClient.connect(login, {
-        onSessionConfirmed: (u, d) => {
-          try {
-            assertLoginAuthorizedForWorkspace(app, u);
-          } catch {
-            return null;
-          }
-          return store.saveIfSessionMatches(u, d);
-        },
-      });
-      console.log(`✅ 在线核验通过：${client.owner().name}（ID: ${client.owner().id}）`);
-    }
-    return;
-  }
-  if (sub === "web-login") {
-    const { values } = parseArgs({
-      args: more,
-      options: {
-        out: { type: "string" },
-        "force-switch-account": { type: "boolean" },
-        "allow-name-mismatch": { type: "boolean" },
-        "allow-unverified-owner": { type: "boolean" },
-      },
-      allowPositionals: true,
-    });
-    if (!WebLoginStore.hasEncryptionKey()) {
-      throw new Error(
-        "执行 pa context web-login 前必须配置静态加密密钥（设置环境变量 PA_FEISHU_WEB_KEY 或通过 systemd LoadCredential 提供 CREDENTIALS_DIRECTORY/feishu-web-key），拒绝明文写入会话 Cookie",
-      );
-    }
-    // 扫码前预检首次绑定 / 工作区主人变更确认参数，避免用户扫码批准后才被告知缺少 --allow-unverified-owner 而重复登录
-    const boundNative = (app.store.get(BOUND_OWNER_KV_KEY) ?? "").trim();
-    const boundWs = (app.store.get(BOUND_WORKSPACE_OWNER_KV_KEY) ?? "").trim();
-    const cfgWs = app.cfg.owner.open_id.trim();
-    const needsFirstBindConfirm = !boundNative || (!!cfgWs && boundWs !== cfgWs) || (!!boundWs && boundWs !== cfgWs);
-    if (needsFirstBindConfirm && !values["allow-unverified-owner"]) {
-      throw new Error(
-        `当前工作区尚未完成个人 Web 账号绑定或 owner.open_id 已变更（配置: ${cfgWs || "未配置"}，已绑定: ${boundWs || "未绑定"}）。` +
-          "由于飞书网页原生账号 ID 与开放平台 open_id 无法跨应用强校验，请确认将使用本人飞书 App 扫码后，追加 --allow-unverified-owner 重新执行：pa context web-login --allow-unverified-owner",
-      );
-    }
-    console.log("正在向飞书申请个人 Web 登录二维码…");
-    const challenge = await beginLogin();
-    console.log("\n" + renderQrTerminal(challenge.qrCode) + "\n");
-    if (values.out) {
-      fs.writeFileSync(values.out, renderQrSvg(challenge.qrCode), "utf8");
-      console.log(`已将二维码写入：${values.out}`);
-    }
-    const deadline = new Date(challenge.expiresAtMs).toLocaleTimeString("zh-CN", { timeZone: app.cfg.owner.timezone, hour12: false });
-    console.log(`请用本人飞书 App 扫码确认（有效期至 ${deadline}，按 Ctrl+C 取消）…`);
-    const ctrl = new AbortController();
-    const onSig = () => ctrl.abort();
-    process.once("SIGINT", onSig);
-    process.once("SIGTERM", onSig);
-    try {
-      const login = await pollLogin(challenge, {
-        signal: ctrl.signal,
-        onProgress: (st) => {
-          if (st === "scanned") console.log("📱 已扫码，请在手机飞书上点击「确认登录」…");
-          if (st === "approved") console.log("✅ 已确认，正在验证账号并保存凭据…");
-        },
-      });
-      await verifyWorkspaceOwnerBinding(app, login, {
-        forceSwitch: !!values["force-switch-account"],
-        allowNameMismatch: !!values["allow-name-mismatch"],
-        allowUnverifiedOwner: !!values["allow-unverified-owner"],
-      });
-      const store = new WebLoginStore(app.cfg.dataDir);
-      const saved = commitWorkspaceLogin(app, login, {
-        forceSwitch: !!values["force-switch-account"],
-        allowUnverifiedOwner: !!values["allow-unverified-owner"],
-        signal: ctrl.signal,
-      });
-      console.log(`✅ 个人 Web 登录成功：${saved.owner_name || "(无昵称)"}（ID: ${saved.owner_id}）`);
-      console.log(`凭据已以 AES-256-GCM (0600) 保存到：${store.file}`);
-      if (!app.cfg.context.enabled || !app.cfg.context.personal_web.enabled) {
-        console.log("提示：在 config.yaml 里把 context.enabled 与 context.personal_web.enabled 设为 true 并重启 `pa run` 即可开启秒级实时接收。");
-      } else {
-        console.log("提示：若 `pa run` 正在运行，将在数秒内自动加载新凭据并重连。");
-      }
-    } finally {
-      process.off("SIGINT", onSig);
-      process.off("SIGTERM", onSig);
+      console.log(`✅ 网关在线核验通过：${st.owner_name || st.owner_id}（ID: ${st.owner_id}）`);
     }
     return;
   }
@@ -332,7 +249,7 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
     await app.engine.drain(["effect"]);
     return;
   }
-  throw new Error("用法：pa context run | today | split <项目> | digest [morning|evening] [--print] | web-login [--out qr.svg] | web-status [--verify] | web-logout");
+  throw new Error("用法：pa context run | today | split <项目> | digest [morning|evening] [--print] | web-status [--verify] | web-unbind | web-logout（个人 Web 扫码登录/登出请使用独立网关命令 feishu-gateway login / logout）");
 }
 
 async function doctor(app: ReturnType<typeof createApp>): Promise<void> {
