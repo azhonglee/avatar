@@ -445,11 +445,13 @@ export async function runPersonalWebSetup(app: App, opts: PersonalWebSetupOption
   if (doc.errors.length) {
     throw new Error(`Avatar 配置文件 ${cfgFile} 语法错误：${doc.errors.map((e) => e.message).join("；")}`);
   }
+  let docMutated = false;
   const setIfNeeded = (key: string, val: unknown, onlyWhenPresentOrNonEmpty = false): void => {
     const curVal = doc.getIn(["context", "personal_web", key]);
     if (onlyWhenPresentOrNonEmpty && curVal === undefined && (val === "" || val === false)) return;
     if (curVal !== val) {
       doc.setIn(["context", "personal_web", key], val);
+      docMutated = true;
     }
   };
   setIfNeeded("enabled", true);
@@ -559,8 +561,8 @@ export async function runPersonalWebSetup(app: App, opts: PersonalWebSetupOption
   }
 
   // 5) 写盘前预检 config.yaml / .bak 可写性，防止 gateway.env 已写入而 config.yaml 拒写导致半写状态
-  const updatedText = doc.toString();
-  const configChanged = updatedText !== rawConfigText;
+  const updatedText = docMutated ? doc.toString() : rawConfigText;
+  const configChanged = docMutated && updatedText !== rawConfigText;
   if (configChanged) {
     assertWritableRegularOrAbsent(cfgFile);
     assertWritableRegularOrAbsent(`${cfgFile}.bak`);
