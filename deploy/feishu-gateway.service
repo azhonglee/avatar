@@ -27,6 +27,13 @@
 #        sudo cp deploy/feishu-gateway.service /etc/systemd/system/
 #        sudo systemctl daemon-reload && sudo systemctl enable --now feishu-gateway
 #        sudo journalctl -u feishu-gateway -f
+#   6. 配置 Avatar 客户端：config.yaml 设置 context.personal_web.enabled: true 与 gateway_socket: /run/feishu-gateway/gateway.sock；
+#      把 /etc/feishu-gateway/secrets/read-token 的内容提供给 Avatar 的 FEISHU_GW_READ_TOKEN（或 Avatar 系统单元的
+#      LoadCredential=feishu-gw-read-token:/etc/feishu-gateway/secrets/read-token）；reply-token 仅在 send_replies: true 时提供。
+#      加组后运行 Avatar 的用户需重新登录或重启其 systemd 用户实例，然后重启 pa run，并用 `pa context web-status --verify` 检查。
+#      令牌就以 secrets 文件为准；服务启动过一次后，在没有这些凭据的 shell 里运行 `feishu-gateway tokens` 会被拒绝（除非加 --force-file），以免生成冲突的 tokens.json。
+#   切换飞书账号：以第 4 步的方式执行 `feishu-gateway login --force-switch-account`（清空旧账号缓存并轮换 db_epoch），
+#      再在 Avatar 侧执行 `pa context web-unbind`。
 #
 # 隔离效果与边界：
 #   - /var/lib/feishu-gateway (0700) 中的加密 Cookie、SQLite 缓存和 /etc/feishu-gateway/secrets/* 对 Avatar 不可读；

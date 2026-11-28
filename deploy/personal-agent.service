@@ -15,6 +15,11 @@ Restart=always
 RestartSec=10
 # 让 lark-cli / acpx / 各 harness 的命令行在 PATH 里（按你的安装位置调整）
 Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# 可选：个人 Web 实时通道（context.personal_web.enabled: true）作为独立网关 feishu-gateway 的客户端，需提供只读令牌：
+#   - 写在 0600 的环境文件里（内容如 FEISHU_GW_READ_TOKEN=...；只在 send_replies: true 时才加 FEISHU_GW_REPLY_TOKEN）：
+# EnvironmentFile=%h/.config/personal-agent/gateway.env
+#   - 跨 OS 用户部署时，运行本服务的用户要在 feishu-gw-client 组里；加组后需重新登录或重启 systemd 用户实例才会生效。
+#   - 同一 OS 用户的 --approve-all worker 仍能读到这些令牌；需要强隔离时让 worker 以独立 OS 用户或容器运行。
 
 [Install]
 WantedBy=default.target

@@ -147,7 +147,7 @@ context:
     auto_close: true          # 有证据（你已回复、Meego 节点已流转）时自动关闭事项
     mute_legacy: true
     create_own_todo: false    # 把你的承诺建成飞书任务（只建给你自己）
-  personal_web:               # 可选：连接独立常驻的飞书个人 Web 网关（先独立运行 `feishu-gateway login` 与 `feishu-gateway run`）
+  personal_web:               # 可选：连接独立常驻的飞书个人 Web 网关（先独立运行 `feishu-gateway login` 与 `feishu-gateway run`；部署见 docs/工作上下文.md 第 6 节）
     enabled: false            # true：启用网关客户端接收任意群 @我 与私聊（改后需重启常驻进程）
     gateway_socket: ""        # 网关 Unix Socket 路径（推荐，如 /run/feishu-gateway/gateway.sock）；与 gateway_url 二选一
     gateway_url: ""           # 网关回环 HTTP 地址（仅允许 127.0.0.1 / localhost / [::1]，如 http://127.0.0.1:7879）
