@@ -46,16 +46,18 @@ export type Effect =
   | { op: "task.move"; args: { guid: string; section: string } }
   | { op: "task.comment"; args: { guid: string; content: string } }
   | { op: "task.complete"; args: { guid: string } }
-  | { op: "notify"; args: { markdown: string; kind?: NotifyKind } }
+  | { op: "notify"; args: { markdown: string; kind?: NotifyKind; owner_open_id?: string } }
   /**
    * 飞书交互卡片：同一个 key 只有一张卡片——第一次发送，之后原地更新（messages patch）。
    * card 是完整的卡片 JSON（schema 2.0）。
    */
-  | { op: "card.upsert"; args: { key: string; card: Record<string, unknown>; kind?: NotifyKind } }
+  | { op: "card.upsert"; args: { key: string; card: Record<string, unknown>; kind?: NotifyKind; owner_open_id?: string } }
   /** 以你本人身份回复一条消息（只在你确认草稿后产生） */
   | { op: "im.reply"; args: { message_id: string; text: string; draft_id?: string } }
   /** 以你本人身份在会话里发一条消息（只在你确认草稿后产生） */
   | { op: "im.send"; args: { chat_id: string; text: string; draft_id?: string } }
+  /** 以你本人身份经个人 Web 协议回复（绑定原确认账号，带发送前核验与独立回读确认；只在你确认草稿后产生） */
+  | { op: "pw.reply"; args: { owner_id: string; chat_id: string; message_id: string; root_id?: string; text: string; draft_id?: string } }
   /** 以你本人身份给 Meego 工作项写评论（只在你确认草稿后产生） */
   | { op: "meego.comment"; args: { project_key: string; work_item_id: string; content: string; draft_id?: string } }
   /** 以你本人身份在「我的文档库」里新建文档（周报草稿确认后） */
@@ -166,6 +168,8 @@ export class Ledger {
         created INTEGER NOT NULL,
         updated INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS work_runnable ON work (kind, terminal, next_at);
+      CREATE INDEX IF NOT EXISTS work_kind_terminal_seq ON work (kind, terminal, seq DESC);
+      CREATE INDEX IF NOT EXISTS work_kind_state_seq ON work (kind, state, seq DESC);
       CREATE INDEX IF NOT EXISTS work_ref ON work (kind, ref);
       -- 不变量：同一张卡片同时至多一项未终结的派单（命令行和常驻进程同时对账也不会重复派单）
       CREATE UNIQUE INDEX IF NOT EXISTS work_one_active_dispatch ON work (ref) WHERE kind = 'dispatch' AND terminal = 0 AND ref != '';
@@ -241,29 +245,86 @@ export class Ledger {
     return added;
   }
 
+  /** 将已因前置条件跳过（state='skipped' 且 terminal=1）的幂等工作原子重新武装为 pending，供新触发证据重试 */
+  rearmSkipped(id: string, payload: unknown): boolean {
+    const now = Date.now();
+    const rearmed = this.tx(() => {
+      const r = this.db
+        .prepare(
+          `UPDATE work
+             SET state = 'pending',
+                 terminal = 0,
+                 outcome = '',
+                 reason = '',
+                 attempts = 0,
+                 next_at = 0,
+                 lease_owner = '',
+                 lease_until = 0,
+                 cancel = 0,
+                 error = '',
+                 payload = ?,
+                 updated = ?
+           WHERE id = ? AND state = 'skipped' AND terminal = 1`,
+        )
+        .run(JSON.stringify(payload ?? {}), now, id);
+      return r.changes > 0;
+    });
+    if (rearmed) this.changed(id);
+    return rearmed;
+  }
+
   get<P = Record<string, unknown>>(id: string): WorkItem<P> | undefined {
     const r = this.db.prepare("SELECT * FROM work WHERE id = ?").get(id) as Row | undefined;
     return r ? toItem<P>(r) : undefined;
+  }
+
+  /** 按 ID 批量读取工作项，避免大窗口扫描时的 N+1 同步查询。 */
+  getMany<P = Record<string, unknown>>(ids: string[]): Map<string, WorkItem<P>> {
+    const out = new Map<string, WorkItem<P>>();
+    const unique = [...new Set(ids.filter(Boolean))];
+    const CHUNK = 400;
+    for (let i = 0; i < unique.length; i += CHUNK) {
+      const slice = unique.slice(i, i + CHUNK);
+      const placeholders = slice.map(() => "?").join(", ");
+      const rows = this.db.prepare(`SELECT * FROM work WHERE id IN (${placeholders})`).all(...slice) as Row[];
+      for (const r of rows) {
+        const item = toItem<P>(r);
+        out.set(item.id, item);
+      }
+    }
+    return out;
   }
 
   /**
    * 领取一项可运行的工作：未终结、到了重试时间、没有有效租约。原子地写入租约并把 attempts +1。
    * effect 额外要求同一 ref 下更早的 effect 已经落定，保证同一任务的“评论→移动”按顺序投递。
    */
-  claim<P = Record<string, unknown>>(kind: WorkKind, leaseMs: number): WorkItem<P> | undefined {
+  claim<P = Record<string, unknown>>(
+    kind: WorkKind,
+    leaseMs: number,
+    opts?: { excludeEffectOps?: string[]; allowEffectIds?: string[] },
+  ): WorkItem<P> | undefined {
     const now = Date.now();
     const order =
       kind === "effect"
         ? `AND NOT EXISTS (SELECT 1 FROM work e WHERE e.kind = 'effect' AND e.ref = w.ref AND e.seq < w.seq AND e.terminal = 0)`
         : "";
+    const excludedOps = kind === "effect" ? (opts?.excludeEffectOps ?? []).filter(Boolean) : [];
+    const allowedIds = kind === "effect" ? (opts?.allowEffectIds ?? []).filter(Boolean) : [];
+    const opFilter = excludedOps.length
+      ? allowedIds.length
+        ? `AND (COALESCE(json_extract(w.payload, '$.op'), '') NOT IN (${excludedOps.map(() => "?").join(", ")}) OR w.id IN (${allowedIds.map(() => "?").join(", ")}))`
+        : `AND COALESCE(json_extract(w.payload, '$.op'), '') NOT IN (${excludedOps.map(() => "?").join(", ")})`
+      : "";
+    const filterArgs = excludedOps.length ? [...excludedOps, ...allowedIds] : [];
     const r = this.db
       .prepare(
         `UPDATE work SET lease_owner = ?, lease_until = ?, attempts = attempts + 1, updated = ?
-         WHERE seq = (SELECT seq FROM work w WHERE kind = ? AND terminal = 0 AND next_at <= ? AND lease_until < ? ${order}
+         WHERE seq = (SELECT seq FROM work w WHERE kind = ? AND terminal = 0 AND next_at <= ? AND lease_until < ? ${order} ${opFilter}
                       ORDER BY next_at, seq LIMIT 1)
          RETURNING *`,
       )
-      .get(this.owner, now + leaseMs, now, kind, now, now) as Row | undefined;
+      .get(this.owner, now + leaseMs, now, kind, now, now, ...filterArgs) as Row | undefined;
     return r ? toItem<P>(r) : undefined;
   }
 
@@ -375,17 +436,44 @@ export class Ledger {
     return n > 0;
   }
 
-  /** 列出工作（控制台用）。 */
-  list<P = Record<string, unknown>>(f: { kinds: WorkKind[]; states?: string[]; ref?: string; limit?: number; before?: number }): WorkItem<P>[] {
+  /** 列出工作（控制台用）。支持 terminal、states 与 search 下推 SQL 过滤，避免在长历史账本上空扫全表。 */
+  list<P = Record<string, unknown>>(f: {
+    kinds: WorkKind[];
+    states?: string[];
+    terminal?: boolean;
+    ref?: string;
+    search?: string;
+    updatedSince?: number;
+    limit?: number;
+    before?: number;
+  }): WorkItem<P>[] {
     const where = [`kind IN (${f.kinds.map(() => "?").join(",")})`];
     const args: (string | number)[] = [...f.kinds];
     if (f.states?.length) {
       where.push(`state IN (${f.states.map(() => "?").join(",")})`);
       args.push(...f.states);
     }
+    if (f.terminal !== undefined) {
+      where.push("terminal = ?");
+      args.push(f.terminal ? 1 : 0);
+    }
     if (f.ref) {
       where.push("ref = ?");
       args.push(f.ref);
+    }
+    if (f.updatedSince !== undefined) {
+      where.push("updated > ?");
+      args.push(f.updatedSince);
+    }
+    if (f.search) {
+      const q = f.search.trim().toLowerCase();
+      if (q) {
+        const pat = `%${q.replace(/[\\%_]/g, "\\$&")}%`;
+        where.push(
+          `LOWER(CAST(COALESCE(json_extract(payload, '$.summary'), '') AS TEXT) || ' ' || ref || ' ' || id) LIKE ? ESCAPE '\\'`,
+        );
+        args.push(pat);
+      }
     }
     if (f.before) {
       where.push("seq < ?");
@@ -408,9 +496,19 @@ export class Ledger {
       .run(Date.now(), e.source, e.actor, e.command, e.target, JSON.stringify(e.args ?? {}), e.ok ? 1 : 0, e.message);
   }
 
-  auditLog(limit = 100, target?: string): AuditEntry[] {
-    if (target) return this.db.prepare("SELECT * FROM audit WHERE target = ? ORDER BY id DESC LIMIT ?").all(target, limit) as unknown as AuditEntry[];
-    return this.db.prepare("SELECT * FROM audit ORDER BY id DESC LIMIT ?").all(limit) as unknown as AuditEntry[];
+  auditLog(limit = 100, target?: string, before?: number): AuditEntry[] {
+    const where: string[] = [];
+    const args: (string | number)[] = [];
+    if (target) {
+      where.push("target = ?");
+      args.push(target);
+    }
+    if (before !== undefined) {
+      where.push("id < ?");
+      args.push(before);
+    }
+    const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    return this.db.prepare(`SELECT * FROM audit ${clause} ORDER BY id DESC LIMIT ?`).all(...args, limit) as unknown as AuditEntry[];
   }
 
   isCancelled(id: string): boolean {

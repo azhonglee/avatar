@@ -1,12 +1,33 @@
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+import { isContextDerivedDispatchBlocked } from "../api/queries.ts";
 import type { Board, BoardTask } from "../board.ts";
 import { repoSpec, type Config } from "../config.ts";
+import {
+  commitAll,
+  ensureGitLfsObjectsForCheckout,
+  git,
+  redactGitUrls,
+  removeStaleWorktreeAdminRecord,
+  resolveExternalLfsStorageGitOpts,
+  tryGit,
+} from "../delivery/git.ts";
 import { comment, move } from "../effects.ts";
-import { checkpoint, type Ctx, type Handler } from "../engine.ts";
-import { loadPrompt, runHarness } from "../harness.ts";
-import type { Effect, Ledger, WorkItem } from "../ledger.ts";
+import { Aborted, checkpoint, type Ctx, type Handler } from "../engine.ts";
+import {
+  applySanitizedGitConfigEnv,
+  applySanitizedNpmrcEnv,
+  buildWorkspaceIsolation,
+  isolatedSandboxTempEnv,
+  loadPrompt,
+  prepareHarnessEnv,
+  runHarness,
+  stageSanitizedGitConfig,
+  stageSanitizedNpmrc,
+  wrapCredentialIsolatedCommand,
+} from "../harness.ts";
+import { LeaseLost, type Effect, type Ledger, type WorkItem } from "../ledger.ts";
 import type { Store } from "../store.ts";
 import { errMsg, log, render, runProcess, truncate } from "../util.ts";
 
@@ -230,6 +251,10 @@ export class Dispatcher {
     };
 
     for (const guid of plan.redo) {
+      if (isContextDerivedDispatchBlocked({ cfg: this.cfg, store: this.store, ledger: this.ledger }, guid)) {
+        log("warn", "跳过归属旧主人的上下文委派卡片再派", { task: guid });
+        continue;
+      }
       const loc = await locate(guid);
       if (!loc) continue;
       if (hasLeft(loc, activeSections) || loc.sectionGuid !== this.board.section("dispatch")) {
@@ -239,6 +264,10 @@ export class Dispatcher {
       if (this.enqueue(cards.find((c) => c.guid === guid)!.task)) enqueued++;
     }
     for (const guid of plan.enqueue) {
+      if (isContextDerivedDispatchBlocked({ cfg: this.cfg, store: this.store, ledger: this.ledger }, guid)) {
+        log("warn", "跳过归属旧主人的上下文委派卡片入队", { task: guid });
+        continue;
+      }
       if (this.enqueue(cards.find((c) => c.guid === guid)!.task)) enqueued++;
     }
     for (const id of plan.suspects) {
@@ -304,14 +333,15 @@ export class Dispatcher {
       run: (item, ctx) => this.advance(item, ctx),
       onExhausted: (item, err) => {
         const p = item.payload;
+        const safeErr = redactGitUrls(err);
         const effects: Effect[] = [];
         if (p.guid) {
           effects.push(
-            comment(p.guid, truncate(`❌ 执行失败（${stateText(item.state)}阶段已达尝试上限 ${this.cfg.dispatch.max_attempts} 次，含进程中断）：${err}\n日志：${this.logDir(p.guid)}`, COMMENT_MAX)),
+            comment(p.guid, truncate(`❌ 执行失败（${stateText(item.state)}阶段已达尝试上限 ${this.cfg.dispatch.max_attempts} 次，含进程中断）：${safeErr}\n日志：${this.logDir(p.guid)}`, COMMENT_MAX)),
             move(p.guid, "attention"),
           );
         }
-        return { patch: { state: "errored", outcome: "errored", reason: "errored" }, effects };
+        return { patch: { state: "errored", outcome: "errored", reason: "errored", error: safeErr }, effects };
       },
     };
   }
@@ -323,6 +353,14 @@ export class Dispatcher {
   async advance(start: Item, ctx: Ctx): Promise<void> {
     let it = start;
     for (;;) {
+      if (
+        isContextDerivedDispatchBlocked({ cfg: this.cfg, store: this.store, ledger: this.ledger }, it.id) ||
+        isContextDerivedDispatchBlocked({ cfg: this.cfg, store: this.store, ledger: this.ledger }, it.ref)
+      ) {
+        this.finish(it, "errored", "owner_isolated", []);
+        log("warn", "该派单源自旧工作区主人的工作上下文，已按主人隔离中止执行", { work: it.id, reason: "owner_isolated" });
+        return;
+      }
       if (this.ledger.isCancelled(it.id)) {
         this.finish(it, "cancelled", "cancelled", [comment(it.payload.guid, `⏹️ ${REASON_TEXT.cancelled}。已有改动保留在工作目录${it.payload.cwd ? `：${it.payload.cwd}` : ""}。`)]);
         return;
@@ -348,7 +386,11 @@ export class Dispatcher {
 
   private finish(it: Item, state: string, reason: string, effects: Effect[], payload?: DispatchPayload): void {
     this.ledger.transition(it, { state, terminal: true, outcome: state, reason, payload }, effects);
-    log(state === "accepted" ? "info" : "warn", "派单结束", { task: it.payload.summary, state, reason });
+    if (reason === "owner_isolated") {
+      log("warn", "派单结束", { work: it.id, state, reason });
+    } else {
+      log(state === "accepted" ? "info" : "warn", "派单结束", { task: it.payload.summary, state, reason });
+    }
   }
 
   /** queued：读取最新的卡片内容，选执行者/审查者，准备工作目录。 */
@@ -386,51 +428,76 @@ export class Dispatcher {
     ]);
   }
 
+  /** 从派单描述解析受信任仓库根目录（无 repo: 时返回 undefined，并禁止挂载任意外部 .git） */
+  private trustedRepoOpts(p: Pick<DispatchPayload, "description" | "base">): {
+    trustedRepoRoot?: string;
+    disableGitWorktreeMounts?: boolean;
+  } {
+    if (!p.base) return { disableGitWorktreeMounts: true };
+    const ref = parseRepo({ description: p.description ?? "" });
+    if (!ref) return { disableGitWorktreeMounts: true };
+    return { trustedRepoRoot: repoSpec(this.cfg, ref).path };
+  }
+
   /** executing：在本轮检查点上运行 worker；成功则提交本轮改动，进入 verifying。 */
   private async execute(it: Item, ctx: Ctx): Promise<Item> {
     let p = it.payload;
     const round = String(p.round);
+    const repoGuard = this.trustedRepoOpts(p);
     if (p.base) {
       const cp = p.checkpoints[round];
+      const gitOpts = { cfg: this.cfg, ...repoGuard };
       if (cp) {
-        // 重入（崩溃 / 失败重试）：丢弃上次没跑完的半成品，回到本轮起点
-        await git(p.cwd, ["reset", "--hard", cp]);
-        await git(p.cwd, ["clean", "-fd"]);
+        // 重入（崩溃 / 失败重试）：丢弃上次没跑完的半成品，回到本轮起点（挂载受信任外部 lfs.storage 以便 smudge 还原 LFS 文件）
+        const resetOpts = await resolveExternalLfsStorageGitOpts(p.cwd, gitOpts);
+        await git(p.cwd, ["reset", "--hard", cp], resetOpts);
+        await git(p.cwd, ["clean", "-fd"], gitOpts);
         log("info", "回到本轮检查点后重跑", { task: p.summary, round: p.round, checkpoint: cp.slice(0, 8) });
       } else {
-        await autoCommit(p.cwd, `pa: 第 ${round} 轮开始前的快照`);
-        p = { ...p, checkpoints: { ...p.checkpoints, [round]: (await git(p.cwd, ["rev-parse", "HEAD"])).trim() } };
+        await autoCommit(p.cwd, `pa: 第 ${round} 轮开始前的快照`, gitOpts);
+        p = { ...p, checkpoints: { ...p.checkpoints, [round]: (await git(p.cwd, ["rev-parse", "HEAD"], { ...gitOpts, readOnly: true })).trim() } };
         it = this.ledger.transition(it, { payload: p }); // 先落检查点，再动手
       }
     }
     const logFile = path.join(this.logDir(p.guid), `worker-${round}-${ctx.attempt}.log`);
     const step = this.ledger.startStep({ work_id: it.id, name: `worker#${round}`, harness: p.harness, log: logFile });
-    const r = await runHarness(this.cfg, {
-      harness: p.harness,
-      prompt: render(loadPrompt("worker.md"), {
-        summary: p.summary.replace(/^\s*\[[\w-]+\]\s*/, ""),
-        description: p.description,
+    let stepClosed = false;
+    try {
+      const r = await runHarness(this.cfg, {
+        harness: p.harness,
+        prompt: render(loadPrompt("worker.md"), {
+          summary: p.summary.replace(/^\s*\[[\w-]+\]\s*/, ""),
+          description: p.description,
+          cwd: p.cwd,
+          feedback: p.feedback || "（无）",
+        }),
         cwd: p.cwd,
-        feedback: p.feedback || "（无）",
-      }),
-      cwd: p.cwd,
-      tools: "write",
-      lark: "none",
-      timeoutSec: this.cfg.dispatch.timeout_sec,
-      logFile,
-      signal: ctx.signal,
-      onSpawn: (pid) => this.ledger.setStepPid(step, pid),
-      stepId: step,
-    });
-    const report = r.text || "（无输出）";
-    if (!r.ok) {
-      this.ledger.endStep(step, "failed", r.aborted ? "中止" : truncate(report, 500));
-      checkpoint(ctx);
-      throw new Error(`${p.harness} 执行失败（exit ${r.exitCode}${r.timedOut ? "，超时" : ""}）：${truncate(report, 800)}`);
+        tools: "write",
+        lark: "none",
+        timeoutSec: this.cfg.dispatch.timeout_sec,
+        logFile,
+        signal: ctx.signal,
+        onSpawn: (pid) => this.ledger.setStepPid(step, pid),
+        stepId: step,
+        ...repoGuard,
+      });
+      const report = r.text || "（无输出）";
+      if (!r.ok) {
+        this.ledger.endStep(step, "failed", r.aborted ? "中止" : truncate(report, 500));
+        stepClosed = true;
+        checkpoint(ctx);
+        throw new Error(`${p.harness} 执行失败（exit ${r.exitCode}${r.timedOut ? "，超时" : ""}）：${truncate(report, 800)}`);
+      }
+      if (p.base) await autoCommit(p.cwd, `pa: 第 ${round} 轮（${p.harness}）`, { cfg: this.cfg, ...repoGuard });
+      this.ledger.endStep(step, "ok", truncate(report, 500));
+      stepClosed = true;
+      return this.ledger.transition(it, { state: "verifying", payload: { ...p, report } });
+    } catch (err) {
+      if (!stepClosed) {
+        this.ledger.endStep(step, "failed", truncate(redactGitUrls(errMsg(err)), 500));
+      }
+      throw err;
     }
-    if (p.base) await autoCommit(p.cwd, `pa: 第 ${round} 轮（${p.harness}）`);
-    this.ledger.endStep(step, "ok", truncate(report, 500));
-    return this.ledger.transition(it, { state: "verifying", payload: { ...p, report } });
   }
 
   /** verifying：确定性校验 → LLM 审查 → 验收关卡决定下一步。 */
@@ -451,7 +518,7 @@ export class Dispatcher {
       const feedback = checks.filter((c) => c.status === "fail").map((c) => `### ${c.name}\n${c.detail}`).join("\n\n");
       return this.ledger.transition(it, { state: "executing", payload: { ...p, history, round: p.round + 1, feedback } }, effects);
     }
-    const stat = p.base ? await gitDiffStat(p.cwd, p.base) : "";
+    const stat = p.base ? await gitDiffStat(p.cwd, p.base, { cfg: this.cfg, readOnly: true, ...this.trustedRepoOpts(p) }) : "";
     const tail = [truncate(p.report, 1800), stat ? `\n变更：\n${stat}` : "", p.branch ? `分支：${p.branch}（worktree：${p.cwd}）` : ""].filter(Boolean).join("\n");
     const final = { ...p, history };
     if (d.next === "accept") {
@@ -474,9 +541,41 @@ export class Dispatcher {
     const name = `校验命令 \`${p.verify}\``;
     const logFile = path.join(this.logDir(p.guid), `verify-${p.round}-${ctx.attempt}.log`);
     const step = this.ledger.startStep({ work_id: it.id, name: `verify#${p.round}`, log: logFile });
+    let baseEnv: ReturnType<typeof prepareHarnessEnv> | undefined;
+    let stagedNpmrc: ReturnType<typeof stageSanitizedNpmrc> | undefined;
+    let stagedGitCfg: ReturnType<typeof stageSanitizedGitConfig> | undefined;
     try {
-      const r = await runProcess("bash", ["-lc", p.verify], {
+      baseEnv = prepareHarnessEnv();
+      stagedNpmrc = stageSanitizedNpmrc(process.env, this.cfg.dataDir);
+      stagedGitCfg = stageSanitizedGitConfig(process.env, this.cfg.dataDir, { cwd: p.cwd });
+      const wrapped = wrapCredentialIsolatedCommand(
+        "bash",
+        ["-lc", p.verify],
+        process.env,
+        buildWorkspaceIsolation(this.cfg, {
+          mode: "verify",
+          cwd: p.cwd,
+          ...this.trustedRepoOpts(p),
+          extraReadOnlyPaths: [
+            ...(baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : []),
+            ...(stagedNpmrc ? [stagedNpmrc.dir] : []),
+            ...(stagedGitCfg ? [stagedGitCfg.dir, ...stagedGitCfg.extraReadOnlyPaths] : []),
+          ],
+          ...(stagedGitCfg?.symlinks.length ? { extraSymlinks: stagedGitCfg.symlinks } : {}),
+          extraBindMounts: [
+            ...(stagedNpmrc ? [{ src: stagedNpmrc.file, dest: stagedNpmrc.homeMountDest, mode: "ro" as const }] : []),
+            ...(stagedGitCfg ? stagedGitCfg.bindMounts : []),
+          ],
+        }),
+      );
+      const verifyEnv: NodeJS.ProcessEnv = wrapped.isolated
+        ? { ...baseEnv.env, ...isolatedSandboxTempEnv() }
+        : { ...baseEnv.env };
+      applySanitizedNpmrcEnv(verifyEnv, stagedNpmrc, wrapped.isolated);
+      applySanitizedGitConfigEnv(verifyEnv, stagedGitCfg, wrapped.isolated);
+      const r = await runProcess(wrapped.cmd, wrapped.args, {
         cwd: p.cwd,
+        env: verifyEnv,
         timeoutMs: this.cfg.acceptance.verify_timeout_sec * 1000,
         group: true,
         signal: ctx.signal,
@@ -493,6 +592,10 @@ export class Dispatcher {
       this.ledger.endStep(step, "failed", String(e));
       checkpoint(ctx);
       return { kind: "command", name, status: "error", detail: `无法运行：${String(e)}` };
+    } finally {
+      stagedGitCfg?.cleanup();
+      stagedNpmrc?.cleanup();
+      baseEnv?.cleanup();
     }
   }
 
@@ -500,38 +603,55 @@ export class Dispatcher {
   private async runReview(it: Item, ctx: Ctx): Promise<CheckResult> {
     const p = it.payload;
     const name = `${p.reviewer} 审查`;
-    const diff = p.base ? await gitDiff(p.cwd, p.base) : "";
+    const repoGuard = this.trustedRepoOpts(p);
+    const diff = p.base ? await gitDiff(p.cwd, p.base, { cfg: this.cfg, readOnly: true, ...repoGuard }) : "";
     let lastErr = "";
     for (let i = 0; i <= this.cfg.acceptance.review_retries; i++) {
       checkpoint(ctx);
       const logFile = path.join(this.logDir(p.guid), `review-${p.round}-${ctx.attempt}-${i + 1}.log`);
       const step = this.ledger.startStep({ work_id: it.id, name: `review#${p.round}`, harness: p.reviewer, log: logFile });
-      const rv = await runHarness(this.cfg, {
-        harness: p.reviewer,
-        prompt: render(loadPrompt("review.md"), {
-          summary: p.summary,
-          description: p.description,
-          report: truncate(p.report, 8000),
-          diff: diff ? truncate(diff, 30000) : "（非代码任务，无 diff）",
-        }),
-        cwd: p.cwd,
-        tools: "read",
-        lark: "none",
-        timeoutSec: this.cfg.acceptance.review_timeout_sec,
-        logFile,
-        signal: ctx.signal,
-        onSpawn: (pid) => this.ledger.setStepPid(step, pid),
-        stepId: step,
-      });
-      checkpoint(ctx);
-      const parsed = rv.text ? parseReview(rv.text) : undefined;
-      if (parsed) {
-        this.ledger.endStep(step, "ok", parsed.verdict);
-        return { kind: "review", name, status: parsed.verdict === "approve" ? "pass" : "fail", detail: formatReview(parsed) };
+      let stepClosed = false;
+      try {
+        const rv = await runHarness(this.cfg, {
+          harness: p.reviewer,
+          prompt: render(loadPrompt("review.md"), {
+            summary: p.summary,
+            description: p.description,
+            report: truncate(p.report, 8000),
+            diff: diff ? truncate(diff, 30000) : "（非代码任务，无 diff）",
+          }),
+          cwd: p.cwd,
+          tools: "read",
+          lark: "none",
+          timeoutSec: this.cfg.acceptance.review_timeout_sec,
+          logFile,
+          signal: ctx.signal,
+          onSpawn: (pid) => this.ledger.setStepPid(step, pid),
+          stepId: step,
+          ...repoGuard,
+        });
+        checkpoint(ctx);
+        const parsed = rv.text ? parseReview(rv.text) : undefined;
+        if (parsed) {
+          this.ledger.endStep(step, "ok", parsed.verdict);
+          stepClosed = true;
+          return { kind: "review", name, status: parsed.verdict === "approve" ? "pass" : "fail", detail: formatReview(parsed) };
+        }
+        lastErr = rv.text ? `结论无法解析：${truncate(rv.text, 300)}` : `无输出（exit ${rv.exitCode}${rv.timedOut ? "，超时" : ""}）`;
+        this.ledger.endStep(step, "failed", lastErr);
+        stepClosed = true;
+        log("warn", "审查器故障", { task: p.summary, try: i + 1, err: lastErr });
+      } catch (err) {
+        const msg = truncate(redactGitUrls(errMsg(err)), 300);
+        if (!stepClosed) {
+          this.ledger.endStep(step, "failed", ctx.signal.aborted ? "中止" : msg);
+        }
+        if (err instanceof Aborted || err instanceof LeaseLost || ctx.signal.aborted) {
+          throw err;
+        }
+        lastErr = `审查器准备/启动失败：${msg}`;
+        log("warn", "审查器故障", { task: p.summary, try: i + 1, err: lastErr });
       }
-      lastErr = rv.text ? `结论无法解析：${truncate(rv.text, 300)}` : `无输出（exit ${rv.exitCode}${rv.timedOut ? "，超时" : ""}）`;
-      this.ledger.endStep(step, "failed", lastErr);
-      log("warn", "审查器故障", { task: p.summary, try: i + 1, err: lastErr });
     }
     return { kind: "review", name, status: "error", detail: lastErr };
   }
@@ -549,13 +669,179 @@ export class Dispatcher {
     const cwd = path.join(this.cfg.dataDir, "worktrees", short);
     const branch = `pa/${short}`;
     const baseKey = `worktree.${t.guid}.base`;
-    if (!fs.existsSync(cwd)) {
-      const head = await git(spec.path, ["rev-parse", "HEAD"]);
-      const hasBranch = (await runProcess("git", ["-C", spec.path, "rev-parse", "--verify", "--quiet", branch])).code === 0;
-      await git(spec.path, hasBranch ? ["worktree", "add", cwd, branch] : ["worktree", "add", "-b", branch, cwd]);
-      if (!this.store.get(baseKey)) this.store.set(baseKey, head.trim());
+
+    const realPathSafe = (p: string): string => {
+      try {
+        return fs.realpathSync(p);
+      } catch {
+        return path.resolve(p);
+      }
+    };
+    const isRegisteredValidWorktree = async (): Promise<boolean> => {
+      if (!fs.existsSync(path.join(cwd, ".git"))) return false;
+      const wtList = await tryGit(spec.path, ["worktree", "list", "--porcelain"], {
+        cfg: this.cfg,
+        readOnly: true,
+        trustedRepoRoot: spec.path,
+      });
+      if (wtList.code !== 0) return false;
+      const targetReal = realPathSafe(cwd);
+      const registered = wtList.stdout
+        .split(/\r?\n/)
+        .filter((l) => l.startsWith("worktree "))
+        .map((l) => realPathSafe(l.slice("worktree ".length).trim()))
+        .includes(targetReal);
+      if (!registered) return false;
+      const inside = await tryGit(cwd, ["rev-parse", "--is-inside-work-tree"], {
+        cfg: this.cfg,
+        readOnly: true,
+        trustedRepoRoot: spec.path,
+      });
+      return inside.code === 0 && inside.stdout.trim() === "true";
+    };
+
+    let ready = fs.existsSync(cwd) && (await isRegisteredValidWorktree());
+    if (fs.existsSync(cwd) && !ready) {
+      let isEmptyDir = false;
+      try {
+        isEmptyDir = fs.statSync(cwd).isDirectory() && fs.readdirSync(cwd).length === 0;
+      } catch {
+        isEmptyDir = false;
+      }
+      if (!isEmptyDir) {
+        throw new Error(`工作树目录 ${cwd} 已存在且不是有效的已注册 Git worktree，拒绝按空基线继续执行`);
+      }
     }
-    const base = this.store.get(baseKey) ?? "";
+
+    if (!ready) {
+      // 预先仅创建本次派单专属空目录并只将该目录开放给 git worktree add，绝不把包含其他在途派单的 worktrees/ 父目录设为可写；
+      // 若存在指向当前目标路径的失效 worktree 管理记录，仅在宿主机定向清理该单一目标记录，绝不执行全局 git worktree prune（防止沙箱看不到其他同级派单目录时误删其有效注册）。
+      fs.mkdirSync(cwd, { recursive: true });
+      try {
+        const stale = await removeStaleWorktreeAdminRecord(spec.path, cwd, {
+          cfg: this.cfg,
+          trustedRepoRoot: spec.path,
+        });
+        if (stale.locked) {
+          throw new Error(`工作树 ${cwd} 存在已锁定的历史 worktree 管理记录，拒绝自动覆盖`);
+        }
+        const head = (
+          await git(spec.path, ["rev-parse", "HEAD"], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path })
+        ).trim();
+        const hasBranch = (await tryGit(spec.path, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path })).code === 0;
+        if (!hasBranch) {
+          const lfsPre = await ensureGitLfsObjectsForCheckout(spec.path, head, {
+            cfg: this.cfg,
+            trustedRepoRoot: spec.path,
+          });
+          // 新分支必须显式以已预拉取的 head 作为起点，防止预拉取期间宿主机仓库切换分支或推进 HEAD 导致检出树与基线错位
+          await git(spec.path, ["worktree", "add", "-b", branch, cwd, head], {
+            cfg: this.cfg,
+            trustedRepoRoot: spec.path,
+            extraWritablePaths: [
+              cwd,
+              ...(lfsPre.lfsStorageExternal && lfsPre.lfsStorageDir ? [lfsPre.lfsStorageDir] : []),
+            ],
+            ...(lfsPre.lfsStorageExternal && lfsPre.lfsStorageDir
+              ? { extraGitConfigArgs: ["-c", `lfs.storage=${lfsPre.lfsStorageDir}`] }
+              : {}),
+          });
+        } else {
+          // 已有分支：先锁定当前 tip SHA 预拉取缺失 LFS 对象，再复核分支尖端未在预检期间推进；若推进则自动重跑预检，避免无凭据检出沙箱缺少新提交的 LFS 对象
+          let checkedOut = false;
+          const MAX_EXISTING_BRANCH_PREFLIGHT = 3;
+          for (let attempt = 0; attempt < MAX_EXISTING_BRANCH_PREFLIGHT; attempt++) {
+            const beforeSha = (
+              await git(spec.path, ["rev-parse", "--verify", `refs/heads/${branch}`], {
+                cfg: this.cfg,
+                readOnly: true,
+                trustedRepoRoot: spec.path,
+              })
+            ).trim();
+            const lfsPre = await ensureGitLfsObjectsForCheckout(spec.path, beforeSha, {
+              cfg: this.cfg,
+              trustedRepoRoot: spec.path,
+              branchHint: branch,
+            });
+            const afterPreSha = (
+              await git(spec.path, ["rev-parse", "--verify", `refs/heads/${branch}`], {
+                cfg: this.cfg,
+                readOnly: true,
+                trustedRepoRoot: spec.path,
+              })
+            ).trim();
+            if (afterPreSha !== beforeSha) {
+              continue;
+            }
+            try {
+              await git(spec.path, ["worktree", "add", cwd, branch], {
+                cfg: this.cfg,
+                trustedRepoRoot: spec.path,
+                extraWritablePaths: [
+                  cwd,
+                  ...(lfsPre.lfsStorageExternal && lfsPre.lfsStorageDir ? [lfsPre.lfsStorageDir] : []),
+                ],
+                ...(lfsPre.lfsStorageExternal && lfsPre.lfsStorageDir
+                  ? { extraGitConfigArgs: ["-c", `lfs.storage=${lfsPre.lfsStorageDir}`] }
+                  : {}),
+              });
+              checkedOut = true;
+              break;
+            } catch (wtErr) {
+              const postErrSha = (
+                await tryGit(spec.path, ["rev-parse", "--verify", `refs/heads/${branch}`], {
+                  cfg: this.cfg,
+                  readOnly: true,
+                  trustedRepoRoot: spec.path,
+                })
+              ).stdout.trim();
+              if (postErrSha && postErrSha !== beforeSha && attempt + 1 < MAX_EXISTING_BRANCH_PREFLIGHT) {
+                fs.rmSync(cwd, { recursive: true, force: true });
+                fs.mkdirSync(cwd, { recursive: true });
+                await removeStaleWorktreeAdminRecord(spec.path, cwd, {
+                  cfg: this.cfg,
+                  trustedRepoRoot: spec.path,
+                });
+                continue;
+              }
+              throw wtErr;
+            }
+          }
+          if (!checkedOut) {
+            throw new Error(`分支 ${branch} 在 LFS 预检期间持续推进，已中止工作树检出以避免缺失 LFS 对象`);
+          }
+        }
+        if (!this.store.get(baseKey)) this.store.set(baseKey, head);
+        ready = true;
+      } catch (err) {
+        try {
+          if (fs.existsSync(cwd) && fs.readdirSync(cwd).length === 0) fs.rmdirSync(cwd);
+        } catch {
+          // 忽略空目录回滚失败
+        }
+        throw err;
+      }
+    }
+
+    let base = (this.store.get(baseKey) ?? "").trim();
+    if (!base && ready) {
+      // 若进程在 git worktree add 完成后、写入 baseKey 前中断，从已注册 worktree 恢复真实基线提交
+      const mb = await tryGit(spec.path, ["merge-base", "HEAD", branch], {
+        cfg: this.cfg,
+        readOnly: true,
+        trustedRepoRoot: spec.path,
+      });
+      const recovered =
+        (mb.code === 0 ? mb.stdout.trim() : "") ||
+        (await git(cwd, ["rev-parse", "HEAD"], { cfg: this.cfg, readOnly: true, trustedRepoRoot: spec.path })).trim();
+      if (recovered) {
+        this.store.set(baseKey, recovered);
+        base = recovered;
+      }
+    }
+    if (!base) {
+      throw new Error(`工作树 ${cwd} 缺少有效基线提交，无法继续代码任务`);
+    }
     return { cwd, branch, base, verify: spec.verify ?? "" };
   }
 }
@@ -573,26 +859,16 @@ export function formatReview(r: Review): string {
   return [r.summary, ...issues].filter(Boolean).join("\n") || (r.verdict === "approve" ? "没有发现问题" : "需修改");
 }
 
-const GIT_ID = ["-c", "user.name=personal-agent", "-c", "user.email=personal-agent@localhost"];
-
-async function git(cwd: string, args: string[]): Promise<string> {
-  const r = await runProcess("git", ["-C", cwd, ...GIT_ID, ...args]);
-  if (r.code !== 0) throw new Error(`git ${args.join(" ")} 失败：${r.stderr.trim()}`);
-  return r.stdout;
-}
-
-/** 有改动就提交（含新文件）；没有改动什么都不做。 */
-async function autoCommit(cwd: string, message: string): Promise<void> {
-  await git(cwd, ["add", "-A"]);
-  const dirty = (await runProcess("git", ["-C", cwd, "diff", "--cached", "--quiet"])).code !== 0;
-  if (dirty) await git(cwd, ["commit", "-q", "--no-verify", "-m", message]);
+/** 有改动就提交（含新文件）；没有改动什么都不做（复用交付层签名感知提交逻辑）。 */
+async function autoCommit(cwd: string, message: string, opts?: import("../delivery/git.ts").GitRunOpts): Promise<void> {
+  await commitAll(cwd, message, opts);
 }
 
 /** 相对创建 worktree 时的基线（每轮结束都已自动提交，所以比较到 HEAD 即可）。 */
-async function gitDiff(cwd: string, base: string): Promise<string> {
-  return (await runProcess("git", ["-C", cwd, "diff", base, "HEAD"])).stdout;
+async function gitDiff(cwd: string, base: string, opts?: import("../delivery/git.ts").GitRunOpts): Promise<string> {
+  return (await tryGit(cwd, ["diff", base, "HEAD"], { ...opts, readOnly: true })).stdout;
 }
 
-async function gitDiffStat(cwd: string, base: string): Promise<string> {
-  return (await runProcess("git", ["-C", cwd, "diff", "--stat", base, "HEAD"])).stdout.trim();
+async function gitDiffStat(cwd: string, base: string, opts?: import("../delivery/git.ts").GitRunOpts): Promise<string> {
+  return (await tryGit(cwd, ["diff", "--stat", base, "HEAD"], { ...opts, readOnly: true })).stdout.trim();
 }

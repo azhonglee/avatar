@@ -1,13 +1,14 @@
 import fs from "node:fs";
+import path from "node:path";
 import { z } from "zod";
 import type { App } from "../app.ts";
-import { deliveryOf, taskUrl } from "../api/queries.ts";
+import { deliveryOf, isContextDerivedDispatchBlocked, taskUrl } from "../api/queries.ts";
 import type { DeliveryStatus } from "../api/types.ts";
 import { CommandError } from "../commands.ts";
 import { repoSpec, type Config, type RepoSpec } from "../config.ts";
 import { comment } from "../effects.ts";
 import type { Handler } from "../engine.ts";
-import type { Effect, Ledger, WorkItem } from "../ledger.ts";
+import { LeaseLost, type Effect, type Ledger, type WorkItem } from "../ledger.ts";
 import { errMsg, log, truncate } from "../util.ts";
 import { parseRepo, type DispatchPayload } from "../workflows/dispatch.ts";
 import { denyReason, prBody, prTitle, retentionText, type DeliveryAction, type DeliveryPayload } from "./body.ts";
@@ -21,8 +22,11 @@ import {
   isClean,
   parseRemote,
   pushBranch,
+  redactGitUrls,
   remoteDefaultBranch,
   remoteUrl,
+  removeStaleWorktreeAdminRecord,
+  resolveExternalLfsStorageGitOpts,
   revParse,
   tryGit,
 } from "./git.ts";
@@ -71,9 +75,9 @@ export function resolveProvider(cfg: Config, spec: RepoSpec): { name: string; cf
   return { name, cfg: all[name] };
 }
 
-/** 去掉文本里 URL 的账号密码（remote 地址可能内嵌令牌，git 的报错会原样带出）。 */
+/** 去掉文本里 URL 的内嵌账号密码（userinfo@）与查询串（?token=... 等凭据），防止凭据进入账本、日志或飞书任务评论。 */
 export function maskUrl(text: string): string {
-  return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^@\s/]+@/gi, "$1***@");
+  return redactGitUrls(text);
 }
 
 function isPermanent(e: unknown): boolean {
@@ -88,6 +92,9 @@ export function registerDelivery(app: App): void {
 
   /** 派单存在、已结束、是这张卡片最新的一次、有分支，且当前交付状态允许这个动作。 */
   function checkTarget(id: string, action: DeliveryAction): { w: Dispatch; status: DeliveryStatus } {
+    if (isContextDerivedDispatchBlocked(app, id)) {
+      throw new CommandError("conflict", "该派单源自旧工作区主人的工作上下文，已按主人隔离阻断操作");
+    }
     const w = ledger.get<DispatchPayload>(id);
     if (!w || w.kind !== "dispatch") throw new CommandError("not_found", `没有这项派单：${id}`);
     if (!w.terminal) throw new CommandError("conflict", "派单还在进行中，结束后才能交付");
@@ -132,7 +139,8 @@ export function registerDelivery(app: App): void {
     target: (a) => a.id,
     run: async (a) => {
       const { w } = checkTarget(a.id, "merge_local");
-      if (a.target_branch && (await tryGit(w.payload.cwd, ["check-ref-format", "--branch", a.target_branch])).code !== 0)
+      const spec = repoOf(cfg, w.payload);
+      if (a.target_branch && (await tryGit(w.payload.cwd, ["check-ref-format", "--branch", a.target_branch], { cfg, readOnly: true, trustedRepoRoot: spec?.path })).code !== 0)
         throw new CommandError("invalid", `分支名不合法：${a.target_branch}`);
       enqueue(w, "merge_local", { target_branch: a.target_branch });
       return { ok: true, message: `正在快进合并到本地分支${a.target_branch ? ` ${a.target_branch}` : ""}`, target: w.id };
@@ -202,24 +210,29 @@ export function registerDelivery(app: App): void {
     const w = loadDispatch(p.dispatch_id);
     const d = w.payload;
     const spec = needWorktree(d);
+    const gitOpts = { cfg, trustedRepoRoot: spec.path };
     const prov = resolveProvider(cfg, spec);
     if ("error" in prov) throw new DeliveryError(prov.error);
-    const raw = await remoteUrl(d.cwd, prov.cfg.remote).catch((e) => {
+    const raw = await remoteUrl(d.cwd, prov.cfg.remote, gitOpts).catch((e) => {
       throw new DeliveryError(errMsg(e));
     });
     const remote = parseRemote(raw);
     if (!remote) throw new DeliveryError(`无法从 remote ${prov.cfg.remote} 的地址识别仓库：${maskUrl(raw)}`);
     const provider = makeProvider(prov.cfg, remote, deps);
 
-    await commitAll(d.cwd, "pa: 交付前提交未提交的改动");
-    const target = spec.target_branch || (await remoteDefaultBranch(d.cwd, prov.cfg.remote)) || (await currentBranch(spec.path)) || "main";
+    await commitAll(d.cwd, "pa: 交付前提交未提交的改动", gitOpts);
+    const target =
+      spec.target_branch ||
+      (await remoteDefaultBranch(d.cwd, prov.cfg.remote, gitOpts)) ||
+      (await currentBranch(spec.path, gitOpts)) ||
+      "main";
     if (target === d.branch) throw new DeliveryError(`目标分支与源分支相同（${target}）`);
-    const pushed = await pushBranch(d.cwd, prov.cfg.remote, d.branch);
+    const pushed = await pushBranch(d.cwd, prov.cfg.remote, d.branch, gitOpts);
     if (!pushed.ok) {
       const msg = `推送 ${d.branch} 到 ${prov.cfg.remote} 失败：${maskUrl(pushed.message)}`;
       throw pushed.rejected ? new DeliveryError(`${msg}\n远端分支有本地没有的提交，请检查后重试。`) : new Error(msg);
     }
-    const body = prBody(d, { taskUrl: taskUrl(app, w.ref), dispatchId: w.id, diffStat: await diffStat(d.cwd, d.base) });
+    const body = prBody(d, { taskUrl: taskUrl(app, w.ref), dispatchId: w.id, diffStat: await diffStat(d.cwd, d.base, gitOpts) });
     const pr = await openOrReuse(provider, { source: d.branch, target, title: prTitle(d.summary, p.title), body, draft: !!p.draft });
     const label = prLabel(prov.cfg.type);
     const message = `已${pr.reused ? "复用已有的" : "创建"} ${label}${p.draft && !pr.reused ? "（草稿）" : ""}：${pr.url}`;
@@ -231,27 +244,29 @@ export function registerDelivery(app: App): void {
     const d = loadDispatch(p.dispatch_id).payload;
     const spec = needWorktree(d);
     const repo = spec.path;
-    const target = p.target_branch || spec.target_branch || (await currentBranch(repo));
+    const gitOpts = { cfg, trustedRepoRoot: repo };
+    const target = p.target_branch || spec.target_branch || (await currentBranch(repo, gitOpts));
     if (!target) throw new DeliveryError(`主仓库 ${repo} 处于游离 HEAD，请指定目标分支`);
     if (target === d.branch) throw new DeliveryError(`目标分支与源分支相同（${target}）`);
-    if (!(await branchExists(repo, target))) throw new DeliveryError(`主仓库 ${repo} 没有本地分支 ${target}`);
-    await commitAll(d.cwd, "pa: 交付前提交未提交的改动");
-    const from = await revParse(repo, `refs/heads/${target}`);
-    const to = await revParse(repo, `refs/heads/${d.branch}`);
+    if (!(await branchExists(repo, target, gitOpts))) throw new DeliveryError(`主仓库 ${repo} 没有本地分支 ${target}`);
+    await commitAll(d.cwd, "pa: 交付前提交未提交的改动", gitOpts);
+    const from = await revParse(repo, `refs/heads/${target}`, gitOpts);
+    const to = await revParse(repo, `refs/heads/${d.branch}`, gitOpts);
     const range = `${from.slice(0, 7)}..${to.slice(0, 7)}`;
     if (from !== to) {
-      if (!(await isAncestor(repo, from, to)))
+      if (!(await isAncestor(repo, from, to, gitOpts)))
         throw new DeliveryError(
           `无法快进：${target} 上有 ${d.branch} 没有的新提交。可以改用“创建 PR”，或在 worktree（${d.cwd}）里 rebase 到 ${target} 后再合并。`,
         );
       try {
-        if ((await currentBranch(repo)) === target) {
+        if ((await currentBranch(repo, gitOpts)) === target) {
           // 目标分支正检出在主仓库：只有工作区干净时才合并，且只允许快进
-          if (!(await isClean(repo))) throw new DeliveryError(`主仓库 ${repo} 当前检出了 ${target} 且有未提交的改动，为避免覆盖没有合并。请先提交或暂存后重试。`);
-          await git(repo, ["merge", "--ff-only", "-q", `refs/heads/${d.branch}`]);
+          if (!(await isClean(repo, gitOpts))) throw new DeliveryError(`主仓库 ${repo} 当前检出了 ${target} 且有未提交的改动，为避免覆盖没有合并。请先提交或暂存后重试。`);
+          const mergeOpts = await resolveExternalLfsStorageGitOpts(repo, gitOpts);
+          await git(repo, ["merge", "--ff-only", "-q", `refs/heads/${d.branch}`], mergeOpts);
         } else {
           // 没检出：直接更新分支引用（不带 + 的 refspec 只允许快进；目标分支在别的 worktree 检出时 git 会拒绝）
-          await git(repo, ["fetch", "-q", ".", `refs/heads/${d.branch}:refs/heads/${target}`]);
+          await git(repo, ["fetch", "-q", ".", `refs/heads/${d.branch}:refs/heads/${target}`], gitOpts);
         }
       } catch (e) {
         if (e instanceof DeliveryError) throw e;
@@ -297,6 +312,11 @@ export function registerDelivery(app: App): void {
     finish(item, { ...p, message }, say(p.guid, `↩️ ${message}`));
   }
 
+/**
+ * 当已放弃派单的 worktree 目录已被外部手动删除时，仅在宿主机定向清理指向该路径的单个 `.git/worktrees/<name>` 管理记录；
+ * 严禁在隔离沙箱内执行全局 `git worktree prune`（沙箱遮蔽了 `/tmp` 与其他目录，会误删宿主机上其他正常未解锁 worktree 的记录）；
+ * 同时尊重 `git worktree lock`：若存在 `locked` 标记文件则保留该管理记录并返回 `locked: true`，由调用方跳过分支删除。
+ */
   async function cleanup(item: Item): Promise<void> {
     const p = item.payload;
     const skip = (why: string) => finish(item, { ...p, message: why }, [], "cancelled");
@@ -310,20 +330,43 @@ export function registerDelivery(app: App): void {
     const d = w.payload;
     const spec = repoOf(cfg, d);
     const removed: string[] = [];
+    let lockedWorktree = false;
     if (spec && fs.existsSync(spec.path)) {
+      const wtParent = path.join(cfg.dataDir, "worktrees");
+      const gitOpts = { cfg, trustedRepoRoot: spec.path };
       if (d.cwd && fs.existsSync(d.cwd)) {
-        await git(spec.path, ["worktree", "remove", "--force", d.cwd]);
+        const wtParent = path.join(cfg.dataDir, "worktrees");
+        const cwdParent = path.dirname(path.resolve(d.cwd));
+        const resolvedData = path.resolve(cfg.dataDir);
+        const relToData = path.relative(cwdParent, resolvedData);
+        const cwdParentContainsData = relToData === "" || (!relToData.startsWith("..") && !path.isAbsolute(relToData));
+        const extraWritable = [wtParent];
+        if (cwdParent !== "/tmp" && !cwdParentContainsData && fs.existsSync(cwdParent)) {
+          extraWritable.push(cwdParent);
+        }
+        await git(spec.path, ["worktree", "remove", "--force", d.cwd], { ...gitOpts, extraWritablePaths: extraWritable });
         removed.push(`worktree ${d.cwd}`);
+      } else if (d.cwd) {
+        const stale = await removeStaleWorktreeAdminRecord(spec.path, d.cwd, gitOpts);
+        if (stale.locked) {
+          lockedWorktree = true;
+          log("warn", "保留已锁定的 worktree 管理记录并跳过关联分支清理", { worktree: d.cwd, branch: d.branch });
+        } else if (stale.removed) {
+          removed.push(`失效 worktree 记录 ${d.cwd}`);
+        }
       }
-      await tryGit(spec.path, ["worktree", "prune"]);
-      if (d.branch.startsWith("pa/") && (await branchExists(spec.path, d.branch))) {
-        await git(spec.path, ["branch", "-D", d.branch]);
+      if (!lockedWorktree && d.branch.startsWith("pa/") && (await branchExists(spec.path, d.branch, gitOpts))) {
+        await git(spec.path, ["branch", "-D", d.branch], gitOpts);
         removed.push(`本地分支 ${d.branch}`);
       }
     }
-    // 之后再派这张卡片时重新记录基线
-    if (w.ref) app.store.set(`worktree.${w.ref}.base`, "");
-    const message = removed.length ? `已清理放弃的派单：删除${removed.join("、")}` : "放弃的派单没有需要清理的 worktree 或分支";
+    // 之后再派这张卡片时重新记录基线（锁定 worktree 保留原记录）
+    if (!lockedWorktree && w.ref) app.store.set(`worktree.${w.ref}.base`, "");
+    const message = lockedWorktree
+      ? `该派单关联的 worktree 已被 git worktree lock 锁定，已保留管理记录与分支 ${d.branch || ""}`.trim()
+      : removed.length
+        ? `已清理放弃的派单：删除${removed.join("、")}`
+        : "放弃的派单没有需要清理的 worktree 或分支";
     finish(item, { ...p, message }, removed.length ? say(p.guid, `🧹 ${message}`) : []);
   }
 
@@ -333,6 +376,15 @@ export function registerDelivery(app: App): void {
     maxAttempts: MAX_ATTEMPTS,
     async run(item) {
       const p = item.payload;
+      if (
+        isContextDerivedDispatchBlocked(app, p.dispatch_id) ||
+        (!!p.guid && isContextDerivedDispatchBlocked(app, p.guid))
+      ) {
+        const msg = "该派单源自旧工作区主人的工作上下文，已按主人隔离中止交付";
+        ledger.transition(item, { state: "errored", terminal: true, outcome: "errored", error: msg, payload: { ...p, message: msg } });
+        log("warn", "主人隔离中止交付", { work: item.id, dispatch: p.dispatch_id, action: p.action });
+        return;
+      }
       try {
         switch (p.action) {
           case "create_pr":
@@ -349,8 +401,9 @@ export function registerDelivery(app: App): void {
             throw new DeliveryError(`未知的交付动作：${String((p as { action?: unknown }).action)}`);
         }
       } catch (e) {
-        if (!isPermanent(e)) throw e; // 网络等暂时性错误：交给引擎退避重试
+        if (e instanceof LeaseLost) throw e;
         const msg = maskUrl(errMsg(e));
+        if (!isPermanent(e)) throw new Error(msg); // 网络等暂时性错误：先脱敏再交给引擎退避重试，防止 work.error / 日志泄露凭据 URL
         ledger.transition(item, { state: "errored", terminal: true, outcome: "errored", error: msg, payload: { ...p, message: msg } }, say(p.guid, `❌ ${ACTION_TEXT[p.action] ?? "交付"}失败：${msg}`));
         log("warn", "交付失败", { work: item.id, action: p.action, err: msg });
       }

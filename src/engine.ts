@@ -25,6 +25,8 @@ export interface Handler<P = Record<string, unknown>> {
    * 至多一次的工作（agent 作业、自由对话）设为 false：重启后按“中断”处理，不悄悄重跑。
    */
   refundOnStop?: boolean;
+  /** 可选：领取前的附加过滤（例如非持钥交互式 CLI 跳过未完结的 pw.reply，避免消耗重试次数，同时允许已完成回读的回执本地收尾） */
+  claimOpts?: () => { excludeEffectOps?: string[]; allowEffectIds?: string[] } | undefined;
   /** 重试耗尽：给出终态和需要投递的副作用（通知、评论、移卡片）。 */
   onExhausted(item: WorkItem<P>, lastError: string): { patch: Patch<P>; effects?: Effect[] };
 }
@@ -75,6 +77,11 @@ export class Engine {
     this.handlers.set(h.kind, h as unknown as Handler<never>);
   }
 
+  /** 当前引擎是否正以常驻模式运行（`pa run`）；单次 `drain` CLI 返回 false。 */
+  isDaemonRunning(): boolean {
+    return this.started;
+  }
+
   /** 常驻模式：定时领取所有种类的工作。命令行单次运行不调用它，只用 drain。 */
   start(): void {
     this.started = true;
@@ -118,7 +125,7 @@ export class Engine {
         if (local >= h.concurrency) break;
         const global = this.opts.globalLimit?.[h.kind];
         if (global !== undefined && this.ledger.leasedCount(h.kind) >= global) break;
-        const item = this.ledger.claim(h.kind, this.opts.leaseMs);
+        const item = this.ledger.claim(h.kind, this.opts.leaseMs, h.claimOpts?.());
         if (!item) break;
         this.launch(h, item);
         started++;

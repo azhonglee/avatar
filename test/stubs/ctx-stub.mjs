@@ -44,17 +44,54 @@ if (role === "lark") {
   logCall(writes.includes(key) || key === "im +messages-send" ? { input: stdin() } : {});
   if ((fx.fail ?? []).includes(argv[0])) fail(`${argv[0]} 故障`);
   if (key === "auth status") {
-    process.stdout.write(JSON.stringify({ identities: { user: { openId: "ou_owner", userName: fx.user_name ?? "张三" } } }) + "\n");
+    if (fx.auth_fail) fail("auth status 故障");
+    const user = {
+      ...(fx.user_open_id !== null ? { openId: fx.user_open_id ?? "ou_owner" } : {}),
+      ...(fx.user_name !== null ? { userName: fx.user_name ?? "张三" } : {}),
+    };
+    process.stdout.write(JSON.stringify({ identities: { user } }) + "\n");
     process.exit(0);
   }
   switch (key) {
+    case "im chats": {
+      if (argv[2] === "get") {
+        if (fx.chat_meta_fail) fail("im chats get 故障");
+        let chatId = "";
+        try {
+          chatId = JSON.parse(flag("--params") ?? "{}").chat_id ?? "";
+        } catch {
+          chatId = "";
+        }
+        const meta = (fx.chat_meta ?? {})[chatId];
+        if (!meta) fail(`chat not found: ${chatId}`);
+        ok(meta);
+      }
+      fail(`桩未实现：${argv.slice(0, 3).join(" ")}`);
+    }
     case "im +messages-search":
-      if (argv.includes("--is-at-me")) ok({ messages: fx.at_me ?? [] });
+      if (argv.includes("--is-at-me")) ok({ messages: fx.at_me ?? [], ...(fx.at_me_has_more ? { has_more: true } : {}) });
       if (flag("--chat-type") === "p2p") ok({ messages: fx.p2p ?? [] });
       if (flag("--sender")) ok({ messages: fx.mine ?? [] });
       ok({ messages: [] });
     case "im +chat-messages-list":
       ok({ messages: (fx.chats ?? {})[flag("--chat-id")] ?? [] });
+    case "im +messages-mget": {
+      const ids = new Set((flag("--message-ids") ?? "").split(",").map((s) => s.trim()).filter(Boolean));
+      const pool = Array.isArray(fx.mget)
+        ? fx.mget
+        : [
+            ...(fx.at_me ?? []),
+            ...(fx.p2p ?? []),
+            ...(fx.mine ?? []),
+            ...Object.values(fx.chats ?? {}).flat(),
+          ];
+      const byId = new Map();
+      for (const m of pool) {
+        const mid = String(m.message_id ?? m.id ?? "");
+        if (mid && ids.has(mid)) byId.set(mid, m);
+      }
+      ok({ messages: [...byId.values()] });
+    }
     case "task +get-my-tasks":
       ok({ items: fx.tasks ?? [] });
     case "minutes +search":

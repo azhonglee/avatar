@@ -4,16 +4,25 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
+import { hasCredentialMountIsolation } from "../src/harness.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const STUBS = path.join(ROOT, "test", "stubs");
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pa-e2e-"));
+const HANG_MARKERS: Record<string, string> = {
+  crash: path.join(tmp, "hang"),
+  cancel: path.join(tmp, "hang-cancel"),
+};
+const RPC_TOKEN = crypto.randomBytes(24).toString("hex");
+let stubRpcWorker: Worker | undefined;
 const env = {
   ...process.env,
   PA_CONFIG: path.join(tmp, "config.yaml"),
@@ -21,8 +30,10 @@ const env = {
   STUB_LOG: path.join(tmp, "lark-calls.ndjson"),
   STUB_ACPX_LOG: path.join(tmp, "acpx-calls.ndjson"),
   STUB_EVENTS_DIR: path.join(tmp, "events"),
+  STUB_RPC_URL: "",
+  STUB_RPC_TOKEN: RPC_TOKEN,
 };
-const state = () => JSON.parse(fs.readFileSync(env.STUB_STATE, "utf8"));
+const state = () => JSON.parse(fs.readFileSync(env.STUB_STATE!, "utf8"));
 const pa = (...args: string[]) => execFileSync(path.join(ROOT, "bin", "pa"), args, { env, encoding: "utf8", cwd: tmp });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const alive = (pid: number) => {
@@ -37,22 +48,103 @@ const alive = (pid: number) => {
 const addCard = (guid: string, summary: string, description: string, section = "sec_派给Agent") => {
   const s = state();
   s.tasks[guid] = { guid, summary, description, section, comments: [] };
-  fs.writeFileSync(env.STUB_STATE, JSON.stringify(s));
+  fs.writeFileSync(env.STUB_STATE!, JSON.stringify(s));
 };
 /** 直接读账本（只读）。 */
 const db = () => new DatabaseSync(path.join(tmp, "data", "state.db"), { readOnly: true });
 const calls = (file: string) => fs.readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+const latestStepPid = (ref: string): number => {
+  try {
+    const d = db();
+    const row = d
+      .prepare("SELECT s.pid FROM steps s JOIN work w ON w.id = s.work_id WHERE w.ref = ? AND s.pid IS NOT NULL ORDER BY s.id DESC LIMIT 1")
+      .get(ref) as { pid?: number } | undefined;
+    d.close();
+    return Number(row?.pid ?? 0);
+  } catch {
+    return 0;
+  }
+};
 
-before(() => {
+before(async () => {
+  // 在独立 Worker 线程运行本地测试桩 RPC 服务，避免主线程 execFileSync 阻塞事件循环；
+  // 严格校验每轮随机令牌且仅允许通过固定 marker ID 读写白名单挂起标记，绝不接受调用方传入任意宿主机路径
+  const workerSrc = `
+    const http = require("node:http");
+    const fs = require("node:fs");
+    const { parentPort, workerData } = require("node:worker_threads");
+    const readBody = (req) => new Promise((resolve) => {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    });
+    const resolveMarker = (id) => (id && Object.prototype.hasOwnProperty.call(workerData.markers, id) ? workerData.markers[id] : "");
+    const srv = http.createServer(async (req, res) => {
+      if (req.headers["x-stub-token"] !== workerData.token) {
+        res.statusCode = 403;
+        return res.end("forbidden");
+      }
+      const u = new URL(req.url || "/", "http://127.0.0.1");
+      if (req.method === "POST" && u.pathname === "/acpx-log") {
+        fs.appendFileSync(workerData.acpxLog, await readBody(req));
+        return res.end("ok");
+      }
+      if (req.method === "GET" && u.pathname === "/hang-check") {
+        const f = resolveMarker(u.searchParams.get("id") || "");
+        if (!f) { res.statusCode = 400; return res.end("unknown marker"); }
+        return res.end(fs.existsSync(f) ? fs.readFileSync(f, "utf8") : "");
+      }
+      if (req.method === "POST" && u.pathname === "/hang-mark") {
+        const f = resolveMarker(u.searchParams.get("id") || "");
+        if (!f) { res.statusCode = 400; return res.end("unknown marker"); }
+        const body = await readBody(req);
+        fs.writeFileSync(f, body || "started");
+        return res.end("ok");
+      }
+      if (req.method === "GET" && u.pathname === "/lark-state") {
+        res.setHeader("content-type", "application/json");
+        return res.end(fs.existsSync(workerData.statePath) ? fs.readFileSync(workerData.statePath, "utf8") : JSON.stringify({ tasks: {}, messages: [], seq: 0, sections: [] }));
+      }
+      if (req.method === "POST" && u.pathname === "/lark-state") {
+        fs.writeFileSync(workerData.statePath, await readBody(req));
+        return res.end("ok");
+      }
+      if (req.method === "POST" && u.pathname === "/lark-log") {
+        fs.appendFileSync(workerData.larkLog, await readBody(req));
+        return res.end("ok");
+      }
+      res.statusCode = 404;
+      res.end("not found");
+    });
+    srv.listen(0, "127.0.0.1", () => {
+      parentPort.postMessage({ port: srv.address().port });
+    });
+  `;
+  stubRpcWorker = new Worker(workerSrc, {
+    eval: true,
+    workerData: {
+      acpxLog: env.STUB_ACPX_LOG,
+      statePath: env.STUB_STATE,
+      larkLog: env.STUB_LOG,
+      markers: HANG_MARKERS,
+      token: RPC_TOKEN,
+    },
+  });
+  const port = await new Promise<number>((resolve, reject) => {
+    stubRpcWorker!.once("message", (msg: { port: number }) => resolve(msg.port));
+    stubRpcWorker!.once("error", reject);
+  });
+  env.STUB_RPC_URL = `http://127.0.0.1:${port}`;
+
   const repo = path.join(tmp, "demo-repo");
   fs.mkdirSync(repo);
   execFileSync("git", ["-C", repo, "init", "-q", "-b", "main"]);
   fs.writeFileSync(path.join(repo, "README.md"), "demo\n");
   execFileSync("git", ["-C", repo, "add", "-A"]);
   execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@x", "commit", "-qm", "init"]);
-  fs.mkdirSync(env.STUB_EVENTS_DIR);
+  fs.mkdirSync(env.STUB_EVENTS_DIR!);
   fs.writeFileSync(
-    env.PA_CONFIG,
+    env.PA_CONFIG!,
     `
 data_dir: ${path.join(tmp, "data")}
 bins: { lark: ${path.join(STUBS, "lark-cli")}, acpx: ${path.join(STUBS, "acpx")} }
@@ -69,9 +161,20 @@ context: { enabled: false }
 `,
   );
 });
-after(() => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }));
+after(async () => {
+  if (stubRpcWorker) await stubRpcWorker.terminate();
+  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+});
 
-test("init：记录主人 open_id，建看板分组和知识库节点", () => {
+test("init：记录主人 open_id，建看板分组和知识库节点", async () => {
+  // 校验测试桩 RPC 严格鉴权且拒绝非白名单 marker ID（绝不读写任意宿主机路径）
+  const unauth = await fetch(`${env.STUB_RPC_URL}/hang-check?id=crash`);
+  assert.equal(unauth.status, 403);
+  const badMarker = await fetch(`${env.STUB_RPC_URL}/hang-check?id=${encodeURIComponent("/etc/passwd")}`, {
+    headers: { "x-stub-token": RPC_TOKEN },
+  });
+  assert.equal(badMarker.status, 400);
+
   const out = pa("init");
   assert.match(out, /ou_owner/);
   const s = state();
@@ -150,10 +253,10 @@ test("验收关卡：审查一直打回 → 返工一轮后进“需人工介入
 });
 
 test("崩溃恢复：执行中 kill -9 常驻进程，再次运行时结束遗留进程、回到检查点重跑并完成", async () => {
-  const hangFile = path.join(tmp, "hang");
+  const hangFile = HANG_MARKERS.crash;
   fs.writeFileSync(hangFile, "armed");
   addCard("task_crash_1", "[codex] 崩溃恢复", "repo: demo");
-  const env2 = { ...env, STUB_HANG_FILE: hangFile };
+  const env2 = { ...env, STUB_HANG_FILE: hangFile, STUB_HANG_ID: "crash" };
   const daemon = spawn(path.join(ROOT, "bin", "pa"), ["run"], { env: env2, cwd: tmp, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
   daemon.stdout.on("data", (d) => (output += d));
@@ -162,16 +265,24 @@ test("崩溃恢复：执行中 kill -9 常驻进程，再次运行时结束遗�
   try {
     const deadline = Date.now() + 60_000;
     // outbox 移卡片与 worker 启动并行：等两件事都到位再 kill -9
-    while ((fs.readFileSync(hangFile, "utf8") === "armed" || state().tasks.task_crash_1.section !== "sec_Agent进行中") && Date.now() < deadline)
+    while (
+      (fs.readFileSync(hangFile, "utf8") === "armed" ||
+        latestStepPid("task_crash_1") <= 0 ||
+        state().tasks.task_crash_1.section !== "sec_Agent进行中") &&
+      Date.now() < deadline
+    )
       await sleep(100);
-    hungPid = Number(fs.readFileSync(hangFile, "utf8"));
+    hungPid = latestStepPid("task_crash_1") || Number(fs.readFileSync(hangFile, "utf8"));
     assert.ok(hungPid > 0, `worker 没有启动。输出：\n${output}`);
+    assert.ok(alive(hungPid), "kill -9 前宿主机 worker 进程存活");
     const wt = path.join(tmp, "data", "worktrees", "task_cra");
     assert.ok(fs.existsSync(path.join(wt, "partial.txt")), "半成品已写入");
 
     daemon.kill("SIGKILL");
     await new Promise((r) => daemon.on("close", r));
-    assert.ok(alive(hungPid), "kill -9 后 harness 成了孤儿进程，还在运行");
+    if (process.platform !== "linux" || !hasCredentialMountIsolation()) {
+      assert.ok(alive(hungPid), "kill -9 后无命名空间隔离时 harness 成了孤儿进程，还在运行");
+    }
     assert.equal(state().tasks.task_crash_1.section, "sec_Agent进行中", "卡片停在进行中");
 
     // 再次运行（命令行单次派单即可，常驻进程重启效果相同）：接管 → 清理孤儿 → 回检查点 → 重跑
@@ -206,20 +317,23 @@ test("崩溃恢复：执行中 kill -9 常驻进程，再次运行时结束遗�
 });
 
 test("取消：执行中把卡片拖回 Inbox，对账按 ID 核实后取消，结束正在跑的 harness", async () => {
-  const hangFile = path.join(tmp, "hang-cancel");
+  const hangFile = HANG_MARKERS.cancel;
   fs.writeFileSync(hangFile, "armed");
   addCard("task_cancel_1", "[codex] 取消测试", "repo: demo");
-  const env2 = { ...env, STUB_HANG_FILE: hangFile };
+  const env2 = { ...env, STUB_HANG_FILE: hangFile, STUB_HANG_ID: "cancel" };
   const daemon = spawn(path.join(ROOT, "bin", "pa"), ["run"], { env: env2, cwd: tmp, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
   daemon.stdout.on("data", (d) => (output += d));
   daemon.stderr.on("data", (d) => (output += d));
   let hungPid = 0;
   try {
-    const started = () => fs.readFileSync(hangFile, "utf8") !== "armed" && state().tasks.task_cancel_1.comments.some((c: string) => c.includes("开始执行"));
+    const started = () =>
+      fs.readFileSync(hangFile, "utf8") !== "armed" &&
+      latestStepPid("task_cancel_1") > 0 &&
+      state().tasks.task_cancel_1.comments.some((c: string) => c.includes("开始执行"));
     for (let i = 0; i < 600 && !started(); i++) await sleep(100);
     assert.ok(started(), `worker 没有启动。输出：\n${output}`);
-    hungPid = Number(fs.readFileSync(hangFile, "utf8"));
+    hungPid = latestStepPid("task_cancel_1") || Number(fs.readFileSync(hangFile, "utf8"));
 
     // 用户把正在跑的卡片拖回 Inbox；任意一次对账（这里用命令行）发现它不在两列，按 ID 核实后请求取消
     const s = state();

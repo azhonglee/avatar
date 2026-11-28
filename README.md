@@ -56,7 +56,8 @@ bin/pa console                         # 打印带令牌的控制台登录链接
 
 ```
 pa doctor | init | run | brief [morning|evening] [--print] | capture | dispatch | status
-pa context run | today | digest [morning|evening] [--print]   工作上下文：采集理解一轮 / 看今天 / 发晨间卡
+pa context run | today | split <项目> | digest [morning|evening] [--print]   工作上下文：采集理解 / 看今天 / 拆子项目 / 发早晚卡
+pa context web-login [--out qr.svg] | web-status [--verify] | web-logout     个人 Web 协议扫码登录与实时通道状态
 pa console [--rotate]                  打印控制台登录链接（--rotate 作废旧令牌）
 pa command <名称> [JSON 参数]          通过统一命令层执行操作（与卡片/控制台按钮一致）
 pa job <名称> | ask <文字> | publish-doc <file.md> [--title] [--parent 节点名]
@@ -84,8 +85,9 @@ src/
   notify-prefs.ts   通知偏好（免打扰时段、按类型开关、失败告警不拦截）
   usage.ts          acpx 用量解析、按天/执行者/任务统计、每日与单任务预算守卫
   candidates.ts     候选任务反馈、准确率统计、分诊校准闭环
-  context/          工作上下文：connectors（采集）· understand（带证据的理解）· store（ctx_* 图谱）·
-                    views（排序与视图）· drafts（起草）· cards（晨间卡 / 收尾卡 / 提醒 / 草稿）· index（周期、命令、自主等级）
+  context/          工作上下文：connectors（采集）· feishu-web/ + personal-web（独立 TS 个人 Web 长连接与秒级快通道）·
+                    understand（带证据的理解）· store（ctx_* 图谱与跨通道去重）· views（排序与视图）·
+                    drafts（起草）· cards（晨间卡 / 收尾卡 / 提醒 / 草稿）· index（周期、命令、自主等级）
   config.ts / lark.ts / guard.ts / harness.ts / events.ts / board.ts / store.ts
   workflows/        triage.ts / capture.ts / dispatch.ts / brief.ts / agent.ts
 web/                React + Vite + TypeScript 本机控制台 SPA + scripts/demo-server.ts

@@ -5,7 +5,7 @@ import YAML, { isMap, type Document } from "yaml";
 import { z } from "zod";
 import type { App } from "./app.ts";
 import type { SettingsUpdateResult, SettingsView } from "./api/types.ts";
-import { ConfigSchema } from "./config.ts";
+import { ConfigSchema, markConfigMutated } from "./config.ts";
 import { parseHHMM } from "./notify-prefs.ts";
 import { errMsg, log } from "./util.ts";
 
@@ -24,8 +24,16 @@ import { errMsg, log } from "./util.ts";
 export const MASK = "******";
 
 const HOT = new Set(["notify", "budget", "acceptance", "capture", "dispatch", "delivery", "cards", "lark_web", "applink_host", "context"]);
-/** 热加载分组里仍需重启的字段（引擎并发上限、定时任务、模块开关在启动时确定） */
-const COLD_PATHS = new Set(["dispatch.max_parallel", "context.enabled", "context.schedule", "context.morning", "context.evening", "context.weekly"]);
+/** 热加载分组里仍需重启的字段（引擎并发上限、定时任务、模块开关、常驻长连接开关在启动时确定） */
+const COLD_PATHS = new Set([
+  "dispatch.max_parallel",
+  "context.enabled",
+  "context.schedule",
+  "context.morning",
+  "context.evening",
+  "context.weekly",
+  "context.personal_web.enabled",
+]);
 const FORBIDDEN = ["data_dir", "bins"];
 
 type Obj = Record<string, unknown>;
@@ -50,13 +58,20 @@ export function diffPaths(a: unknown, b: unknown, prefix: string[] = []): string
   return JSON.stringify(a) === JSON.stringify(b) ? [] : [prefix];
 }
 
-/** 把 target 原地同步成 source（对象递归，其他值替换），保留 target 对象本身的引用。 */
-function syncInPlace(target: Obj, source: Obj, skip: (k: string) => boolean = () => false): void {
-  for (const k of Object.keys(target)) if (!(k in source) && !skip(k)) delete target[k];
+/** 把 target 原地同步成 source（按完整点分路径递归跳过冷配置项），保留 target 对象本身的引用。 */
+function syncInPlace(target: Obj, source: Obj, prefix: string[]): void {
+  for (const k of Object.keys(target)) {
+    if (!(k in source) && isHotPath([...prefix, k])) delete target[k];
+  }
   for (const [k, v] of Object.entries(source)) {
-    if (skip(k)) continue;
-    if (isObj(v) && isObj(target[k])) syncInPlace(target[k] as Obj, v);
-    else target[k] = structuredClone(v);
+    const p = [...prefix, k];
+    if (!isHotPath(p)) continue;
+    if (isObj(v)) {
+      if (!isObj(target[k])) target[k] = {};
+      syncInPlace(target[k] as Obj, v, p);
+    } else {
+      target[k] = structuredClone(v);
+    }
   }
 }
 
@@ -327,14 +342,15 @@ export class SettingsService {
     }
   }
 
-  /** 可热加载的分组原地同步到 app.cfg */
+  /** 可热加载的分组原地同步到 app.cfg（深层嵌套冷字段保持启动时的原值，直到重启） */
   private applyHot(data: Obj): void {
     const cfg = this.app.cfg as unknown as Obj;
     for (const k of HOT) {
       const src = data[k];
-      if (isObj(src) && isObj(cfg[k])) syncInPlace(cfg[k] as Obj, src, (sub) => !isHotPath([k, sub]));
-      else if (src !== undefined) cfg[k] = structuredClone(src);
+      if (isObj(src) && isObj(cfg[k])) syncInPlace(cfg[k] as Obj, src, [k]);
+      else if (src !== undefined && isHotPath([k])) cfg[k] = structuredClone(src);
     }
+    markConfigMutated(this.app.cfg);
   }
 
   private audit(args: Record<string, unknown>, ok: boolean, message: string): void {

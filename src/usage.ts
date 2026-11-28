@@ -1,3 +1,4 @@
+import { isContextDerivedDispatchBlocked } from "./api/queries.ts";
 import type { App } from "./app.ts";
 import type { UsageSummary } from "./api/types.ts";
 import { setUsageRecorder } from "./harness.ts";
@@ -129,7 +130,7 @@ interface StepRow {
   ref: string | null;
 }
 
-export function usageSummary(app: Pick<App, "cfg" | "ledger">, daysIn: number, now = Date.now()): UsageSummary {
+export function usageSummary(app: Pick<App, "cfg" | "ledger"> & { store?: App["store"] }, daysIn: number, now = Date.now()): UsageSummary {
   const { cfg, ledger } = app;
   const tz = cfg.owner.timezone;
   const days = Math.min(Math.max(Math.floor(daysIn) || 1, 1), 90);
@@ -149,7 +150,7 @@ export function usageSummary(app: Pick<App, "cfg" | "ledger">, daysIn: number, n
     byDay.set(day, { day, usd: 0, tokens_in: 0, tokens_out: 0, duration_ms: 0 });
   }
   const byHarness = new Map<string, UsageSummary["by_harness"][number]>();
-  const byCard = new Map<string, number>();
+  const byCard = new Map<string, { usd: number; workIds: Set<string> }>();
   let metered = false;
   for (const r of rows) {
     if (r.tokens_in > 0 || r.tokens_out > 0 || r.cost_usd > 0) metered = true;
@@ -167,17 +168,33 @@ export function usageSummary(app: Pick<App, "cfg" | "ledger">, daysIn: number, n
     h.runs += 1;
     h.duration_ms += r.duration_ms;
     byHarness.set(r.harness, h);
-    if (r.kind === "dispatch" && r.ref) byCard.set(r.ref, (byCard.get(r.ref) ?? 0) + r.cost_usd);
+    if (r.kind === "dispatch" && r.ref) {
+      let entry = byCard.get(r.ref);
+      if (!entry) {
+        entry = { usd: 0, workIds: new Set() };
+        byCard.set(r.ref, entry);
+      }
+      entry.usd += r.cost_usd;
+      entry.workIds.add(r.work_id);
+    }
   }
-  // 花费最多的任务：同一张卡片的所有派单合计，链接到最新一次派单
-  const top = [...byCard.entries()]
-    .filter(([, c]) => c > 0)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 10)
-    .map(([ref, c]) => {
-      const w = ledger.latest<DispatchPayload>("dispatch", ref);
-      return { dispatch_id: w?.id ?? ref, summary: (w?.payload.summary ?? "").replace(/^\s*\[[\w-]+\]\s*/, "") || ref, usd: round(c) };
-    });
+  // 花费最多的任务：按卡片合并后按花费降序筛选，且每个 distinct ref / work_id 最多查一次主人隔离（不在每条 step 循环里重复查库）
+  const blockedCache = new Map<string, boolean>();
+  const isBlockedId = (id: string): boolean => {
+    if (!app.store) return false;
+    const hit = blockedCache.get(id);
+    if (hit !== undefined) return hit;
+    const blocked = isContextDerivedDispatchBlocked({ cfg, ledger, store: app.store }, id);
+    blockedCache.set(id, blocked);
+    return blocked;
+  };
+  const top: UsageSummary["top_tasks"] = [];
+  for (const [ref, entry] of [...byCard.entries()].filter(([, v]) => v.usd > 0).sort((a, b) => b[1].usd - a[1].usd)) {
+    if (app.store && (isBlockedId(ref) || [...entry.workIds].some(isBlockedId))) continue;
+    const w = ledger.latest<DispatchPayload>("dispatch", ref);
+    top.push({ dispatch_id: w?.id ?? ref, summary: (w?.payload.summary ?? "").replace(/^\s*\[[\w-]+\]\s*/, "") || ref, usd: round(entry.usd) });
+    if (top.length >= 10) break;
+  }
   const by_day = [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day)).map((d) => ({ ...d, usd: round(d.usd) }));
   const b = cfg.budget;
   const today = ledger.costSince(startOfLocalDay(tz, now));

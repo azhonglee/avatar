@@ -27,6 +27,18 @@ const Harness = z.object({
 });
 export type Harness = z.infer<typeof Harness>;
 
+/** 上下文采集范围与群过滤共用校验规则（供 Schema 与个人 Web 发送前磁盘复核复用） */
+export const ContextScopeConfigSchema = z.object({
+  /** 首次采集回看天数 */
+  lookback_days: z.number().int().min(1).max(30).default(7),
+  /** 群消息范围：spoken = @我、私聊和我发言过的群；allowlist = 只看 groups_allow 里的群（加上 @我、私聊） */
+  groups: z.enum(["spoken", "allowlist"]).default("spoken"),
+  groups_allow: z.array(z.string()).default([]),
+  /** 永远不读的会话（chat_id 或群名关键字） */
+  groups_deny: z.array(z.string()).default([]),
+  max_groups: z.number().int().min(1).max(200).default(40),
+});
+
 const Schema = z.object({
   owner: z
     .object({
@@ -193,8 +205,7 @@ const Schema = z.object({
       harness: z.string().default(""),
       /** 是否把消息内容发给模型做理解；关闭时只做确定性采集（Meego / 飞书任务直接成为事项） */
       understand: z.boolean().default(true),
-      /** 首次采集回看天数 */
-      lookback_days: z.number().int().min(1).max(30).default(7),
+      lookback_days: ContextScopeConfigSchema.shape.lookback_days,
       /** 采集 + 理解的周期 */
       schedule: z.string().default("*/10 * * * *"),
       morning: z.string().default("30 8 * * 1-5"),
@@ -212,12 +223,10 @@ const Schema = z.object({
           docs: z.boolean().default(true),
         })
         .prefault({}),
-      /** 群消息范围：spoken = @我、私聊和我发言过的群；allowlist = 只看 groups_allow 里的群（加上 @我、私聊） */
-      groups: z.enum(["spoken", "allowlist"]).default("spoken"),
-      groups_allow: z.array(z.string()).default([]),
-      /** 永远不读的会话（chat_id 或群名关键字） */
-      groups_deny: z.array(z.string()).default([]),
-      max_groups: z.number().int().min(1).max(200).default(40),
+      groups: ContextScopeConfigSchema.shape.groups,
+      groups_allow: ContextScopeConfigSchema.shape.groups_allow,
+      groups_deny: ContextScopeConfigSchema.shape.groups_deny,
+      max_groups: ContextScopeConfigSchema.shape.max_groups,
       /** 保留哪些机器人的通知（名字或内容匹配任一正则即保留；其余机器人消息当噪音丢弃） */
       bot_allow: z.array(z.string()).default(["Meego", "项目管理", "Codebase", "云文档", "审批", "智能纪要", "MLOps", "Bits"]),
       /** Meego / 飞书任务创建超过这么多天且没有近期动静的，视为历史遗留 */
@@ -244,6 +253,24 @@ const Schema = z.object({
           mute_legacy: z.boolean().default(true),
           /** 你承诺的事自动在飞书任务里给自己建一条待办 */
           create_own_todo: z.boolean().default(false),
+        })
+        .prefault({}),
+      /**
+       * 个人 Web 协议实时通道（基于飞书网页版长连接重新实现）：
+       * 无需拉机器人进群即可秒级收到本人所有群聊与私聊推送；对外回复永远需要你确认草稿。
+       */
+      personal_web: z
+        .object({
+          /** 是否启用个人 Web 协议长连接（需先运行 `pa context web-login` 本人扫码登录） */
+          enabled: z.boolean().default(false),
+          /** 收到真实 @我 或对方私聊时，不等 10 分钟定时周期，立刻走单会话快通道理解与提醒 */
+          fast_lane: z.boolean().default(true),
+          /** 同一会话短时间连发多条消息时合并等待的毫秒数 */
+          debounce_ms: z.number().int().min(0).max(30_000).default(2500),
+          /** 快通道识别出高优先级「别人在等你」时是否自动起草回复草稿（仅起草，仍需你确认才发） */
+          pre_draft: z.boolean().default(false),
+          /** 当草稿目标来自个人 Web 原生数字 ID 且尚无开放平台 om_ ID 时，允许你确认后经个人 Web 协议回复（带发送前核验与独立回读确认） */
+          send_replies: z.boolean().default(false),
         })
         .prefault({}),
     })
@@ -303,7 +330,12 @@ const Schema = z.object({
     .default({}),
 });
 
-export type Config = z.infer<typeof Schema> & { dataDir: string; file: string };
+export type Config = z.infer<typeof Schema> & {
+  dataDir: string;
+  file: string;
+  /** loadConfig() 实际解析并应用到本配置对象的原始磁盘文本（不可枚举，仅用于热刷新基线比对） */
+  readonly loadedRaw?: string;
+};
 
 /** 解析 `repo:` 引用：配置里的别名（字符串或 {path, verify}），否则当作路径。 */
 export interface RepoSpec {
@@ -323,11 +355,24 @@ export function repoSpec(cfg: Config, ref: string): RepoSpec {
 /** 配置的 zod schema（设置服务用它校验写入）。 */
 export const ConfigSchema = Schema;
 
+const CONFIG_MUTATION_GEN = Symbol("pa.configMutationGen");
+
+export function markConfigMutated(cfg: Config): void {
+  const rec = cfg as unknown as Record<symbol, number | undefined>;
+  rec[CONFIG_MUTATION_GEN] = (rec[CONFIG_MUTATION_GEN] ?? 0) + 1;
+}
+
+export function getConfigMutationGen(cfg: Config): number {
+  const rec = cfg as unknown as Record<symbol, number | undefined>;
+  return rec[CONFIG_MUTATION_GEN] ?? 0;
+}
+
 export function loadConfig(file = process.env.PA_CONFIG ?? path.join(ROOT, "config.yaml")): Config {
   if (!fs.existsSync(file)) {
     throw new Error(`找不到配置文件 ${file}。先执行：cp config.example.yaml config.yaml 并按需修改`);
   }
-  const parsed = Schema.safeParse(YAML.parse(fs.readFileSync(file, "utf8")) ?? {});
+  const raw = fs.readFileSync(file, "utf8");
+  const parsed = Schema.safeParse(YAML.parse(raw) ?? {});
   if (!parsed.success) throw new Error(`配置文件 ${file} 有误：\n${z.prettifyError(parsed.error)}`);
   const cfg = parsed.data;
   for (const name of [cfg.roles.brain, cfg.roles.reviewer, cfg.dispatch.default_harness].filter(Boolean)) {
@@ -338,5 +383,7 @@ export function loadConfig(file = process.env.PA_CONFIG ?? path.join(ROOT, "conf
   }
   const dataDir = path.resolve(expandHome(cfg.data_dir));
   for (const sub of ["logs", "runs", "workspace", "worktrees"]) fs.mkdirSync(path.join(dataDir, sub), { recursive: true });
-  return { ...cfg, dataDir, file };
+  const out: Config = { ...cfg, dataDir, file };
+  Object.defineProperty(out, "loadedRaw", { value: raw, enumerable: false, writable: false, configurable: true });
+  return out;
 }

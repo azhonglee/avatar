@@ -1,10 +1,12 @@
+import { isContextDerivedWorkOrTask, isWorkBlockedByOwner } from "./api/queries.ts";
 import type { Board, SectionKey } from "./board.ts";
+import { computePwReplyCid, hasWorkspaceOwnerMismatch, isLiveDaemonHeartbeat } from "./context/personal-web.ts";
 import { deepFind, runProcess } from "./util.ts";
 import type { Store } from "./store.ts";
 import type { Config } from "./config.ts";
 import type { Handler } from "./engine.ts";
 import type { Effect, Ledger, NotifyKind } from "./ledger.ts";
-import type { Lark } from "./lark.ts";
+import { verifyActiveLarkUser, type Lark } from "./lark.ts";
 
 /**
  * 发布器：投递 outbox 里的飞书写操作。
@@ -19,15 +21,84 @@ export interface EffectHooks {
    * 由通知偏好模块设置。
    */
   gate?: (kind: NotifyKind | undefined, e: Effect) => number | false | undefined;
+  /**
+   * 个人 Web 协议回复执行器（由工作上下文模块注册，只在用户确认草稿后触发，绑定确认账号并带发送前核验与独立回读确认）。
+   */
+  pwReply?: (args: { owner_id: string; chat_id: string; message_id: string; root_id?: string; text: string; cid: string }) => Promise<void>;
+  /** 判断当前进程是否正以常驻模式运行（`pa run`）；单次 CLI 返回 false */
+  isDaemonRunning?: () => boolean;
+  /** 判断当前消费者（含常驻进程与单次 CLI）是否因缺少凭据而应让出未回读的 `pw.reply`，避免无密钥进程误领并消耗重试次数 */
+  shouldDeferPwReply?: (cid?: string, isDaemon?: boolean) => boolean;
+  /** 检查上下文模块是否已检测到磁盘 config.yaml 主人变更或绑定冲突（不改写共享 cfg.owner.open_id） */
+  isContextOwnerMismatched?: () => boolean;
+  /** 投递基于草稿的 CLI 外部消息（`im.reply` / `im.send`）前实时复检源消息未撤回、会话未排除且仍在允许范围内 */
+  verifyCliDraftDelivery?: (args: { draft_id?: string; chat_id?: string; message_id?: string }) => Promise<void> | void;
 }
 
 export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: Lark, store: Store, hooks: EffectHooks = {}): Handler<Effect> {
+  const shouldReservePwReply = (cid?: string): boolean => {
+    const isDaemon = !!hooks.isDaemonRunning?.();
+    if (hooks.shouldDeferPwReply) return hooks.shouldDeferPwReply(cid, isDaemon);
+    return !hooks.pwReply && !isDaemon && isLiveDaemonHeartbeat(store);
+  };
   return {
     kind: "effect",
     concurrency: 1,
     maxAttempts: cfg.engine.effect_attempts,
+    claimOpts: () => {
+      if (!shouldReservePwReply()) return undefined;
+      // 保留仍需凭据执行的 pw.reply 给持钥常驻进程，但对已完成 verified 回读的回复允许无密钥消费者直接幂等收尾
+      const verifiedIds: string[] = [];
+      if (hooks.pwReply) {
+        for (const w of ledger.active<Effect>("effect")) {
+          if (w.payload.op !== "pw.reply") continue;
+          const { cid } = computePwReplyCid({
+            draft_id: w.payload.args.draft_id,
+            effect_id: w.id,
+            owner_id: w.payload.args.owner_id,
+            chat_id: w.payload.args.chat_id,
+            message_id: w.payload.args.message_id,
+            text: w.payload.args.text,
+          });
+          if (!shouldReservePwReply(cid)) verifiedIds.push(w.id);
+        }
+      }
+      return verifiedIds.length
+        ? { excludeEffectOps: ["pw.reply"], allowEffectIds: verifiedIds }
+        : { excludeEffectOps: ["pw.reply"] };
+    },
     async run(item) {
       const e = item.payload;
+      // 若工作区 owner.open_id 与已绑定的个人 Web 主人不一致，严禁向新主人投递旧主人的上下文卡片、提醒、草稿或自主任务
+      const isContextEffect =
+        item.ref.startsWith("card:ctx-") ||
+        item.ref.startsWith("ctx-draft:") ||
+        (item.ref.startsWith("context:") && item.ref !== "context:pw-needs-login") ||
+        e.op === "pw.reply" ||
+        (e.op === "card.upsert" && e.args.key.startsWith("ctx-"));
+      if (isContextEffect && (hasWorkspaceOwnerMismatch(store, cfg.owner.open_id) || hooks.isContextOwnerMismatched?.())) {
+        throw new Error("当前工作区 owner.open_id 与已绑定的个人 Web 主人不一致，已阻断上下文通知与外部动作投递以防跨账号泄漏");
+      }
+      // 归属旧主人的上下文委派派单卡片（card:dispatch:<guid>）、失败告警卡片（failure:<workId>）及任务操作，同样严格按主人隔离
+      if (isWorkBlockedByOwner({ cfg, store, ledger }, item)) {
+        throw new Error("该派单卡片、失败告警或外部动作源自旧工作区主人的工作上下文，已按主人隔离阻断投递");
+      }
+      // 任何以用户态 lark-cli 发布工作上下文派生数据（含上下文委派派单/交付产生的评论、移列、完成）或对外回复的写操作，
+      // 执行前实时核验活跃 CLI 登录用户与工作区主人一致
+      const isContextTaskEffect =
+        (e.op === "task.move" || e.op === "task.comment" || e.op === "task.complete") &&
+        (isContextEffect ||
+          isContextDerivedWorkOrTask({ cfg, store, ledger }, e.args.guid) ||
+          isContextDerivedWorkOrTask({ cfg, store, ledger }, item.ref));
+      const needsActiveLarkUserCheck =
+        e.op === "doc.create" ||
+        e.op === "task.create_own" ||
+        e.op === "im.reply" ||
+        e.op === "im.send" ||
+        isContextTaskEffect;
+      if (needsActiveLarkUserCheck) {
+        await verifyActiveLarkUser(lark, cfg.owner.open_id, `执行用户态外部动作 (${e.op})`);
+      }
       if (e.op === "notify" || e.op === "card.upsert") {
         const g = hooks.gate?.(e.args.kind, e);
         if (g === false) return void ledger.transition(item, { state: "skipped", terminal: true });
@@ -55,18 +126,53 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
           await upsertCard(lark, store, cfg.owner.open_id, e.args.key, e.args.card);
           break;
         // ── 以下只会在你确认草稿 / 开启对应自主动作后产生，均以你本人身份执行 ──
-        case "im.reply":
+        case "im.reply": {
+          if (!cfg.context.enabled || !cfg.context.sources.im || !hooks.verifyCliDraftDelivery) {
+            throw new Error("工作上下文或 IM 采集未启用，拒绝投递 CLI 会话回复（fail-closed）");
+          }
+          const draftId = e.args.draft_id || (item.ref.startsWith("ctx-draft:") ? item.ref.slice("ctx-draft:".length) : undefined);
+          await hooks.verifyCliDraftDelivery({ draft_id: draftId, message_id: e.args.message_id });
           await lark.run(["im", "+messages-reply", "--message-id", e.args.message_id, "--text", "-", "--idempotency-key", item.id.slice(0, 50)], {
             as: "user",
             input: e.args.text,
           });
           break;
-        case "im.send":
+        }
+        case "im.send": {
+          if (!cfg.context.enabled || !cfg.context.sources.im || !hooks.verifyCliDraftDelivery) {
+            throw new Error("工作上下文或 IM 采集未启用，拒绝投递 CLI 会话消息（fail-closed）");
+          }
+          const draftId = e.args.draft_id || (item.ref.startsWith("ctx-draft:") ? item.ref.slice("ctx-draft:".length) : undefined);
+          await hooks.verifyCliDraftDelivery({ draft_id: draftId, chat_id: e.args.chat_id });
           await lark.run(["im", "+messages-send", "--chat-id", e.args.chat_id, "--text", "-", "--idempotency-key", item.id.slice(0, 50)], {
             as: "user",
             input: e.args.text,
           });
           break;
+        }
+        case "pw.reply": {
+          const { cid } = computePwReplyCid({
+            draft_id: e.args.draft_id,
+            effect_id: item.id,
+            owner_id: e.args.owner_id,
+            chat_id: e.args.chat_id,
+            message_id: e.args.message_id,
+            text: e.args.text,
+          });
+          if (shouldReservePwReply(cid)) {
+            return void ledger.release(item.id, { nextAt: Date.now() + 2_000, refund: true });
+          }
+          if (!hooks.pwReply) throw new Error("个人 Web 回复未注册");
+          await hooks.pwReply({
+            owner_id: e.args.owner_id,
+            chat_id: e.args.chat_id,
+            message_id: e.args.message_id,
+            root_id: e.args.root_id,
+            text: e.args.text,
+            cid,
+          });
+          break;
+        }
         case "meego.comment": {
           const r = await runProcess(cfg.bins.bytedcli, [
             "meego", "comment", "create", "--project-key", e.args.project_key, "--work-item-id", e.args.work_item_id, "--content", e.args.content, "--json",
@@ -84,12 +190,20 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
           break;
         }
         case "task.create_own": {
-          await store.once(`task.create_own.${e.args.item_id ?? item.id}`, async () => {
+          const createdOwner = cfg.owner.open_id.trim();
+          const guid = await store.once(`task.create_own.${e.args.item_id ?? item.id}`, async () => {
             const args = ["task", "+create", "--summary", e.args.summary, "--description", e.args.description, "--assignee", cfg.owner.open_id];
             if (e.args.due) args.push("--due", e.args.due);
             const out = await lark.run(args, { as: "user" });
-            return String(deepFind(out, "guid") ?? "created");
+            const g = String(deepFind(out, "guid") ?? "created");
+            if (g && g !== "created" && createdOwner) {
+              store.set(`ctx.own_task_owner.${g}`, createdOwner);
+            }
+            return g;
           });
+          if (guid && guid !== "created" && createdOwner && !store.get(`ctx.own_task_owner.${guid}`)) {
+            store.set(`ctx.own_task_owner.${guid}`, createdOwner);
+          }
           break;
         }
         default:
@@ -103,8 +217,14 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
 
 export const move = (guid: string, section: SectionKey): Effect => ({ op: "task.move", args: { guid, section } });
 export const comment = (guid: string, content: string): Effect => ({ op: "task.comment", args: { guid, content } });
-export const notify = (markdown: string, kind?: NotifyKind): Effect => ({ op: "notify", args: { markdown, kind } });
-export const card = (key: string, c: Record<string, unknown>, kind?: NotifyKind): Effect => ({ op: "card.upsert", args: { key, card: c, kind } });
+export const notify = (markdown: string, kind?: NotifyKind, owner_open_id?: string): Effect => ({
+  op: "notify",
+  args: { markdown, kind, ...(owner_open_id ? { owner_open_id } : {}) },
+});
+export const card = (key: string, c: Record<string, unknown>, kind?: NotifyKind, owner_open_id?: string): Effect => ({
+  op: "card.upsert",
+  args: { key, card: c, kind, ...(owner_open_id ? { owner_open_id } : {}) },
+});
 
 /**
  * 同一个 key 只有一张卡片：没发过就以机器人身份私信主人（幂等键 = key），记下 message_id；发过就原地更新。

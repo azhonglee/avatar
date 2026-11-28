@@ -1,6 +1,32 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { CtxDraftKind, CtxItemKind, CtxItemStatus, CtxPriority, CtxSource } from "../api/types.ts";
+import { isDeadOwner } from "../ledger.ts";
+
+/**
+ * 计算观测的内容修订签名：包含正文及真实 @mention 标识（防止将普通 "@姓名" 编辑为真实 @mention 时被误判为无变更）。
+ */
+export function obsRevision(o: { text: string; meta?: Record<string, unknown> }): string {
+  const meta = o.meta ?? {};
+  const rawMentions = Array.isArray(meta.mentions) ? meta.mentions : [];
+  if (!meta.at_me && rawMentions.length === 0) return o.text;
+  const mentionsSig = rawMentions
+    .map((m) => {
+      const rec = m as { id?: unknown; start?: unknown; end?: unknown };
+      return `${String(rec.id ?? "")}:${String(rec.start ?? "")}:${String(rec.end ?? "")}`;
+    })
+    .join(",");
+  return `${o.text}\0at=${meta.at_me ? "1" : "0"}\0m=${mentionsSig}`;
+}
+
+/**
+ * 计算紧凑、安全的观测修订令牌（32 位 SHA-256 十六进制摘要，含内容/@mention 与 edit_gen），
+ * 用于冲突卡片回调与前端按钮绑定，避免把 2000 字原文或 NUL 字节塞进飞书卡片回调载荷。
+ */
+export function obsRevisionToken(o: { text: string; meta?: Record<string, unknown> }): string {
+  const editGen = typeof o.meta?.edit_gen === "number" && Number.isFinite(o.meta.edit_gen) ? o.meta.edit_gen : 0;
+  return createHash("sha256").update(`${obsRevision(o)}\0g=${editGen}`).digest("hex").slice(0, 32);
+}
 
 /**
  * 工作图谱存储：观测（原始信号）→ 项目 / 事项 / 知识 / 动态 / 人 / 冲突 / 草稿，每条事实挂证据。
@@ -109,7 +135,7 @@ export interface ConflictRow {
   id: string;
   project_id: string;
   topic: string;
-  claims: { claim: string; obs_id: string; quote: string; time: number }[];
+  claims: { claim: string; obs_id: string; quote: string; time: number; obs_rev?: string }[];
   status: "open" | "resolved";
   resolution: string;
   created: number;
@@ -240,6 +266,12 @@ export class ContextStore {
         target TEXT NOT NULL DEFAULT '{}', target_label TEXT NOT NULL DEFAULT '', content TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'proposed', error TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL, updated INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS ctx_mute_conv (conv TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS ctx_conv_claim (
+        conv TEXT PRIMARY KEY,
+        holder TEXT NOT NULL,
+        proc_owner TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
     `);
     // 迁移：子项目
     const cols = new Set((db.prepare("PRAGMA table_info(ctx_project)").all() as { name: string }[]).map((c) => c.name));
@@ -266,27 +298,172 @@ export class ContextStore {
 
   // ───────── 观测 ─────────
 
-  /** 幂等写入观测；同 ID 已存在且内容变化（消息被编辑）时更新并重新标为待处理。返回新增或变化的数量。 */
-  addObs(list: Obs[]): number {
+  /**
+   * 幂等写入观测（严格按通道原生主键 ID 索引查找，绝不做跨通道启发式猜群或合并）：
+   *   - 同 ID 已存在且曾仅作为历史背景写入（meta.background_only = true）时，首次真实投递将其提升为待处理；
+   *   - 同 ID 已存在且正文变化（消息被编辑）时，更新正文并重新标为待处理；
+   *   - 可选 `beforeCommit` 回调在 `BEGIN IMMEDIATE` 写事务锁内执行，用于跨进程吊销/静音/策略变更的原子终检。
+   * 返回新增或重新变为待处理的数量。
+   */
+  addObs(list: Obs[], beforeCommit?: () => boolean): number {
     const now = Date.now();
-    const get = this.db.prepare("SELECT text FROM ctx_obs WHERE id = ?");
+    const get = this.db.prepare(
+      "SELECT source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, processed FROM ctx_obs WHERE id = ?",
+    );
     const ins = this.db.prepare(
       `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
     );
-    const upd = this.db.prepare("UPDATE ctx_obs SET text = ?, meta = ?, processed = 0 WHERE id = ?");
+    const upd = this.db.prepare(
+      "UPDATE ctx_obs SET source = ?, kind = ?, conv = ?, conv_name = ?, actor_id = ?, actor_name = ?, is_me = ?, time = ?, text = ?, url = ?, meta = ?, processed = 0 WHERE id = ?",
+    );
+    const updMetaOnly = this.db.prepare("UPDATE ctx_obs SET meta = ? WHERE id = ?");
     let n = 0;
     this.tx(() => {
+      if (beforeCommit && !beforeCommit()) return;
       for (const o of list) {
         if (!o.id || !o.time) continue;
-        const cur = get.get(o.id) as { text: string } | undefined;
+        const cur = get.get(o.id) as Row | undefined;
         if (!cur) {
           ins.run(o.id, o.source, o.kind, o.conv, o.conv_name, o.actor_id, o.actor_name, o.is_me ? 1 : 0, o.time, o.text, o.url, JSON.stringify(o.meta ?? {}), now);
           n++;
-        } else if (cur.text !== o.text) {
-          upd.run(o.text, JSON.stringify(o.meta ?? {}), o.id);
-          n++;
+        } else {
+          const curMeta = j<Record<string, unknown>>(cur.meta, {});
+          const wasBgOnly = curMeta.background_only === true;
+          const wasWithdrawn = curMeta.withdrawn === true;
+          const wasTombstone = curMeta.tombstone === true;
+          const curVer = typeof curMeta.edit_version === "number" && Number.isFinite(curMeta.edit_version) ? curMeta.edit_version : undefined;
+          const nextVer = typeof o.meta?.edit_version === "number" && Number.isFinite(o.meta.edit_version) ? o.meta.edit_version : undefined;
+          const curEditTime = typeof curMeta.edit_time === "number" && Number.isFinite(curMeta.edit_time) ? curMeta.edit_time : undefined;
+          const nextEditTime = typeof o.meta?.edit_time === "number" && Number.isFinite(o.meta.edit_time) ? o.meta.edit_time : undefined;
+          const curPollAt =
+            typeof curMeta.poll_observed_at === "number" && Number.isFinite(curMeta.poll_observed_at)
+              ? curMeta.poll_observed_at
+              : undefined;
+          const nextPollAt =
+            typeof o.meta?.poll_observed_at === "number" && Number.isFinite(o.meta.poll_observed_at)
+              ? o.meta.poll_observed_at
+              : undefined;
+          // 仅在同一时钟标尺下判陈旧：修订计数对修订计数，归一化编辑时间戳对编辑时间戳，绝不混比
+          if (curVer !== undefined && nextVer !== undefined && nextVer < curVer) continue;
+          if (curEditTime !== undefined && nextEditTime !== undefined && nextEditTime < curEditTime) continue;
+          const hasNewerRevision =
+            (curVer !== undefined && nextVer !== undefined && nextVer > curVer) ||
+            (curEditTime !== undefined && nextEditTime !== undefined && nextEditTime > curEditTime);
+          if (!hasNewerRevision && curPollAt !== undefined && nextPollAt !== undefined && nextPollAt < curPollAt) {
+            continue;
+          }
+          // 若观测已被撤回或为墓碑（无论是否带服务端修订号，或仅带本地 poll_observed_at），
+          // 除非新到达的副本具备严格更高的可比服务端修订号，或经服务端权威回读确认存活（authoritative_live=true），
+          // 否则绝不允许旧搜索副本凭较新的本地轮询时间戳重新激活已撤回观测
+          const incomingAuthoritativeLive = o.meta?.authoritative_live === true;
+          const isCliIm = o.id.startsWith("im:");
+          if (
+            wasWithdrawn &&
+            (curVer !== undefined || curEditTime !== undefined || curPollAt !== undefined || wasTombstone || isCliIm) &&
+            !hasNewerRevision &&
+            !incomingAuthoritativeLive
+          ) {
+            continue;
+          }
+          const curEffectiveMeta =
+            curMeta.at_me === undefined && String(cur.kind ?? "") === "at_me" ? { ...curMeta, at_me: true } : curMeta;
+          const incomingMeta = { ...(o.meta ?? {}) };
+          delete incomingMeta.authoritative_live;
+          const nextMeta: Record<string, unknown> = { ...curEffectiveMeta, ...incomingMeta };
+          if (curVer !== undefined && nextVer !== undefined) nextMeta.edit_version = Math.max(curVer, nextVer);
+          if (curEditTime !== undefined && nextEditTime !== undefined) nextMeta.edit_time = Math.max(curEditTime, nextEditTime);
+          if (curPollAt !== undefined && nextPollAt !== undefined) nextMeta.poll_observed_at = Math.max(curPollAt, nextPollAt);
+          delete nextMeta.background_only;
+          delete nextMeta.withdrawn;
+          delete nextMeta.tombstone;
+          // 按即将落库的合并后元数据比对修订：未确认的省略（undefined）保留原值且不误触发重开，确认移除（at_me: false）则清除旧标记且后续重复投递幂等
+          const revChanged =
+            obsRevision({ text: String(cur.text ?? ""), meta: curEffectiveMeta }) !==
+            obsRevision({ text: o.text, meta: nextMeta });
+          if (wasBgOnly || wasWithdrawn || revChanged) {
+            const prevGen = typeof curMeta.edit_gen === "number" && Number.isFinite(curMeta.edit_gen) ? curMeta.edit_gen : 0;
+            const mergedMeta: Record<string, unknown> = { ...nextMeta, edit_gen: prevGen + 1 };
+            const curActorId = String(cur.actor_id ?? "");
+            const curConv = String(cur.conv ?? "");
+            const revivingPlaceholder = wasTombstone || (wasWithdrawn && !curActorId);
+            const nextSource = revivingPlaceholder ? o.source : (o.source || String(cur.source ?? "im"));
+            const nextConv = revivingPlaceholder ? o.conv : (o.conv || curConv);
+            const nextActorId = revivingPlaceholder ? o.actor_id : (o.actor_id || curActorId);
+            const nextIsMe = revivingPlaceholder || !!o.actor_id ? (o.is_me ? 1 : 0) : Number(cur.is_me ?? 0);
+            const nextTime = revivingPlaceholder ? o.time : (Number(cur.time ?? 0) || o.time);
+            upd.run(
+              nextSource,
+              o.kind,
+              nextConv,
+              o.conv_name || String(cur.conv_name ?? ""),
+              nextActorId,
+              o.actor_name || String(cur.actor_name ?? ""),
+              nextIsMe,
+              nextTime,
+              o.text,
+              o.url || String(cur.url ?? ""),
+              JSON.stringify(mergedMeta),
+              o.id,
+            );
+            // 原消息正文被编辑时，保留在修订后正文中仍然出现的精确证据摘录（避免长消息修一处错字把多条事项的不同引文都抹成开头 300 字），
+            // 仅将已从修订后正文中移除的过期摘录清空失效，等待重理解给出替换摘录（视图层会安全回退至当前正文）
+            if (String(cur.text ?? "") !== o.text) {
+              const evRows = this.db
+                .prepare("SELECT id, quote FROM ctx_evidence WHERE obs_id = ?")
+                .all(o.id) as { id: number; quote: string }[];
+              const clearQuote = this.db.prepare("UPDATE ctx_evidence SET quote = '' WHERE id = ?");
+              for (const ev of evRows) {
+                const q = (ev.quote ?? "").trim();
+                if (q && !o.text.includes(q)) {
+                  clearQuote.run(ev.id);
+                }
+              }
+            }
+            n++;
+          } else {
+            // 内容与 @mention 均未变化但收到更高的排序水位（edit_version / edit_time / poll_observed_at）：
+            // 仅推进水位元数据，不重置 processed 也不递增 edit_gen，防止后续乱序到达的中间旧版本覆写当前状态
+            const advancedVer = nextVer !== undefined && (curVer === undefined || nextVer > curVer);
+            const advancedEditTime = nextEditTime !== undefined && (curEditTime === undefined || nextEditTime > curEditTime);
+            const advancedPollAt = nextPollAt !== undefined && (curPollAt === undefined || nextPollAt > curPollAt);
+            if (advancedVer || advancedEditTime || advancedPollAt) {
+              const watermarkMeta: Record<string, unknown> = {
+                ...curMeta,
+                ...(advancedVer ? { edit_version: nextVer } : {}),
+                ...(advancedEditTime ? { edit_time: nextEditTime } : {}),
+                ...(advancedPollAt ? { poll_observed_at: nextPollAt } : {}),
+              };
+              updMetaOnly.run(JSON.stringify(watermarkMeta), o.id);
+            }
+          }
         }
+      }
+    });
+    return n;
+  }
+
+  /**
+   * 写入历史背景观测（仅插入未出现过的 ID，标为 processed = 1 且 meta.background_only = true）。
+   * 后续若该消息经真实推送或轮询到达，addObs 会将其提升为待处理。
+   * 可选 `beforeCommit` 回调在 `BEGIN IMMEDIATE` 写事务锁内执行，防止并发吊销/静音后落库背景消息。
+   */
+  addBackgroundObs(list: Obs[], beforeCommit?: () => boolean): number {
+    const now = Date.now();
+    const get = this.db.prepare("SELECT 1 FROM ctx_obs WHERE id = ?");
+    const ins = this.db.prepare(
+      `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+    );
+    let n = 0;
+    this.tx(() => {
+      if (beforeCommit && !beforeCommit()) return;
+      for (const o of list) {
+        if (!o.id || !o.time) continue;
+        if (get.get(o.id)) continue;
+        const meta = { ...(o.meta ?? {}), background_only: true };
+        ins.run(o.id, o.source, o.kind, o.conv, o.conv_name, o.actor_id, o.actor_name, o.is_me ? 1 : 0, o.time, o.text, o.url, JSON.stringify(meta), now);
+        n++;
       }
     });
     return n;
@@ -297,49 +474,356 @@ export class ContextStore {
     return r ? this.toObs(r) : undefined;
   }
 
+  obsPending(id: string): boolean {
+    const r = this.db.prepare("SELECT processed FROM ctx_obs WHERE id = ?").get(id) as { processed: number } | undefined;
+    return r !== undefined && r.processed === 0;
+  }
+
   private toObs(r: Row): Obs {
     return { ...(r as unknown as Obs), is_me: !!r.is_me, meta: j(r.meta, {}) };
   }
 
-  /** 待理解的会话（按最早未处理观测排序），排除静音会话 */
-  pendingConvs(limit: number, sources: string[] = ["im", "minutes", "doc"]): { conv: string; conv_name: string; n: number }[] {
+  private static readonly NOT_WITHDRAWN = " AND COALESCE(json_extract(meta, '$.withdrawn'), 0) = 0";
+
+  /**
+   * 按账号隔离条件：
+   *   - `undefined`：调用方未启用账号隔离过滤（单账号/非 pw 场景）；
+   *   - `null` 或 `""`：工作区当前无有效个人 Web 绑定（例如 owner.open_id 已变更或未绑定）→ 严格拦截所有 `pw:*` 观测；
+   *   - 非空原生账号 ID：严格精确匹配 `native_owner_id = ?`，隔离无主/历史遗留无归属 `pw:*` 记录，绝不混入新账号窗口。
+   */
+  private ownerClause(activeNativeOwner?: string | null): { sql: string; args: string[] } {
+    if (activeNativeOwner === undefined) return { sql: "", args: [] };
+    if (!activeNativeOwner) return { sql: " AND id NOT LIKE 'pw:%'", args: [] };
+    return {
+      sql: " AND (id NOT LIKE 'pw:%' OR COALESCE(json_extract(meta, '$.native_owner_id'), '') = ?)",
+      args: [activeNativeOwner],
+    };
+  }
+
+  /** 检查库中是否已存在归属其他账号（或缺少 native_owner_id 无法证明归属当前账号）的个人 Web 观测 */
+  hasOtherNativeOwnerObs(ownerId: string): boolean {
+    const r = this.db
+      .prepare("SELECT 1 FROM ctx_obs WHERE id LIKE 'pw:%' AND COALESCE(json_extract(meta, '$.native_owner_id'), '') != ? LIMIT 1")
+      .get(ownerId);
+    return !!r;
+  }
+
+  /**
+   * 撤回一条观测（例如消息被撤回或范围外群的 @我 被编辑移除），将其移出待处理队列并永久排除在后续理解/起草背景窗口之外：
+   *   - 当携带修订水位（`editVersion` / `editTimeMs` / `pollObservedAt`）时，比较并推进水位，避免陈旧撤回覆盖更新的存活编辑；
+   *   - 若该 ID 尚未入库但携带修订水位，写入已处理的撤回墓碑行（`processed = 1, meta.withdrawn = true`），防止后续到达的陈旧副本复活已撤回消息。
+   */
+  retirePendingObs(
+    id: string,
+    opts?: {
+      editVersion?: number;
+      editTimeMs?: number;
+      pollObservedAt?: number;
+      conv?: string;
+      source?: CtxSource;
+      kind?: string;
+      time?: number;
+    },
+  ): boolean {
+    return this.tx(() => {
+      const cur = this.db.prepare("SELECT processed, meta FROM ctx_obs WHERE id = ?").get(id) as
+        | { processed: number; meta: string }
+        | undefined;
+      const incVer =
+        typeof opts?.editVersion === "number" && Number.isFinite(opts.editVersion) ? opts.editVersion : undefined;
+      const incEditTime =
+        typeof opts?.editTimeMs === "number" && Number.isFinite(opts.editTimeMs) ? opts.editTimeMs : undefined;
+      const incPollAt =
+        typeof opts?.pollObservedAt === "number" && Number.isFinite(opts.pollObservedAt)
+          ? opts.pollObservedAt
+          : undefined;
+      if (!cur) {
+        if (incVer === undefined && incEditTime === undefined && incPollAt === undefined) return false;
+        const now = Date.now();
+        const tombstoneMeta: Record<string, unknown> = {
+          withdrawn: true,
+          tombstone: true,
+          edit_gen: 1,
+          ...(incVer !== undefined ? { edit_version: incVer } : {}),
+          ...(incEditTime !== undefined ? { edit_time: incEditTime } : {}),
+          ...(incPollAt !== undefined ? { poll_observed_at: incPollAt } : {}),
+        };
+        this.db
+          .prepare(
+            `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed)
+             VALUES (?, ?, ?, ?, '', '', '', 0, ?, '', '', ?, ?, 1)`,
+          )
+          .run(
+            id,
+            opts?.source ?? "im",
+            opts?.kind ?? "group",
+            opts?.conv ?? "im",
+            opts?.time ?? now,
+            JSON.stringify(tombstoneMeta),
+            now,
+          );
+        return true;
+      }
+      const m = j<Record<string, unknown>>(cur.meta, {});
+      const curVer = typeof m.edit_version === "number" && Number.isFinite(m.edit_version) ? m.edit_version : undefined;
+      const curEditTime =
+        typeof m.edit_time === "number" && Number.isFinite(m.edit_time) ? m.edit_time : undefined;
+      const curPollAt =
+        typeof m.poll_observed_at === "number" && Number.isFinite(m.poll_observed_at)
+          ? m.poll_observed_at
+          : undefined;
+      if (curVer !== undefined && incVer !== undefined && incVer < curVer) return false;
+      if (curEditTime !== undefined && incEditTime !== undefined && incEditTime < curEditTime) return false;
+      const hasNewer =
+        (curVer !== undefined && incVer !== undefined && incVer > curVer) ||
+        (curEditTime !== undefined && incEditTime !== undefined && incEditTime > curEditTime);
+      if (!hasNewer && curPollAt !== undefined && incPollAt !== undefined && incPollAt < curPollAt) return false;
+
+      const verChanged = incVer !== undefined && (curVer === undefined || incVer > curVer);
+      const editTimeChanged = incEditTime !== undefined && (curEditTime === undefined || incEditTime > curEditTime);
+      const pollAtChanged = incPollAt !== undefined && (curPollAt === undefined || incPollAt > curPollAt);
+      if (cur.processed !== 0 && m.withdrawn === true && !verChanged && !editTimeChanged && !pollAtChanged) {
+        return false;
+      }
+      if (cur.processed === 0 || m.withdrawn !== true) {
+        const prevGen = typeof m.edit_gen === "number" && Number.isFinite(m.edit_gen) ? m.edit_gen : 0;
+        m.edit_gen = prevGen + 1;
+      }
+      m.withdrawn = true;
+      if (incVer !== undefined) m.edit_version = curVer !== undefined ? Math.max(curVer, incVer) : incVer;
+      if (incEditTime !== undefined) m.edit_time = curEditTime !== undefined ? Math.max(curEditTime, incEditTime) : incEditTime;
+      if (incPollAt !== undefined) m.poll_observed_at = curPollAt !== undefined ? Math.max(curPollAt, incPollAt) : incPollAt;
+      this.db.prepare("UPDATE ctx_obs SET processed = 1, meta = ? WHERE id = ?").run(JSON.stringify(m), id);
+      return true;
+    });
+  }
+
+  /** 待理解的会话（按最早未处理观测排序），支持分页跳过排除列表、按当前绑定 Web 账号隔离，以及在 CLI 认证受阻时仅放行已验权的原生 pw:* IM 观测 */
+  pendingConvs(
+    limit: number,
+    sources: string[] = ["im", "minutes", "doc"],
+    opts: { excludeConvs?: Iterable<string>; activeNativeOwner?: string | null; excludeCliIm?: boolean } = {},
+  ): { conv: string; conv_name: string; n: number }[] {
+    if (!sources.length) return [];
+    const excluded = opts.excludeConvs ? [...opts.excludeConvs] : [];
+    const owner = this.ownerClause(opts.activeNativeOwner);
+    const exclSql = excluded.length ? ` AND conv NOT IN (${excluded.map(() => "?").join(",")})` : "";
+    const cliImSql = opts.excludeCliIm ? " AND NOT (source = 'im' AND id NOT LIKE 'pw:%')" : "";
     const q = `SELECT conv, MAX(conv_name) AS conv_name, COUNT(*) AS n, MIN(time) AS t FROM ctx_obs
-               WHERE processed = 0 AND source IN (${sources.map(() => "?").join(",")}) AND conv NOT IN (SELECT conv FROM ctx_mute_conv)
+               WHERE processed = 0 AND source IN (${sources.map(() => "?").join(",")}) AND conv NOT IN (SELECT conv FROM ctx_mute_conv)${ContextStore.NOT_WITHDRAWN}${exclSql}${cliImSql}${owner.sql}
                GROUP BY conv ORDER BY t LIMIT ?`;
-    return this.db.prepare(q).all(...sources, limit) as { conv: string; conv_name: string; n: number }[];
+    return this.db.prepare(q).all(...sources, ...excluded, ...owner.args, limit) as { conv: string; conv_name: string; n: number }[];
   }
 
   pendingCount(): number {
-    return (this.db.prepare("SELECT COUNT(*) AS n FROM ctx_obs WHERE processed = 0 AND source IN ('im','minutes','doc')").get() as { n: number }).n;
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM ctx_obs WHERE processed = 0 AND source IN ('im','minutes','doc')${ContextStore.NOT_WITHDRAWN}`).get() as { n: number }).n;
   }
 
-  /** 一个会话最近的观测（包含已处理的作为背景） */
   /**
    * 理解窗口：这个会话最早的一批待处理观测（按时间正序，最多 maxFresh 条）+ 它们之前的若干条已处理观测作为背景。
-   * 从最早的待处理开始，保证大群 / 停机后积压的消息分几批都能处理到，不会因为只取最近 N 条而永远卡住。
+   * 当 `opts.onlyMentions` 为 true（例如群已被移出 allowlist，仅允许真实 @我 例外）时，
+   * 在 SQL LIMIT 之前直接筛选 `kind = 'at_me'`，防止前面积压超过 60 条普通消息饿死后到的真实 @我。
    */
-  convWindow(conv: string, maxFresh = 60, context = 12): Obs[] {
-    const fresh = this.db.prepare("SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 ORDER BY time ASC LIMIT ?").all(conv, maxFresh) as Row[];
+  convWindow(
+    conv: string,
+    maxFresh = 60,
+    context = 12,
+    activeNativeOwner?: string | null,
+    opts?: { onlyMentions?: boolean; excludeCliIm?: boolean },
+  ): Obs[] {
+    const owner = this.ownerClause(activeNativeOwner);
+    const nw = ContextStore.NOT_WITHDRAWN;
+    const mentionSql = opts?.onlyMentions
+      ? " AND (kind = 'at_me' OR json_extract(meta, '$.at_me') = 1) AND COALESCE(json_extract(meta, '$.at_me'), 1) != 0 AND COALESCE(json_extract(meta, '$.is_mention_me'), 1) != 0"
+      : "";
+    const cliImSql = opts?.excludeCliIm ? " AND NOT (source = 'im' AND id NOT LIKE 'pw:%')" : "";
+    const fresh = this.db
+      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0${nw}${mentionSql}${cliImSql}${owner.sql} ORDER BY time ASC, id ASC LIMIT ?`)
+      .all(conv, ...owner.args, maxFresh) as Row[];
     if (!fresh.length) return [];
+    if (opts?.onlyMentions) {
+      return fresh.map((r) => this.toObs(r));
+    }
     const t0 = Number(fresh[0].time);
-    const before = this.db.prepare("SELECT * FROM ctx_obs WHERE conv = ? AND processed = 1 AND time <= ? ORDER BY time DESC LIMIT ?").all(conv, t0, context) as Row[];
+    const before = this.db
+      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 1 AND time <= ?${nw}${cliImSql}${owner.sql} ORDER BY time DESC, id DESC LIMIT ?`)
+      .all(conv, t0, ...owner.args, context) as Row[];
     return [...before.reverse(), ...fresh].map((r) => this.toObs(r));
   }
 
-  convObs(conv: string, since: number, limit = 80): Obs[] {
-    const rows = this.db.prepare("SELECT * FROM ctx_obs WHERE conv = ? AND time >= ? ORDER BY time DESC LIMIT ?").all(conv, since, limit) as Row[];
+  /**
+   * 快通道理解窗口：
+   *   - 若触发消息（targetObsId）已被常规周期或前序作业处理完（或已撤回/不属于当前账号），直接返回空数组；
+   *   - 当 `opts.onlyMentions` 为 true（群已移出白名单/有效发言群，仅允许真实 @我）时，仅选择真实 `@me` 观测，不混入普通群消息或普通背景；
+   *   - 否则包含触发消息及其前后待处理消息（最多 maxFresh 条）、紧贴触发前的最近背景，并为批次中**所有**待处理话题消息补齐 root/parent 锚点。
+   */
+  convWindowAround(
+    conv: string,
+    targetObsId: string,
+    maxFresh = 60,
+    context = 12,
+    activeNativeOwner?: string | null,
+    opts?: { onlyMentions?: boolean },
+  ): Obs[] {
+    const owner = this.ownerClause(activeNativeOwner);
+    const nw = ContextStore.NOT_WITHDRAWN;
+    const mentionSql = opts?.onlyMentions
+      ? " AND (kind = 'at_me' OR json_extract(meta, '$.at_me') = 1) AND COALESCE(json_extract(meta, '$.at_me'), 1) != 0 AND COALESCE(json_extract(meta, '$.is_mention_me'), 1) != 0"
+      : "";
+    const target = this.db
+      .prepare(`SELECT * FROM ctx_obs WHERE id = ? AND conv = ? AND processed = 0${nw}${mentionSql}${owner.sql}`)
+      .get(targetObsId, conv, ...owner.args) as Row | undefined;
+    if (!target) return [];
+    const targetTime = Number(target.time);
+    const after = this.db
+      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 AND time >= ?${nw}${mentionSql}${owner.sql} ORDER BY time ASC, id ASC LIMIT ?`)
+      .all(conv, targetTime, ...owner.args, maxFresh) as Row[];
+    const hasTarget = after.some((r) => String(r.id) === String(target.id));
+    let fresh = hasTarget ? after : [target, ...after.slice(0, Math.max(0, maxFresh - 1))];
+    const rem = maxFresh - fresh.length;
+    if (rem > 0) {
+      const seen = new Set(fresh.map((r) => String(r.id)));
+      const earlierPending = this.db
+        .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND processed = 0 AND time <= ?${nw}${mentionSql}${owner.sql} ORDER BY time DESC, id DESC LIMIT ?`)
+        .all(conv, targetTime, ...owner.args, rem + seen.size) as Row[];
+      const extra = earlierPending.filter((r) => !seen.has(String(r.id))).slice(0, rem).reverse();
+      fresh = [...extra, ...fresh];
+    }
+    fresh.sort((a, b) => Number(a.time) - Number(b.time) || String(a.id).localeCompare(String(b.id)));
+    if (opts?.onlyMentions) {
+      return fresh.map((r) => this.toObs(r));
+    }
+    const includedIds = new Set(fresh.map((r) => String(r.id)));
+    // 独立拉取紧贴触发消息之前的最近背景（以 targetTime 为锚点而非最早积压 t0，防止刚补读的近邻背景被旧积压挤出）
+    const beforeTrigger = (
+      this.db
+        .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND time <= ?${nw}${owner.sql} ORDER BY time DESC, id DESC LIMIT ?`)
+        .all(conv, targetTime, ...owner.args, context + includedIds.size) as Row[]
+    )
+      .filter((r) => !includedIds.has(String(r.id)))
+      .slice(0, context);
+    beforeTrigger.forEach((r) => includedIds.add(String(r.id)));
+
+    // 显式补齐本批次所有待处理消息的话题根消息与引用父消息锚点（避免防抖合并多话题 @我 时丢失任一话题上下文）
+    const anchors: Row[] = [];
+    for (const f of fresh) {
+      const meta = j<Record<string, unknown>>(f.meta, {});
+      for (const rawId of [String(meta.native_root_id ?? ""), String(meta.native_parent_id ?? "")]) {
+        if (!rawId) continue;
+        const anchorObsId = `pw:${rawId}`;
+        if (includedIds.has(anchorObsId)) continue;
+        const row = this.db
+          .prepare(`SELECT * FROM ctx_obs WHERE id = ? AND conv = ?${nw}${owner.sql}`)
+          .get(anchorObsId, conv, ...owner.args) as Row | undefined;
+        if (row) {
+          anchors.push(row);
+          includedIds.add(String(row.id));
+        }
+      }
+    }
+    const combined = [...anchors, ...beforeTrigger, ...fresh];
+    combined.sort((a, b) => Number(a.time) - Number(b.time) || String(a.id).localeCompare(String(b.id)));
+    return combined.map((r) => this.toObs(r));
+  }
+
+  convObs(conv: string, since: number, limit = 80, activeNativeOwner?: string | null): Obs[] {
+    const owner = this.ownerClause(activeNativeOwner);
+    const rows = this.db
+      .prepare(`SELECT * FROM ctx_obs WHERE conv = ? AND time >= ?${ContextStore.NOT_WITHDRAWN}${owner.sql} ORDER BY time DESC LIMIT ?`)
+      .all(conv, since, ...owner.args, limit) as Row[];
     return rows.map((r) => this.toObs(r)).reverse();
   }
 
-  markProcessed(ids: string[]): void {
-    const st = this.db.prepare("UPDATE ctx_obs SET processed = 1 WHERE id = ?");
-    this.tx(() => ids.forEach((id) => st.run(id)));
+  latestConvObs(conv: string): Obs | undefined {
+    const row = this.db.prepare("SELECT * FROM ctx_obs WHERE conv = ? ORDER BY time DESC LIMIT 1").get(conv) as Row | undefined;
+    return row ? this.toObs(row) : undefined;
+  }
+
+  isDmConv(conv: string): boolean {
+    return !!this.db
+      .prepare("SELECT 1 FROM ctx_obs WHERE conv = ? AND (kind = 'p2p' OR lower(coalesce(json_extract(meta, '$.chat_type'), '')) = 'p2p') LIMIT 1")
+      .get(conv);
+  }
+
+  /**
+   * 标记观测为已处理；传入 `{ id, rev }` 或 `{ id, text }` 时仅当当前修订与送给模型的版本一致才标记，
+   * 防止模型推理期间到达的正文或 @mention 编辑被旧批次静默吞掉。
+   */
+  markProcessed(entries: (string | { id: string; text?: string; rev?: string })[]): void {
+    const get = this.db.prepare("SELECT text, meta FROM ctx_obs WHERE id = ?");
+    const upd = this.db.prepare("UPDATE ctx_obs SET processed = 1, meta = ? WHERE id = ? AND text = ? AND meta = ?");
+    this.tx(() => {
+      for (const entry of entries) {
+        const id = typeof entry === "string" ? entry : entry.id;
+        const expectedRev = typeof entry === "string" ? undefined : entry.rev;
+        const expectedText = typeof entry === "string" ? undefined : entry.text;
+        const cur = get.get(id) as { text: string; meta: string } | undefined;
+        if (!cur) continue;
+        const m = j<Record<string, unknown>>(cur.meta, {});
+        if (expectedRev !== undefined && obsRevision({ text: cur.text, meta: m }) !== expectedRev) continue;
+        if (expectedRev === undefined && expectedText !== undefined && cur.text !== expectedText) continue;
+        if (m.background_only) delete m.background_only;
+        upd.run(JSON.stringify(m), id, cur.text, cur.meta);
+      }
+    });
+  }
+
+  /** 跨进程会话理解占坑：绑定唯一 holder 令牌与进程 proc_owner，避免旧进程接管失效后误续租或误释放新进程占坑 */
+  claimConv(conv: string, holder: string, procOwner: string, ttlMs = 120_000, now = Date.now()): boolean {
+    return this.tx(() => {
+      const cur = this.db.prepare("SELECT holder, proc_owner, expires_at FROM ctx_conv_claim WHERE conv = ?").get(conv) as
+        | { holder: string; proc_owner: string; expires_at: number }
+        | undefined;
+      if (
+        cur &&
+        !(cur.holder === holder && cur.proc_owner === procOwner) &&
+        cur.expires_at > now &&
+        !isDeadOwner(cur.proc_owner, procOwner)
+      ) {
+        return false;
+      }
+      this.db
+        .prepare("INSERT OR REPLACE INTO ctx_conv_claim (conv, holder, proc_owner, expires_at) VALUES (?, ?, ?, ?)")
+        .run(conv, holder, procOwner, now + ttlMs);
+      return true;
+    });
+  }
+
+  renewConv(conv: string, holder: string, procOwner?: string, ttlMs = 120_000, now = Date.now()): boolean {
+    const r = procOwner
+      ? this.db
+          .prepare("UPDATE ctx_conv_claim SET expires_at = ? WHERE conv = ? AND holder = ? AND proc_owner = ? AND expires_at > ?")
+          .run(now + ttlMs, conv, holder, procOwner, now)
+      : this.db
+          .prepare("UPDATE ctx_conv_claim SET expires_at = ? WHERE conv = ? AND holder = ? AND expires_at > ?")
+          .run(now + ttlMs, conv, holder, now);
+    return Number(r.changes) > 0;
+  }
+
+  /** 在写事务内校验会话认领租约仍由指定执行者有效持有（未过期且未被他进程接管） */
+  isConvClaimedBy(conv: string, holder: string, procOwner: string, now = Date.now()): boolean {
+    return !!this.db
+      .prepare("SELECT 1 FROM ctx_conv_claim WHERE conv = ? AND holder = ? AND proc_owner = ? AND expires_at > ?")
+      .get(conv, holder, procOwner, now);
+  }
+
+  releaseConv(conv: string, holder: string, procOwner?: string): void {
+    if (procOwner) {
+      this.db.prepare("DELETE FROM ctx_conv_claim WHERE conv = ? AND holder = ? AND proc_owner = ?").run(conv, holder, procOwner);
+    } else {
+      this.db.prepare("DELETE FROM ctx_conv_claim WHERE conv = ? AND holder = ?").run(conv, holder);
+    }
   }
 
   muteConv(conv: string, name: string, muted: boolean): void {
-    if (muted) this.db.prepare("INSERT OR REPLACE INTO ctx_mute_conv (conv, name, at) VALUES (?, ?, ?)").run(conv, name, Date.now());
+    const resolvedName = name || (muted ? this.latestConvObs(conv)?.conv_name ?? "" : "");
+    if (muted) this.db.prepare("INSERT OR REPLACE INTO ctx_mute_conv (conv, name, at) VALUES (?, ?, ?)").run(conv, resolvedName, Date.now());
     else this.db.prepare("DELETE FROM ctx_mute_conv WHERE conv = ?").run(conv);
     if (muted) this.db.prepare("UPDATE ctx_obs SET processed = 1 WHERE conv = ?").run(conv);
+  }
+
+  isConvMutedById(conv: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM ctx_mute_conv WHERE conv = ?").get(conv);
   }
 
   mutedConvs(): { conv: string; name: string }[] {
@@ -597,19 +1081,36 @@ export class ContextStore {
 
   addEvidence(entity: string, entityId: string, obsId: string, quote: string, time: number): void {
     this.db
-      .prepare("INSERT OR IGNORE INTO ctx_evidence (entity, entity_id, obs_id, quote, time) VALUES (?, ?, ?, ?, ?)")
+      .prepare(
+        `INSERT INTO ctx_evidence (entity, entity_id, obs_id, quote, time) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(entity, entity_id, obs_id) DO UPDATE SET quote = excluded.quote, time = MAX(time, excluded.time)`,
+      )
       .run(entity, entityId, obsId, quote.slice(0, 300), time);
   }
 
-  evidence(entity: string, entityId: string, limit = 20): EvidenceRow[] {
-    return this.db.prepare("SELECT * FROM ctx_evidence WHERE entity = ? AND entity_id = ? ORDER BY time DESC LIMIT ?").all(entity, entityId, limit) as unknown as EvidenceRow[];
+  /** 查询实体的证据列表：默认排除已撤回观测的摘录，避免新卡片、视图与委派派单继续携带已撤回原文（审计可显式传 includeWithdrawn: true） */
+  evidence(entity: string, entityId: string, limit = 20, opts?: { includeWithdrawn?: boolean }): EvidenceRow[] {
+    if (opts?.includeWithdrawn) {
+      return this.db
+        .prepare("SELECT * FROM ctx_evidence WHERE entity = ? AND entity_id = ? ORDER BY time DESC LIMIT ?")
+        .all(entity, entityId, limit) as unknown as EvidenceRow[];
+    }
+    return this.db
+      .prepare(
+        `SELECT e.* FROM ctx_evidence e
+         LEFT JOIN ctx_obs o ON o.id = e.obs_id
+         WHERE e.entity = ? AND e.entity_id = ?
+           AND COALESCE(json_extract(o.meta, '$.withdrawn'), 0) = 0
+         ORDER BY e.time DESC LIMIT ?`,
+      )
+      .all(entity, entityId, limit) as unknown as EvidenceRow[];
   }
 
-  /** 事项最近一次证据所在的会话（起草回复时用） */
+  /** 事项最近一次有效（未撤回）证据所在的会话（起草回复时用） */
   lastEvidenceObs(entity: string, entityId: string, filter?: (o: Obs) => boolean): Obs | undefined {
     for (const e of this.evidence(entity, entityId, 50)) {
       const o = this.obs(e.obs_id);
-      if (o && (!filter || filter(o))) return o;
+      if (o && o.meta.withdrawn !== true && (!filter || filter(o))) return o;
     }
     return undefined;
   }
@@ -677,17 +1178,32 @@ export class ContextStore {
   // ───────── 冲突 ─────────
 
   addConflict(c: { project_id: string; topic: string; claims: ConflictRow["claims"]; ref?: string }): ConflictRow {
+    const stampedClaims: ConflictRow["claims"] = c.claims.map((cl) => {
+      if (cl.obs_rev) return cl;
+      const obs = cl.obs_id ? this.obs(cl.obs_id) : undefined;
+      return obs ? { ...cl, obs_rev: obsRevisionToken(obs) } : cl;
+    });
+    const normalizedInput = { ...c, claims: stampedClaims };
     const byRef = c.ref ? this.conflicts("open").find((x) => x.id === c.ref) : undefined;
-    const open = byRef ?? this.conflicts("open").find((x) => sameConflict(x, c));
+    const open = byRef ?? this.conflicts("open").find((x) => sameConflict(x, normalizedInput));
     if (open) {
       const claims = [...open.claims];
-      for (const cl of c.claims) if (!claims.some((x) => x.obs_id === cl.obs_id)) claims.push(cl);
+      for (const cl of stampedClaims) {
+        // 仅当 obs_id 与 obs_rev 完全一致时去重；若源消息被编辑后产出新 obs_rev，追加新索引而非原地覆盖旧索引，
+        // 从而旧卡片（即便未带 obs_rev）点击旧 choice 仍命中已失效的旧 obs_rev 并被拒绝
+        const sameRevIdx = claims.findIndex((x) => x.obs_id === cl.obs_id && (x.obs_rev ?? "") === (cl.obs_rev ?? ""));
+        if (sameRevIdx >= 0) {
+          claims[sameRevIdx] = cl;
+        } else {
+          claims.push(cl);
+        }
+      }
       this.db.prepare("UPDATE ctx_conflict SET claims = ? WHERE id = ?").run(JSON.stringify(claims), open.id);
       return { ...open, claims };
     }
     const id = newId("cfl");
-    this.db.prepare("INSERT INTO ctx_conflict (id, project_id, topic, claims, status, created) VALUES (?, ?, ?, ?, 'open', ?)").run(id, c.project_id, c.topic, JSON.stringify(c.claims), Date.now());
-    return { id, ...c, status: "open", resolution: "", created: Date.now() };
+    this.db.prepare("INSERT INTO ctx_conflict (id, project_id, topic, claims, status, created) VALUES (?, ?, ?, ?, 'open', ?)").run(id, c.project_id, c.topic, JSON.stringify(stampedClaims), Date.now());
+    return { id, ...normalizedInput, status: "open", resolution: "", created: Date.now() };
   }
 
   conflicts(status?: "open" | "resolved"): ConflictRow[] {
@@ -709,7 +1225,12 @@ export class ContextStore {
       for (let k = i + 1; k < open.length; k++) {
         const dup = open[k];
         if (gone.has(dup.id) || !sameConflict(keep, dup)) continue;
-        for (const cl of dup.claims) if (!keep.claims.some((x) => x.obs_id === cl.obs_id && x.claim === cl.claim)) keep.claims.push(cl);
+        for (const cl of dup.claims) {
+          const sameRev = keep.claims.some((x) => x.obs_id === cl.obs_id && (x.obs_rev ?? "") === (cl.obs_rev ?? ""));
+          if (!sameRev) {
+            keep.claims.push(cl);
+          }
+        }
         this.db.prepare("UPDATE ctx_conflict SET claims = ? WHERE id = ?").run(JSON.stringify(keep.claims), keep.id);
         this.db.prepare("DELETE FROM ctx_conflict WHERE id = ?").run(dup.id);
         gone.add(dup.id);
@@ -744,13 +1265,21 @@ export class ContextStore {
     return { ...(r as unknown as DraftRow), target: j(r.target, {}) };
   }
 
+  hasProposedDraft(itemId: string, kind: CtxDraftKind): boolean {
+    if (!itemId) return false;
+    return !!this.db
+      .prepare("SELECT 1 FROM ctx_draft WHERE item_id = ? AND kind = ? AND status = 'proposed' LIMIT 1")
+      .get(itemId, kind);
+  }
+
   addDraft(d: Omit<DraftRow, "id" | "created" | "updated" | "status" | "error">): DraftRow {
     const now = Date.now();
-    // 同一事项同一类型只保留一份待确认草稿
-    const old = this.db.prepare("SELECT id FROM ctx_draft WHERE item_id = ? AND kind = ? AND status = 'proposed'").get(d.item_id, d.kind) as { id: string } | undefined;
-    if (old && d.item_id) {
-      this.db.prepare("UPDATE ctx_draft SET content = ?, target = ?, target_label = ?, updated = ? WHERE id = ?").run(d.content, JSON.stringify(d.target), d.target_label, now, old.id);
-      return this.draft(old.id)!;
+    // 同一事项同一类型已有待确认草稿时，先将旧草稿标为 discarded 再签发新 ID（绝不复用旧 ID 原地替换目标与正文，
+    // 防止用户从尚未刷新的旧卡片/标签页点击确认时，把审阅过的正文错发到新会话）
+    if (d.item_id) {
+      this.db
+        .prepare("UPDATE ctx_draft SET status = 'discarded', updated = ? WHERE item_id = ? AND kind = ? AND status = 'proposed'")
+        .run(now, d.item_id, d.kind);
     }
     const id = newId("drf");
     this.db
@@ -791,6 +1320,35 @@ export class ContextStore {
     this.tx(() => {
       this.db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(id);
       this.db.prepare("DELETE FROM ctx_evidence WHERE entity = ? AND entity_id = ?").run(entity, id);
+    });
+  }
+
+  /**
+   * 在仍持有该会话占坑租约的同一写事务内，只将指定提交给模型的精确观测（且当前修订仍匹配）标为已处理，
+   * 避免 mention-only 失败跳过把该群未送入模型的普通待处理消息一并吞掉。
+   */
+  skipObsIfClaimed(
+    conv: string,
+    entries: { id: string; rev: string }[],
+    holder: string,
+    procOwner: string,
+    now = Date.now(),
+  ): number {
+    if (!entries.length) return 0;
+    const get = this.db.prepare("SELECT conv, text, meta, processed FROM ctx_obs WHERE id = ?");
+    const upd = this.db.prepare("UPDATE ctx_obs SET processed = 1, meta = ? WHERE id = ? AND text = ? AND meta = ?");
+    return this.tx(() => {
+      if (!this.isConvClaimedBy(conv, holder, procOwner, now)) return 0;
+      let n = 0;
+      for (const entry of entries) {
+        const cur = get.get(entry.id) as { conv: string; text: string; meta: string; processed: number } | undefined;
+        if (!cur || cur.processed !== 0 || cur.conv !== conv) continue;
+        const m = j<Record<string, unknown>>(cur.meta, {});
+        if (obsRevision({ text: cur.text, meta: m }) !== entry.rev) continue;
+        if (m.background_only) delete m.background_only;
+        n += Number(upd.run(JSON.stringify(m), entry.id, cur.text, cur.meta).changes);
+      }
+      return n;
     });
   }
 

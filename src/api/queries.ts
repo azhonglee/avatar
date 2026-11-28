@@ -1,11 +1,16 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { Cron } from "croner";
+import { tryGit } from "../delivery/git.ts";
 import type { App } from "../app.ts";
+import { CommandError } from "../commands.ts";
+import { repoSpec } from "../config.ts";
+import { hasWorkspaceOwnerMismatch } from "../context/personal-web.ts";
 import { availableActions } from "../core-commands.ts";
 import type { Effect, WorkItem } from "../ledger.ts";
-import { runProcess } from "../util.ts";
-import type { DispatchPayload } from "../workflows/dispatch.ts";
+import { errMsg, log } from "../util.ts";
+import { parseRepo, type DispatchPayload } from "../workflows/dispatch.ts";
 import type {
   AuditView,
   DeliveryStatus,
@@ -130,7 +135,13 @@ function startOfLocalDay(tz: string, now = Date.now()): number {
 
 export function overview(app: App): Overview {
   const { ledger, cfg } = app;
-  const recent = ledger.list<DispatchPayload>({ kinds: ["dispatch"], limit: 500 }).filter((w) => !w.terminal || w.updated > Date.now() - 14 * DAY);
+  const ownerBatch = new HealthOwnerBatch(app);
+  const rawRecent = ledger
+    .list<DispatchPayload>({ kinds: ["dispatch"], limit: 500 })
+    .filter((w) => !w.terminal || w.updated > Date.now() - 14 * DAY);
+  if (ownerBatch.hasForeignOrigins) ownerBatch.preloadPage(rawRecent);
+  const recent = rawRecent.filter((w) => !ownerBatch.isDispatchBlocked(w));
+  ownerBatch.clearPageCache();
   const latest = latestPerCard(app, recent);
   const needs = latest.filter((w) => ATTENTION.includes(w.state as DispatchState)).map((w) => summarize(app, w));
   const review = latest
@@ -141,13 +152,16 @@ export function overview(app: App): Overview {
   const dayStart = startOfLocalDay(cfg.owner.timezone);
   const today = recent.filter((w) => w.created >= dayStart);
   const count = (s: string) => today.filter((w) => w.state === s).length;
-  const h = health(app);
+  const h = health(app, ownerBatch);
+  // 使用 health() 在全 14 天报告窗口内分页统计出的当前主人未确认可操作失败总数，
+  // 避免最新 200 条失败被旧主人隔离记录占满时把当前主人的待处理失败挤出概览或误判为健康
+  const actionableCount = h.actionable_failures;
   return {
     attention: {
       needs_human: needs.filter((s) => !(s.delivery === "discarded")),
       to_review: review,
       candidates: app.ext.candidates?.pendingCount() ?? 0,
-      failures: h.failed.filter((f) => !f.acknowledged).length,
+      failures: actionableCount,
     },
     running,
     today: {
@@ -159,10 +173,10 @@ export function overview(app: App): Overview {
       budget_usd: cfg.budget.daily_usd,
     },
     health: {
-      ok: !!h.daemon.last_heartbeat && Date.now() - h.daemon.last_heartbeat < 60_000 && h.failed.every((f) => f.acknowledged),
+      ok: !!h.daemon.last_heartbeat && Date.now() - h.daemon.last_heartbeat < 60_000 && actionableCount === 0,
       pending_events: ledger.active("event").length,
       pending_effects: ledger.active("effect").length,
-      dead: h.failed.filter((f) => !f.acknowledged).length,
+      dead: actionableCount,
       daemon_owner: h.daemon.owner,
     },
   };
@@ -170,26 +184,350 @@ export function overview(app: App): Overview {
 
 export type DispatchFilter = "active" | "attention" | "review" | "done" | "all";
 
-export function listDispatches(app: App, f: { filter?: DispatchFilter; q?: string; limit?: number }): DispatchSummary[] {
-  const items = app.ledger.list<DispatchPayload>({ kinds: ["dispatch"], limit: Math.min(f.limit ?? 200, 500) });
-  const q = f.q?.trim().toLowerCase();
-  return items
-    .filter((w) => {
-      switch (f.filter ?? "all") {
-        case "active":
-          return !w.terminal;
-        case "attention":
-          return ATTENTION.includes(w.state as DispatchState);
-        case "review":
-          return REVIEW.includes(w.state as DispatchState);
-        case "done":
-          return w.terminal;
-        default:
-          return true;
+/** 判断某条派单（或其关联任务 ref / 交付工作 / 卡片 key / 完整重试链路）是否源自工作上下文委派且归属的旧主人与当前配置 owner.open_id 不一致 */
+export function isContextDerivedDispatchBlocked(app: Pick<App, "cfg" | "store" | "ledger">, dispatchId: string): boolean {
+  if (!dispatchId) return false;
+  const curOwner = app.cfg.owner.open_id.trim();
+  const normalized = dispatchId.startsWith("card:") ? dispatchId.slice("card:".length) : dispatchId;
+  const w = app.ledger.get(normalized);
+  if (w?.kind === "delivery") {
+    const p = w.payload as { dispatch_id?: unknown; guid?: unknown };
+    const candidates = [
+      w.ref,
+      typeof p.dispatch_id === "string" ? p.dispatch_id : "",
+      typeof p.guid === "string" ? p.guid : "",
+    ].filter(Boolean);
+    if (candidates.some((c) => c !== normalized && isContextDerivedDispatchBlocked(app, c))) return true;
+  } else if (!w && normalized.startsWith("delivery:")) {
+    const rest = normalized.slice("delivery:".length);
+    if (rest.startsWith("dispatch:")) {
+      const parts = rest.split(":");
+      const parsedDispatchId = parts.length >= 3 ? parts.slice(0, 3).join(":") : "";
+      const parsedDeliveryGuid = parts[1] ?? "";
+      if (parsedDispatchId && isContextDerivedDispatchBlocked(app, parsedDispatchId)) return true;
+      if (parsedDeliveryGuid && isContextDerivedDispatchBlocked(app, parsedDeliveryGuid)) return true;
+    }
+  }
+  const parsedGuid = normalized.startsWith("dispatch:") ? (normalized.split(":")[1] ?? "") : "";
+  const candidateGuids = [...new Set([normalized, w?.ref ?? "", parsedGuid].filter(Boolean))];
+  const directOrigin = (app.store.get(`ctx.dispatch_owner.${normalized}`) ?? "").trim();
+  const refOrigin = (w?.ref ? app.store.get(`ctx.dispatch_ref_owner.${w.ref}`) : undefined)?.trim() ?? "";
+  const idAsRefOrigin = (app.store.get(`ctx.dispatch_ref_owner.${normalized}`) ?? "").trim();
+  const parsedGuidOrigin = parsedGuid ? (app.store.get(`ctx.dispatch_ref_owner.${parsedGuid}`) ?? "").trim() : "";
+  const ownTaskOrigin =
+    candidateGuids
+      .map((g) => (app.store.get(`ctx.own_task_owner.${g}`) ?? "").trim())
+      .find(Boolean) ?? "";
+  const originOwner = directOrigin || refOrigin || idAsRefOrigin || parsedGuidOrigin || ownTaskOrigin;
+  if (originOwner && originOwner !== curOwner) return true;
+  const prevOwnerOpenId = (app.store.get("owner.open_id") ?? "").trim();
+  const ownerSwitched =
+    hasWorkspaceOwnerMismatch(app.store, curOwner) ||
+    (!!prevOwnerOpenId && prevOwnerOpenId !== curOwner);
+  if (!ownerSwitched) return false;
+  if (originOwner) return true;
+  // 兜底兼容升级前已通过 task.create_own 或 item_delegate 创建但尚未写 owner 标记的派单/任务（含同 ref 的完整重试历史与卡片 key）
+  try {
+    for (const g of candidateGuids) {
+      const legacyOwn = app.store.db
+        .prepare("SELECT 1 FROM kv WHERE k LIKE 'op.task.create_own.%' AND v = ? LIMIT 1")
+        .get(g);
+      if (legacyOwn) return true;
+    }
+    const hasTable = app.store.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ctx_item'").get();
+    if (!hasTable) return false;
+    const directRow = app.store.db
+      .prepare("SELECT 1 FROM ctx_item WHERE json_extract(meta, '$.delegated') = ? LIMIT 1")
+      .get(normalized);
+    if (directRow) return true;
+    const candidateRef = w?.ref || parsedGuid || normalized;
+    if (candidateRef) {
+      const refRow = app.store.db
+        .prepare("SELECT 1 FROM ctx_item WHERE json_extract(meta, '$.delegated') = ? LIMIT 1")
+        .get(candidateRef);
+      if (refRow) return true;
+      const historyRow = app.store.db
+        .prepare(
+          `SELECT 1 FROM work w
+            WHERE w.kind = 'dispatch' AND w.ref = ?
+              AND EXISTS (SELECT 1 FROM ctx_item ci WHERE json_extract(ci.meta, '$.delegated') = w.id)
+            LIMIT 1`,
+        )
+        .get(candidateRef);
+      if (historyRow) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** 判断某条个人任务 GUID（含上下文委派派单任务与自主创建的 task.create_own 任务）是否归属旧主人而应对当前主人隐藏 */
+export function isContextOwnedTaskBlocked(app: Pick<App, "cfg" | "store" | "ledger">, guid: string): boolean {
+  if (!guid) return false;
+  if (isContextDerivedDispatchBlocked(app, guid)) return true;
+  const curOwner = app.cfg.owner.open_id.trim();
+  const ownOrigin = (app.store.get(`ctx.own_task_owner.${guid}`) ?? "").trim();
+  if (ownOrigin && ownOrigin !== curOwner) return true;
+  const prevOwnerOpenId = (app.store.get("owner.open_id") ?? "").trim();
+  const ownerSwitched =
+    hasWorkspaceOwnerMismatch(app.store, curOwner) ||
+    (!!prevOwnerOpenId && prevOwnerOpenId !== curOwner);
+  if (!ownerSwitched) return false;
+  if (ownOrigin) return true;
+  // 兼容升级前通过 task.create_own 创建、仅在 op.task.create_own.* 记录了 guid 的自主任务
+  try {
+    const legacyOwn = app.store.db
+      .prepare("SELECT 1 FROM kv WHERE k LIKE 'op.task.create_own.%' AND v = ? LIMIT 1")
+      .get(guid);
+    if (legacyOwn) return true;
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
+/**
+ * 判断某条派单 / 交付工作 / 任务 GUID 是否源自工作上下文（无论当前工作区配置主人是否变更）。
+ * 用于在投递其后续评论/移列/完成副作用前强制核验活跃 lark-cli 登录用户，防止 CLI 切号后以他人身份发布委派报告。
+ */
+export function isContextDerivedWorkOrTask(
+  app: Pick<App, "cfg" | "store" | "ledger">,
+  idOrGuid: string,
+  visited: Set<string> = new Set(),
+): boolean {
+  if (!idOrGuid) return false;
+  const normalized = idOrGuid.startsWith("card:") ? idOrGuid.slice("card:".length) : idOrGuid;
+  if (!normalized || visited.has(normalized)) return false;
+  visited.add(normalized);
+
+  const w = app.ledger.get(normalized);
+  if (w?.kind === "delivery") {
+    const p = w.payload as { dispatch_id?: unknown; guid?: unknown };
+    const candidates = [
+      w.ref,
+      typeof p.dispatch_id === "string" ? p.dispatch_id : "",
+      typeof p.guid === "string" ? p.guid : "",
+    ].filter(Boolean);
+    if (candidates.some((c) => isContextDerivedWorkOrTask(app, c, visited))) return true;
+  } else if (!w && normalized.startsWith("delivery:")) {
+    const rest = normalized.slice("delivery:".length);
+    if (rest.startsWith("dispatch:")) {
+      const parts = rest.split(":");
+      const parsedDispatchId = parts.length >= 3 ? parts.slice(0, 3).join(":") : "";
+      const parsedDeliveryGuid = parts[1] ?? "";
+      if (parsedDispatchId && isContextDerivedWorkOrTask(app, parsedDispatchId, visited)) return true;
+      if (parsedDeliveryGuid && isContextDerivedWorkOrTask(app, parsedDeliveryGuid, visited)) return true;
+    }
+  }
+
+  const parsedGuid = normalized.startsWith("dispatch:") ? (normalized.split(":")[1] ?? "") : "";
+  const hasOrigin =
+    !!(app.store.get(`ctx.dispatch_owner.${normalized}`) ?? "").trim() ||
+    !!(w?.ref ? (app.store.get(`ctx.dispatch_ref_owner.${w.ref}`) ?? "").trim() : "") ||
+    !!(app.store.get(`ctx.dispatch_ref_owner.${normalized}`) ?? "").trim() ||
+    !!(parsedGuid ? (app.store.get(`ctx.dispatch_ref_owner.${parsedGuid}`) ?? "").trim() : "") ||
+    !!(app.store.get(`ctx.own_task_owner.${normalized}`) ?? "").trim() ||
+    !!(w?.ref ? (app.store.get(`ctx.own_task_owner.${w.ref}`) ?? "").trim() : "") ||
+    !!(parsedGuid ? (app.store.get(`ctx.own_task_owner.${parsedGuid}`) ?? "").trim() : "");
+  if (hasOrigin) return true;
+
+  try {
+    const candidateRef = w?.ref || parsedGuid || normalized;
+    const hasCtxTable = app.store.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ctx_item'").get();
+    if (hasCtxTable) {
+      if (app.store.db.prepare("SELECT 1 FROM ctx_item WHERE json_extract(meta, '$.delegated') = ? LIMIT 1").get(normalized)) {
+        return true;
       }
-    })
-    .filter((w) => !q || `${w.payload.summary ?? ""} ${w.ref} ${w.id}`.toLowerCase().includes(q))
-    .map((w) => summarize(app, w));
+      if (candidateRef) {
+        if (app.store.db.prepare("SELECT 1 FROM ctx_item WHERE json_extract(meta, '$.delegated') = ? LIMIT 1").get(candidateRef)) {
+          return true;
+        }
+        const historyRow = app.store.db
+          .prepare(
+            `SELECT 1 FROM work w
+              WHERE w.kind = 'dispatch' AND w.ref = ?
+                AND EXISTS (SELECT 1 FROM ctx_item ci WHERE json_extract(ci.meta, '$.delegated') = w.id)
+              LIMIT 1`,
+          )
+          .get(candidateRef);
+        if (historyRow) return true;
+      }
+    }
+    if (candidateRef) {
+      const legacyOwn = app.store.db
+        .prepare("SELECT 1 FROM kv WHERE k LIKE 'op.task.create_own.%' AND v = ? LIMIT 1")
+        .get(candidateRef);
+      if (legacyOwn) return true;
+    }
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
+/** 生成紧凑的主人隔离标签（用于 brief 卡片与去重键，保证飞书 50 字符幂等键不截断冲突） */
+export function briefOwnerTag(ownerOpenId: string): string {
+  const clean = ownerOpenId.trim();
+  if (!clean) return "";
+  return createHash("sha256").update(clean).digest("hex").slice(0, 12);
+}
+
+/**
+ * 统一判断任意账本工作项 / 卡片 key（含 failure:<workId> 失败告警卡片、queued brief、delivery、effect、context）
+ * 是否应因工作区主人隔离而被阻断或隐藏。
+ */
+export function isWorkBlockedByOwner(
+  app: Pick<App, "cfg" | "store" | "ledger">,
+  workOrId: WorkItem | string,
+  visited: Set<string> = new Set(),
+): boolean {
+  const rawId = typeof workOrId === "string" ? workOrId : workOrId.id;
+  if (!rawId || visited.has(rawId)) return false;
+  visited.add(rawId);
+
+  const curOwner = app.cfg.owner.open_id.trim();
+  const curBriefTag = briefOwnerTag(curOwner);
+  const ownerMismatch = hasWorkspaceOwnerMismatch(app.store, curOwner);
+  if (typeof workOrId === "string") {
+    if (workOrId.startsWith("card:failure:")) {
+      return isWorkBlockedByOwner(app, workOrId.slice("card:failure:".length), visited);
+    }
+    if (workOrId.startsWith("failure:")) {
+      return isWorkBlockedByOwner(app, workOrId.slice("failure:".length), visited);
+    }
+  }
+
+  const w = typeof workOrId === "string" ? app.ledger.get(workOrId) : workOrId;
+  if (!w) {
+    if (ownerMismatch) {
+      const isBriefKey = rawId === "brief" || rawId.startsWith("card:brief:") || rawId.startsWith("brief:");
+      if (isBriefKey) {
+        // 显式按当前主人作用域生成的 brief 卡片键放行，未绑定或旧主人作用域的 brief 键阻断
+        return !curBriefTag || !rawId.endsWith(`-${curBriefTag}`);
+      }
+      if (
+        rawId.startsWith("card:ctx-") ||
+        rawId.startsWith("ctx-draft:") ||
+        (rawId.startsWith("context:") && rawId !== "context:pw-needs-login")
+      ) {
+        return true;
+      }
+    }
+    return isContextOwnedTaskBlocked(app, rawId);
+  }
+
+  if (ownerMismatch && isContextHealthWork(w)) return true;
+
+  if (w.kind === "context") {
+    const p = w.payload as Record<string, unknown>;
+    const boundOwner = typeof p?.owner_open_id === "string" ? p.owner_open_id.trim() : "";
+    if (boundOwner && boundOwner !== curOwner) return true;
+    const prevOwnerOpenId = (app.store.get("owner.open_id") ?? "").trim();
+    if (!boundOwner && prevOwnerOpenId && prevOwnerOpenId !== curOwner) return true;
+    return false;
+  }
+
+  if (w.kind === "dispatch" || w.kind === "delivery") {
+    if (isContextDerivedDispatchBlocked(app, w.id) || (!!w.ref && isContextDerivedDispatchBlocked(app, w.ref))) {
+      return true;
+    }
+    return false;
+  }
+
+  if (w.kind === "effect") {
+    const e = w.payload as unknown as Partial<Effect>;
+    // 显式绑定了目标主人的通知/卡片（如 sendBrief 生成的概览），仅在目标主人与当前 owner.open_id 不一致时阻断；
+    // 为当前主人重新渲染并绑定了 curOwner 的 brief（buildBrief 已按主人过滤旧上下文任务）允许正常投递，未绑定旧版 brief 保持兜底阻断
+    const boundRecipient =
+      e.args && "owner_open_id" in e.args && typeof e.args.owner_open_id === "string"
+        ? e.args.owner_open_id.trim()
+        : "";
+    if (boundRecipient && boundRecipient !== curOwner) return true;
+    const isBriefEffect =
+      w.ref === "brief" ||
+      w.ref.startsWith("card:brief:") ||
+      (e.op === "card.upsert" && typeof e.args?.key === "string" && e.args.key.startsWith("brief:"));
+    if (isBriefEffect && !boundRecipient && ownerMismatch) return true;
+    if (w.ref.startsWith("card:failure:")) {
+      if (isWorkBlockedByOwner(app, w.ref.slice("card:failure:".length), visited)) return true;
+    }
+    if (e.op === "card.upsert" && typeof e.args?.key === "string" && e.args.key.startsWith("failure:")) {
+      if (isWorkBlockedByOwner(app, e.args.key.slice("failure:".length), visited)) return true;
+    }
+    const candidates = [
+      w.ref,
+      e.op === "card.upsert" && typeof e.args?.key === "string" ? e.args.key : "",
+      e.args && "guid" in e.args && typeof e.args.guid === "string" ? e.args.guid : "",
+    ].filter(Boolean);
+    if (candidates.some((c) => isContextOwnedTaskBlocked(app, c))) return true;
+    return false;
+  }
+
+  return !!w.ref && isContextOwnedTaskBlocked(app, w.ref);
+}
+
+export function listDispatches(app: App, f: { filter?: DispatchFilter; q?: string; limit?: number }): DispatchSummary[] {
+  const maxItems = Math.min(Math.max(0, f.limit ?? 200), 500);
+  if (maxItems === 0) return [];
+  const rawQ = f.q?.trim();
+  const q = rawQ?.toLowerCase();
+  // SQLite LOWER() 仅折叠 ASCII；在全部 Unicode 码点中，仅 'i'（来自 İ U+0130）与 'k'（来自 K U+212A）
+  // 会由非 ASCII 字符经 JS .toLowerCase() 折叠进 ASCII。因此检查原始查询：仅当不含 i/k 且不含具大小写映射的非 ASCII 字符时才下推 SQL 预筛。
+  const canPushSearch =
+    !!rawQ &&
+    [...rawQ].every((ch) => {
+      const code = ch.charCodeAt(0);
+      if (code < 128) {
+        const lo = ch.toLowerCase();
+        return lo !== "i" && lo !== "k";
+      }
+      return ch.toLowerCase() === ch && ch.toUpperCase() === ch;
+    });
+  let states: string[] | undefined;
+  let terminal: boolean | undefined;
+  switch (f.filter ?? "all") {
+    case "active":
+      terminal = false;
+      break;
+    case "attention":
+      states = [...ATTENTION];
+      break;
+    case "review":
+      states = [...REVIEW];
+      break;
+    case "done":
+      terminal = true;
+      break;
+    default:
+      break;
+  }
+  const ownerBatch = new HealthOwnerBatch(app);
+  const pageSize = Math.min(Math.max(maxItems * 2, 50), 500);
+  const matched: WorkItem<DispatchPayload>[] = [];
+  let before: number | undefined;
+  for (;;) {
+    const page = app.ledger.list<DispatchPayload>({
+      kinds: ["dispatch"],
+      states,
+      terminal,
+      search: canPushSearch ? q : undefined,
+      limit: pageSize,
+      before,
+    });
+    if (!page.length) break;
+    if (ownerBatch.hasForeignOrigins) ownerBatch.preloadPage(page);
+    for (const w of page) {
+      if (q && !canPushSearch && !`${w.payload.summary ?? ""} ${w.ref} ${w.id}`.toLowerCase().includes(q)) continue;
+      if (ownerBatch.isDispatchBlocked(w)) continue;
+      matched.push(w);
+      if (matched.length >= maxItems) break;
+    }
+    if (matched.length >= maxItems || page.length < pageSize) break;
+    before = page[page.length - 1].seq;
+  }
+  ownerBatch.clearPageCache();
+  return matched.map((w) => summarize(app, w));
 }
 
 function stepView(s: ReturnType<App["ledger"]["steps"]>[number]): StepView {
@@ -237,17 +575,72 @@ function effectSummary(e: Effect): string {
 }
 
 export function auditViews(app: App, target?: string, limit = 50): AuditView[] {
-  return app.ledger.auditLog(limit, target).map((a) => ({ id: a.id, at: a.at, source: a.source, command: a.command, target: a.target, ok: !!a.ok, message: a.message }));
+  const maxItems = Math.max(0, limit);
+  if (maxItems === 0) return [];
+  const curOwner = app.cfg.owner.open_id.trim();
+  const ownerMismatch = hasWorkspaceOwnerMismatch(app.store, curOwner);
+  const pageSize = Math.min(Math.max(maxItems * 2, 50), 500);
+  const out: AuditView[] = [];
+  let before: number | undefined;
+  for (;;) {
+    const page = app.ledger.auditLog(pageSize, target, before);
+    if (!page.length) break;
+    for (const a of page) {
+      if (ownerMismatch && a.command.startsWith("context.")) continue;
+      if (a.target && isWorkBlockedByOwner(app, a.target)) continue;
+      // 嵌套委派命令（如 context.item_delegate 调用 dispatch.create 失败时无派单 ID）通过 args.__context_owner 保留主人归属隔离
+      let blockedByOrigin = false;
+      if (a.args) {
+        try {
+          const parsed = JSON.parse(a.args) as { __context_owner?: unknown };
+          if (typeof parsed.__context_owner === "string") {
+            const origin = parsed.__context_owner.trim();
+            if ((origin && origin !== curOwner) || ownerMismatch) blockedByOrigin = true;
+          }
+        } catch {
+          // ignore malformed args json
+        }
+      }
+      if (blockedByOrigin) continue;
+      out.push({ id: a.id, at: a.at, source: a.source, command: a.command, target: a.target, ok: !!a.ok, message: a.message });
+      if (out.length >= maxItems) break;
+    }
+    if (out.length >= maxItems || page.length < pageSize) break;
+    before = page[page.length - 1].id;
+  }
+  return out;
+}
+
+function dispatchRepoGuard(app: App, p: Pick<DispatchPayload, "description" | "base">): {
+  trustedRepoRoot?: string;
+  disableGitWorktreeMounts?: boolean;
+} {
+  if (!p.base) return { disableGitWorktreeMounts: true };
+  const ref = parseRepo({ description: p.description ?? "" });
+  if (!ref) return { disableGitWorktreeMounts: true };
+  return { trustedRepoRoot: repoSpec(app.cfg, ref).path };
 }
 
 export async function dispatchDetail(app: App, id: string): Promise<DispatchDetail | undefined> {
+  if (isContextDerivedDispatchBlocked(app, id)) {
+    throw new CommandError("conflict", "该派单源自旧工作区主人的工作上下文，已按主人隔离阻断访问");
+  }
   const w = app.ledger.get<DispatchPayload>(id);
   if (!w || w.kind !== "dispatch") return undefined;
   const p = w.payload;
   const s = summarize(app, w);
   const latest = app.ledger.latest("dispatch", w.ref);
   let diffStat = "";
-  if (p.base && p.cwd && fs.existsSync(p.cwd)) diffStat = (await runProcess("git", ["-C", p.cwd, "diff", "--stat", p.base])).stdout.trim();
+  if (p.base && p.cwd && fs.existsSync(p.cwd)) {
+    try {
+      diffStat = (
+        await tryGit(p.cwd, ["diff", "--stat", p.base], { cfg: app.cfg, readOnly: true, ...dispatchRepoGuard(app, p) })
+      ).stdout.trim();
+    } catch (err) {
+      log("warn", "读取派单 diffStat 失败（保留账本详情，绝不回退非隔离 Git）", { id, err: errMsg(err) });
+      diffStat = "";
+    }
+  }
   return {
     ...s,
     description: p.description ?? "",
@@ -263,7 +656,7 @@ export async function dispatchDetail(app: App, id: string): Promise<DispatchDeta
     effects: app.ledger.effectsOf(id).map((e) => ({ id: e.id, op: e.payload.op, state: e.state, summary: effectSummary(e.payload), error: e.error, updated: e.updated })),
     previous: app.ledger
       .list<DispatchPayload>({ kinds: ["dispatch"], ref: w.ref, limit: 20 })
-      .filter((x) => x.id !== id)
+      .filter((x) => x.id !== id && !isContextDerivedDispatchBlocked(app, x.id))
       .map((x) => summarize(app, x)),
     diff_stat: diffStat,
     actions: availableActions(w, {
@@ -279,15 +672,19 @@ export async function dispatchDetail(app: App, id: string): Promise<DispatchDeta
 const DIFF_MAX = 400_000;
 
 export async function dispatchDiff(app: App, id: string): Promise<DiffView | undefined> {
+  if (isContextDerivedDispatchBlocked(app, id)) {
+    throw new CommandError("conflict", "该派单源自旧工作区主人的工作上下文，已按主人隔离阻断访问");
+  }
   const w = app.ledger.get<DispatchPayload>(id);
   if (!w || w.kind !== "dispatch") return undefined;
   const p = w.payload;
   if (!p.base || !p.cwd || !fs.existsSync(p.cwd)) return { base: p.base ?? "", head: "", stat: "", patch: "", truncated: false };
+  const gitOpts = { cfg: app.cfg, readOnly: true, ...dispatchRepoGuard(app, p) };
   // 与基线比较（含尚未提交的已跟踪文件改动）；只读，不改动索引
   const [head, stat, patch] = await Promise.all([
-    runProcess("git", ["-C", p.cwd, "rev-parse", "HEAD"]),
-    runProcess("git", ["-C", p.cwd, "diff", "--stat", p.base]),
-    runProcess("git", ["-C", p.cwd, "diff", "--no-color", p.base]),
+    tryGit(p.cwd, ["rev-parse", "HEAD"], gitOpts),
+    tryGit(p.cwd, ["diff", "--stat", p.base], gitOpts),
+    tryGit(p.cwd, ["diff", "--no-color", p.base], gitOpts),
   ]);
   return {
     base: p.base,
@@ -304,6 +701,24 @@ export function stepLog(app: App, stepId: number, offset: number): LogChunk | un
   const s = app.ledger.step(stepId);
   if (!s) return undefined;
   const file = path.resolve(s.log || "");
+  if (isContextDerivedDispatchBlocked(app, s.work_id) || isWorkBlockedByOwner(app, s.work_id)) {
+    throw new CommandError("conflict", "该步骤日志属于旧工作区主人的工作上下文，已按主人隔离阻断读取");
+  }
+  const curOwner = app.cfg.owner.open_id.trim();
+  const prevOwnerOpenId = (app.store.get("owner.open_id") ?? "").trim();
+  const ownerSwitched =
+    hasWorkspaceOwnerMismatch(app.store, curOwner) ||
+    (!!prevOwnerOpenId && prevOwnerOpenId !== curOwner);
+  if (ownerSwitched) {
+    const work = app.ledger.get(s.work_id);
+    const isContextStep =
+      work?.kind === "context" ||
+      s.work_id.startsWith("context:") ||
+      path.basename(file).startsWith("context-");
+    if (isContextStep) {
+      throw new CommandError("conflict", "当前工作区 owner.open_id 与旧上下文主人不一致，已阻断读取上下文运行日志以防跨账号泄漏");
+    }
+  }
   // 只允许读取数据目录下的日志
   if (!s.log || !file.startsWith(path.resolve(app.cfg.dataDir) + path.sep) || !fs.existsSync(file)) {
     return { step_id: stepId, offset, next_offset: offset, text: "", eof: true, running: s.status === "running" };
@@ -323,10 +738,399 @@ export function stepLog(app: App, stepId: number, offset: number): LogChunk | un
   return { step_id: stepId, offset: start, next_offset: start + len, text: buf.toString("utf8"), eof: start + len >= size, running: s.status === "running" };
 }
 
-function healthItem(w: WorkItem): HealthItem {
+function isContextHealthWork(w: WorkItem<unknown>): boolean {
+  if (w.kind === "context") return true;
+  if (w.ref.startsWith("card:ctx-") || w.ref.startsWith("ctx-draft:")) return true;
+  if (w.ref.startsWith("context:") && w.ref !== "context:pw-needs-login") return true;
+  if (w.kind === "effect") {
+    const e = w.payload as unknown as Partial<Effect>;
+    if (e.op === "pw.reply") return true;
+    if (e.op === "card.upsert" && typeof e.args?.key === "string" && e.args.key.startsWith("ctx-")) return true;
+  }
+  return false;
+}
+
+/**
+ * `health()` 专用的批量主人隔离检查器：
+ *   - 在单次请求内仅以常数次 SQLite 查询预加载 `kv` 归属映射、旧主人 `ctx_item` 委派集合及历史委派 ref；
+ *   - 每页按需以 `IN (...)` 批量预取可能涉及归属链路的关联 `work` 行并缓存结果，彻底消除大窗口下的逐行 N+1 同步查询，
+ *     同时与 `isWorkBlockedByOwner` 保持逐分支一致的隔离判定语义。
+ */
+class HealthOwnerBatch {
+  readonly curOwner: string;
+  readonly curBriefTag: string;
+  readonly ownerMismatch: boolean;
+  readonly prevOwnerOpenId: string;
+  readonly ownerSwitched: boolean;
+  private readonly dispatchOwner = new Map<string, string>();
+  private readonly dispatchRefOwner = new Map<string, string>();
+  private readonly ownTaskOwner = new Map<string, string>();
+  private readonly legacyOwnTaskGuids = new Set<string>();
+  private readonly legacyDelegatedIds = new Set<string>();
+  private readonly legacyDelegatedDispatchRefs = new Set<string>();
+  private readonly hasAnyForeignOrigin: boolean;
+  /** 仅限当前分页存活的完整 WorkItem 缓存（每页开始前清空，防止大窗口故障扫描在内存中驻留全部 payload） */
+  private readonly pageWorkCache = new Map<string, WorkItem<unknown> | null>();
+  /** 跨页复用的轻量级布尔归属判定缓存（不持有任何 WorkItem payload） */
+  private readonly dispatchBlockedMemo = new Map<string, boolean>();
+  private readonly ledger: App["ledger"];
+
+  get hasForeignOrigins(): boolean {
+    return this.hasAnyForeignOrigin;
+  }
+
+  clearPageCache(): void {
+    this.pageWorkCache.clear();
+  }
+
+  constructor(app: Pick<App, "cfg" | "store" | "ledger">) {
+    this.ledger = app.ledger;
+    this.curOwner = app.cfg.owner.open_id.trim();
+    this.curBriefTag = briefOwnerTag(this.curOwner);
+    this.ownerMismatch = hasWorkspaceOwnerMismatch(app.store, this.curOwner);
+    this.prevOwnerOpenId = (app.store.get("owner.open_id") ?? "").trim();
+    this.ownerSwitched = this.ownerMismatch || (!!this.prevOwnerOpenId && this.prevOwnerOpenId !== this.curOwner);
+
+    let foreignOrigin = this.ownerSwitched;
+    try {
+      const kvRows = app.store.db
+        .prepare(
+          `SELECT k, v FROM kv
+           WHERE k LIKE 'ctx.dispatch_owner.%'
+              OR k LIKE 'ctx.dispatch_ref_owner.%'
+              OR k LIKE 'ctx.own_task_owner.%'
+              OR (? = 1 AND k LIKE 'op.task.create_own.%')`,
+        )
+        .all(this.ownerSwitched ? 1 : 0) as { k: string; v: string }[];
+      for (const row of kvRows) {
+        const val = (row.v ?? "").trim();
+        if (!val) continue;
+        if (row.k.startsWith("ctx.dispatch_owner.")) {
+          this.dispatchOwner.set(row.k.slice("ctx.dispatch_owner.".length), val);
+          if (val !== this.curOwner) foreignOrigin = true;
+        } else if (row.k.startsWith("ctx.dispatch_ref_owner.")) {
+          this.dispatchRefOwner.set(row.k.slice("ctx.dispatch_ref_owner.".length), val);
+          if (val !== this.curOwner) foreignOrigin = true;
+        } else if (row.k.startsWith("ctx.own_task_owner.")) {
+          this.ownTaskOwner.set(row.k.slice("ctx.own_task_owner.".length), val);
+          if (val !== this.curOwner) foreignOrigin = true;
+        } else if (row.k.startsWith("op.task.create_own.")) {
+          this.legacyOwnTaskGuids.add(val);
+        }
+      }
+      if (this.ownerSwitched) {
+        const hasCtxTable = app.store.db
+          .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ctx_item'")
+          .get();
+        if (hasCtxTable) {
+          const delRows = app.store.db
+            .prepare("SELECT DISTINCT json_extract(meta, '$.delegated') AS d FROM ctx_item WHERE json_extract(meta, '$.delegated') IS NOT NULL")
+            .all() as { d: unknown }[];
+          for (const r of delRows) {
+            if (typeof r.d === "string" && r.d) this.legacyDelegatedIds.add(r.d);
+          }
+          if (this.legacyDelegatedIds.size > 0) {
+            // 直接按上面已收集的委派 work 主键分块查询，避免对每条 dispatch 扫描整张无索引 ctx_item 表
+            const delIds = [...this.legacyDelegatedIds];
+            const CHUNK = 500;
+            for (let i = 0; i < delIds.length; i += CHUNK) {
+              const slice = delIds.slice(i, i + CHUNK);
+              const placeholders = slice.map(() => "?").join(",");
+              const refRows = app.store.db
+                .prepare(`SELECT DISTINCT ref FROM work WHERE kind = 'dispatch' AND id IN (${placeholders})`)
+                .all(...slice) as { ref: string }[];
+              for (const r of refRows) {
+                if (r.ref) this.legacyDelegatedDispatchRefs.add(r.ref);
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore optional table absence
+    }
+    this.hasAnyForeignOrigin = foreignOrigin;
+  }
+
+  private collectLookupIdsFromWork(w: WorkItem<unknown>, out: Set<string>): void {
+    const addNorm = (raw: string, checkDispatchMemo = true) => {
+      if (!raw) return;
+      const norm = raw.startsWith("card:") ? raw.slice("card:".length) : raw;
+      if (!norm || this.pageWorkCache.has(norm)) return;
+      if (checkDispatchMemo && this.dispatchBlockedMemo.has(norm)) return;
+      out.add(norm);
+    };
+    const addFailureTarget = (raw: string) => {
+      if (raw.startsWith("card:failure:")) addNorm(raw.slice("card:failure:".length), false);
+      else if (raw.startsWith("failure:")) addNorm(raw.slice("failure:".length), false);
+    };
+
+    addFailureTarget(w.ref);
+    if (w.kind === "effect") {
+      const e = w.payload as unknown as Partial<Effect>;
+      if (e.op === "card.upsert" && typeof e.args?.key === "string") {
+        addFailureTarget(e.args.key);
+      }
+    }
+    if (!this.hasAnyForeignOrigin) return;
+
+    if (w.kind === "delivery") {
+      const p = w.payload as { dispatch_id?: unknown; guid?: unknown };
+      addNorm(w.ref);
+      if (typeof p.dispatch_id === "string") addNorm(p.dispatch_id);
+      if (typeof p.guid === "string") addNorm(p.guid);
+    } else if (w.kind === "dispatch") {
+      addNorm(w.ref);
+    } else if (w.kind === "effect") {
+      const e = w.payload as unknown as Partial<Effect>;
+      addNorm(w.ref);
+      if (e.op === "card.upsert" && typeof e.args?.key === "string") addNorm(e.args.key);
+      if (e.args && "guid" in e.args && typeof e.args.guid === "string") addNorm(e.args.guid);
+    } else if (w.ref) {
+      addNorm(w.ref);
+    }
+  }
+
+  preloadPage<P = Record<string, unknown>>(items: readonly WorkItem<P>[]): void {
+    // 严格按页释放上一页的完整 WorkItem payload，仅跨页保留轻量归属事实
+    this.pageWorkCache.clear();
+    for (const w of items) {
+      this.pageWorkCache.set(w.id, w as WorkItem<unknown>);
+    }
+    let frontier: WorkItem<unknown>[] = items as WorkItem<unknown>[];
+    for (let depth = 0; depth < 3 && frontier.length > 0; depth++) {
+      const missing = new Set<string>();
+      for (const w of frontier) {
+        this.collectLookupIdsFromWork(w, missing);
+      }
+      // 也解析 `delivery:dispatch:...` 合成键中的派单 ID
+      if (this.hasAnyForeignOrigin) {
+        for (const id of [...missing]) {
+          if (id.startsWith("delivery:dispatch:")) {
+            const parts = id.slice("delivery:".length).split(":");
+            const parsedDispatchId = parts.length >= 3 ? parts.slice(0, 3).join(":") : "";
+            if (parsedDispatchId && !this.pageWorkCache.has(parsedDispatchId) && !this.dispatchBlockedMemo.has(parsedDispatchId)) {
+              missing.add(parsedDispatchId);
+            }
+          }
+        }
+      }
+      if (missing.size === 0) break;
+      const missingList = [...missing];
+      const fetched = this.ledger.getMany(missingList);
+      const nextFrontier: WorkItem<unknown>[] = [];
+      for (const id of missingList) {
+        const hit = fetched.get(id) ?? null;
+        this.pageWorkCache.set(id, hit);
+        if (hit) nextFrontier.push(hit);
+      }
+      frontier = nextFrontier;
+    }
+  }
+
+  private getCachedWork(id: string): WorkItem<unknown> | undefined {
+    if (this.pageWorkCache.has(id)) return this.pageWorkCache.get(id) ?? undefined;
+    const hit = this.ledger.get(id) ?? null;
+    this.pageWorkCache.set(id, hit);
+    return hit ?? undefined;
+  }
+
+  isDispatchBlocked(w: Pick<WorkItem, "id" | "ref">): boolean {
+    if (!this.hasAnyForeignOrigin) return false;
+    return this.isContextDerivedDispatchBlockedFast(w.id) || (!!w.ref && this.isContextDerivedDispatchBlockedFast(w.ref));
+  }
+
+  private isContextDerivedDispatchBlockedFast(dispatchId: string, visited: Set<string> = new Set()): boolean {
+    if (!dispatchId || !this.hasAnyForeignOrigin) return false;
+    const normalized = dispatchId.startsWith("card:") ? dispatchId.slice("card:".length) : dispatchId;
+    if (!normalized || visited.has(normalized)) return false;
+    if (this.dispatchBlockedMemo.has(normalized)) return this.dispatchBlockedMemo.get(normalized)!;
+    const isTopLevel = visited.size === 0;
+    visited.add(normalized);
+
+    const remember = (res: boolean): boolean => {
+      if (isTopLevel && this.dispatchBlockedMemo.size < 50_000) {
+        this.dispatchBlockedMemo.set(normalized, res);
+      }
+      return res;
+    };
+
+    const w = this.getCachedWork(normalized);
+    if (w?.kind === "delivery") {
+      const p = w.payload as { dispatch_id?: unknown; guid?: unknown };
+      const candidates = [
+        w.ref,
+        typeof p.dispatch_id === "string" ? p.dispatch_id : "",
+        typeof p.guid === "string" ? p.guid : "",
+      ].filter(Boolean);
+      if (candidates.some((c) => c !== normalized && this.isContextDerivedDispatchBlockedFast(c, visited))) {
+        return remember(true);
+      }
+    } else if (!w && normalized.startsWith("delivery:")) {
+      const rest = normalized.slice("delivery:".length);
+      if (rest.startsWith("dispatch:")) {
+        const parts = rest.split(":");
+        const parsedDispatchId = parts.length >= 3 ? parts.slice(0, 3).join(":") : "";
+        const parsedDeliveryGuid = parts[1] ?? "";
+        if (parsedDispatchId && this.isContextDerivedDispatchBlockedFast(parsedDispatchId, visited)) return remember(true);
+        if (parsedDeliveryGuid && this.isContextDerivedDispatchBlockedFast(parsedDeliveryGuid, visited)) return remember(true);
+      }
+    }
+
+    const parsedGuid = normalized.startsWith("dispatch:") ? (normalized.split(":")[1] ?? "") : "";
+    const candidateGuids = [...new Set([normalized, w?.ref ?? "", parsedGuid].filter(Boolean))];
+    const directOrigin = this.dispatchOwner.get(normalized) ?? "";
+    const refOrigin = (w?.ref ? this.dispatchRefOwner.get(w.ref) : "") ?? "";
+    const idAsRefOrigin = this.dispatchRefOwner.get(normalized) ?? "";
+    const parsedGuidOrigin = parsedGuid ? (this.dispatchRefOwner.get(parsedGuid) ?? "") : "";
+    const ownTaskOrigin = candidateGuids.map((g) => this.ownTaskOwner.get(g) ?? "").find(Boolean) ?? "";
+    const originOwner = directOrigin || refOrigin || idAsRefOrigin || parsedGuidOrigin || ownTaskOrigin;
+    if (originOwner && originOwner !== this.curOwner) return remember(true);
+    if (!this.ownerSwitched) return remember(false);
+    if (originOwner) return remember(true);
+
+    for (const g of candidateGuids) {
+      if (this.legacyOwnTaskGuids.has(g)) return remember(true);
+    }
+    if (this.legacyDelegatedIds.has(normalized)) return remember(true);
+    const candidateRef = w?.ref || parsedGuid || normalized;
+    if (candidateRef) {
+      if (this.legacyDelegatedIds.has(candidateRef)) return remember(true);
+      if (this.legacyDelegatedDispatchRefs.has(candidateRef)) return remember(true);
+    }
+    return remember(false);
+  }
+
+  private isContextOwnedTaskBlockedFast(guid: string): boolean {
+    if (!guid || !this.hasAnyForeignOrigin) return false;
+    if (this.isContextDerivedDispatchBlockedFast(guid)) return true;
+    const ownOrigin = this.ownTaskOwner.get(guid) ?? "";
+    if (ownOrigin && ownOrigin !== this.curOwner) return true;
+    if (!this.ownerSwitched) return false;
+    if (ownOrigin) return true;
+    return this.legacyOwnTaskGuids.has(guid);
+  }
+
+  isWorkBlocked(workOrId: WorkItem<unknown> | string, visited: Set<string> = new Set()): boolean {
+    const rawId = typeof workOrId === "string" ? workOrId : workOrId.id;
+    if (!rawId || visited.has(rawId)) return false;
+    visited.add(rawId);
+
+    if (typeof workOrId === "string") {
+      if (workOrId.startsWith("card:failure:")) {
+        return this.isWorkBlocked(workOrId.slice("card:failure:".length), visited);
+      }
+      if (workOrId.startsWith("failure:")) {
+        return this.isWorkBlocked(workOrId.slice("failure:".length), visited);
+      }
+    }
+
+    const w = typeof workOrId === "string" ? this.getCachedWork(workOrId) : workOrId;
+    if (!w) {
+      if (this.ownerMismatch) {
+        const isBriefKey = rawId === "brief" || rawId.startsWith("card:brief:") || rawId.startsWith("brief:");
+        if (isBriefKey) {
+          return !this.curBriefTag || !rawId.endsWith(`-${this.curBriefTag}`);
+        }
+        if (
+          rawId.startsWith("card:ctx-") ||
+          rawId.startsWith("ctx-draft:") ||
+          (rawId.startsWith("context:") && rawId !== "context:pw-needs-login")
+        ) {
+          return true;
+        }
+      }
+      return this.isContextOwnedTaskBlockedFast(rawId);
+    }
+
+    if (this.ownerMismatch && isContextHealthWork(w)) return true;
+
+    if (w.kind === "context") {
+      const p = w.payload as Record<string, unknown>;
+      const boundOwner = typeof p?.owner_open_id === "string" ? p.owner_open_id.trim() : "";
+      if (boundOwner && boundOwner !== this.curOwner) return true;
+      if (!boundOwner && this.prevOwnerOpenId && this.prevOwnerOpenId !== this.curOwner) return true;
+      return false;
+    }
+
+    if (w.kind === "dispatch" || w.kind === "delivery") {
+      if (!this.hasAnyForeignOrigin) return false;
+      if (
+        this.isContextDerivedDispatchBlockedFast(w.id) ||
+        (!!w.ref && this.isContextDerivedDispatchBlockedFast(w.ref))
+      ) {
+        return true;
+      }
+      return false;
+    }
+
+    if (w.kind === "effect") {
+      const e = w.payload as unknown as Partial<Effect>;
+      const boundRecipient =
+        e.args && "owner_open_id" in e.args && typeof e.args.owner_open_id === "string"
+          ? e.args.owner_open_id.trim()
+          : "";
+      if (boundRecipient && boundRecipient !== this.curOwner) return true;
+      const isBriefEffect =
+        w.ref === "brief" ||
+        w.ref.startsWith("card:brief:") ||
+        (e.op === "card.upsert" && typeof e.args?.key === "string" && e.args.key.startsWith("brief:"));
+      if (isBriefEffect && !boundRecipient && this.ownerMismatch) return true;
+      if (w.ref.startsWith("card:failure:")) {
+        if (this.isWorkBlocked(w.ref.slice("card:failure:".length), visited)) return true;
+      }
+      if (e.op === "card.upsert" && typeof e.args?.key === "string" && e.args.key.startsWith("failure:")) {
+        if (this.isWorkBlocked(e.args.key.slice("failure:".length), visited)) return true;
+      }
+      if (!this.hasAnyForeignOrigin) return false;
+      const candidates = [
+        w.ref,
+        e.op === "card.upsert" && typeof e.args?.key === "string" ? e.args.key : "",
+        e.args && "guid" in e.args && typeof e.args.guid === "string" ? e.args.guid : "",
+      ].filter(Boolean);
+      if (candidates.some((c) => this.isContextOwnedTaskBlockedFast(c))) return true;
+      return false;
+    }
+
+    return !!w.ref && this.isContextOwnedTaskBlockedFast(w.ref);
+  }
+}
+
+function buildHealthItem(w: WorkItem, isolated: boolean): HealthItem {
+  if (isolated) {
+    // 隔离记录不含任何可操作按钮，使用哈希脱敏展示 ID，绝不经 ledger key 泄漏旧主人的原生群/私聊 ID 或消息 ID
+    const opaqueId = `isolated:${createHash("sha256").update(w.id).digest("hex").slice(0, 16)}`;
+    return {
+      id: opaqueId,
+      kind: w.kind as HealthItem["kind"],
+      ref: "context:isolated",
+      state: w.state,
+      terminal: w.terminal,
+      attempts: w.attempts,
+      next_at: w.next_at,
+      error: "工作区 owner.open_id 与已绑定账号不一致，上下文已隔离",
+      summary: "上下文任务已按主人隔离",
+      updated: w.updated,
+      acknowledged: w.outcome === "acknowledged",
+      isolated: true,
+    };
+  }
   const p = w.payload as Record<string, unknown>;
+  const contextSummary = (): string => {
+    const task = String(p.task ?? w.ref);
+    if (task === "fast") return p.conv_name ? `快通道理解：${String(p.conv_name)}` : "快通道理解";
+    if (task === "cycle") return "工作上下文采集";
+    if (task === "draft") return "回复起草";
+    if (task === "split") return "拆分子项目";
+    if (task === "weekly") return "周报草稿";
+    return task;
+  };
   const summary =
-    w.kind === "effect" ? effectSummary(w.payload as unknown as Effect) : String(p.summary ?? p.name ?? p.action ?? w.ref).slice(0, 120);
+    w.kind === "effect"
+      ? effectSummary(w.payload as unknown as Effect)
+      : w.kind === "context"
+        ? contextSummary().slice(0, 120)
+        : String(p.summary ?? p.name ?? p.action ?? w.ref).slice(0, 120);
   return {
     id: w.id,
     kind: w.kind as HealthItem["kind"],
@@ -342,14 +1146,67 @@ function healthItem(w: WorkItem): HealthItem {
   };
 }
 
-export function health(app: App): Health {
+export function health(app: App, existingBatch?: HealthOwnerBatch): Health {
   const { ledger, store, cfg } = app;
-  const kinds = ["event", "effect", "job", "delivery"] as const;
-  const retrying = kinds.flatMap((k) => ledger.active(k)).filter((w) => w.attempts > 1 || !!w.error).map(healthItem);
-  const failed = ledger
-    .list({ kinds: [...kinds], states: ["dead", "errored"], limit: 200 })
-    .filter((w) => w.updated > Date.now() - 14 * DAY)
-    .map(healthItem);
+  const ownerBatch = existingBatch ?? new HealthOwnerBatch(app);
+  const kinds = ["event", "effect", "job", "delivery", "context"] as const;
+  const retryingRaw = kinds.flatMap((k) => ledger.active(k)).filter((w) => w.attempts > 1 || !!w.error);
+  ownerBatch.preloadPage(retryingRaw);
+  const retrying = retryingRaw.map((w) =>
+    buildHealthItem(w, (ownerBatch.ownerMismatch && isContextHealthWork(w)) || ownerBatch.isWorkBlocked(w)),
+  );
+
+  // 在 14 天报告窗口内分页批量扫描全部失败项：
+  //   1. 通过 HealthOwnerBatch 预加载归属映射与每页关联 work 行，避免逐行同步 SQLite 查询阻塞事件循环；
+  //   2. 精确累计当前主人未确认的可操作失败总数（actionable_failures），不受 200 条展示上限截断；
+  //   3. 展示列表（最多 200 条）按优先级依次保留：未确认当前主人失败 → 已确认当前主人失败 → 旧主人隔离记录，
+  //      并在展示桶已满后跳过不必要的摘要构造与 SHA-256 脱敏计算。
+  const cutoff = Date.now() - 14 * DAY;
+  const DISPLAY_LIMIT = 200;
+  const PAGE_SIZE = 1000;
+  const actionableOwnFailed: HealthItem[] = [];
+  const acknowledgedOwnFailed: HealthItem[] = [];
+  const isolatedFailed: HealthItem[] = [];
+  let actionableFailures = 0;
+  let before: number | undefined;
+  for (;;) {
+    const page = ledger.list({
+      kinds: [...kinds],
+      states: ["dead", "errored"],
+      updatedSince: cutoff,
+      limit: PAGE_SIZE,
+      before,
+    });
+    if (!page.length) break;
+    ownerBatch.preloadPage(page);
+    for (const w of page) {
+      const acked = w.outcome === "acknowledged";
+      // 未确认当前主人失败桶已满 200 条时，已确认失败既不计入 actionable_failures 也不会进入展示列表，直接跳过
+      if (acked && actionableOwnFailed.length >= DISPLAY_LIMIT) continue;
+      const isolated = (ownerBatch.ownerMismatch && isContextHealthWork(w)) || ownerBatch.isWorkBlocked(w);
+      if (isolated) {
+        if (actionableOwnFailed.length + acknowledgedOwnFailed.length + isolatedFailed.length < DISPLAY_LIMIT) {
+          isolatedFailed.push(buildHealthItem(w, true));
+        }
+      } else if (!acked) {
+        actionableFailures++;
+        if (actionableOwnFailed.length < DISPLAY_LIMIT) {
+          actionableOwnFailed.push(buildHealthItem(w, false));
+        }
+      } else if (actionableOwnFailed.length + acknowledgedOwnFailed.length < DISPLAY_LIMIT) {
+        acknowledgedOwnFailed.push(buildHealthItem(w, false));
+      }
+    }
+    if (page.length < PAGE_SIZE) break;
+    before = page[page.length - 1].seq;
+  }
+  ownerBatch.clearPageCache();
+  const failed: HealthItem[] = [];
+  for (const bucket of [actionableOwnFailed, acknowledgedOwnFailed, isolatedFailed]) {
+    if (failed.length >= DISPLAY_LIMIT) break;
+    failed.push(...bucket.slice(0, DISPLAY_LIMIT - failed.length));
+  }
+
   const hb = store.get("daemon.heartbeat");
   const [owner, at] = hb ? hb.split("|") : [null, null];
   let guard: Health["guard"] = [];
@@ -370,7 +1227,13 @@ export function health(app: App): Health {
         }
       });
   }
-  return { daemon: { owner: owner ?? null, last_heartbeat: at ? Number(at) : null }, retrying, failed, guard };
+  return {
+    daemon: { owner: owner ?? null, last_heartbeat: at ? Number(at) : null },
+    retrying,
+    failed,
+    actionable_failures: actionableFailures,
+    guard,
+  };
 }
 
 export function jobs(app: App): JobView[] {

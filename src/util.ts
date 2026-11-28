@@ -100,7 +100,7 @@ export function isAlive(pid: number): boolean {
 export interface RunOpts {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
-  input?: string;
+  input?: string | Buffer;
   /** 用已打开的文件描述符作为 stdin（普通文件 FD，避免部分程序拒绝 Node spawn 的 Unix socketpair） */
   stdinFd?: number;
   timeoutMs?: number;

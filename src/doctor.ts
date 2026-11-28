@@ -5,7 +5,15 @@ import YAML from "yaml";
 import type { App } from "./app.ts";
 import type { DoctorCheck, DoctorReport } from "./api/types.ts";
 import { repoSpec } from "./config.ts";
-import { resolveBin } from "./harness.ts";
+import { WebLoginStore } from "./context/feishu-web/index.ts";
+import {
+  buildWorkspaceIsolation,
+  detectIsolatedCodexKeyringConflict,
+  prepareHarnessEnv,
+  resolveBin,
+  resolveTrustedBwrapBin,
+  wrapCredentialIsolatedCommand,
+} from "./harness.ts";
 import { consoleBaseUrl, isLoopbackHost } from "./server/index.ts";
 import { validateConfig } from "./settings.ts";
 import { deepFind, errMsg, runProcess, truncate } from "./util.ts";
@@ -87,7 +95,13 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
     if (!p) {
       p = (async () => {
         const full = resolveBin(bin);
-        const r = await runProcess(full, args, { timeoutMs: cmdTimeout });
+        const baseEnv = prepareHarnessEnv();
+        let r: Awaited<ReturnType<typeof runProcess>>;
+        try {
+          r = await runProcess(full, args, { env: baseEnv.env, timeoutMs: cmdTimeout });
+        } finally {
+          baseEnv.cleanup();
+        }
         if (r.timedOut) throw new Error(`${bin} ${args.join(" ")} 超时`);
         if (r.code !== 0) throw new Error(`${bin} ${args.join(" ")} 退出码 ${r.code}：${truncate((r.stderr || r.stdout).trim(), 200)}`);
         return { path: full, version: (r.stdout.trim() || r.stderr.trim()).split("\n")[0] };
@@ -113,6 +127,53 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
     return major > 22 || (major === 22 && minor >= 13)
       ? ok(`Node ${process.versions.node}`)
       : fail(`当前 Node ${process.versions.node}，需要 ≥ 22.13`, `安装新版 Node，例如：\n\n${code("nvm install 22 && nvm use 22")}`);
+  });
+
+  add("worker_isolation", "沙箱隔离", async () => {
+    const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pa-doctor-iso-"));
+    const baseEnv = prepareHarnessEnv(env);
+    try {
+      const trueBin = resolveBin("true");
+      // 直接构造与实际派单工人一致的 worker-write 隔离计划，确保全新 Linux 工作区（尚无个人 Web 密钥或观测）也会真正探测内核命名空间
+      const plan = buildWorkspaceIsolation(
+        cfg,
+        {
+          mode: "worker-write",
+          cwd: probeDir,
+          cmdPath: trueBin,
+          disableGitWorktreeMounts: true,
+        },
+        env,
+      );
+      if (!plan.requireIsolation) {
+        return ok("当前平台非强制内核隔离模式");
+      }
+      const wrapped = wrapCredentialIsolatedCommand(trueBin, [], env, plan);
+      if (!wrapped.isolated) {
+        return fail(
+          "当前环境要求强制沙箱隔离，但未启用任何内核命名空间后端",
+          `安装 bubblewrap（如 ${code("sudo apt install bubblewrap")}）并确保非特权用户命名空间可用`,
+        );
+      }
+      const r = await runProcess(wrapped.cmd, wrapped.args, { cwd: probeDir, env: baseEnv.env, timeoutMs: cmdTimeout });
+      if (r.timedOut || r.code !== 0) {
+        const msg = truncate((r.stderr || r.stdout || `exit ${r.code}`).trim(), 200);
+        return fail(
+          `Linux 隔离沙箱探测失败（所有派单与模型执行都将被阻断）：${msg}`,
+          `安装 bubblewrap（如 ${code("sudo apt install bubblewrap")}），并检查非特权用户命名空间（${code("sysctl kernel.unprivileged_userns_clone")}）或 Ubuntu AppArmor ${code("bwrap")} 策略`,
+        );
+      }
+      const backend = resolveTrustedBwrapBin() ? "bwrap" : "unshare + pivot_root";
+      return ok(`内核 PID + 最小只读根挂载隔离可用（${backend}）`);
+    } catch (e) {
+      return fail(
+        `Linux 隔离沙箱不可用（所有派单与模型执行都将被阻断）：${errMsg(e)}`,
+        `安装 bubblewrap（如 ${code("sudo apt install bubblewrap")}），并检查非特权用户命名空间（${code("sysctl kernel.unprivileged_userns_clone")}）或 Ubuntu AppArmor ${code("bwrap")} 策略`,
+      );
+    } finally {
+      baseEnv.cleanup();
+      fs.rmSync(probeDir, { recursive: true, force: true });
+    }
   });
 
   add("config", "配置文件", async () => {
@@ -248,6 +309,19 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
         }
         const how = h.type === "doubao-cli" ? `${cmdPath} -p（豆包 CLI）` : `${cmdPath} exec（只读）`;
         const detail = `${how}${h.model ? `，模型 ${h.model}` : ""}${roles.length ? `，角色：${roles.join("、")}` : ""}（未实际调用模型）`;
+        if (h.type === "codex-exec") {
+          const keyringConflict = detectIsolatedCodexKeyringConflict(cfg, env, name, {
+            home,
+            includeContextObs: cfg.roles.reviewer === name,
+          });
+          if (keyringConflict?.severity === "error") {
+            return fail(`${detail}；${keyringConflict.message}`, keyringConflict.fix);
+          }
+          if (keyringConflict?.severity === "warn") {
+            problems.push(keyringConflict.message);
+            fixes.push(keyringConflict.fix);
+          }
+        }
         return problems.length ? warn(`${detail}；${problems.join("；")}`, fixes.join("\n\n")) : ok(detail);
       }
       if (!h.agent === !h.agentCommand) return fail("必须且只能设置 agent 或 agentCommand 之一", `在设置页或配置文件的 ${code(`harnesses.${name}`)} 里修正`);
@@ -287,7 +361,33 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
       const fixPath = `检查 ${code(`dispatch.repos.${alias}`)} 的路径是否正确`;
       if (!fs.existsSync(spec.path)) return fail(`路径不存在：${spec.path}`, fixPath);
       if (!(await probeOk("git"))) return skip(`git 不可用，跳过：${spec.path}`);
-      const r = await runProcess(resolveBin("git"), ["-C", spec.path, "rev-parse", "--is-inside-work-tree"], { timeoutMs: cmdTimeout });
+      const baseEnv = prepareHarnessEnv();
+      let r: Awaited<ReturnType<typeof runProcess>>;
+      try {
+        const wrapped = wrapCredentialIsolatedCommand(
+          resolveBin("git"),
+          [
+            "-C",
+            spec.path,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "rev-parse",
+            "--is-inside-work-tree",
+          ],
+          process.env,
+          buildWorkspaceIsolation(cfg, {
+            mode: "git-ro",
+            cwd: spec.path,
+            trustedRepoRoot: spec.path,
+            extraReadOnlyPaths: baseEnv.env.CREDENTIALS_DIRECTORY ? [baseEnv.env.CREDENTIALS_DIRECTORY] : [],
+          }),
+        );
+        r = await runProcess(wrapped.cmd, wrapped.args, { env: baseEnv.env, timeoutMs: cmdTimeout });
+      } finally {
+        baseEnv.cleanup();
+      }
       if (r.code !== 0 || r.stdout.trim() !== "true") return fail(`${spec.path} 不是 git 仓库`, `${fixPath}，或在该目录运行 ${code("git init")}`);
       return ok(`${spec.path}${spec.verify ? `，校验命令：${code(spec.verify)}` : "，未配置校验命令"}`);
     });
@@ -348,6 +448,63 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
       return warn(`${detail}；卡片已启用但 events.card_actions 为 false：卡片上的按钮不会生效`, `把 ${code("events.card_actions")} 改为 true 并重启常驻进程。\n\n${fix}`);
     if (cfg.cards.enabled && cfg.events.card_actions && !app.ext.cards) return ok(`${detail}（卡片模块未启用，暂不订阅 card.action.trigger）`, fix);
     return ok(detail, fix);
+  });
+
+  add("personal_web", "个人 Web 实时通道", async () => {
+    if (!cfg.context.enabled || !cfg.context.personal_web.enabled) {
+      return skip(
+        "未启用（当前仅走 lark-cli 定时采集）",
+        `如需秒级响应任意群 @我 与私聊，先运行 ${code("bin/pa context web-login")} 扫码，再把 ${code("context.personal_web.enabled")} 设为 true`,
+      );
+    }
+    const inspected = new WebLoginStore(cfg.dataDir).inspect();
+    const pw = app.ext.context?.status().personal_web;
+    if (inspected.status === "missing_key") {
+      if (pw && pw.logged_in && pw.state === "listening") {
+        return ok(`${pw.owner_name || pw.owner_id}（常驻进程在线监听中；当前 shell 未注入解密密钥，未在本地解密凭据文件）`);
+      }
+      return warn(
+        `检测到已加密的个人 Web 凭据，但当前环境缺少解密密钥（常驻状态：${pw?.state ?? "未知"}）`,
+        "请在常驻服务环境中提供 PA_FEISHU_WEB_KEY 或通过 systemd LoadCredential 配置 feishu-web-key",
+      );
+    }
+    if (inspected.status === "plaintext_rejected") {
+      return warn(
+        "检测到未加密的明文个人 Web 凭据，已按安全策略拒绝加载",
+        `配置加密密钥（PA_FEISHU_WEB_KEY 或 CREDENTIALS_DIRECTORY/feishu-web-key）后运行 ${code("bin/pa context web-login --allow-unverified-owner")} 重新扫码加密保存`,
+      );
+    }
+    const login = inspected.status === "ok" ? inspected.login : undefined;
+    if (!login) {
+      if (inspected.status === "missing" && pw && pw.logged_in && pw.state === "listening") {
+        return ok(`${pw.owner_name || pw.owner_id}（常驻进程在线监听中；当前默认路径无本地凭据文件，常驻服务可能使用了自定义 PA_FEISHU_WEB_CRED_FILE）`);
+      }
+      return warn(
+        "已启用但尚未扫码登录（期间仍由每 10 分钟的飞书轮询兜底）",
+        `配置加密密钥后运行 ${code("bin/pa context web-login --allow-unverified-owner")} 使用本人飞书 App 扫码登录`,
+      );
+    }
+    const state = pw?.state ?? "idle";
+    const lastError = pw?.last_error ?? "";
+    if (state === "needs_login") {
+      return warn(
+        `会话已失效（${lastError || "需要重新扫码"}）`,
+        `运行 ${code("bin/pa context web-login")} 重新扫码登录`,
+      );
+    }
+    if (state === "publication_blocked") {
+      return warn(
+        `消息入库受阻，已暂缓确认推送（${lastError || "请检查数据库或排除规则"}）`,
+        "检查常驻进程日志确认数据库写入与排除规则解析是否正常",
+      );
+    }
+    if ((state === "reconnecting" || state === "reverifying") && lastError) {
+      return warn(
+        `${login.owner_name || login.owner_id}（实时长连接重连/复验中，原因：${lastError}；期间由飞书轮询兜底）`,
+        `检查网络连通性与常驻进程日志，如持续失败可运行 ${code("bin/pa context web-login")} 重新扫码登录`,
+      );
+    }
+    return ok(`${login.owner_name || login.owner_id}（已登录，当前状态：${state}）`);
   });
 
   add("data_dir", "数据目录", async () => {

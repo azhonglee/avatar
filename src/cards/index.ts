@@ -1,5 +1,5 @@
 import type { App } from "../app.ts";
-import { summarize, taskUrl } from "../api/queries.ts";
+import { isContextDerivedDispatchBlocked, isWorkBlockedByOwner, summarize, taskUrl } from "../api/queries.ts";
 import type { CommandName } from "../api/types.ts";
 import type { BusEvents } from "../bus.ts";
 import { availableActions } from "../core-commands.ts";
@@ -223,11 +223,12 @@ export class CardService {
 
   /** 失败落定的事件 / 作业 / 交付 / 飞书写入 → 告警卡片；之后它的状态变化（重试、忽略）更新同一张卡片。 */
   private onMaybeFailure(e: BusEvents["work.changed"]): void {
+    const w = this.app.ledger.get(e.id);
+    if (isWorkBlockedByOwner(this.app, w ?? e.id)) return;
     const marker = `cards.failure.${e.id}`;
     const key = `failure:${e.id}`;
     if (this.app.store.get(marker)) return this.schedule(key, () => this.renderFailure(e.id));
     if (!e.terminal || !FAILED.includes(e.state)) return;
-    const w = this.app.ledger.get(e.id);
     if (!w || !failureWorthy(w)) return;
     this.app.store.set(marker, "1");
     this.now(key, () => this.renderFailure(e.id));
@@ -278,8 +279,9 @@ export class CardService {
 
   /** 渲染这张任务最新一次派单的卡片。 */
   renderDispatch(guid: string, notice?: string): void {
+    if (isContextDerivedDispatchBlocked(this.app, guid)) return;
     const w = this.app.ledger.latest<DispatchPayload>("dispatch", guid);
-    if (!w) return;
+    if (!w || isContextDerivedDispatchBlocked(this.app, w.id)) return;
     this.emit(`dispatch:${guid}`, dispatchCard(this.dispatchView(w), this.ctx(notice)), w.terminal ? "result" : "progress");
   }
 
@@ -334,7 +336,7 @@ export class CardService {
 
   renderFailure(id: string, notice?: string): void {
     const w = this.app.ledger.get(id);
-    if (!w) return;
+    if (!w || isWorkBlockedByOwner(this.app, w)) return;
     this.emit(`failure:${id}`, failureCard(this.failureView(w), this.ctx(notice)), "failure");
   }
 
