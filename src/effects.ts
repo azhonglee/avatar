@@ -1,10 +1,19 @@
+import { createHash } from "node:crypto";
 import type { Board, SectionKey } from "./board.ts";
-import { deepFind, runProcess } from "./util.ts";
+import { deepFind, errMsg, runProcess } from "./util.ts";
 import type { Store } from "./store.ts";
 import type { Config } from "./config.ts";
 import type { Handler } from "./engine.ts";
 import type { Effect, Ledger, NotifyKind } from "./ledger.ts";
 import type { Lark } from "./lark.ts";
+
+/** 确定不可重试的副作用失败：立刻落 dead 终态，不进入 10 次退避重试循环 */
+export class PermanentEffectError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, cause !== undefined ? { cause } : undefined);
+    this.name = "PermanentEffectError";
+  }
+}
 
 /**
  * 发布器：投递 outbox 里的飞书写操作。
@@ -19,6 +28,10 @@ export interface EffectHooks {
    * 由通知偏好模块设置。
    */
   gate?: (kind: NotifyKind | undefined, e: Effect) => number | false | undefined;
+  /**
+   * 个人 Web 协议回复执行器（由工作上下文模块注册，只在用户确认草稿后触发，带发送前核验与独立回读确认）。
+   */
+  pwReply?: (args: { chat_id: string; message_id: string; root_id?: string; text: string; cid: string }) => Promise<void>;
 }
 
 export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: Lark, store: Store, hooks: EffectHooks = {}): Handler<Effect> {
@@ -67,6 +80,29 @@ export function effectHandler(cfg: Config, ledger: Ledger, board: Board, lark: L
             input: e.args.text,
           });
           break;
+        case "pw.reply": {
+          if (!hooks.pwReply) throw new Error("个人 Web 回复未注册");
+          // 按草稿 + 正文生成 cid：同一草稿再次确认（新的 effect id）也命中同一条投递记录，不会重复发送；改了正文才算新回复
+          const textHash = createHash("sha256").update(e.args.text.replace(/\r\n/g, "\n").trim()).digest("hex");
+          const key = e.args.draft_id ? `draft:${e.args.draft_id}:${textHash}` : item.id;
+          const cid = createHash("sha256").update(`avatar-pw\0${key}`).digest("hex").slice(0, 32);
+          try {
+            await hooks.pwReply({
+              chat_id: e.args.chat_id,
+              message_id: e.args.message_id,
+              root_id: e.args.root_id,
+              text: e.args.text,
+              cid,
+            });
+          } catch (err) {
+            if (err instanceof PermanentEffectError) {
+              ledger.transition(item, { state: "dead", terminal: true, error: errMsg(err) });
+              return;
+            }
+            throw err;
+          }
+          break;
+        }
         case "meego.comment": {
           const r = await runProcess(cfg.bins.bytedcli, [
             "meego", "comment", "create", "--project-key", e.args.project_key, "--work-item-id", e.args.work_item_id, "--content", e.args.content, "--json",

@@ -24,8 +24,16 @@ import { errMsg, log } from "./util.ts";
 export const MASK = "******";
 
 const HOT = new Set(["notify", "budget", "acceptance", "capture", "dispatch", "delivery", "cards", "lark_web", "applink_host", "context"]);
-/** 热加载分组里仍需重启的字段（引擎并发上限、定时任务、模块开关在启动时确定） */
-const COLD_PATHS = new Set(["dispatch.max_parallel", "context.enabled", "context.schedule", "context.morning", "context.evening", "context.weekly"]);
+/** 热加载分组里仍需重启的字段（引擎并发上限、定时任务、模块开关、常驻长连接开关在启动时确定） */
+const COLD_PATHS = new Set([
+  "dispatch.max_parallel",
+  "context.enabled",
+  "context.schedule",
+  "context.morning",
+  "context.evening",
+  "context.weekly",
+  "context.personal_web.enabled",
+]);
 const FORBIDDEN = ["data_dir", "bins"];
 
 type Obj = Record<string, unknown>;
@@ -51,11 +59,12 @@ export function diffPaths(a: unknown, b: unknown, prefix: string[] = []): string
 }
 
 /** 把 target 原地同步成 source（对象递归，其他值替换），保留 target 对象本身的引用。 */
-function syncInPlace(target: Obj, source: Obj, skip: (k: string) => boolean = () => false): void {
-  for (const k of Object.keys(target)) if (!(k in source) && !skip(k)) delete target[k];
+function syncInPlace(target: Obj, source: Obj, prefix: string[] = [], skip: (path: string[]) => boolean = () => false): void {
+  for (const k of Object.keys(target)) if (!(k in source) && !skip([...prefix, k])) delete target[k];
   for (const [k, v] of Object.entries(source)) {
-    if (skip(k)) continue;
-    if (isObj(v) && isObj(target[k])) syncInPlace(target[k] as Obj, v);
+    const nextPath = [...prefix, k];
+    if (skip(nextPath)) continue;
+    if (isObj(v) && isObj(target[k])) syncInPlace(target[k] as Obj, v, nextPath, skip);
     else target[k] = structuredClone(v);
   }
 }
@@ -332,7 +341,7 @@ export class SettingsService {
     const cfg = this.app.cfg as unknown as Obj;
     for (const k of HOT) {
       const src = data[k];
-      if (isObj(src) && isObj(cfg[k])) syncInPlace(cfg[k] as Obj, src, (sub) => !isHotPath([k, sub]));
+      if (isObj(src) && isObj(cfg[k])) syncInPlace(cfg[k] as Obj, src, [k], (p) => !isHotPath(p));
       else if (src !== undefined) cfg[k] = structuredClone(src);
     }
   }

@@ -112,12 +112,24 @@ export interface RunOpts {
   signal?: AbortSignal;
 }
 
-/** 运行子进程并收集输出；超时或中止时先 SIGTERM，10 秒后 SIGKILL。 */
+/**
+ * 去掉个人 Web 凭据相关变量（密钥、密文路径、systemd 凭据目录），子进程一律默认不继承：
+ * 校验命令、git hooks 等都会执行仓库里的代码。
+ */
+export function scrubPersonalWebEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...base };
+  delete out.PA_FEISHU_WEB_KEY;
+  delete out.PA_FEISHU_WEB_CRED_FILE;
+  delete out.CREDENTIALS_DIRECTORY;
+  return out;
+}
+
+/** 运行子进程并收集输出；超时或中止时先 SIGTERM，10 秒后 SIGKILL。默认环境已去掉个人 Web 凭据变量。 */
 export function runProcess(cmd: string, args: string[], opts: RunOpts = {}): Promise<ProcResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, {
       cwd: opts.cwd,
-      env: opts.env ?? process.env,
+      env: opts.env ?? scrubPersonalWebEnv(process.env),
       stdio: [opts.stdinFd ?? "pipe", "pipe", "pipe"],
       detached: !!opts.group,
     });

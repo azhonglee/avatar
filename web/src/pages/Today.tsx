@@ -72,7 +72,20 @@ function Lanes({ t }: { t: CtxToday }) {
   );
 }
 
+const PW_STATE: Record<string, { label: string; dot: string }> = {
+  listening: { label: "实时在线", dot: "dot-success" },
+  connecting: { label: "连接中", dot: "dot-warn" },
+  reconnecting: { label: "重连中", dot: "dot-warn" },
+  reverifying: { label: "核验会话中", dot: "dot-warn" },
+  publication_blocked: { label: "暂缓确认", dot: "dot-warn" },
+  needs_login: { label: "需重新扫码", dot: "dot-danger" },
+  idle: { label: "待启动", dot: "dot-muted" },
+  stopped: { label: "已停止", dot: "dot-muted" },
+};
+
 function SourcesCard({ s }: { s: CtxStatus }) {
+  const pw = s.personal_web;
+  const pwUi = pw ? (PW_STATE[pw.state] ?? { label: pw.state, dot: "dot-muted" }) : null;
   return (
     <Card title="数据来源" actions={<Link to="/settings">设置</Link>}>
       <ul className="src-list">
@@ -83,6 +96,21 @@ function SourcesCard({ s }: { s: CtxStatus }) {
             <span className="muted small">{x.error ? <span title={x.error}>出错：{x.error.slice(0, 40)}</span> : x.last_pull ? <RelTime ts={x.last_pull} /> : "未采集"}</span>
           </li>
         ))}
+        {pw?.enabled && pwUi && (
+          <li>
+            <span className={`dot ${pwUi.dot}`} aria-hidden />
+            <span className="src-name">个人 Web 实时</span>
+            <span className="muted small" title={pw.last_error || undefined}>
+              {pwUi.label}
+              {pw.last_message_at ? (
+                <>
+                  {" · "}
+                  <RelTime ts={pw.last_message_at} />
+                </>
+              ) : null}
+            </span>
+          </li>
+        )}
       </ul>
       <div className="muted small">
         {s.understand_enabled ? `待理解的消息 ${s.pending_obs} 条` : "未开启消息理解（只采集 Meego 与飞书任务）"} · 项目 {s.totals.projects} · 知识 {s.totals.knowledge} · 人 {s.totals.people}

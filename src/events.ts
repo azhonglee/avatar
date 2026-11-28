@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import readline from "node:readline";
 import type { Config } from "./config.ts";
 import type { Identity } from "./lark.ts";
-import { errMsg, log } from "./util.ts";
+import { errMsg, log, scrubPersonalWebEnv } from "./util.ts";
 
 export interface Subscription {
   key: string;
@@ -72,6 +72,7 @@ export class EventSupervisor {
     if (this.stopping) return;
     const child = spawn(this.cfg.bins.lark, ["event", "consume", sub.key, "--as", sub.as], {
       cwd: this.cfg.dataDir,
+      env: scrubPersonalWebEnv(process.env),
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.procs.set(sub.key, child);

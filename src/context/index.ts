@@ -11,6 +11,7 @@ import { deepFind, errMsg, log, truncate } from "../util.ts";
 import { draftCard, eveningCard, itemCard, KIND_LABEL, morningCard, type CtxRenderCtx } from "./cards.ts";
 import { Connectors, relinkMeegoItems } from "./connectors.ts";
 import { defaultDraftKind, Drafter } from "./drafts.ts";
+import { PersonalWebBridge, type FastAnchor } from "./personal-web.ts";
 import { ContextStore, type ItemRow } from "./store.ts";
 import { splitProject, Understander, UnderstandParseError, type SplitResult } from "./understand.ts";
 import { ContextViews, startOfDay } from "./views.ts";
@@ -29,7 +30,12 @@ import { ContextViews, startOfDay } from "./views.ts";
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 
-type CtxPayload = { task: "cycle" } | { task: "draft"; item_id: string; kind?: CtxDraftKind } | { task: "weekly"; days: number } | { task: "split"; project_id: string };
+type CtxPayload =
+  | { task: "cycle" }
+  | { task: "fast"; conv: string; conv_name: string; trigger_obs_id: string; anchor?: FastAnchor }
+  | { task: "draft"; item_id: string; kind?: CtxDraftKind }
+  | { task: "weekly"; days: number }
+  | { task: "split"; project_id: string };
 
 export class ContextService {
   app: App;
@@ -38,7 +44,10 @@ export class ContextService {
   understander: Understander;
   views: ContextViews;
   drafter: Drafter;
+  personalWeb: PersonalWebBridge;
   running = false;
+  /** 正在执行理解的会话集合：防止 fastCycle 与 cycle / 连续 fastCycle 并行理解同一会话导致重复建事项与提醒 */
+  private readonly activeConvs = new Set<string>();
 
   constructor(app: App) {
     this.app = app;
@@ -47,6 +56,29 @@ export class ContextService {
     this.understander = new Understander(app, this.store);
     this.views = new ContextViews(app, this.store);
     this.drafter = new Drafter(app, this.store);
+    this.personalWeb = new PersonalWebBridge(app, this.store, {
+      onFastTrigger: (t) => {
+        this.enqueue(`fast:${t.conv}:${t.trigger_obs_id}`, {
+          task: "fast",
+          conv: t.conv,
+          conv_name: t.conv_name,
+          trigger_obs_id: t.trigger_obs_id,
+          anchor: t.anchor,
+        });
+      },
+      onReconnect: () => {
+        this.enqueue(`cycle:pw-reconnect-${Math.floor(Date.now() / 60_000)}`, { task: "cycle" });
+      },
+      onNeedsLogin: (reason) => {
+        const day = this.today();
+        this.app.ledger.emit(
+          "context:pw-needs-login",
+          [notify(`⚠️ 飞书个人 Web 实时通道登录已失效（${truncate(reason, 200)}）。请运行 \`pa context web-login\` 重新扫码；期间每 10 分钟的飞书定时采集仍继续兜底。`, "failure")],
+          `pw-needs-login-${day}`,
+        );
+        this.app.engine.kick();
+      },
+    });
   }
 
   private get cfg() {
@@ -110,11 +142,17 @@ export class ContextService {
         let budget = this.cfg.context.max_convs_per_cycle;
         const par = this.cfg.context.understand_parallel;
         while (budget > 0 && !signal?.aborted) {
-          const pending = this.store.pendingConvs(Math.min(budget, 8 * par));
+          const pending = this.store.pendingConvs(Math.min(budget, 8 * par)).filter((c) => !this.activeConvs.has(c.conv));
           if (!pending.length) break;
           const groups: (typeof pending)[] = Array.from({ length: Math.min(par, pending.length) }, () => []);
           pending.forEach((c, i) => groups[i % groups.length].push(c));
-          const results = await Promise.allSettled(groups.map((g) => this.understander.runBatch(workId, g, signal)));
+          for (const c of pending) this.activeConvs.add(c.conv);
+          let results: PromiseSettledResult<Awaited<ReturnType<Understander["runBatch"]>>>[];
+          try {
+            results = await Promise.allSettled(groups.map((g) => this.understander.runBatch(workId, g, signal)));
+          } finally {
+            for (const c of pending) this.activeConvs.delete(c.conv);
+          }
           if (signal?.aborted) throw new Error("aborted");
           let progress = 0;
           results.forEach((res, gi) => {
@@ -168,6 +206,42 @@ export class ContextService {
     } finally {
       this.running = false;
     }
+  }
+
+  /**
+   * 快通道单会话理解：收到个人 Web 的「@我」或对方私聊时触发，
+   * 不等待 10 分钟定时周期与全量来源采集，直接理解当前会话并立刻推送提醒卡片（可选预起草，仍需你确认才发）。
+   */
+  async fastCycle(
+    workId: string,
+    p: { conv: string; conv_name: string; trigger_obs_id: string; anchor?: FastAnchor },
+    signal?: AbortSignal,
+  ): Promise<{ fresh: number; created: number; nudged: number; pre_drafted: number }> {
+    if (!this.cfg.context.understand) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+    await this.ensureOwnerName();
+    if (p.anchor) {
+      await this.personalWeb.hydrateContext(p.anchor, p.conv, p.conv_name, signal);
+    }
+    const window = this.store.convWindow(p.conv);
+    if (!window.length) return { fresh: 0, created: 0, nudged: 0, pre_drafted: 0 };
+    const r = await this.understander.runBatch(workId, [{ conv: p.conv, conv_name: p.conv_name }], signal);
+    relinkMeegoItems(this.store);
+    this.store.mergeConflicts();
+    this.markNotImportant();
+    this.syncDrafts();
+    const nudged = this.nudge(r.created);
+    this.autonomy(r.created);
+
+    let preDrafted = 0;
+    if (this.cfg.context.personal_web.pre_draft) {
+      for (const c of r.created) {
+        const it = this.store.item(c.id);
+        if (!it || it.status !== "open" || it.kind !== "ask_me" || it.priority !== "high") continue;
+        if (it.meta.needs_review || it.feedback === "unimportant" || !this.draftable(it)) continue;
+        if (this.enqueue(`draft:${it.id}:reply:fast`, { task: "draft", item_id: it.id, kind: "reply" })) preDrafted++;
+      }
+    }
+    return { fresh: r.fresh, created: r.created.length, nudged, pre_drafted: preDrafted };
   }
 
   private async ensureOwnerName(): Promise<void> {
@@ -349,6 +423,20 @@ export class ContextService {
           this.app.ledger.transition(item, { state: r.skipped ? "skipped" : "done", terminal: true, payload: { ...p, report: r } as never });
           return;
         }
+        if (p.task === "fast") {
+          if (this.activeConvs.has(p.conv)) {
+            this.app.ledger.release(item.id, { nextAt: Date.now() + 3_000, refund: true });
+            return;
+          }
+          this.activeConvs.add(p.conv);
+          try {
+            const r = await this.fastCycle(item.id, p, ctx.signal);
+            this.app.ledger.transition(item, { state: "done", terminal: true, payload: { ...p, report: r } as never });
+          } finally {
+            this.activeConvs.delete(p.conv);
+          }
+          return;
+        }
         if (p.task === "draft") {
           const d = await this.drafter.forItem(p.item_id, p.kind);
           this.app.ledger.transition(item, { state: "done", terminal: true, payload: { ...p, draft_id: d.id } as never });
@@ -370,7 +458,7 @@ export class ContextService {
       },
       onExhausted: (item, err) => {
         const p = item.payload;
-        if (p.task === "cycle") return { patch: { state: "errored" } };
+        if (p.task === "cycle" || p.task === "fast") return { patch: { state: "errored" } };
         const what = p.task === "draft" ? "起草" : p.task === "split" ? "拆分子项目" : "周报草稿";
         return { patch: { state: "errored" }, effects: [notify(`⚠️ ${what}没有成功：${truncate(err, 300)}`, "failure")] };
       },
@@ -397,9 +485,11 @@ export class ContextService {
     ];
     // 启动后先跑一轮（停机期间的消息）
     const t = setTimeout(() => this.enqueue(`cycle:start-${Date.now()}`, { task: "cycle" }), 5000);
+    const pw = this.personalWeb.start();
     return {
       stop: () => {
         clearTimeout(t);
+        pw.stop();
         crons.forEach((x) => x.stop());
       },
     };
@@ -461,6 +551,9 @@ export function registerContext(app: App): ContextService | undefined {
   if (!app.cfg.context.enabled) return undefined;
   const svc = new ContextService(app);
   const { commands, ledger, bus } = app;
+  app.effectHooks.pwReply = async (args) => {
+    await svc.personalWeb.sendVerifiedReply(args);
+  };
   app.engine.register(svc.handler());
   bus.on("effect.settled", (e) => {
     if (e.ref.startsWith("ctx-draft:")) svc.syncDraft(e.ref.slice("ctx-draft:".length));
@@ -719,7 +812,7 @@ export function registerContext(app: App): ContextService | undefined {
   }
 
   app.ext.context = {
-    today: () => (svc.syncDrafts(), svc.views.today(svc.running)),
+    today: () => (svc.syncDrafts(), svc.views.today(svc.running, svc.personalWeb.status())),
     projects: (o) => svc.views.projects(!!o.legacy),
     project: (pid) => svc.views.projectDetail(pid),
     items: (f) => svc.items(f),
@@ -729,7 +822,7 @@ export function registerContext(app: App): ContextService | undefined {
     people: () => svc.views.people(),
     conflicts: (status) => svc.store.conflicts(status).map((c) => svc.views.conflictView(c)),
     drafts: (status) => (svc.syncDrafts(), svc.store).drafts(status ? { status: status.split(",") as never } : {}).map((d) => svc.views.draftView(d)),
-    status: () => svc.views.status(svc.running),
+    status: () => svc.views.status(svc.running, svc.personalWeb.status()),
     start: () => svc.start(),
     refresh: () => void svc.enqueue(`cycle:hint-${Math.floor(Date.now() / 60_000)}`, { task: "cycle" }),
     runOnce: () => svc.runOnce(),

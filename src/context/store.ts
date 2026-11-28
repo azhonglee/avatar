@@ -146,6 +146,44 @@ export function norm(s: string): string {
     .trim();
 }
 
+/** 会话名未知时（只有占位名），正文至少这么长才认为是同一条消息 */
+const WEAK_MERGE_MIN_CHARS = 8;
+
+/** 提取真实会话名：剥离 "私聊：" 前缀后排除占位名（空 / "私聊" / "本人" / 纯数字）；群聊排除 "群聊" / "群聊(...)" */
+export function realConvName(s: string): string {
+  const t = s.trim();
+  if (!t) return "";
+  if (t.startsWith("私聊：")) {
+    const rest = t.slice("私聊：".length).trim();
+    if (!rest || rest === "私聊" || rest === "本人" || !isRealActorName(rest)) return "";
+    return rest;
+  }
+  if (/^(群聊|私聊)($|\()/.test(t)) return "";
+  return t;
+}
+
+/** 占位会话名（个人 Web 未查到名称时的“群聊(…)”/“私聊：数字”，或 lark-cli 缺 chat_name 时的“群聊”/“私聊”）不能证明是同一会话 */
+export function isRealConvName(s: string): boolean {
+  return !!realConvName(s);
+}
+
+/** 个人 Web 拿不到姓名时 actor_name 是原生数字 ID，不能用来比对 */
+export function isRealActorName(s: string): boolean {
+  return !!s && !/^\d+$/.test(s);
+}
+
+/** 跨通道判断两条观测是否同一条消息：会话名或发送人明确不同 → none；已确认同一会话（别名命中或真实会话名一致）→ strong；否则 weak。 */
+function crossMatch(a: Row, b: Pick<Obs, "conv_name" | "actor_name">, sameChatAlias = false): "strong" | "weak" | "none" {
+  const aActor = String(a.actor_name ?? "");
+  if (isRealActorName(aActor) && isRealActorName(b.actor_name) && aActor !== b.actor_name) return "none";
+  if (sameChatAlias) return "strong";
+  const aConv = realConvName(String(a.conv_name ?? ""));
+  const bConv = realConvName(b.conv_name);
+  const convKnown = !!aConv && !!bConv;
+  if (convKnown && aConv !== bConv) return "none";
+  return convKnown ? "strong" : "weak";
+}
+
 function grams(s: string): Set<string> {
   const n = norm(s);
   const g = new Set<string>();
@@ -240,6 +278,7 @@ export class ContextStore {
         target TEXT NOT NULL DEFAULT '{}', target_label TEXT NOT NULL DEFAULT '', content TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'proposed', error TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL, updated INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS ctx_mute_conv (conv TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS ctx_pw_alias (kind TEXT NOT NULL, native_id TEXT NOT NULL, value TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (kind, native_id));
     `);
     // 迁移：子项目
     const cols = new Set((db.prepare("PRAGMA table_info(ctx_project)").all() as { name: string }[]).map((c) => c.name));
@@ -266,10 +305,20 @@ export class ContextStore {
 
   // ───────── 观测 ─────────
 
-  /** 幂等写入观测；同 ID 已存在且内容变化（消息被编辑）时更新并重新标为待处理。返回新增或变化的数量。 */
+  /**
+   * 幂等写入观测；同 ID 已存在且内容变化（消息被编辑）时更新并重新标为待处理。
+   * 当飞书定时采集（im:*）与个人 Web 实时推送（pw:*）先后收到同一条消息时，按「同说话人 + 同会话类型 + 15 秒内 + 正文规范化一致」
+   * 自动合并，并把开放平台 message_id / chat_id / 群名 / 姓名回填到既有观测，避免重复理解。
+   * 返回新增或变化的数量。
+   */
   addObs(list: Obs[]): number {
     const now = Date.now();
     const get = this.db.prepare("SELECT text FROM ctx_obs WHERE id = ?");
+    const nearIm = this.db.prepare(
+      `SELECT id, conv, conv_name, actor_id, actor_name, text, url, meta FROM ctx_obs
+       WHERE source = 'im' AND is_me = ? AND time BETWEEN ? AND ? AND id LIKE ? LIMIT 30`,
+    );
+    const enrich = this.db.prepare("UPDATE ctx_obs SET conv_name = ?, actor_name = ?, url = ?, meta = ? WHERE id = ?");
     const ins = this.db.prepare(
       `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
@@ -281,6 +330,64 @@ export class ContextStore {
         if (!o.id || !o.time) continue;
         const cur = get.get(o.id) as { text: string } | undefined;
         if (!cur) {
+          if (o.source === "im" && (o.id.startsWith("im:") || o.id.startsWith("pw:"))) {
+            const nt = norm(o.text);
+            if (nt.length >= 2) {
+              const otherPrefix = o.id.startsWith("im:") ? "pw:%" : "im:%";
+              const inChatType = String(o.meta.chat_type ?? "");
+              const cands = nearIm.all(o.is_me ? 1 : 0, o.time - 15_000, o.time + 15_000, otherPrefix) as Row[];
+              let strong = false;
+              const hit = cands.find((c) => {
+                if (norm(String(c.text ?? "")) !== nt) return false;
+                const cMeta = j<Record<string, unknown>>(c.meta, {});
+                const cChatType = String(cMeta.chat_type ?? "");
+                if (inChatType && cChatType && inChatType !== cChatType) return false;
+                const isIncomingLark = o.id.startsWith("im:");
+                const nativeChat = String(isIncomingLark ? (cMeta.native_chat_id ?? "") : (o.meta.native_chat_id ?? ""));
+                const openChat = isIncomingLark ? o.conv : String(c.conv ?? "");
+                const mappedOpen = nativeChat ? this.pwAlias("chat", nativeChat) : undefined;
+                if (mappedOpen && openChat.startsWith("oc_") && mappedOpen !== openChat) return false;
+                const sameChatAlias = !!mappedOpen && mappedOpen === openChat;
+                const m = crossMatch(c, o, sameChatAlias);
+                if (m === "none" || (m === "weak" && nt.length < WEAK_MERGE_MIN_CHARS)) return false;
+                strong = m === "strong";
+                return true;
+              });
+              // 弱匹配（会话名未知）只丢弃重复观测，不回填任何 ID 或名称，防止把另一个会话的开放平台 ID 写到这条消息上
+              if (hit && !strong) continue;
+              if (hit) {
+                const hitMeta = j<Record<string, unknown>>(hit.meta, {});
+                const isIncomingLark = o.id.startsWith("im:");
+                const nativeChat = String(isIncomingLark ? (hitMeta.native_chat_id ?? "") : (o.meta.native_chat_id ?? ""));
+                const openChat = isIncomingLark ? o.conv : String(hit.conv ?? "");
+                if (nativeChat && openChat.startsWith("oc_")) this.setPwAlias("chat", nativeChat, openChat);
+                const nativeActor = isIncomingLark ? String(hit.actor_id ?? "") : o.actor_id;
+                const larkActorName = isIncomingLark ? o.actor_name : String(hit.actor_name ?? "");
+                if (!o.is_me && nativeActor && isRealActorName(larkActorName)) this.setPwAlias("actor", nativeActor, larkActorName);
+                const mergedMeta = isIncomingLark
+                  ? {
+                      ...hitMeta,
+                      open_message_id: String(o.meta.message_id ?? o.id.slice(3)),
+                      open_chat_id: o.conv,
+                      open_actor_id: o.actor_id,
+                    }
+                  : {
+                      ...hitMeta,
+                      native_message_id: String(o.meta.native_message_id ?? o.id.slice(3)),
+                      native_chat_id: String(o.meta.native_chat_id ?? ""),
+                      native_root_id: String(o.meta.native_root_id ?? ""),
+                    };
+                const curConvName = String(hit.conv_name ?? "");
+                const betterConv = isIncomingLark && isRealConvName(o.conv_name) && !isRealConvName(curConvName) ? o.conv_name : curConvName;
+                const curActorName = String(hit.actor_name ?? "");
+                const betterActor =
+                  isIncomingLark && o.actor_name && (!curActorName || /^\d+$/.test(curActorName)) ? o.actor_name : curActorName;
+                const betterUrl = String(hit.url ?? "") || o.url;
+                enrich.run(betterConv, betterActor, betterUrl, JSON.stringify(mergedMeta), String(hit.id));
+                continue;
+              }
+            }
+          }
           ins.run(o.id, o.source, o.kind, o.conv, o.conv_name, o.actor_id, o.actor_name, o.is_me ? 1 : 0, o.time, o.text, o.url, JSON.stringify(o.meta ?? {}), now);
           n++;
         } else if (cur.text !== o.text) {
@@ -290,6 +397,57 @@ export class ContextStore {
       }
     });
     return n;
+  }
+
+  /** 写入背景历史观测（只插未出现过且未跨通道命中的记录，直接标为已处理，供 convWindow 作为上下文背景） */
+  addBackgroundObs(list: Obs[]): number {
+    const now = Date.now();
+    const get = this.db.prepare("SELECT 1 FROM ctx_obs WHERE id = ?");
+    const nearIm = this.db.prepare(
+      `SELECT id, conv, text, conv_name, actor_name, meta FROM ctx_obs
+       WHERE source = 'im' AND is_me = ? AND time BETWEEN ? AND ? AND id LIKE ? LIMIT 30`,
+    );
+    const ins = this.db.prepare(
+      `INSERT INTO ctx_obs (id, source, kind, conv, conv_name, actor_id, actor_name, is_me, time, text, url, meta, ingested, processed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+    );
+    let n = 0;
+    this.tx(() => {
+      for (const o of list) {
+        if (!o.id || !o.time) continue;
+        if (get.get(o.id)) continue;
+        const nt = norm(o.text);
+        if (o.source === "im" && (o.id.startsWith("im:") || o.id.startsWith("pw:")) && nt.length >= 2) {
+          const otherPrefix = o.id.startsWith("im:") ? "pw:%" : "im:%";
+          const inChatType = String(o.meta.chat_type ?? "");
+          const cands = nearIm.all(o.is_me ? 1 : 0, o.time - 15_000, o.time + 15_000, otherPrefix) as Row[];
+          const dup = cands.some((c) => {
+            if (norm(String(c.text ?? "")) !== nt) return false;
+            const cMeta = j<Record<string, unknown>>(c.meta, {});
+            const cChatType = String(cMeta.chat_type ?? "");
+            if (inChatType && cChatType && inChatType !== cChatType) return false;
+            const isIncomingLark = o.id.startsWith("im:");
+            const nativeChat = String(isIncomingLark ? (cMeta.native_chat_id ?? "") : (o.meta.native_chat_id ?? ""));
+            const openChat = isIncomingLark ? o.conv : String(c.conv ?? "");
+            const mappedOpen = nativeChat ? this.pwAlias("chat", nativeChat) : undefined;
+            if (mappedOpen && openChat.startsWith("oc_") && mappedOpen !== openChat) return false;
+            const sameChatAlias = !!mappedOpen && mappedOpen === openChat;
+            const m = crossMatch(c, o, sameChatAlias);
+            return m === "strong" || (m === "weak" && nt.length >= WEAK_MERGE_MIN_CHARS);
+          });
+          if (dup) continue;
+        }
+        ins.run(o.id, o.source, o.kind, o.conv, o.conv_name, o.actor_id, o.actor_name, o.is_me ? 1 : 0, o.time, o.text, o.url, JSON.stringify(o.meta ?? {}), now);
+        n++;
+      }
+    });
+    return n;
+  }
+
+  /** 删除指定观测（用于消息撤回或编辑清空时移除本地旧正文）。 */
+  deleteObs(id: string): boolean {
+    const r = this.db.prepare("DELETE FROM ctx_obs WHERE id = ?").run(id);
+    return Number(r.changes ?? 0) > 0;
   }
 
   obs(id: string): Obs | undefined {
@@ -344,6 +502,16 @@ export class ContextStore {
 
   mutedConvs(): { conv: string; name: string }[] {
     return this.db.prepare("SELECT conv, name FROM ctx_mute_conv").all() as { conv: string; name: string }[];
+  }
+
+  /** 个人 Web 原生 ID 与开放平台的对应（chat：原生会话 ID → oc_；actor：原生用户 ID → 姓名），来自跨通道强匹配 */
+  setPwAlias(kind: "chat" | "actor", nativeId: string, value: string): void {
+    this.db.prepare("INSERT OR REPLACE INTO ctx_pw_alias (kind, native_id, value, at) VALUES (?, ?, ?, ?)").run(kind, nativeId, value, Date.now());
+  }
+
+  pwAlias(kind: "chat" | "actor", nativeId: string): string {
+    const r = this.db.prepare("SELECT value FROM ctx_pw_alias WHERE kind = ? AND native_id = ?").get(kind, nativeId) as { value: string } | undefined;
+    return r?.value ?? "";
   }
 
   // ───────── 项目 ─────────

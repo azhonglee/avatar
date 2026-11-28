@@ -496,6 +496,16 @@ export interface CtxToday {
   status: CtxStatus;
 }
 
+export interface CtxPersonalWebStatus {
+  enabled: boolean;
+  logged_in: boolean;
+  state: string;
+  owner_id: string;
+  owner_name: string;
+  last_message_at: number | null;
+  last_error: string;
+}
+
 export interface CtxStatus {
   last_cycle: number | null;
   last_error: string;
@@ -504,6 +514,7 @@ export interface CtxStatus {
   pending_obs: number;
   totals: { projects: number; open_items: number; knowledge: number; people: number };
   understand_enabled: boolean;
+  personal_web?: CtxPersonalWebStatus;
 }
 
 /** 一轮采集 + 理解的结果 */

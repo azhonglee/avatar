@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { ROOT, type Config } from "./config.ts";
 import type { Profile } from "./guard.ts";
-import { runProcess } from "./util.ts";
+import { runProcess, scrubPersonalWebEnv } from "./util.ts";
 
 export interface HarnessRun {
   harness: string;
@@ -45,6 +45,8 @@ export interface HarnessResult {
   aborted: boolean;
 }
 
+export { scrubPersonalWebEnv } from "./util.ts";
+
 /** 通过 acpx（ACP）以无头方式调用任一 harness 跑一次性任务，返回最终回复文本。 */
 export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessResult> {
   const h = cfg.harnesses[run.harness];
@@ -66,7 +68,7 @@ export async function runHarness(cfg: Config, run: HarnessRun): Promise<HarnessR
     Object.entries(h.env).map(([k, v]) => [k, v.replace(/\$\{(\w+)\}/g, (_, n: string) => process.env[n] ?? "")]),
   );
   const env: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...scrubPersonalWebEnv(process.env),
     ...harnessEnv,
     PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${process.env.PATH ?? ""}`,
     PA_GUARD_PROFILE: run.lark,
@@ -149,7 +151,7 @@ async function runCodexExec(cfg: Config, run: HarnessRun, h: Config["harnesses"]
   const started = new Date().toISOString();
   const r = await runProcess(cmd, args, {
     cwd: run.cwd,
-    env: { ...process.env, ...harnessEnv },
+    env: { ...scrubPersonalWebEnv(process.env), ...harnessEnv },
     input: run.prompt,
     timeoutMs: (run.timeoutSec + 60) * 1000,
     group: true,
@@ -200,7 +202,7 @@ async function runDoubaoCli(cfg: Config, run: HarnessRun, h: Config["harnesses"]
     // run.lark === "none" 时不会执行真实 lark-cli
   }
   const env: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...scrubPersonalWebEnv(process.env),
     ...harnessEnv,
     DOUBAO_CLI_NO_UPDATE_CHECK: "1",
     PATH: `${path.join(ROOT, "bin", "guard")}${path.delimiter}${process.env.PATH ?? ""}`,

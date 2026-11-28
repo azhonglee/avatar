@@ -134,7 +134,7 @@ context:
   sources: { meego: true, im: true, minutes: true, calendar: true, tasks: true, docs: true }
   groups: spoken              # spoken：@我、私聊和我发言过的群；allowlist：只看 groups_allow 里的群
   groups_allow: []
-  groups_deny: []             # 永远不读的会话（chat_id 或群名关键字）
+  groups_deny: []             # 永远不读的会话（chat_id 或群名关键字）；个人 Web 通道还可写 pw_chat:<原生会话ID>，oc_ ID 按 lark-cli 记下的群名对应
   max_groups: 40
   bot_allow: [Meego, 项目管理, Codebase, 云文档, 审批, 智能纪要, MLOps, Bits]   # 保留哪些机器人的通知，其余当噪音
   legacy_days: 180            # Meego / 飞书任务超过这么久没动静视为历史遗留（自动静音）
@@ -147,6 +147,12 @@ context:
     auto_close: true          # 有证据（你已回复、Meego 节点已流转）时自动关闭事项
     mute_legacy: true
     create_own_todo: false    # 把你的承诺建成飞书任务（只建给你自己）
+  personal_web:               # 可选：个人 Web 协议实时通道（需配置 PA_FEISHU_WEB_KEY 并运行 `pa context web-login`）
+    enabled: false            # true：启用长连接秒级接收任意群 @我 与私聊（改后需重启常驻进程）
+    fast_lane: true           # 收到真实 @我 或对方私聊时立刻走单会话快通道理解与提醒
+    debounce_ms: 2500         # 同一会话短时间连发多条消息的合并等待毫秒数
+    pre_draft: false          # 高优先级请求自动预起草回复草稿（仍需你确认才发）
+    send_replies: false       # 确认草稿后允许走个人 Web 协议回复（带发送前核验与独立回读确认）
 
 capture:
   min_confidence: 0.6        # ≥ 该值进“待确认”
