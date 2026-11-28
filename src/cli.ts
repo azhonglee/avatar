@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { parseArgs } from "node:util";
 import { createApp, initApp, runConfiguredJob, runDaemon, runDispatchOnce, sendBrief } from "./app.ts";
 import { loadConfig } from "./config.ts";
-import { createGatewayClientForConfig, resolveGatewayClientConfig, verifyGatewayOwnerForWorkspace } from "./context/personal-web.ts";
+import { createGatewayClientForConfig, legacyPersonalWebArtifacts, resolveGatewayClientConfig, verifyGatewayOwnerForWorkspace } from "./context/personal-web.ts";
 import { decide, type Profile } from "./guard.ts";
 import { consoleBaseUrl, isLoopbackHost, resolveConsoleHost, serverToken } from "./server/index.ts";
 import { formatReport, runDoctor } from "./doctor.ts";
@@ -23,6 +23,7 @@ const USAGE = `用法：pa <命令>
   context digest [morning|evening]   发送晨间卡 / 收尾卡（--print 只打印不发送）
   context split <项目>        把一个大项目拆成子项目（模型归类，可重复执行）
   context web-status [--verify]      查询独立飞书个人 Web 网关的连接与缓存状态（登录/登出请使用 feishu-gateway）
+  context web-logout          删除旧版残留在本机数据目录的个人 Web 会话凭据（feishu-web.json）
   status                      最近 24 小时的派单、作业，以及重试中/失败的事件和飞书写入
   console [--rotate]          打印控制台登录链接（--rotate 作废旧链接）；常驻进程运行时可用
   command <名称> [JSON 参数]   执行一条命令（与控制台/卡片按钮相同），如 pa command dispatch.cancel '{"id":"…"}'
@@ -138,6 +139,17 @@ async function main(): Promise<void> {
 async function context(app: ReturnType<typeof createApp>, rest: string[]): Promise<void> {
   const [sub, ...more] = rest;
 
+  // 清理旧版（进程内个人 Web）遗留在 Avatar 侧的会话凭据；登录态现在只应存在于独立网关
+  if (sub === "web-logout") {
+    const legacy = legacyPersonalWebArtifacts(app.cfg);
+    for (const f of legacy.files) fs.rmSync(f, { force: true });
+    console.log(legacy.files.length ? `已删除旧版个人 Web 凭据：\n${legacy.files.map((f) => `  ${f}`).join("\n")}` : "未发现旧版个人 Web 凭据文件。");
+    if (legacy.envKeys.length) {
+      console.log(`请从 Avatar 的运行环境（shell / systemd 单元）中移除：${legacy.envKeys.join("、")}，然后重启 pa run。`);
+    }
+    console.log("旧会话在飞书侧仍可能有效：请在飞书 App 的登录设备管理中移除对应的网页登录；网关的登录/登出请使用 feishu-gateway login / logout。");
+    return;
+  }
   // 查询独立个人 Web 网关状态（只读，不依赖 context.enabled）
   if (sub === "web-status") {
     const verify = more.includes("--verify");
@@ -202,7 +214,7 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
     await app.engine.drain(["effect"]);
     return;
   }
-  throw new Error("用法：pa context run | today | split <项目> | digest [morning|evening] [--print] | web-status [--verify]（个人 Web 扫码登录/登出请使用独立网关命令 feishu-gateway login / logout）");
+  throw new Error("用法：pa context run | today | split <项目> | digest [morning|evening] [--print] | web-status [--verify] | web-logout（个人 Web 扫码登录/登出请使用独立网关命令 feishu-gateway login / logout）");
 }
 
 async function doctor(app: ReturnType<typeof createApp>): Promise<void> {

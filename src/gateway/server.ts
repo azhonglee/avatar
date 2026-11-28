@@ -331,8 +331,9 @@ export async function startGatewayServer(
             }
           }
         }
-        if (!page.has_more || page.events.length === 0) break;
-        cursor = page.events[page.events.length - 1].seq;
+        // 以本页实际扫描到的最后一个 seq 续拉：整页事件都被排除规则过滤掉时也要继续往后翻
+        if (!page.has_more || page.next_after <= cursor) break;
+        cursor = page.next_after;
         await new Promise<void>((r) => setImmediate(r));
       }
 

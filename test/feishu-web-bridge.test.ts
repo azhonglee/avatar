@@ -7,7 +7,7 @@ import YAML from "yaml";
 import { createApp } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { ContextService } from "../src/context/index.ts";
-import { verifyGatewayOwnerForWorkspace } from "../src/context/personal-web.ts";
+import { legacyPersonalWebArtifacts, verifyGatewayOwnerForWorkspace } from "../src/context/personal-web.ts";
 import { runDoctor } from "../src/doctor.ts";
 import { EventSupervisor } from "../src/events.ts";
 import { FeishuGatewayClient } from "../src/gateway/client.ts";
@@ -161,7 +161,67 @@ describe("feishu-web gateway client bridge, store dedup, drafts, and env scrub",
       // 5) Gateway delete tombstone event deletes existing local obs
       await bridge.handleGatewayEvent({ seq: 99, kind: "delete", message_id: "m-atme", chat_id: "chat-1", created_at: Date.now() });
       assert.equal(svc.store.obs("pw:m-atme"), undefined, "recalled message must be deleted locally");
+
+      // 6) 网关没给会话名、又存在按名称的排除规则（敏感群）：丢弃，不按“未命中”放行
+      bridge.handleGatewayMessage(makeGatewayMsg({ id: "m-noname", conversationId: "chat-1", chatName: "" }));
+      assert.equal(svc.store.obs("pw:m-noname"), undefined, "missing chat name must not bypass name-based deny rules");
     } finally {
+      app.store.db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("sends readback_only and client deny rules to the gateway, resets the cursor on db epoch change, and detects legacy credentials", async () => {
+    const dir = makeTmp("pa-pw-epoch-");
+    const app = makeApp(dir);
+    const svc = new ContextService(app);
+    const bridge = svc.personalWeb;
+    try {
+      const hooks = (bridge as unknown as { hooks: { gatewayClient?: unknown; onReconnect: () => void } }).hooks;
+      let captured: Record<string, unknown> | undefined;
+      let streams = 0;
+      hooks.onReconnect = () => undefined;
+      hooks.gatewayClient = {
+        sendReply: async (req: Record<string, unknown>) => {
+          captured = req;
+          return { replyId: "r1", rootId: "m1", parentId: "m1", threadId: "", verified: true };
+        },
+        streamEvents: async (o: { onStatus?: (st: unknown) => void }) => {
+          streams++;
+          o.onStatus?.({
+            state: "listening", logged_in: true, credential_status: "ok", owner_id: "owner-1", owner_name: "Owner",
+            since: Date.now(), last_message_at: null, last_error: "", allow_reply: true,
+            min_seq: 1, latest_seq: 100, cached_events: 100, db_epoch: streams === 1 ? "epoch-a" : "epoch-b",
+          });
+          if (streams >= 2) bridge.stop();
+        },
+      };
+
+      // 关闭 send_replies 后的收尾请求必须带 readback_only，并把客户端排除规则交给网关按实时会话名核对
+      app.cfg.context.personal_web.send_replies = false;
+      app.store.set("ctx.pw_reply_started.cid-readback-01", String(Date.now()));
+      svc.store.muteConv("oc_muted_grp", "静音外部群", true);
+      await bridge.sendVerifiedReply({ chat_id: "chat-1", message_id: "m1", text: "测试", cid: "cid-readback-01" });
+      assert.equal(captured?.readback_only, true);
+      assert.ok((captured?.client_deny as string[]).includes("敏感群"));
+      assert.ok((captured?.client_deny as string[]).includes("静音外部群"));
+
+      // 网关事件库实例变化：重置游标
+      app.store.set("ctx.pw_gateway.cursor", "50");
+      bridge.start();
+      const deadline = Date.now() + 5_000;
+      while (streams < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+      assert.equal(streams, 2);
+      assert.equal(bridge.cursor(), 0, "db epoch change must reset the local cursor");
+      assert.equal(app.store.get("ctx.pw_gateway.db_epoch"), "epoch-b");
+
+      // 旧版进程内个人 Web 残留的凭据文件与密钥变量能被检测到
+      fs.writeFileSync(path.join(app.cfg.dataDir, "feishu-web.json"), "{}");
+      const legacy = legacyPersonalWebArtifacts(app.cfg, { PA_FEISHU_WEB_KEY: "old-key" });
+      assert.deepEqual(legacy.files, [path.join(app.cfg.dataDir, "feishu-web.json")]);
+      assert.deepEqual(legacy.envKeys, ["PA_FEISHU_WEB_KEY"]);
+    } finally {
+      bridge.stop();
       app.store.db.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }

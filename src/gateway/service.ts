@@ -19,6 +19,8 @@ import {
 import {
   CID_RE,
   GatewayHttpError,
+  MAX_CLIENT_DENY_RULE_LEN,
+  MAX_CLIENT_DENY_RULES,
   MAX_CONTEXT_LIMIT,
   MAX_REPLY_TEXT_BYTES,
   type GatewayAnchor,
@@ -223,9 +225,14 @@ export class FeishuGatewayService {
 
   /** 网关侧不可被客户端绕过的黑名单判定（支持原生 ID、pw_chat:<id> 与群名/私聊名关键字）。 */
   isDeniedChat(chatId: string, chatName: string): boolean {
+    return this.matchesRules(this.cfg.deny_chats, chatId, chatName);
+  }
+
+  /** 规则列表是否命中该会话（原生 ID、pw_chat:<id>、名称包含关键字或规范化私聊名一致） */
+  private matchesRules(rules: readonly string[], chatId: string, chatName: string): boolean {
     const ids = new Set([chatId, `pw_chat:${chatId}`]);
     const normChat = normalizeChatName(chatName);
-    for (const raw of this.cfg.deny_chats) {
+    for (const raw of rules) {
       const rule = raw.trim();
       if (!rule) continue;
       if (ids.has(rule)) return true;
@@ -254,8 +261,10 @@ export class FeishuGatewayService {
     const inspected = this.loginStore.inspect();
     const login = inspected.status === "ok" ? inspected.login : undefined;
     let stats = { min_seq: 0, latest_seq: 0, cached_events: 0 };
+    let epoch = "";
     try {
       stats = this.store.seqStats();
+      epoch = this.store.dbEpoch();
     } catch {
       // ignore if DB already closed
     }
@@ -290,6 +299,7 @@ export class FeishuGatewayService {
       min_seq: stats.min_seq,
       latest_seq: stats.latest_seq,
       cached_events: stats.cached_events,
+      ...(epoch ? { db_epoch: epoch } : {}),
     };
   }
 
@@ -520,8 +530,9 @@ export class FeishuGatewayService {
       try {
         chatName = (await client.readChat(msg.conversationId, { signal })).name.trim();
       } catch (err) {
-        if (this.hasDenyRules()) {
-          throw new Error(`查询会话名称失败，无法核对网关排除规则，暂不确认该消息：${errMsg(err)}`);
+        // 客户端（Avatar）也有按名称的排除规则，网关无从知晓：没有缓存名时一律不确认，等飞书重投后再查
+        if (this.hasDenyRules() || !this.store.getChatName(msg.conversationId)) {
+          throw new Error(`查询会话名称失败且无缓存名称，无法核对排除规则，暂不确认该消息：${errMsg(err)}`);
         }
       }
     }
@@ -663,6 +674,18 @@ export class FeishuGatewayService {
     if (typeof req.cid !== "string" || !CID_RE.test(req.cid)) {
       throw new GatewayHttpError(400, "invalid_cid", "cid 格式无效（需 8-128 位字母/数字/._:-）", true);
     }
+    if (req.readback_only !== undefined && typeof req.readback_only !== "boolean") {
+      throw new GatewayHttpError(400, "invalid_request", "readback_only 必须是布尔值", true);
+    }
+    if (
+      req.client_deny !== undefined &&
+      (!Array.isArray(req.client_deny) ||
+        req.client_deny.length > MAX_CLIENT_DENY_RULES ||
+        req.client_deny.some((r) => typeof r !== "string" || r.length > MAX_CLIENT_DENY_RULE_LEN))
+    ) {
+      throw new GatewayHttpError(400, "invalid_request", `client_deny 必须是不超过 ${MAX_CLIENT_DENY_RULES} 条、每条不超过 ${MAX_CLIENT_DENY_RULE_LEN} 字符的字符串数组`, true);
+    }
+    const clientDeny = req.client_deny ?? [];
 
     const expectedOwner = req.expected_owner_id?.trim() ?? "";
     const textHash = hashReplyText(req.text);
@@ -711,10 +734,13 @@ export class FeishuGatewayService {
       }
 
       const readbackOnly = prev?.status === "created" && !!prev.reply_id;
+      if (!readbackOnly && req.readback_only) {
+        throw new GatewayHttpError(403, "reply_disabled", "客户端已关闭发送，只允许对已发出的回复做回读核验，拒绝新发送", true);
+      }
       if (!readbackOnly && !this.cfg.allow_reply) {
         throw new GatewayHttpError(403, "reply_disabled", "网关未开启回复权限（需在 gateway.yaml 中设置 allow_reply: true）", true);
       }
-      if (!readbackOnly && this.isDeniedChat(req.chat_id, "")) {
+      if (!readbackOnly && (this.isDeniedChat(req.chat_id, "") || this.matchesRules(clientDeny, req.chat_id, ""))) {
         throw new GatewayHttpError(403, "chat_denied", `目标会话 ${req.chat_id} 已被网关排除，拒绝发送个人 Web 回复`, true);
       }
 
@@ -809,7 +835,7 @@ export class FeishuGatewayService {
           },
           {
             onBeforeSend: ({ chat, rootId, parentId, threaded }) => {
-              if (this.isDeniedChat(req.chat_id, chat.name)) {
+              if (this.isDeniedChat(req.chat_id, chat.name) || this.matchesRules(clientDeny, req.chat_id, chat.name)) {
                 throw new GatewayHttpError(403, "chat_denied", `目标会话「${chat.name || req.chat_id}」已被网关排除，拒绝发送个人 Web 回复`, true);
               }
               this.store.saveDelivery({

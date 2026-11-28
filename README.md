@@ -107,7 +107,8 @@ test/               后端单元/引擎/集成/端到端测试（桩程序，不
 - **飞书权限守卫**：分诊和 worker 不能调用 `lark-cli`；superagent 作业只放行读和白名单写操作，审计记入 `<data_dir>/logs/guard.log`。机器人和卡片按钮只响应主人本人。
 - **控制台鉴权与边界**：默认监听 `0.0.0.0`（可设为 `127.0.0.1` 仅限本机），访问需令牌（HttpOnly + SameSite=Strict Cookie），写请求校验同源与 JSON，禁止经 API 修改 `data_dir` / `bins`，日志读取限定在 `data_dir` 内。
 - 守卫不是操作系统级沙箱：`--approve-all` 的 worker 仍可在开发机上执行命令，请只在你信任的仓库上派单。
-- **个人 Web 独立常驻网关边界（可选功能，默认关闭）**：个人 Web 协议、AES-256-GCM 静态加密会话 Cookie（`FEISHU_GW_KEY` / `PA_FEISHU_WEB_KEY` / systemd `LoadCredential`）与长连接已完整拆出到独立进程 `bin/feishu-gateway`（见 [gateway.example.yaml](gateway.example.yaml)、[deploy/feishu-gateway.service](deploy/feishu-gateway.service)、[deploy/Dockerfile.gateway](deploy/Dockerfile.gateway)）。推荐以独立 OS 用户或独立容器部署，通过 `0660` Unix Domain Socket + 读写分离双令牌（`read_token` 只读流与游标补拉，`reply_token` 且网关侧默认 `allow_reply: false` 才允许受控回复）与 Avatar 主进程隔离开，Avatar 及其 `--approve-all` worker 永远不接触飞书 Cookie 与加密密钥。仍存在上游私有协议变更风险，请按需开启并遵守组织合规要求。
+- **个人 Web 独立常驻网关边界（可选功能，默认关闭）**：个人 Web 协议、AES-256-GCM 静态加密会话 Cookie（`FEISHU_GW_KEY` / `PA_FEISHU_WEB_KEY` / systemd `LoadCredential`）与长连接已完整拆出到独立进程 `bin/feishu-gateway`（见 [gateway.example.yaml](gateway.example.yaml)、[deploy/feishu-gateway.service](deploy/feishu-gateway.service)、[deploy/Dockerfile.gateway](deploy/Dockerfile.gateway)）。推荐以独立 OS 用户或独立容器部署，通过 `0660` Unix Domain Socket + 读写分离双令牌（`read_token` 只读流与游标补拉，`reply_token` 且网关侧默认 `allow_reply: false` 才允许受控回复）与 Avatar 主进程隔离开，Avatar 及其 `--approve-all` worker 不再接触飞书 Cookie 与加密密钥。边界：与 Avatar 同一 OS 用户的 worker 仍能从 `/proc/<pid>/environ` 或凭据目录读到网关令牌（read_token 可读任意会话历史，reply_token 在 `allow_reply: true` 时可发消息），需要真正隔离时请让 worker 以独立 OS 用户或容器运行。仍存在上游私有协议变更风险，请按需开启并遵守组织合规要求。
+- **从进程内个人 Web 升级**：旧版 `pa context web-login` 把加密会话保存在 `<data_dir>/feishu-web.json`。改用网关后请运行 `pa context web-logout` 删除它，从 Avatar 的运行环境中移除 `PA_FEISHU_WEB_KEY`，并在飞书 App 的登录设备管理里移除旧的网页登录；`pa doctor` 会提示残留。
 
 ## 开发与本地演示
 

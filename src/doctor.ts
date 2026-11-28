@@ -5,7 +5,7 @@ import YAML from "yaml";
 import type { App } from "./app.ts";
 import type { DoctorCheck, DoctorReport } from "./api/types.ts";
 import { repoSpec } from "./config.ts";
-import { createGatewayClientForConfig, resolveGatewayClientConfig, verifyGatewayOwnerForWorkspace } from "./context/personal-web.ts";
+import { createGatewayClientForConfig, legacyPersonalWebArtifacts, resolveGatewayClientConfig, verifyGatewayOwnerForWorkspace } from "./context/personal-web.ts";
 import { GatewayHttpError } from "./gateway/protocol.ts";
 import { resolveBin } from "./harness.ts";
 import { consoleBaseUrl, isLoopbackHost } from "./server/index.ts";
@@ -350,6 +350,19 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
       return warn(`${detail}；卡片已启用但 events.card_actions 为 false：卡片上的按钮不会生效`, `把 ${code("events.card_actions")} 改为 true 并重启常驻进程。\n\n${fix}`);
     if (cfg.cards.enabled && cfg.events.card_actions && !app.ext.cards) return ok(`${detail}（卡片模块未启用，暂不订阅 card.action.trigger）`, fix);
     return ok(detail, fix);
+  });
+
+  add("personal_web_legacy", "旧版个人 Web 凭据残留", async () => {
+    const legacy = legacyPersonalWebArtifacts(cfg, env);
+    if (!legacy.files.length && !legacy.envKeys.length) return ok("未发现旧版遗留的个人 Web 会话凭据");
+    const parts = [
+      ...(legacy.files.length ? [`数据目录中仍有会话凭据文件 ${legacy.files.join("、")}`] : []),
+      ...(legacy.envKeys.length ? [`运行环境中仍设置了 ${legacy.envKeys.join("、")}`] : []),
+    ];
+    return warn(
+      `${parts.join("；")}：同一系统用户下的 worker 仍可能读到个人飞书会话`,
+      `运行 ${code("pa context web-logout")} 删除残留文件，并从 Avatar 运行环境移除 ${code("PA_FEISHU_WEB_KEY")}；登录态只保留在独立网关`,
+    );
   });
 
   add("personal_web", "个人 Web 独立网关", async () => {

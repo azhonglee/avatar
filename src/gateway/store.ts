@@ -179,6 +179,16 @@ export class GatewayStore {
     this.db.close();
   }
 
+  /** 事件库实例标识：首次建库时随机生成，库被删除重建后会变化，供客户端判断是否需要重置游标 */
+  dbEpoch(): string {
+    let epoch = this.getKv("db_epoch");
+    if (!epoch) {
+      epoch = crypto.randomUUID();
+      this.setKv("db_epoch", epoch);
+    }
+    return epoch;
+  }
+
   getKv(k: string): string | undefined {
     const row = this.db.prepare("SELECT v FROM gw_kv WHERE k = ?").get(k) as { v: string } | undefined;
     return row?.v;
@@ -392,6 +402,7 @@ export class GatewayStore {
       latest_seq: stats.latest_seq,
       has_more: hasMore,
       truncated,
+      next_after: slice.length ? Number(slice[slice.length - 1].seq) : safeAfter,
     };
   }
 

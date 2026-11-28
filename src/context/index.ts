@@ -11,7 +11,7 @@ import { deepFind, errMsg, log, truncate } from "../util.ts";
 import { draftCard, eveningCard, itemCard, KIND_LABEL, morningCard, type CtxRenderCtx } from "./cards.ts";
 import { Connectors, relinkMeegoItems } from "./connectors.ts";
 import { defaultDraftKind, Drafter } from "./drafts.ts";
-import { PersonalWebBridge, type FastAnchor } from "./personal-web.ts";
+import { legacyPersonalWebArtifacts, PersonalWebBridge, type FastAnchor } from "./personal-web.ts";
 import { ContextStore, type ItemRow } from "./store.ts";
 import { splitProject, Understander, UnderstandParseError, type SplitResult } from "./understand.ts";
 import { ContextViews, startOfDay } from "./views.ts";
@@ -468,6 +468,13 @@ export class ContextService {
   /** 常驻进程的定时任务 */
   start(): { stop(): void } {
     const c = this.cfg.context;
+    const legacy = legacyPersonalWebArtifacts(this.cfg);
+    if (legacy.files.length || legacy.envKeys.length) {
+      log("warn", "发现旧版遗留的个人 Web 会话凭据，同一系统用户下的 worker 仍可能读到；请运行 pa context web-logout 并移除 PA_FEISHU_WEB_KEY", {
+        files: legacy.files,
+        env: legacy.envKeys,
+      });
+    }
     const opts = { timezone: this.cfg.owner.timezone, protect: true };
     const slot = (cr: Cron) => (cr.currentRun() ?? new Date()).toISOString().slice(0, 16);
     const guard = (name: string, fn: (cr: Cron) => void) => (cr: Cron) => {

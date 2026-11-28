@@ -28,9 +28,12 @@
 #        sudo systemctl daemon-reload && sudo systemctl enable --now feishu-gateway
 #        sudo journalctl -u feishu-gateway -f
 #
-# 隔离效果：
-#   - Avatar 及其 --approve-all harness worker 仅属于 feishu-gw-client 组，只能连接 /run/feishu-gateway/gateway.sock；
-#   - /var/lib/feishu-gateway (0700) 中的加密 Cookie、SQLite 缓存和 /etc/feishu-gateway/secrets/* 对 Avatar 不可读。
+# 隔离效果与边界：
+#   - /var/lib/feishu-gateway (0700) 中的加密 Cookie、SQLite 缓存和 /etc/feishu-gateway/secrets/* 对 Avatar 不可读；
+#   - Avatar 及其 --approve-all harness worker 属于 feishu-gw-client 组，可以连接 /run/feishu-gateway/gateway.sock；
+#   - 注意：与 Avatar 同一 OS 用户的 worker 能通过 /proc/<avatar-pid>/environ 或 Avatar 的凭据目录读到 read_token / reply_token，
+#     拿到 read_token 即可读取任意会话历史与全部缓存，allow_reply 开启时拿到 reply_token 还能以本人身份发消息。
+#     环境变量剥离只能阻止子进程继承，挡不住同用户读取；需要真正隔离时，请让派单 worker 以独立 OS 用户（或容器）运行。
 
 [Unit]
 Description=Feishu Personal Web Gateway (isolated daemon)

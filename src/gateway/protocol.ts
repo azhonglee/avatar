@@ -90,6 +90,8 @@ export interface GatewayStatus {
   min_seq: number;
   latest_seq: number;
   cached_events: number;
+  /** 网关事件库实例标识（建库时随机生成）；变化说明网关库被重建，客户端须重置游标 */
+  db_epoch?: string;
   verified?: boolean;
 }
 
@@ -107,6 +109,8 @@ export interface GatewayEventsResponse {
   latest_seq: number;
   has_more: boolean;
   truncated: boolean;
+  /** 本页实际扫描到的最后一个 seq（含被过滤掉的事件），续拉时以它为游标，避免整页被过滤时卡住 */
+  next_after: number;
 }
 
 export interface GatewayContextRequest {
@@ -129,6 +133,10 @@ export interface GatewayReplyRequest {
   cid: string;
   /** 可选：调用方期望网关当前绑定的个人账号 ID，不匹配时原子拒绝（防跨账号误发） */
   expected_owner_id?: string;
+  /** 只允许对已发出（created）的回复做回读核验，拒绝任何新发送（客户端已关闭 send_replies 时使用） */
+  readback_only?: boolean;
+  /** 客户端侧的排除规则（会话 ID 或名称关键字），网关在发送前用实时会话名一并核对 */
+  client_deny?: string[];
 }
 
 export interface GatewayReplyResult {
@@ -180,6 +188,8 @@ export const MAX_CONTEXT_LIMIT = 30;
 export const MAX_EVENTS_LIMIT = 500;
 export const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 export const CID_RE = /^[A-Za-z0-9._:-]{8,128}$/;
+export const MAX_CLIENT_DENY_RULES = 500;
+export const MAX_CLIENT_DENY_RULE_LEN = 200;
 
 export function isLoopbackHostname(host: string): boolean {
   const h = host.trim().toLowerCase().replace(/^\[|\]$/g, "");

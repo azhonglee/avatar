@@ -8,6 +8,8 @@ import { FeishuGatewayClient } from "../gateway/client.ts";
 import {
   GATEWAY_USER_SENDER_TYPE,
   GatewayHttpError,
+  MAX_CLIENT_DENY_RULE_LEN,
+  MAX_CLIENT_DENY_RULES,
   type GatewayAnchor,
   type GatewayEvent,
   type GatewayListenerState,
@@ -31,6 +33,8 @@ import { isRealConvName, realConvName, type ContextStore, type Obs } from "./sto
 
 export const BOUND_OWNER_KV_KEY = "ctx.personal_web.bound_owner_id";
 export const CURSOR_KV_KEY = "ctx.pw_gateway.cursor";
+/** 与游标配套保存的网关事件库实例标识：变化说明网关库被重建，游标必须重置 */
+const EPOCH_KV_KEY = "ctx.pw_gateway.db_epoch";
 const STATE_KV_KEY = "ctx.personal_web.state";
 const SPOKEN_GROUPS_KV_KEY = "ctx.personal_web.spoken_groups";
 const REPLY_STARTED_PREFIX = "ctx.pw_reply_started.";
@@ -124,6 +128,17 @@ export function createGatewayClientForConfig(
     readToken: resolved.readToken,
     replyToken: resolved.replyToken,
   });
+}
+
+/**
+ * 旧版（进程内个人 Web）遗留在 Avatar 侧的会话凭据：加密 Cookie 文件及其锁文件、仍在环境里的密钥变量。
+ * 现在登录态只应存在于独立网关，这些残留会让 Avatar 与同用户 worker 仍能接触到会话。
+ */
+export function legacyPersonalWebArtifacts(cfg: Pick<Config, "dataDir">, env: NodeJS.ProcessEnv = process.env): { files: string[]; envKeys: string[] } {
+  const base = [path.join(cfg.dataDir, "feishu-web.json"), env.PA_FEISHU_WEB_CRED_FILE?.trim() ? path.resolve(env.PA_FEISHU_WEB_CRED_FILE.trim()) : ""].filter(Boolean);
+  const files = [...new Set(base.flatMap((f) => [f, `${f}.lock`, `${f}.lock.db`]))].filter((f) => fs.existsSync(f));
+  const envKeys = ["PA_FEISHU_WEB_KEY", "PA_FEISHU_WEB_CRED_FILE"].filter((k) => !!env[k]?.trim());
+  return { files, envKeys };
 }
 
 /** 核验网关上报的个人账号与当前 Avatar 工作区的绑定关系，防止指向错误网关实例导致跨账号混库。 */
@@ -335,6 +350,21 @@ export class PersonalWebBridge {
             try {
               applyGatewayStatus(st);
               reconnectDelayMs = 1_000;
+              const savedEpoch = this.app.store.get(EPOCH_KV_KEY) ?? "";
+              if (st.db_epoch && savedEpoch && savedEpoch !== st.db_epoch) {
+                log("warn", "网关事件库实例已变化（网关数据库被重建），重置本地游标并重新订阅", {
+                  local_cursor: this.cursor(),
+                  saved_epoch: savedEpoch,
+                  gateway_epoch: st.db_epoch,
+                });
+                this.resetCursor(0);
+                this.app.store.set(EPOCH_KV_KEY, st.db_epoch);
+                this.hooks.onReconnect();
+                cursorResetReconnect = true;
+                streamCtrl.abort();
+                return;
+              }
+              if (st.db_epoch && !savedEpoch) this.app.store.set(EPOCH_KV_KEY, st.db_epoch);
               if (this.cursor() > st.latest_seq) {
                 log("warn", "检测到网关事件游标回退（网关数据库可能已重建），重置本地游标并重新订阅", {
                   local_cursor: this.cursor(),
@@ -478,6 +508,40 @@ export class PersonalWebBridge {
     );
   }
 
+  /** 是否存在要靠会话名才能判定的排除或静音规则（pw_chat:<id> / 纯数字原生 ID 只按 ID 匹配，不算） */
+  private hasNameBasedExclusions(): boolean {
+    const idOnly = (r: string) => r.startsWith("pw_chat:") || /^\d+$/.test(r);
+    return (
+      this.cfg.context.groups_deny.some((d) => !!d.trim() && !idOnly(d.trim())) ||
+      this.store.mutedConvs().some((m) => !m.conv.startsWith("pw_chat:"))
+    );
+  }
+
+  /**
+   * 交给网关在发送前用实时会话名核对的规则：groups_deny 原样、oc_ 规则换成 lark-cli 记下的群名、
+   * 静音会话的 pw_chat ID 与真实会话名。网关以“ID 相等 / 名称包含关键字 / 规范化私聊名一致”匹配。
+   */
+  private clientDenyRules(): string[] {
+    const out = new Set<string>();
+    const addOc = (oc: string) => {
+      const name = this.openGroupName(oc);
+      if (name) out.add(name);
+    };
+    for (const raw of this.cfg.context.groups_deny) {
+      const r = raw.trim();
+      if (!r) continue;
+      out.add(r);
+      if (r.startsWith("oc_")) addOc(r);
+    }
+    for (const m of this.store.mutedConvs()) {
+      if (m.conv.startsWith("pw_chat:")) out.add(m.conv);
+      if (m.conv.startsWith("oc_")) addOc(m.conv);
+      const name = realConvName(m.name);
+      if (name) out.add(name);
+    }
+    return [...out].filter((r) => r.length <= MAX_CLIENT_DENY_RULE_LEN).slice(0, MAX_CLIENT_DENY_RULES);
+  }
+
   private loadSpokenGroups(): Set<string> {
     const raw = this.app.store.get(SPOKEN_GROUPS_KV_KEY);
     if (!raw) return new Set();
@@ -532,6 +596,11 @@ export class PersonalWebBridge {
 
     const chatName = msg.chatName.trim();
     if (this.isDeniedChat(msg.conversationId, chatName)) return;
+    // 不知道会话名就无法核对按名称的排除/静音规则：宁可丢弃也不放行（每 10 分钟的飞书采集仍会按规则兜底）
+    if (!chatName && this.hasNameBasedExclusions()) {
+      log("warn", "个人 Web 网关消息缺少会话名，无法核对按名称的排除规则，已丢弃", { chat_id: msg.conversationId, message_id: msg.id });
+      return;
+    }
 
     const isAtMe = !isMe && !!ownerId && msg.mentions.some((m) => m.id === ownerId);
     if (msg.conversationKind === "group") {
@@ -702,7 +771,9 @@ export class PersonalWebBridge {
 
     const startedKey = `${REPLY_STARTED_PREFIX}${args.cid}`;
     const alreadyStarted = !!this.app.store.get(startedKey);
-    if (!alreadyStarted && !this.cfg.context.personal_web.send_replies) {
+    // 关闭 send_replies 后只允许“已发出、只差回读”的收尾：本地标记无法证明网关真的发过包，交给网关按投递记录判定，拒绝任何新发送
+    const readbackOnly = !this.cfg.context.personal_web.send_replies;
+    if (readbackOnly && !alreadyStarted) {
       throw new PermanentEffectError("未开启个人 Web 回复（需在配置中设置 context.personal_web.send_replies: true）");
     }
 
@@ -723,6 +794,8 @@ export class PersonalWebBridge {
         text: args.text,
         cid: args.cid,
         ...(expectedOwner ? { expected_owner_id: expectedOwner } : {}),
+        ...(readbackOnly ? { readback_only: true } : {}),
+        client_deny: this.clientDenyRules(),
       });
       this.app.store.db.prepare("DELETE FROM kv WHERE k = ?").run(startedKey);
       return res;
