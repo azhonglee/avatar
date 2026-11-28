@@ -5,8 +5,7 @@ import YAML from "yaml";
 import type { App } from "./app.ts";
 import type { DoctorCheck, DoctorReport } from "./api/types.ts";
 import { repoSpec } from "./config.ts";
-import { createGatewayClientForConfig, legacyPersonalWebArtifacts, resolveGatewayClientConfig, verifyGatewayOwnerForWorkspace } from "./context/personal-web.ts";
-import { GatewayHttpError } from "./gateway/protocol.ts";
+import { inspectPersonalWebBoundary, inspectPersonalWebGateway, legacyPersonalWebArtifacts } from "./context/personal-web.ts";
 import { resolveBin } from "./harness.ts";
 import { consoleBaseUrl, isLoopbackHost } from "./server/index.ts";
 import { validateConfig } from "./settings.ts";
@@ -371,116 +370,9 @@ export async function runDoctor(app: App, o: DoctorOptions = {}): Promise<Doctor
     );
   });
 
-  add("personal_web", "个人 Web 独立网关", async () => {
-    const pwCfg = cfg.context.personal_web;
-    if (!cfg.context.enabled || !pwCfg.enabled) {
-      return skip(
-        "未启用（当前仅走 lark-cli 定时采集）",
-        `如需秒级响应任意群 @我 与私聊，请先以独立进程/用户部署 ${code("bin/feishu-gateway")}（${code("feishu-gateway login")} + ${code("feishu-gateway run")}），再在 ${code("config.yaml")} 中配置 ${code("context.personal_web.gateway_socket")}（或 ${code("gateway_url")}）并将 ${code("enabled")} 设为 true`,
-      );
-    }
-    const resolved = resolveGatewayClientConfig(pwCfg, env);
-    if (!resolved.socketPath && !resolved.baseUrl) {
-      return fail(
-        "已启用个人 Web 通道但未配置网关地址",
-        `在 ${code("config.yaml")} 中配置 ${code("context.personal_web.gateway_socket")} 或回环 ${code("gateway_url")}`,
-      );
-    }
-    if (!resolved.readToken) {
-      return fail(
-        `缺少网关只读令牌（环境变量 ${pwCfg.read_token_env || "FEISHU_GW_READ_TOKEN"} 未设置）`,
-        `非 systemd 部署请在网关侧运行 ${code("bin/feishu-gateway tokens")} 获取 read_token；systemd ${code("LoadCredential")} 部署请查看 ${code("/etc/feishu-gateway/secrets/read-token")}，并在运行 Avatar 前导出环境变量 ${code(pwCfg.read_token_env || "FEISHU_GW_READ_TOKEN")}`,
-      );
-    }
-    if (resolved.replyToken && resolved.readToken === resolved.replyToken) {
-      return fail(
-        "安全约束违规：read_token 与 reply_token 相同",
-        `为 ${code(pwCfg.read_token_env)} 与 ${code(pwCfg.reply_token_env)} 配置各自独立的令牌`,
-      );
-    }
-    if (pwCfg.send_replies && !resolved.replyToken) {
-      return fail(
-        `已开启 send_replies 但缺少回复令牌（环境变量 ${pwCfg.reply_token_env || "FEISHU_GW_REPLY_TOKEN"} 未设置）`,
-        `在运行 Avatar 前导出 ${code(pwCfg.reply_token_env || "FEISHU_GW_REPLY_TOKEN")}（文件模式来自 ${code("bin/feishu-gateway tokens")}，systemd 部署见 ${code("/etc/feishu-gateway/secrets/reply-token")}），或关闭 ${code("context.personal_web.send_replies")}`,
-      );
-    }
-    let client;
-    try {
-      client = createGatewayClientForConfig(pwCfg, env);
-    } catch (e) {
-      return fail(`个人 Web 网关配置无效：${errMsg(e)}`, `检查 ${code("config.yaml")} 中的 ${code("context.personal_web")} 地址与令牌配置`);
-    }
-    try {
-      const st = await client.status({ timeoutMs: 3_000 });
-      if (st.owner_id) {
-        try {
-          verifyGatewayOwnerForWorkspace(app, st.owner_id);
-        } catch (e) {
-          return fail(
-            errMsg(e),
-            `确认 ${resolved.endpointLabel} 指向正确的网关实例；如网关已通过 ${code("--force-switch-account")} 切换账号，请运行 ${code("pa context web-unbind")} 解除当前工作区旧绑定`,
-          );
-        }
-      }
-      if (st.credential_status === "missing_key") {
-        return fail(
-          `网关缺少凭据解密密钥（${resolved.endpointLabel}）`,
-          `在网关侧配置 ${code("FEISHU_GW_KEY")}（或 systemd ${code("LoadCredential=feishu-gw-key:...")}）并重启网关`,
-        );
-      }
-      if (st.credential_status === "plaintext_rejected" || st.credential_status === "invalid") {
-        return fail(
-          `网关凭据异常（${st.credential_status}）：${st.last_error || "解密失败"}`,
-          `在网关侧核对 ${code("FEISHU_GW_KEY")} 或重新运行 ${code("bin/feishu-gateway login")}`,
-        );
-      }
-      if (!st.logged_in || st.state === "needs_login") {
-        return warn(
-          `网关在线但尚未登录或会话已失效（${st.last_error || st.credential_status}）`,
-          `在网关侧运行 ${code("bin/feishu-gateway login")} 使用本人飞书 App 扫码登录`,
-        );
-      }
-      if (pwCfg.send_replies && !st.allow_reply) {
-        return warn(
-          `网关已连接（${st.owner_name || st.owner_id}，${st.state}），但网关侧 allow_reply 为 false，无法发送回复`,
-          `如需走个人 Web 发送回复，请在网关 ${code("gateway.yaml")} 中显式设置 ${code("allow_reply: true")} 并重启网关`,
-        );
-      }
-      return ok(`${st.owner_name || st.owner_id}（${resolved.endpointLabel}，状态：${st.state}，缓存 seq ${st.latest_seq}）`);
-    } catch (e) {
-      if (e instanceof GatewayHttpError && (e.statusCode === 401 || e.statusCode === 403)) {
-        return fail(
-          `网关鉴权失败（${e.code}）：${e.message}`,
-          `核对 ${code(pwCfg.read_token_env || "FEISHU_GW_READ_TOKEN")} 是否与网关当前生效的 read_token 一致（文件模式运行 ${code("bin/feishu-gateway tokens")}，systemd ${code("LoadCredential")} 部署请核对 ${code("/etc/feishu-gateway/secrets/read-token")}）`,
-        );
-      }
-      return warn(
-        `无法连接到个人 Web 网关 ${resolved.endpointLabel}：${errMsg(e)}（期间由每 10 分钟的飞书轮询兜底）`,
-        `确认独立网关正在运行（${code("bin/feishu-gateway run")}）且当前用户对 socket 有访问权限`,
-      );
-    }
-  });
+  add("personal_web", "个人 Web 独立网关", async () => (await inspectPersonalWebGateway(app, { env, timeoutMs: Math.min(cmdTimeout, 3_000) })).personalWeb);
 
-  add("personal_web_boundary", "个人 Web 令牌隔离边界", async () => {
-    const pwCfg = cfg.context.personal_web;
-    if (!cfg.context.enabled || !pwCfg.enabled) {
-      return skip("个人 Web 通道未启用");
-    }
-    const resolved = resolveGatewayClientConfig(pwCfg, env);
-    if (pwCfg.send_replies) {
-      return warn(
-        "已开启 context.personal_web.send_replies：与 Avatar 同 OS 用户运行的 --approve-all worker 可从 /proc/<pid>/environ 或 $CREDENTIALS_DIRECTORY 读取 reply_token，在网关 allow_reply=true 时能以本人身份回复消息",
-        `如不需要经个人 Web 自动发送回复，将 ${code("context.personal_web.send_replies")} 设为 false 并从 Avatar 运行环境/凭据目录移除 ${code(pwCfg.reply_token_env || "FEISHU_GW_REPLY_TOKEN")}；如需保留，请将派单 worker 隔离在独立 OS 用户或容器中运行`,
-      );
-    }
-    if (resolved.replyToken) {
-      return warn(
-        `context.personal_web.send_replies 已关闭，但 Avatar 进程环境或 $CREDENTIALS_DIRECTORY 中仍存在 reply_token（${pwCfg.reply_token_env || "FEISHU_GW_REPLY_TOKEN"}）：同 OS 用户的 --approve-all worker 仍可读取该令牌并在网关 allow_reply=true 时直接调用回复接口`,
-        `从 Avatar 运行环境或 systemd LoadCredential 中移除 ${code(pwCfg.reply_token_env || "FEISHU_GW_REPLY_TOKEN")}（reply-token），仅保留只读令牌`,
-      );
-    }
-    return ok("个人 Web 回复已关闭且未向 Avatar 暴露 reply_token（仅使用只读通道；如需对 read_token 做强隔离，仍建议以独立 OS 用户或容器运行 worker）");
-  });
+  add("personal_web_boundary", "个人 Web 令牌隔离边界", async () => inspectPersonalWebBoundary(app, env));
 
   add("data_dir", "数据目录", async () => {
     const probeFile = path.join(cfg.dataDir, `.doctor-${process.pid}-${now()}`);

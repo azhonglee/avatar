@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { App } from "../app.ts";
@@ -6,6 +7,7 @@ import type { Config } from "../config.ts";
 import { PermanentEffectError } from "../effects.ts";
 import { FeishuGatewayClient } from "../gateway/client.ts";
 import {
+  ENV_NAME_RE,
   GATEWAY_USER_SENDER_TYPE,
   GatewayHttpError,
   MAX_CLIENT_DENY_RULE_LEN,
@@ -69,12 +71,210 @@ export interface PersonalWebBridgeHooks {
   streamIdleTimeoutMs?: number;
 }
 
+export const GATEWAY_ENV_FILENAME = "gateway.env";
+const MAX_GATEWAY_ENV_BYTES = 64 * 1024;
+
+export type GatewayTokenSource = "env" | "credential" | "env_file" | "none";
+export type GatewayEnvUnsafeKind = "file_type" | "owner" | "mode";
+
+export interface GatewayEnvFileReadResult {
+  status: "ok" | "missing" | "unsafe" | "error";
+  file: string;
+  values: Record<string, string>;
+  unsafeKind?: GatewayEnvUnsafeKind;
+  error?: string;
+}
+
 export interface ResolvedGatewayClientConfig {
   socketPath?: string;
   baseUrl?: string;
   readToken: string;
   replyToken: string;
+  readTokenSource: GatewayTokenSource;
+  replyTokenSource: GatewayTokenSource;
+  envFilePath?: string;
+  envFileError?: string;
+  envFileUnsafeKind?: GatewayEnvUnsafeKind;
   endpointLabel: string;
+}
+
+export function gatewayEnvFilePath(dataDir: string): string {
+  return path.join(path.resolve(dataDir), GATEWAY_ENV_FILENAME);
+}
+
+export function formatTokenSourceLabel(src: GatewayTokenSource): string {
+  switch (src) {
+    case "env":
+      return "环境变量";
+    case "credential":
+      return "systemd 凭据";
+    case "env_file":
+      return "gateway.env";
+    case "none":
+      return "未配置";
+  }
+}
+
+/** 解析受限的 KEY=VALUE 凭据文件文本（支持 # 注释、可选 export 前缀、单双引号）。 */
+export function parseGatewayEnvText(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const rawLine of text.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const body = trimmed.startsWith("export ") ? trimmed.slice("export ".length).trim() : trimmed;
+    const eq = body.indexOf("=");
+    if (eq <= 0) continue;
+    const key = body.slice(0, eq).trim();
+    if (!ENV_NAME_RE.test(key)) continue;
+    let rawVal = body.slice(eq + 1).trim();
+    let val = rawVal;
+    if (rawVal.length >= 2 && rawVal.startsWith("'") && rawVal.endsWith("'")) {
+      val = rawVal.slice(1, -1);
+    } else if (rawVal.length >= 2 && rawVal.startsWith('"') && rawVal.endsWith('"')) {
+      val = rawVal
+        .slice(1, -1)
+        .replace(/\\(["\\$`])/g, "$1");
+    }
+    if (!val || /[\r\n\0]/.test(val)) continue;
+    out[key] = val;
+  }
+  return out;
+}
+
+function formatEnvValue(val: string): string {
+  if (/[\r\n\0]/.test(val)) {
+    throw new Error("令牌值包含非法控制字符（换行或空字节）");
+  }
+  if (!val.includes("'")) return `'${val}'`;
+  const escaped = val.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\$/g, "\\$").replace(/`/g, "\\`");
+  return `"${escaped}"`;
+}
+
+/**
+ * 读取 `<data_dir>/gateway.env` 受限凭据文件（单 fd 打开后 `fstatSync` 校验，消除 TOCTOU）：
+ *   - 使用 `O_NOFOLLOW` 拒绝符号链接，并在同一个 fd 上拒绝目录/FIFO/socket 等非普通文件；
+ *   - 在 POSIX 上必须仅属主可访问（mode & 0o077 === 0，即 0600 / 0400）且属主与当前进程一致。
+ */
+export function readGatewayEnvFile(dataDir: string): GatewayEnvFileReadResult {
+  const file = gatewayEnvFilePath(dataDir);
+  const openFlags =
+    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+  let fd: number;
+  try {
+    fd = fs.openSync(file, openFlags);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      return { status: "missing", file, values: {} };
+    }
+    if (code === "ELOOP" || code === "EISDIR") {
+      return {
+        status: "unsafe",
+        file,
+        values: {},
+        unsafeKind: "file_type",
+        error: `${file} 必须是普通文件（拒绝符号链接或目录）`,
+      };
+    }
+    return { status: "error", file, values: {}, error: `无法访问 ${file}：${errMsg(e)}` };
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) {
+      return {
+        status: "unsafe",
+        file,
+        values: {},
+        unsafeKind: "file_type",
+        error: `${file} 必须是普通文件（拒绝符号链接、目录或特殊文件）`,
+      };
+    }
+    if (st.size > MAX_GATEWAY_ENV_BYTES) {
+      return { status: "error", file, values: {}, error: `${file} 体积超过上限（${MAX_GATEWAY_ENV_BYTES} 字节），已拒绝加载` };
+    }
+    if (process.platform !== "win32") {
+      if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
+        return {
+          status: "unsafe",
+          file,
+          values: {},
+          unsafeKind: "owner",
+          error: `${file} 属主与当前运行用户不一致，拒绝加载`,
+        };
+      }
+      const perm = st.mode & 0o777;
+      if ((perm & 0o077) !== 0) {
+        return {
+          status: "unsafe",
+          file,
+          values: {},
+          unsafeKind: "mode",
+          error: `${file} 权限过于宽松（当前 ${perm.toString(8).padStart(4, "0")}，必须为 0600），已拒绝加载`,
+        };
+      }
+    }
+    const raw = fs.readFileSync(fd, "utf8");
+    return { status: "ok", file, values: parseGatewayEnvText(raw) };
+  } catch (e) {
+    return { status: "error", file, values: {}, error: `读取 ${file} 失败：${errMsg(e)}` };
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** 原子写入 `0600` 权限的 `<data_dir>/gateway.env`（`O_EXCL | O_NOFOLLOW` + 随机临时名 + `fchmodSync`，零宽松权限窗口）。 */
+export function writeGatewayEnvFile(dataDir: string, entries: Record<string, string>): string {
+  const dir = path.resolve(dataDir);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const file = gatewayEnvFilePath(dir);
+  try {
+    const existing = fs.lstatSync(file);
+    if (existing.isSymbolicLink()) throw new Error(`${file} 是符号链接，拒绝覆盖写入`);
+    if (!existing.isFile()) throw new Error(`${file} 不是普通文件，拒绝覆盖写入`);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+
+  const lines = [
+    "# Avatar 个人 Web 网关凭据文件（由 pa context web-setup 维护，权限固定 0600，请勿提交到版本库）",
+  ];
+  for (const [key, rawVal] of Object.entries(entries)) {
+    const k = key.trim();
+    const v = rawVal.trim();
+    if (!ENV_NAME_RE.test(k)) throw new Error(`无效的环境变量名：${key}`);
+    if (!v) throw new Error(`环境变量 ${k} 的值不能为空`);
+    lines.push(`${k}=${formatEnvValue(v)}`);
+  }
+  const content = lines.join("\n") + "\n";
+  const rand = crypto.randomBytes(6).toString("hex");
+  const tmp = path.join(dir, `.${GATEWAY_ENV_FILENAME}.${process.pid}.${Date.now()}.${rand}.tmp`);
+  const createFlags =
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(tmp, createFlags, 0o600);
+    fs.fchmodSync(fd, 0o600);
+    fs.writeFileSync(fd, content, "utf8");
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+    fs.rmSync(tmp, { force: true });
+    throw e;
+  }
+  return file;
 }
 
 function readSystemdCredential(names: string[], env: NodeJS.ProcessEnv = process.env): string {
@@ -91,10 +291,14 @@ function readSystemdCredential(names: string[], env: NodeJS.ProcessEnv = process
   return "";
 }
 
-/** 从配置指定的环境变量（或 systemd LoadCredential）解析网关地址与读写分离双令牌。 */
+/**
+ * 从配置指定的环境变量、systemd LoadCredential 或 `<data_dir>/gateway.env`（0600）解析网关地址与读写分离双令牌。
+ * 优先级：显式环境变量 > systemd LoadCredential > `<data_dir>/gateway.env`。
+ */
 export function resolveGatewayClientConfig(
   pwCfg: Config["context"]["personal_web"],
   env: NodeJS.ProcessEnv = process.env,
+  opts: { dataDir?: string } = {},
 ): ResolvedGatewayClientConfig {
   const socketRaw = pwCfg.gateway_socket.trim();
   const urlRaw = pwCfg.gateway_url.trim();
@@ -103,22 +307,45 @@ export function resolveGatewayClientConfig(
   const readEnvName = pwCfg.read_token_env.trim();
   const replyEnvName = pwCfg.reply_token_env.trim();
 
-  const readToken =
-    (readEnvName ? env[readEnvName]?.trim() : "") ||
-    readSystemdCredential(["feishu-gw-read-token", "read-token"], env);
-  const replyToken =
-    (replyEnvName ? env[replyEnvName]?.trim() : "") ||
-    readSystemdCredential(["feishu-gw-reply-token", "reply-token"], env);
+  const envFile = opts.dataDir ? readGatewayEnvFile(opts.dataDir) : undefined;
+  const envFilePath = envFile?.file;
+  const envFileError = envFile && (envFile.status === "unsafe" || envFile.status === "error") ? envFile.error : undefined;
+  const envFileUnsafeKind = envFile?.status === "unsafe" ? envFile.unsafeKind : undefined;
+
+  const pickToken = (envName: string, credNames: string[]): { value: string; source: GatewayTokenSource } => {
+    const fromEnv = envName ? env[envName]?.trim() : "";
+    if (fromEnv) return { value: fromEnv, source: "env" };
+    const fromCred = readSystemdCredential(credNames, env);
+    if (fromCred) return { value: fromCred, source: "credential" };
+    const fromFile = envName && envFile?.status === "ok" ? envFile.values[envName]?.trim() : "";
+    if (fromFile) return { value: fromFile, source: "env_file" };
+    return { value: "", source: "none" };
+  };
+
+  const read = pickToken(readEnvName, ["feishu-gw-read-token", "read-token"]);
+  const reply = pickToken(replyEnvName, ["feishu-gw-reply-token", "reply-token"]);
 
   const endpointLabel = socketPath ? `unix://${socketPath}` : (baseUrl ?? "(未配置)");
-  return { socketPath, baseUrl, readToken, replyToken, endpointLabel };
+  return {
+    socketPath,
+    baseUrl,
+    readToken: read.value,
+    replyToken: reply.value,
+    readTokenSource: read.source,
+    replyTokenSource: reply.source,
+    envFilePath,
+    envFileError,
+    envFileUnsafeKind,
+    endpointLabel,
+  };
 }
 
 export function createGatewayClientForConfig(
   pwCfg: Config["context"]["personal_web"],
   env: NodeJS.ProcessEnv = process.env,
+  opts: { dataDir?: string } = {},
 ): FeishuGatewayClient {
-  const resolved = resolveGatewayClientConfig(pwCfg, env);
+  const resolved = resolveGatewayClientConfig(pwCfg, env, opts);
   if (resolved.readToken && resolved.replyToken && resolved.readToken === resolved.replyToken) {
     throw new Error("安全约束违规：read_token 与 reply_token 的值不能相同，请为读写配置不同令牌");
   }
@@ -206,6 +433,287 @@ export function unbindPersonalWebAccount(app: App): { previousOwnerId: string } 
   return { previousOwnerId };
 }
 
+export interface PersonalWebCheckResult {
+  status: "ok" | "warn" | "fail" | "skip";
+  detail: string;
+  fix: string;
+}
+
+export interface PersonalWebInspection {
+  personalWeb: PersonalWebCheckResult;
+  boundary: PersonalWebCheckResult;
+  resolved?: ResolvedGatewayClientConfig;
+}
+
+const backtick = (s: string) => "`" + s + "`";
+
+function formatEnvFileFixHint(resolved: ResolvedGatewayClientConfig, envFileLabel: string): string {
+  if (!resolved.envFileError) return "";
+  if (resolved.envFileUnsafeKind === "mode") {
+    return `执行 ${backtick(`chmod 600 ${envFileLabel}`)} 修复权限`;
+  }
+  if (resolved.envFileUnsafeKind === "file_type") {
+    return `移除异常的符号链接/非普通文件 ${backtick(envFileLabel)} 后重新运行 ${backtick("bin/pa context web-setup")}`;
+  }
+  if (resolved.envFileUnsafeKind === "owner") {
+    return `核对 ${backtick(envFileLabel)} 文件属主或删除后重新运行 ${backtick("bin/pa context web-setup")}`;
+  }
+  return `检查或重新生成 ${backtick(envFileLabel)}`;
+}
+
+/** 个人 Web 令牌隔离边界同步检查（独立于网络探测，供 `pa doctor` 与 `inspectPersonalWebGateway` 共用）。 */
+export function inspectPersonalWebBoundary(
+  app: App,
+  env: NodeJS.ProcessEnv = process.env,
+  preResolved?: ResolvedGatewayClientConfig,
+): PersonalWebCheckResult {
+  const { cfg } = app;
+  const pwCfg = cfg.context.personal_web;
+  if (!cfg.context.enabled || !pwCfg.enabled) {
+    return { status: "skip", detail: "个人 Web 通道未启用", fix: "" };
+  }
+  const resolved = preResolved ?? resolveGatewayClientConfig(pwCfg, env, { dataDir: cfg.dataDir });
+  const replyEnv = pwCfg.reply_token_env.trim() || "FEISHU_GW_REPLY_TOKEN";
+  const envFileLabel = resolved.envFilePath ?? gatewayEnvFilePath(cfg.dataDir);
+  if (pwCfg.send_replies) {
+    return {
+      status: "warn",
+      detail: `已开启 context.personal_web.send_replies：与 Avatar 同 OS 用户运行的 --approve-all worker 可从 /proc/<pid>/environ、$CREDENTIALS_DIRECTORY 或 ${GATEWAY_ENV_FILENAME} 读取 reply_token，在网关 allow_reply=true 时能以本人身份回复消息`,
+      fix: `如不需要经个人 Web 自动发送回复，运行 ${backtick("bin/pa context web-setup --no-reply")}（或将 ${backtick("context.personal_web.send_replies")} 设为 false 并移除 ${backtick(replyEnv)}）；如需保留，请将派单 worker 隔离在独立 OS 用户或容器中运行`,
+    };
+  }
+  if (resolved.replyToken) {
+    return {
+      status: "warn",
+      detail: `context.personal_web.send_replies 已关闭，但 Avatar 仍存在 reply_token（${replyEnv}，来源：${formatTokenSourceLabel(resolved.replyTokenSource)}）：同 OS 用户的 --approve-all worker 仍可读取该令牌并在网关 allow_reply=true 时直接调用回复接口`,
+      fix:
+        resolved.replyTokenSource === "env_file"
+          ? `运行 ${backtick("bin/pa context web-setup --no-reply")} 从 ${backtick(envFileLabel)} 中清理 ${backtick(replyEnv)}，仅保留只读令牌`
+          : `从 Avatar 运行环境或 systemd LoadCredential 中移除 ${backtick(replyEnv)}（reply-token），仅保留只读令牌`,
+    };
+  }
+  return {
+    status: "ok",
+    detail: "个人 Web 回复已关闭且未向 Avatar 暴露 reply_token（仅使用只读通道；如需对 read_token 做强隔离，仍建议以独立 OS 用户或容器运行 worker）",
+    fix: "",
+  };
+}
+
+/**
+ * 个人 Web 独立网关只读检测（供 `pa doctor` 与 `pa init` 共用）：
+ *   - `personalWeb`：检查开关、端点、只读/回复令牌（含 `<data_dir>/gateway.env` 权限安全）、在线连通性与账号绑定；
+ *   - `boundary`：检查 `send_replies` 与 `reply_token` 的同用户隔离风险。
+ */
+export async function inspectPersonalWebGateway(
+  app: App,
+  opts: { env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
+): Promise<PersonalWebInspection> {
+  const { cfg } = app;
+  const env = opts.env ?? process.env;
+  const timeoutMs = opts.timeoutMs ?? 3_000;
+  const pwCfg = cfg.context.personal_web;
+
+  if (!cfg.context.enabled || !pwCfg.enabled) {
+    return {
+      personalWeb: {
+        status: "skip",
+        detail: "未启用（当前仅走 lark-cli 定时采集）",
+        fix: `如需秒级响应任意群 @我 与私聊，请先以独立进程/用户部署 ${backtick("bin/feishu-gateway")}（${backtick("feishu-gateway login")} + ${backtick("feishu-gateway run")}），再运行 ${backtick("bin/pa context web-setup")} 自动接入，或手动在 ${backtick("config.yaml")} 中配置 ${backtick("context.personal_web.gateway_socket")}（或 ${backtick("gateway_url")}）并将 ${backtick("enabled")} 设为 true`,
+      },
+      boundary: inspectPersonalWebBoundary(app, env),
+    };
+  }
+
+  const resolved = resolveGatewayClientConfig(pwCfg, env, { dataDir: cfg.dataDir });
+  const readEnvRaw = pwCfg.read_token_env.trim();
+  const replyEnvRaw = pwCfg.reply_token_env.trim();
+  const readEnv = readEnvRaw || "FEISHU_GW_READ_TOKEN";
+  const replyEnv = replyEnvRaw || "FEISHU_GW_REPLY_TOKEN";
+  const envFileLabel = resolved.envFilePath ?? gatewayEnvFilePath(cfg.dataDir);
+  const boundary = inspectPersonalWebBoundary(app, env, resolved);
+
+  if (!resolved.socketPath && !resolved.baseUrl) {
+    return {
+      personalWeb: {
+        status: "fail",
+        detail: "已启用个人 Web 通道但未配置网关地址",
+        fix: `运行 ${backtick("bin/pa context web-setup")} 自动写入，或在 ${backtick("config.yaml")} 中配置 ${backtick("context.personal_web.gateway_socket")} 或回环 ${backtick("gateway_url")}`,
+      },
+      boundary,
+      resolved,
+    };
+  }
+
+  if (!resolved.readToken) {
+    const fileWarn = resolved.envFileError ? `；且 ${resolved.envFileError}` : "";
+    const fileHint = formatEnvFileFixHint(resolved, envFileLabel);
+    const prefixHint = fileHint ? `${fileHint}；或` : "";
+    const envNameDesc = readEnvRaw
+      ? `环境变量 ${readEnv}、systemd 凭据与 ${GATEWAY_ENV_FILENAME} 均未提供有效令牌`
+      : `config.yaml 中 read_token_env 为空且 systemd 凭据未提供只读令牌`;
+    return {
+      personalWeb: {
+        status: "fail",
+        detail: `缺少网关只读令牌（${envNameDesc}${fileWarn}）`,
+        fix: `${prefixHint}单机部署运行 ${backtick("bin/pa context web-setup")} 自动配置并同步只读令牌到 ${backtick(envFileLabel)}（或运行 ${backtick("bin/feishu-gateway tokens")} 获取 read_token）；systemd ${backtick("LoadCredential")} 部署请查看 ${backtick("/etc/feishu-gateway/secrets/read-token")} 并在运行 Avatar 前导出环境变量 ${backtick(readEnv)}`,
+      },
+      boundary,
+      resolved,
+    };
+  }
+
+  if (resolved.replyToken && resolved.readToken === resolved.replyToken) {
+    return {
+      personalWeb: {
+        status: "fail",
+        detail: "安全约束违规：read_token 与 reply_token 相同",
+        fix: `为 ${backtick(readEnv)} 与 ${backtick(replyEnv)} 配置各自独立的令牌`,
+      },
+      boundary,
+      resolved,
+    };
+  }
+
+  if (pwCfg.send_replies && !resolved.replyToken) {
+    const fileWarn = resolved.envFileError ? `；且 ${resolved.envFileError}` : "";
+    const fileHint = formatEnvFileFixHint(resolved, envFileLabel);
+    const prefixHint = fileHint ? `${fileHint}；或` : "";
+    const replyNameDesc = replyEnvRaw
+      ? `${replyEnv} 未在环境变量、systemd 凭据或 ${GATEWAY_ENV_FILENAME} 中配置`
+      : `config.yaml 中 reply_token_env 为空且 systemd 凭据未提供回复令牌`;
+    return {
+      personalWeb: {
+        status: "fail",
+        detail: `已开启 send_replies 但缺少回复令牌（${replyNameDesc}${fileWarn}）`,
+        fix: `${prefixHint}运行 ${backtick("bin/pa context web-setup --with-reply")} 同步回复令牌，或在运行 Avatar 前导出 ${backtick(replyEnv)}（文件模式来自 ${backtick("bin/feishu-gateway tokens")}，systemd 部署见 ${backtick("/etc/feishu-gateway/secrets/reply-token")}），或关闭 ${backtick("context.personal_web.send_replies")}`,
+      },
+      boundary,
+      resolved,
+    };
+  }
+
+  let client: FeishuGatewayClient;
+  try {
+    client = createGatewayClientForConfig(pwCfg, env, { dataDir: cfg.dataDir });
+  } catch (e) {
+    return {
+      personalWeb: {
+        status: "fail",
+        detail: `个人 Web 网关配置无效：${errMsg(e)}`,
+        fix: `检查 ${backtick("config.yaml")} 中的 ${backtick("context.personal_web")} 地址与令牌配置`,
+      },
+      boundary,
+      resolved,
+    };
+  }
+
+  const tokenSourceDesc = `令牌来源：${formatTokenSourceLabel(resolved.readTokenSource)}`;
+  try {
+    const st = await client.status({ timeoutMs });
+    if (st.owner_id) {
+      try {
+        verifyGatewayOwnerForWorkspace(app, st.owner_id);
+      } catch (e) {
+        return {
+          personalWeb: {
+            status: "fail",
+            detail: errMsg(e),
+            fix: `确认 ${resolved.endpointLabel} 指向正确的网关实例；如网关已通过 ${backtick("--force-switch-account")} 切换账号，请运行 ${backtick("pa context web-unbind")} 解除当前工作区旧绑定`,
+          },
+          boundary,
+          resolved,
+        };
+      }
+    }
+    if (st.credential_status === "missing_key") {
+      return {
+        personalWeb: {
+          status: "fail",
+          detail: `网关缺少凭据解密密钥（${resolved.endpointLabel}）`,
+          fix: `在网关侧配置 ${backtick("FEISHU_GW_KEY")}（或 systemd ${backtick("LoadCredential=feishu-gw-key:...")}）并重启网关`,
+        },
+        boundary,
+        resolved,
+      };
+    }
+    if (st.credential_status === "plaintext_rejected" || st.credential_status === "invalid") {
+      return {
+        personalWeb: {
+          status: "fail",
+          detail: `网关凭据异常（${st.credential_status}）：${st.last_error || "解密失败"}`,
+          fix: `在网关侧核对 ${backtick("FEISHU_GW_KEY")} 或重新运行 ${backtick("bin/feishu-gateway login")}`,
+        },
+        boundary,
+        resolved,
+      };
+    }
+    if (!st.logged_in || st.state === "needs_login") {
+      return {
+        personalWeb: {
+          status: "warn",
+          detail: `网关在线但尚未登录或会话已失效（${st.last_error || st.credential_status}）`,
+          fix: `在网关侧运行 ${backtick("bin/feishu-gateway login")} 使用本人飞书 App 扫码登录`,
+        },
+        boundary,
+        resolved,
+      };
+    }
+    if (pwCfg.send_replies && !st.allow_reply) {
+      return {
+        personalWeb: {
+          status: "warn",
+          detail: `网关已连接（${st.owner_name || st.owner_id}，${st.state}），但网关侧 allow_reply 为 false，无法发送回复`,
+          fix: `如需走个人 Web 发送回复，请在网关 ${backtick("gateway.yaml")} 中显式设置 ${backtick("allow_reply: true")} 并重启网关`,
+        },
+        boundary,
+        resolved,
+      };
+    }
+    if (resolved.envFileError) {
+      const fixHint = formatEnvFileFixHint(resolved, envFileLabel);
+      return {
+        personalWeb: {
+          status: "warn",
+          detail: `${st.owner_name || st.owner_id}（${resolved.endpointLabel}，${tokenSourceDesc}，状态：${st.state}），但本地凭据文件异常：${resolved.envFileError}`,
+          fix: `${fixHint}，或删除不需要的 ${backtick(envFileLabel)}`,
+        },
+        boundary,
+        resolved,
+      };
+    }
+    return {
+      personalWeb: {
+        status: "ok",
+        detail: `${st.owner_name || st.owner_id}（${resolved.endpointLabel}，${tokenSourceDesc}，状态：${st.state}，缓存 seq ${st.latest_seq}）`,
+        fix: "",
+      },
+      boundary,
+      resolved,
+    };
+  } catch (e) {
+    if (e instanceof GatewayHttpError && (e.statusCode === 401 || e.statusCode === 403)) {
+      return {
+        personalWeb: {
+          status: "fail",
+          detail: `网关鉴权失败（${e.code}，${tokenSourceDesc}）：${e.message}`,
+          fix: `运行 ${backtick("bin/pa context web-setup")} 同步最新 read_token，或核对 ${backtick(readEnv)} 是否与网关当前生效的 read_token 一致（文件模式运行 ${backtick("bin/feishu-gateway tokens")}，systemd ${backtick("LoadCredential")} 部署请核对 ${backtick("/etc/feishu-gateway/secrets/read-token")}）`,
+        },
+        boundary,
+        resolved,
+      };
+    }
+    return {
+      personalWeb: {
+        status: "warn",
+        detail: `无法连接到个人 Web 网关 ${resolved.endpointLabel}（${tokenSourceDesc}）：${errMsg(e)}（期间由每 10 分钟的飞书轮询兜底）`,
+        fix: `确认独立网关正在运行（${backtick("bin/feishu-gateway run")}）且当前用户对 socket 有访问权限`,
+      },
+      boundary,
+      resolved,
+    };
+  }
+}
+
 export class PersonalWebBridge {
   private readonly app: App;
   private readonly store: ContextStore;
@@ -236,7 +744,7 @@ export class PersonalWebBridge {
 
   private getClient(): FeishuGatewayClient {
     if (this.hooks.gatewayClient) return this.hooks.gatewayClient;
-    return createGatewayClientForConfig(this.cfg.context.personal_web);
+    return createGatewayClientForConfig(this.cfg.context.personal_web, process.env, { dataDir: this.cfg.dataDir });
   }
 
   cursor(): number {
@@ -375,9 +883,10 @@ export class PersonalWebBridge {
       }
 
       if (!this.hooks.gatewayClient) {
-        const resolved = resolveGatewayClientConfig(this.cfg.context.personal_web);
+        const resolved = resolveGatewayClientConfig(this.cfg.context.personal_web, process.env, { dataDir: this.cfg.dataDir });
         if (!resolved.readToken) {
-          const msg = `缺少网关只读令牌（请设置环境变量 ${this.cfg.context.personal_web.read_token_env || "FEISHU_GW_READ_TOKEN"} 或 systemd LoadCredential）`;
+          const extra = resolved.envFileError ? `；${resolved.envFileError}` : "";
+          const msg = `缺少网关只读令牌（请运行 pa context web-setup，或设置环境变量 ${this.cfg.context.personal_web.read_token_env || "FEISHU_GW_READ_TOKEN"} / systemd LoadCredential${extra}）`;
           this.persistState({ state: "needs_login", logged_in: false, since: Date.now(), last_error: msg });
           if (!notifiedNeedsLogin) {
             notifiedNeedsLogin = true;

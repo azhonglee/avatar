@@ -4,11 +4,14 @@ import { createApp, initApp, runConfiguredJob, runDaemon, runDispatchOnce, sendB
 import { loadConfig } from "./config.ts";
 import {
   createGatewayClientForConfig,
+  formatTokenSourceLabel,
+  inspectPersonalWebGateway,
   legacyPersonalWebArtifacts,
   resolveGatewayClientConfig,
   unbindPersonalWebAccount,
   verifyGatewayOwnerForWorkspace,
 } from "./context/personal-web.ts";
+import { runPersonalWebSetup, type SetupTokenOrigin } from "./context/personal-web-setup.ts";
 import { decide, type Profile } from "./guard.ts";
 import { consoleBaseUrl, isLoopbackHost, resolveConsoleHost, serverToken } from "./server/index.ts";
 import { formatReport, runDoctor } from "./doctor.ts";
@@ -28,6 +31,7 @@ const USAGE = `用法：pa <命令>
   context today               打印「今天」：最该处理的事、冲突、草稿、今天的会
   context digest [morning|evening]   发送晨间卡 / 收尾卡（--print 只打印不发送）
   context split <项目>        把一个大项目拆成子项目（模型归类，可重复执行）
+  context web-setup [选项]           自动配置个人 Web 网关地址并同步只读令牌到 <data_dir>/gateway.env（0600）
   context web-status [--verify]      查询独立飞书个人 Web 网关的连接与缓存状态（登录/登出请使用 feishu-gateway）
   context web-unbind          解除当前工作区与个人 Web 账号的绑定并重置本地网关游标（切换网关账号时使用）
   context web-logout          删除旧版残留在本机数据目录的个人 Web 会话凭据（feishu-web.json）
@@ -62,6 +66,24 @@ async function main(): Promise<void> {
       const kbRoot = app.store.get("kb.root");
       const kbInfo = !cfg.kb.enabled ? "已关闭" : kbRoot ? `${kbSpace}（我的文档库 / 根节点 ${kbRoot}）` : (kbSpace ?? "未初始化");
       console.log(`✅ 初始化完成\n主人 open_id：${cfg.owner.open_id}\n看板清单：${app.store.get("board.tasklist")}\n知识空间：${kbInfo}`);
+      if (cfg.context.enabled && cfg.context.personal_web.enabled) {
+        const icon: Record<string, string> = { ok: "✅", warn: "⚠️ ", fail: "❌", skip: "⏭️ " };
+        try {
+          const pw = await inspectPersonalWebGateway(app, { timeoutMs: 3_000 });
+          console.log(`个人 Web 网关：${icon[pw.personalWeb.status]} ${pw.personalWeb.detail}`);
+          if ((pw.personalWeb.status === "warn" || pw.personalWeb.status === "fail") && pw.personalWeb.fix) {
+            console.log(`  指引：${pw.personalWeb.fix}`);
+          }
+          if (pw.boundary.status === "warn" || pw.boundary.status === "fail") {
+            console.log(`个人 Web 边界提醒：${icon[pw.boundary.status]} ${pw.boundary.detail}`);
+            if (pw.boundary.fix) console.log(`  指引：${pw.boundary.fix}`);
+          }
+        } catch (e) {
+          console.log(`个人 Web 网关：⚠️  只读检测异常（${errMsg(e)}），可稍后运行 bin/pa doctor 核查`);
+        }
+      } else if (cfg.context.enabled) {
+        console.log("个人 Web 网关：未启用（可选：部署独立网关后运行 bin/pa context web-setup 接入）");
+      }
       return;
     }
     case "run":
@@ -185,20 +207,112 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
     console.log("下次连接个人 Web 网关时将自动绑定网关当前账号并从新事件库重新同步（历史观测不会被删除）。");
     return;
   }
+  // 自动配置个人 Web 网关地址并同步/更新只读令牌到 <data_dir>/gateway.env（0600，不依赖 context.enabled）
+  if (sub === "web-setup") {
+    if (more.includes("--help") || more.includes("-h")) {
+      console.log(
+        `用法：pa context web-setup [选项]
+
+  --gateway-config <file>    指定网关 gateway.yaml 路径（缺省查找 FEISHU_GW_CONFIG 或仓库根目录 gateway.yaml）
+  --socket <path>            显式指定网关 Unix Socket 路径（与 --url 二选一）
+  --url <http://127.0.0.1:…> 显式指定网关回环 HTTP 地址（与 --socket 二选一）
+  --read-token-file <path>   从文件读取只读令牌（如 /etc/feishu-gateway/secrets/read-token，推荐用于跨用户部署）
+  --read-token <token>       显式传入只读令牌
+  --with-reply               显式开启 send_replies 并同步回复令牌（需网关侧同时开启 allow_reply）
+  --reply-token-file <path>  配合 --with-reply 从文件读取回复令牌
+  --reply-token <token>      配合 --with-reply 显式传入回复令牌
+  --no-reply                 显式关闭 send_replies 并从 gateway.env 清理回复令牌
+  --verify                   额外执行飞书在线会话核验（GET /v1/status?verify=1）
+  --no-verify                跳过网关连通性与鉴权探测，仅校验格式并写入文件`,
+      );
+      return;
+    }
+    const { values } = parseArgs({
+      args: more,
+      options: {
+        "gateway-config": { type: "string" },
+        socket: { type: "string" },
+        url: { type: "string" },
+        "read-token": { type: "string" },
+        "read-token-file": { type: "string" },
+        "with-reply": { type: "boolean" },
+        "no-reply": { type: "boolean" },
+        "reply-token": { type: "string" },
+        "reply-token-file": { type: "string" },
+        verify: { type: "boolean" },
+        "no-verify": { type: "boolean" },
+      },
+      allowPositionals: false,
+    });
+    const res = await runPersonalWebSetup(app, {
+      gatewayConfig: values["gateway-config"],
+      socket: values.socket,
+      url: values.url,
+      readToken: values["read-token"],
+      readTokenFile: values["read-token-file"],
+      withReply: values["with-reply"],
+      noReply: values["no-reply"],
+      replyToken: values["reply-token"],
+      replyTokenFile: values["reply-token-file"],
+      verify: values.verify,
+      noVerify: values["no-verify"],
+    });
+    const originLabel = (o: SetupTokenOrigin): string => {
+      switch (o) {
+        case "gateway_tokens":
+          return "本地网关 tokens.json";
+        case "file":
+          return "指定令牌文件";
+        case "arg":
+          return "命令行参数";
+        case "env":
+          return "环境变量";
+        case "credential":
+          return "systemd 凭据";
+        case "env_file":
+          return "已有 gateway.env";
+      }
+    };
+    console.log(`✅ 个人 Web 网关配置已完成`);
+    console.log(`配置文件：${res.configFile}${res.configChanged ? "（已更新，原文件备份为 .bak）" : "（无变化）"}`);
+    console.log(`凭据文件：${res.envFile}（权限 0600）`);
+    console.log(`网关地址：${res.endpointLabel}`);
+    console.log(`只读令牌：${res.readTokenEnv}（来源：${originLabel(res.readTokenOrigin)}）`);
+    console.log(
+      `回复通道：${res.sendReplies ? "已开启" : "已关闭"}（回复令牌：${res.replyTokenStored ? `${res.replyTokenEnv} 已同步` : res.removedReplyTokenFromEnvFile ? "已从 gateway.env 清理" : "未写入"}）`,
+    );
+    if (res.reachable && res.gatewayStatus) {
+      const st = res.gatewayStatus;
+      console.log(
+        `网关状态：${st.logged_in ? `${st.owner_name || st.owner_id}（ID: ${st.owner_id}）` : `未登录（${st.credential_status}）`}，state=${st.state}，allow_reply=${st.allow_reply}，缓存事件 ${st.cached_events} 条（seq ${st.min_seq}..${st.latest_seq}）`,
+      );
+      if (res.verifiedOnline) {
+        console.log(`✅ 飞书在线会话核验通过：${st.owner_name || st.owner_id}（ID: ${st.owner_id}）`);
+      }
+    }
+    for (const w of res.warnings) console.log(`⚠️  ${w}`);
+    if (res.daemonRunning) {
+      console.log("提示：检测到 Avatar 常驻进程正在运行，请重启 `bin/pa run` 使新配置生效。");
+    }
+    return;
+  }
+
   // 查询独立个人 Web 网关状态（只读，不依赖 context.enabled）
   if (sub === "web-status") {
     const verify = more.includes("--verify");
     const pwCfg = app.cfg.context.personal_web;
-    const resolved = resolveGatewayClientConfig(pwCfg);
+    const resolved = resolveGatewayClientConfig(pwCfg, process.env, { dataDir: app.cfg.dataDir });
+    const fmtTok = (has: boolean, src: typeof resolved.readTokenSource) => (has ? `已配置（${formatTokenSourceLabel(src)}）` : "未配置");
     console.log(
       `启用状态：${pwCfg.enabled ? "已启用" : "未启用"}（fast_lane=${pwCfg.fast_lane}，debounce_ms=${pwCfg.debounce_ms}，pre_draft=${pwCfg.pre_draft}，send_replies=${pwCfg.send_replies}）`,
     );
-    console.log(`网关地址：${resolved.endpointLabel}（只读令牌：${resolved.readToken ? "已配置" : "未配置"}，回复令牌：${resolved.replyToken ? "已配置" : "未配置"}）`);
+    console.log(`网关地址：${resolved.endpointLabel}（只读令牌：${fmtTok(!!resolved.readToken, resolved.readTokenSource)}，回复令牌：${fmtTok(!!resolved.replyToken, resolved.replyTokenSource)}）`);
+    if (resolved.envFileError) console.log(`⚠️  凭据文件异常：${resolved.envFileError}`);
     if (!resolved.socketPath && !resolved.baseUrl) {
       if (verify) throw new Error("未配置 context.personal_web.gateway_socket 或 gateway_url");
       return;
     }
-    const client = createGatewayClientForConfig(pwCfg);
+    const client = createGatewayClientForConfig(pwCfg, process.env, { dataDir: app.cfg.dataDir });
     const st = await client.status({ verify });
     if (st.owner_id) verifyGatewayOwnerForWorkspace(app, st.owner_id);
     console.log(`网关账号：${st.logged_in ? `${st.owner_name || st.owner_id}（ID: ${st.owner_id}）` : `未登录（${st.credential_status}）`}`);
@@ -249,7 +363,7 @@ async function context(app: ReturnType<typeof createApp>, rest: string[]): Promi
     await app.engine.drain(["effect"]);
     return;
   }
-  throw new Error("用法：pa context run | today | split <项目> | digest [morning|evening] [--print] | web-status [--verify] | web-unbind | web-logout（个人 Web 扫码登录/登出请使用独立网关命令 feishu-gateway login / logout）");
+  throw new Error("用法：pa context run | today | split <项目> | digest [morning|evening] [--print] | web-setup [选项] | web-status [--verify] | web-unbind | web-logout（个人 Web 扫码登录/登出请使用独立网关命令 feishu-gateway login / logout）");
 }
 
 async function doctor(app: ReturnType<typeof createApp>): Promise<void> {
